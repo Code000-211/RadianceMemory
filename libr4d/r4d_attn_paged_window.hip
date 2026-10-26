@@ -1,5 +1,6 @@
 /* r4d_attn_paged_window.hip -- paged attention at head_dim 128, 256 and 512, 1/2/4/8 queries per
- * KV head, any sliding window, causal or not, bf16 or fp8-e4m3 cache, q at any row pitch.
+ * KV head (16 at 512), any sliding window, causal or not, bf16 or fp8-e4m3 cache, q at any row
+ * pitch.
  *
  * head_dim 128 is Unlimited-OCR's decoder (10 query heads over 10 KV heads): the plain MHA case,
  * served here so its q slice of the fused q|k|v plane is read in place (attn_paged_qrow) instead
@@ -7,8 +8,9 @@
  *
  * Gemma 4's text layers: sliding layers are 16 query heads over 8 KV heads at head_dim 256 with a
  * 1024-token window (gqa 2 at every TP); full layers are 16 over 2 at head_dim 512 (gqa 8 at
- * TP1/TP2, 4 at TP4, 2 at TP8). Where this overlaps the library's other h256 legs, the row table
- * decides (r4d_rows.cpp).
+ * TP1/TP2, 4 at TP4, 2 at TP8). The 12B's full layers are 16 over 1 (gqa 16 at TP1; its one KV
+ * head is replicated at TP2/TP4, gqa 8/4). Where this overlaps the library's other h256 legs, the
+ * row table decides (r4d_rows.cpp).
  *
  * Two kernels behind one entry point:
  *   - Scalar, for decode and verify: a workgroup owns one (sequence, KV head, slice of BQ query
@@ -1260,7 +1262,7 @@ extern "C" {
     }
 R4D_WIN_DEF(128, 1)
 R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
-R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8)
+R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8) R4D_WIN_DEF(512, 16)
 #undef R4D_WIN_DEF
 
 /* attn_paged_qrow_tree: the scalar kernel with a tree verify's mask (TREE). */

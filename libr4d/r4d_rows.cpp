@@ -4208,10 +4208,10 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
 /* The windowed kernels (r4d_attn_paged_window.hip): head_dim 128, 256 and 512, 1/2/4/8 queries per
- * KV head, any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a 1024-token
- * window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8); h128/gqa1 is Unlimited-OCR's
- * MHA decoder. One kernel serves every q_len (splitting the key range when there are too few tiles
- * to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
+ * KV head (16 at 512), any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a
+ * 1024-token window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8), the 12B's at
+ * gqa 16 (TP1); h128/gqa1 is Unlimited-OCR's MHA decoder. One kernel serves every q_len (splitting
+ * the key range when there are too few tiles to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
  * is derived: 16.
  *
  * h256 at gqa 4 and 8 take a window only (C_GE 1), leaving the window-0 band to the gqa4 / gqa8
@@ -4241,6 +4241,7 @@ R4D_WIN_C(cAnchorH512G1Bf16, 512, 1, "bf16", 1) R4D_WIN_C(cAnchorH512G1Fp8, 512,
 R4D_WIN_C(cAnchorH512G2Bf16, 512, 2, "bf16", 1) R4D_WIN_C(cAnchorH512G2Fp8, 512, 2, "fp8_e4m3", 1)
 R4D_WIN_C(cAnchorH512G4Bf16, 512, 4, "bf16", 1) R4D_WIN_C(cAnchorH512G4Fp8, 512, 4, "fp8_e4m3", 1)
 R4D_WIN_C(cAnchorH512G8Bf16, 512, 8, "bf16", 1) R4D_WIN_C(cAnchorH512G8Fp8, 512, 8, "fp8_e4m3", 1)
+R4D_WIN_C(cWinH512G16Bf16, 512, 16, "bf16", 0) R4D_WIN_C(cWinH512G16Fp8, 512, 16, "fp8_e4m3", 0)
 #undef R4D_WIN_C
 /* Twelve queries per KV head, head_dim 256 (r4d_attn_paged_h256_gqa12.hip): Qwen3.8-Flash-Next's
  * QSA layers, 24 query heads over 2. `q_len <= 5` is the same `q_len * gqa <= 64` bound, tighter
@@ -7232,6 +7233,7 @@ static const RadKernelInfo kKernels[] = {
 R4D_WIN_PAIR(128, 1)
 R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
+R4D_WIN_PAIR(512, 16)
 #undef R4D_WIN_PAIR
 #undef R4D_WIN_ROW
 

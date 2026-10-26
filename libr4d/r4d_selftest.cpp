@@ -30052,6 +30052,17 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);
+    /* Gemma 4 12B global at one rank: 16 query heads over its one kv head, in the trunk and in the
+     * assistant (one row a sequence, a verify of sixteen). Launches, then numeric checks. */
+    attn_case(pl, "attn_window_h512_gqa16_fp8kv",  512, 16, 32, "fp8_e4m3", 1);
+    attn_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16, 32, "bf16",     1);
+    attn_case(pl, "attn_window_h512_gqa16_fp8kv",  512, 16,  1, "fp8_e4m3", 0);
+    attn_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16,  1, "bf16",     0);
+    attn_numeric_case(pl, "attn_window_h512_gqa16_fp8kv",  512, 16, 32, "fp8_e4m3", 0);
+    attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16, 32, "bf16",     0);
+    attn_numeric_case(pl, "attn_window_h512_gqa16_fp8kv",  512, 16,  1, "fp8_e4m3", 0, 700);
+    attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16,  1, "bf16",     0, 700);
+    attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16, 16, "bf16",     0, 300);
     /* The h256/gqa2 prefill numeric check with ctx 2048 > window 1024, so the window applies: for
      * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so wlo0 = 961 and
      * tstart = 961/48 = 20. This exercises the window mask and the below-window tile skip (tiles

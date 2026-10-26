@@ -185,6 +185,8 @@ int     r4d_rad_attn_window_h512_gqa4_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa4_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa16_fp8 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);

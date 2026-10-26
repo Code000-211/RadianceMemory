@@ -43,6 +43,7 @@ using Fn = int (*)(const RadArgs*, RadStream);
 static Fn pick(int hd, int gqa, bool fp8) {
 #define P(H, G) if (hd == H && gqa == G) return fp8 ? r4d_rad_attn_window_h##H##_gqa##G##_fp8 : r4d_rad_attn_window_h##H##_gqa##G##_bf16;
     P(128, 1) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
+    P(512, 16)
 #undef P
     return nullptr;
 }
@@ -197,6 +198,13 @@ int main(int argc, char** argv) {
         {"h512 gqa4 full decode, 64 splits, short ctx", 512, 4, 1, false, true, false, false, 0, {4}, {37}, -1, 262144, s512},
         {"h256 gqa2 swa w1024 verify, ragged, splits", 256, 2, 2, true, true, true, true, 1024, {3, 5}, {20, 900}, -1, 262144, s256},
         {"h512 gqa2 full ragged", 512, 2, 2, false, true, true, false, 0, {3, 1, 9}, {50, 64, 9}},
+        /* Gemma 4 12B full at TP1: 16 q heads over its one kv head, one position a tile; the
+         * assistant's full layer is the same geometry at one row a sequence */
+        {"h512 gqa16 full ragged bf16", 512, 16, 1, false, true, true, false, 0, {3, 1, 9}, {50, 64, 9}},
+        {"h512 gqa16 full decode split fp8", 512, 16, 1, true, true, false, true, 0, {1}, {700}, -1, 4096, s512},
+        {"h512 gqa16 full verify16 split", 512, 16, 1, false, true, false, false, 0, {16}, {300}, -1, 1024, s512},
+        {"h512 gqa16 full decode, 3 seqs, 64 splits", 512, 16, 1, false, true, true, false, 0, {1, 1, 1}, {40, 90, 300}, -1, 262144, s512},
+        {"h512 gqa16 kvh2 noncausal missing-block", 512, 16, 2, false, false, true, false, 0, {4, 2}, {37, 20}, 1},
         /* the coverage the rows claim beyond Gemma: non-causal, two-sided window, a missing block */
         {"h256 gqa4 noncausal w20 missing-block", 256, 4, 1, false, false, true, false, 20, {6, 2}, {70, 30}, 2},
         {"h512 gqa1 noncausal full", 512, 1, 1, false, false, false, false, 0, {4}, {37}},
@@ -208,6 +216,8 @@ int main(int argc, char** argv) {
         {"wmma h512 gqa8 prefill fp8+descale", 512, 8, 1, true, true, false, true, 0, {130}, {130}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa2 kvh2 ragged + decode rows", 512, 2, 2, false, true, true, false, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa1 noncausal", 512, 1, 1, false, false, false, false, 0, {64}, {100}, -1, 0, 0, 0, 1},
+        {"wmma h512 gqa16 prefill 200 of 900", 512, 16, 1, false, true, false, false, 0, {200}, {900}, -1, 262144, s512, 0, 1},
+        {"wmma h512 gqa16 ragged + decode rows fp8+descale", 512, 16, 1, true, true, true, true, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa2 swa w1024 prefill 300 of 1500", 256, 2, 2, false, true, false, false, 1024, {300}, {1500}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa2 swa w64 ragged fp8+descale", 256, 2, 2, true, true, true, true, 64, {100, 90}, {250, 90}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa4 noncausal w20 missing-block", 256, 4, 1, false, false, true, false, 20, {80, 70}, {200, 70}, 3, 0, 0, 0, 1},
