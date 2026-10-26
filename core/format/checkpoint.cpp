@@ -233,6 +233,9 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
         /* LFM2-VL names the wrapper, not the text model; one plugin serves LFM2 with or without
          * its tower. `model_type` stays in the free-form keys. */
         if (out->arch == "lfm2vl") out->arch = "lfm2";
+        /* Gemma 4 12B (`gemma4_unified`): its text model is Gemma 4's, served by the gemma4
+         * plugins; `model_type` tells them apart. */
+        if (out->arch == "gemma4unified") out->arch = "gemma4";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
