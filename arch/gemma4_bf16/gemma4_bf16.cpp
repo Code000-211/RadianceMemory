@@ -1414,10 +1414,11 @@ struct Gemma4Head {
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
-/* Does the container carry an assistant head at all? */
+/* Does the container carry an assistant head at all? The 12B's is the same head under another
+ * name (Gemma4UnifiedAssistantForCausalLM). */
 static bool has_assistant(const RadModelMeta* m) {
     const char* a = rad_meta_gets(m, "draft.architectures", "");
-    return a && std::strstr(a, "Gemma4Assistant") != nullptr;
+    return a && (std::strstr(a, "Gemma4Assistant") || std::strstr(a, "Gemma4UnifiedAssistant"));
 }
 
 int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, const Geom& trunk,
@@ -1459,16 +1460,17 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
     }
     /* The head reads the trunk's cache, so everything the cache's shape depends on must agree:
      * the two head widths, the two kv head counts and the window. A head that disagrees was trained
-     * with another trunk. */
+     * with another trunk. The counts are the model's, not a rank's: a replicated kv head (fewer
+     * than ranks) is one head on every rank. */
     if (n_trunk != trunk.n_embd || vocab != trunk.n_vocab_all || head_s != cs.head_dim ||
-        head_g != cg.head_dim || n_kv != cs.n_head_kv * trunk.world ||
-        n_kv_g != cg.n_head_kv * trunk.world || win != cs.window) {
+        head_g != cg.head_dim || n_kv != cs.n_head_kv_all || n_kv_g != cg.n_head_kv_all ||
+        win != cs.window) {
         fprintf(stderr, "radiance: gemma4 assistant: this head was not made for this trunk -- it "
                         "states width %lld, vocabulary %lld, heads %lld/%lld x %lld/%lld kv over a "
                         "window of %lld; the trunk's cache is %lld/%lld kv heads of %lld/%lld over "
                         "%lld, at width %lld and vocabulary %lld\n",
                 (long long)n_trunk, vocab, n_kv, n_kv_g, head_s, head_g, win,
-                (long long)(cs.n_head_kv * trunk.world), (long long)(cg.n_head_kv * trunk.world),
+                (long long)cs.n_head_kv_all, (long long)cg.n_head_kv_all,
                 (long long)cs.head_dim, (long long)cg.head_dim, (long long)cs.window,
                 (long long)trunk.n_embd, (long long)trunk.n_vocab_all);
         return RAD_E_INVAL;

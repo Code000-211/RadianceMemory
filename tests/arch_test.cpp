@@ -5006,6 +5006,130 @@ TEST(the_gemma4_31b_form_reads_asymmetric_int4_and_int5_linears) {
     }
 }
 
+/* Gemma 4 12B (`gemma4_unified`, served here through the arch id's alias) on the same twelve
+ * layers: width 3840, 16 query heads over 8 sliding KV heads and ONE global KV head, its layer
+ * schedule from layer_types. */
+const char* k_gem12_keys[] = {
+    "model_type", "sliding_window", "global_head_dim", "num_global_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor", "num_kv_shared_layers",
+    "final_logit_softcapping", "attention_k_eq_v", "hidden_size_per_layer_input", "layer_types",
+};
+const char* k_gem12_vals[] = {
+    "gemma4_unified", "1024", "512", "1", "10000", "1000000", "0.25", "0", "30", "1", "0",
+    "sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention "
+    "full_attention sliding_attention sliding_attention sliding_attention sliding_attention "
+    "sliding_attention full_attention",
+};
+
+RadModelMeta gemma4_12b_meta() {
+    RadModelMeta m = gemma4_meta();
+    m.name      = "test-gemma4-12b-form";
+    m.n_embd    = 3840;
+    m.n_head    = 16;
+    m.n_head_kv = 8;
+    m.n_ff      = 15360;
+    m.n_kv      = (int)(sizeof(k_gem12_keys) / sizeof(k_gem12_keys[0]));
+    m.kv_key    = k_gem12_keys;
+    m.kv_val    = k_gem12_vals;
+    return m;
+}
+
+/* At one rank the global class is 16 q heads over one KV head (gqa 16). At two and four the
+ * sliding heads split (4 and 2 a rank, gqa 2) and the global head is replicated: each rank keeps
+ * a share of the q heads (gqa 8 and 4) and the whole k row (rows 0..511), as one span or as the k
+ * part of a fused q|k. Each layer's attention reads its own cache in its class's group, and a
+ * step reduces the lookup and two a layer. */
+TEST(the_gemma4_12b_form_declares_and_steps_at_one_two_and_four_ranks) {
+    const int64_t L = 12, hs = 256, hg = 512;
+    for (bool fused : { false, true }) {
+        for (int world : { 1, 2, 4 }) {
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuilder b;
+                if (fused) {
+                    const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+                    b.encs = { { "attn_qkv.", e }, { "attn_o.", e }, { "ffn_gate_up.", e },
+                               { "ffn_down.", e } };
+                }
+                RadModelMeta meta = gemma4_12b_meta();
+                RadBuildCtx  ctx  = build_ctx(rank, world);
+                CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+                CHECK_EQ(gemma4_bf16::g_model[rank].fuse, fused);
+                REQUIRE_EQ((int)b.kv_groups.size(), 2);
+                CHECK_EQ(b.kv_groups[0].d.n_head_kv, 8 / world);
+                CHECK_EQ(b.kv_groups[0].d.head_dim, hs);
+                CHECK_EQ(b.kv_groups[1].d.n_head_kv, 1);
+                CHECK_EQ(b.kv_groups[1].d.head_dim, hg);
+                const int64_t nq = 16 / world;
+                if (!fused) {
+                    const RecOp* as = find_op(b, "attn_paged", 0);
+                    const RecOp* ag = find_op(b, "attn_paged", 5);
+                    REQUIRE(as != nullptr && ag != nullptr);
+                    CHECK_EQ(pint(as, "head_dim"), hs);
+                    CHECK_EQ(pint(as, "n_head"), nq);
+                    CHECK_EQ(pint(as, "gqa"), 2);
+                    CHECK_EQ(pint(as, "window"), 1024);
+                    CHECK_EQ(pint(ag, "head_dim"), hg);
+                    CHECK_EQ(pint(ag, "n_head"), nq);
+                    CHECK_EQ(pint(ag, "gqa"), 16 / world);
+                    CHECK_EQ(pint(ag, "window"), 0);
+                    const RecWeight* q0 = find_w(b, "blk.0.attn_q.weight");
+                    const RecWeight* k0 = find_w(b, "blk.0.attn_k.weight");
+                    const RecWeight* q5 = find_w(b, "blk.5.attn_q.weight");
+                    const RecWeight* k5 = find_w(b, "blk.5.attn_k.weight");
+                    REQUIRE(q0 && k0 && q5 && k5);
+                    CHECK_EQ(q0->d.shape[0], nq * hs); CHECK_EQ(q0->d.shape[1], 3840);
+                    CHECK_EQ(k0->d.shape[0], (8 / world) * hs);
+                    CHECK_EQ(q5->d.shape[0], nq * hg);
+                    CHECK_EQ(k5->d.shape[0], hg);
+                    CHECK(find_w(b, "blk.5.attn_v.weight") == nullptr);   /* k == v */
+                    CHECK(!k0->span_set);                                 /* an even share */
+                    CHECK_EQ(k5->span_set, world > 1);
+                    if (world > 1) { CHECK_EQ(k5->span_lo, 0); CHECK_EQ(k5->span_hi, hg); }
+                } else {
+                    const RecWeight* s0 = find_w(b, "blk.0.attn_qkv.weight");
+                    REQUIRE(s0 != nullptr);
+                    CHECK_EQ(s0->n_part_spans, 0);                        /* even shares */
+                    for (const char* v : { "weight", "scale" }) {
+                        const RecWeight* w = find_w(b, std::string("blk.5.attn_qkv.") + v);
+                        REQUIRE(w != nullptr);
+                        if (world == 1) { CHECK_EQ(w->n_part_spans, 0); continue; }
+                        REQUIRE_EQ(w->n_part_spans, 2);                   /* q and k, no v */
+                        CHECK_EQ(w->part_lo[0], rank * nq * hg);
+                        CHECK_EQ(w->part_hi[0], (rank + 1) * nq * hg);
+                        CHECK_EQ(w->part_total[0], 16 * hg);
+                        CHECK_EQ(w->part_lo[1], 0);
+                        CHECK_EQ(w->part_hi[1], hg);
+                        CHECK_EQ(w->part_total[1], hg);
+                    }
+                }
+
+                RadBatch batch = decode_batch();
+                RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+                gemma4_bf16::step(&c, &batch);
+                CHECK_LINT(b, &c);
+                CHECK(c.step_fail.empty());
+                std::vector<std::pair<int, int64_t>> kv;
+                for (const auto& i : c.issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o || (o->op != "attn_paged" && o->op != "attn_paged_qrow")) continue;
+                    REQUIRE(i.opd.size() > 1);
+                    CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_KV);
+                    kv.push_back({ (int)i.opd[1].handle, (int64_t)i.opd[1].offset });
+                }
+                REQUIRE_EQ((int)kv.size(), (int)L);
+                for (int l = 0; l < (int)L; ++l) {
+                    CHECK_EQ(kv[(size_t)l].first, (l % 6 == 5) ? 2 : 1);
+                    CHECK_EQ(kv[(size_t)l].second, (int64_t)l);
+                }
+                const std::vector<std::string> ops = issued_ops(b, c);
+                CHECK_EQ(count_issued(ops, "all_reduce") + count_issued(ops, "ar_rmsnorm_quant_i8"),
+                         world > 1 ? (int)(1 + 2 * L) : 0);
+            }
+        }
+    }
+}
+
 TEST(gemma4_attention_shapes_for_both_classes) {
     RadBuilder b;
     RadModelMeta meta = gemma4_meta();
@@ -5540,6 +5664,104 @@ TEST(gemma4_probe_names_the_heads_operating_depth) {
     RadModelMeta without = gemma4_meta();
     CHECK_OK(gemma4_bf16::probe(&without, &q));
     CHECK_EQ(q.draft_depth, 0);
+}
+
+/* The 12B's assistant: the same head under the name Gemma4UnifiedAssistantForCausalLM, width
+ * 1024 over a 3840 trunk, 16 q heads over the trunk's 8 sliding and one global KV head. */
+const char* k_gem12d_keys[] = {
+    "model_type", "sliding_window", "global_head_dim", "num_global_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor", "num_kv_shared_layers",
+    "final_logit_softcapping", "attention_k_eq_v", "hidden_size_per_layer_input", "layer_types",
+    "draft.architectures", "draft.backbone_hidden_size", "draft.use_ordered_embeddings",
+    "draft.text_config.hidden_size", "draft.text_config.num_hidden_layers",
+    "draft.text_config.layer_types", "draft.text_config.num_attention_heads",
+    "draft.text_config.num_key_value_heads", "draft.text_config.num_global_key_value_heads",
+    "draft.text_config.head_dim", "draft.text_config.global_head_dim",
+    "draft.text_config.intermediate_size", "draft.text_config.sliding_window",
+    "draft.text_config.vocab_size", "draft.text_config.rms_norm_eps",
+    "draft.text_config.rope_parameters.sliding_attention.rope_theta",
+    "draft.text_config.rope_parameters.full_attention.rope_theta",
+    "draft.text_config.rope_parameters.full_attention.partial_rotary_factor",
+};
+std::vector<const char*> gem12d_vals() {
+    std::vector<const char*> v(std::begin(k_gem12_vals), std::end(k_gem12_vals));
+    for (const char* s : { "Gemma4UnifiedAssistantForCausalLM", "3840", "0", "1024", "4",
+                           "sliding_attention sliding_attention sliding_attention full_attention",
+                           "16", "8", "1", "256", "512", "8192", "1024", "262144", "1e-06", "10000",
+                           "1000000", "0.25" })
+        v.push_back(s);
+    return v;
+}
+
+/* Declared at one, two and four ranks: the head's full layer is gqa 16, 8 and 4 over the trunk's
+ * one (replicated) global KV head, its sliding layers gqa 2. A pass reads layers 10 and 11. A head
+ * stating another global KV count than the trunk's is still refused. */
+TEST(the_gemma4_12b_assistant_is_declared_at_one_two_and_four_ranks) {
+    const std::vector<const char*> vals = gem12d_vals();
+    REQUIRE_EQ(vals.size(), sizeof(k_gem12d_keys) / sizeof(k_gem12d_keys[0]));
+    for (int world : { 1, 2, 4 }) {
+        for (int rank : { 0, world - 1 }) {
+            RadBuilder b;
+            RadModelMeta meta = gemma4_12b_meta();
+            meta.n_kv = (int)vals.size(); meta.kv_key = k_gem12d_keys; meta.kv_val = vals.data();
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_spec = 3;
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+            CHECK_EQ(b.drafter.depth, 3);
+            CHECK_EQ(count_op(b, "attn_paged"), 16);
+            const int64_t nq = 16 / world;
+            for (int l = 0; l < 4; ++l) {
+                const RecOp* at = find_op(b, "attn_paged", 12 + l);
+                REQUIRE(at != nullptr);
+                CHECK_EQ(pint(at, "n_head"), nq);
+                CHECK_EQ(pint(at, "head_dim"), l == 3 ? 512 : 256);
+                CHECK_EQ(pint(at, "gqa"), l == 3 ? nq : 2);
+            }
+            const RecWeight* wq3 = find_w(b, "mtp.blk.3.attn_q.weight");
+            const RecWeight* pre = find_w(b, "mtp.pre_proj.weight");
+            const RecWeight* post = find_w(b, "mtp.post_proj.weight");
+            REQUIRE(wq3 && pre && post);
+            CHECK_EQ(wq3->d.shape[0], nq * 512); CHECK_EQ(wq3->d.shape[1], 1024);
+            CHECK_EQ(pre->d.shape[0], 1024);     CHECK_EQ(pre->d.shape[1], 2 * 3840);
+            CHECK_EQ(post->d.shape[0], 3840);    CHECK_EQ(post->d.shape[1], 1024);
+            const RecMap* mpre = find_map(b, "mtp.pre_proj.weight");
+            REQUIRE(mpre != nullptr);
+            CHECK_EQ(mpre->src[0], std::string("draft.pre_projection.weight"));
+
+            RadBatch batch = head_batch(-1);
+            RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK(c.step_fail.empty());
+            int seen = 0;
+            for (const auto& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o || o->op != "attn_paged") continue;
+                REQUIRE(i.opd.size() > 1);
+                CHECK_EQ((int)i.opd[1].handle, seen < 3 ? 1 : 2);
+                CHECK_EQ((long long)i.opd[1].offset, seen < 3 ? 10LL : 11LL);
+                ++seen;
+            }
+            CHECK_EQ(seen, 4);
+        }
+    }
+    std::vector<const char*> two = gem12d_vals();
+    two[20] = "2";   /* draft.text_config.num_global_key_value_heads */
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        RadModelMeta meta = gemma4_12b_meta();
+        meta.n_kv = (int)two.size(); meta.kv_key = k_gem12d_keys; meta.kv_val = two.data();
+        RadBuildCtx ctx = build_ctx(0, world);
+        ctx.max_spec = 3;
+        CHECK_EQ(stderr_of_rc([&] { return gemma4_bf16::declare(&b, &meta, &ctx); }),
+                 (int)RAD_E_INVAL);
+    }
+    RadArchProbe p{};
+    RadModelMeta with = gemma4_12b_meta();
+    with.n_kv = (int)vals.size(); with.kv_key = k_gem12d_keys; with.kv_val = vals.data();
+    CHECK_OK(gemma4_bf16::probe(&with, &p));
+    CHECK_EQ(p.draft_depth, gemma4_bf16::kHeadDepth);
 }
 
 /* ===================== gemma4: the 26B-A4B, a dense and a routed arm side by side ===================== */
