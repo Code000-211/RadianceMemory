@@ -1005,6 +1005,30 @@ int main(int argc, char** argv) {
         if (L.declared && L.status == RAD_OK) plan.push_back(&L);
     std::sort(plan.begin(), plan.end(), plan_less);
 
+    /* The checkpoint tensors no planned weight reads. Only declared weights are written, so a
+     * tower or head the plugin does not recognise is left out without an error; this says so. A
+     * tensor beside a read one (`X.weight_scale` beside `X.weight`) counts as read. */
+    {
+        auto stem = [](const std::string& n) { return n.substr(0, n.rfind('.')); };
+        std::unordered_set<std::string> read, stems;
+        for (const RadNameMap& nm : prog.name_map) {
+            const auto it = nm.declared ? logical.find(nm.declared) : logical.end();
+            if (it == logical.end() || !it->second.declared || it->second.status != RAD_OK) continue;
+            for (int k = 0; k < nm.n_src; ++k)
+                if (nm.src[k]) { read.insert(nm.src[k]); stems.insert(stem(nm.src[k])); }
+        }
+        std::vector<std::string> unread;
+        for (const SrcTensor& t : ck.tensors())
+            if (!read.count(t.name) && !stems.count(stem(t.name))) unread.push_back(t.name);
+        if (!unread.empty()) {
+            std::string list;
+            for (size_t i = 0; i < unread.size() && i < 8; ++i) list += (i ? ", " : "") + unread[i];
+            RAD_WARN("%zu of %zu checkpoint tensors are read by no declared weight and are not "
+                     "written: %s%s", unread.size(), ck.tensors().size(), list.c_str(),
+                     unread.size() > 8 ? ", ..." : "");
+        }
+    }
+
     {
         int64_t n_q = 0, n_kept = 0, n_imp = 0;
         for (const Logical* L : plan) (L->rule ? n_q : L->src.imported ? n_imp : n_kept)++;
