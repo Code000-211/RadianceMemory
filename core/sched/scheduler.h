@@ -470,7 +470,15 @@ public:
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
     int64_t plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
-                       int64_t* checkpoint_pos, int64_t keep_at = 0) const;
+                       int64_t* checkpoint_pos, int64_t keep_at = 0,
+                       const Request* r = nullptr) const;
+    /* Visible for tests: `want` tokens of `r` from `n_computed` cut so the chunk ends inside no run
+     * the language model reads both ways (RadEncoderDecl::bidirectional): before the run on a
+     * quantum, or at its end when the chunk starts in it and `budget` holds that, else 0. A run
+     * longer than any step keeps the cut where it falls. `want` unchanged for a program with no
+     * such runs. */
+    int64_t bidi_fit(const Request& r, int64_t n_computed, int64_t n_target, int64_t want,
+                     int64_t budget) const;
 
     /* The smallest step the prefill stager overlaps, in tokens (0 = no stager), set once by the
      * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap).

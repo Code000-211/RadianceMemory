@@ -886,6 +886,13 @@ typedef struct RadEncoderDecl {
      * position tables or kernels are per geometry; the core ends a pass where the grid changes.
      * 0 packs segments of any grid into a pass. */
     int32_t     one_grid;
+
+    /* ---- appended in ABI 32 (runs the language model reads both ways) */
+    /* 1: the language model attends the placeholders of one picture or video frame to each other
+     * both ways (Gemma 4's use_bidirectional_attention "vision"), text before and after them
+     * causally. The core then ends no prefill chunk inside such a run and states each trunk pass's
+     * runs (RadBatch::n_bidi). 0 for an audio encoder. */
+    int32_t     bidirectional;
 } RadEncoderDecl;
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);

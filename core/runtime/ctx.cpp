@@ -951,15 +951,16 @@ int Ctx::lane_join(int from, int to) {
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 432,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 472,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
-     * issue the scatter only when they have some. */
-    if (b->enc || b->n_mm_rows > 0) return 0;
+     * issue the scatter only when they have some (and the second attention over a run read both
+     * ways, n_bidi, only on such a pass). */
+    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
     /* Legacy architecture plugins have no pass-key callback. Only refuse them when the resolved
      * program contains a launcher explicitly marked as using live prefill splits, and this batch
      * can issue a prefill, mixed, speculative-verify or draft query through it. */

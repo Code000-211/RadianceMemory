@@ -1339,6 +1339,11 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
             (int)d->one_grid);
         return RAD_E_INVAL;
     }
+    if (d->bidirectional != 0 && (d->bidirectional != 1 || audio)) {
+        err(RAD_E_INVAL, "declare_encoder '%s': bidirectional %d -- 0, or 1 for a picture and video "
+                         "encoder", nm, (int)d->bidirectional);
+        return RAD_E_INVAL;
+    }
     slot = *d;
     slot_name = nm;
     slot.name = nullptr;   /* the plugin's storage; the name is the copy */

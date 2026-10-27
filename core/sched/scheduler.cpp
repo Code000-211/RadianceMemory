@@ -975,7 +975,7 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
  * so a chunk clamped to it is already aligned; in the other order a chunk past the checkpoint
  * would be rounded down and miss the boundary. */
 int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
-                              int64_t* checkpoint_pos, int64_t keep_at) const {
+                              int64_t* checkpoint_pos, int64_t keep_at, const Request* r) const {
     if (checkpoint_pos) *checkpoint_pos = -1;
     int64_t remaining = n_target - n_computed;
     if (remaining <= 0 || budget <= 0) return 0;
@@ -1100,7 +1100,46 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
             if (checkpoint_pos && *checkpoint_pos > aligned) *checkpoint_pos = -1;
         }
     }
+    if (r) {
+        const int64_t fit = bidi_fit(*r, n_computed, n_target, want, budget);
+        /* A trimmed chunk keeps a window snapshot it still carries (as above); a grown one drops it. */
+        if (fit != want && checkpoint_pos && (fit > want || *checkpoint_pos > n_computed + fit))
+            *checkpoint_pos = -1;
+        want = fit;
+    }
     return want;
+}
+
+/* A chunk that ended inside a run read both ways would give the run's rows of this chunk keys the
+ * next chunk writes. So it ends before the run, on a quantum (and before every run that lands in,
+ * as a video's frames do); a chunk that starts at or inside the run (nothing fits before it) runs
+ * to the run's end, rounded up to a quantum unless the sequence ends first, past every run that
+ * lands in, or waits for a step that holds that. A run no step holds is cut where the chunk falls,
+ * and its rows see the run up to the cut (RadBatch::bidi_used). */
+int64_t Scheduler::bidi_fit(const Request& r, int64_t n_computed, int64_t n_target, int64_t want,
+                            int64_t budget) const {
+    if (!prog_ || !prog_->encoder.bidirectional || !r.media || want <= 0) return want;
+    const mm::PromptMedia& pm = *r.media;
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+    /* The run read both ways that a chunk ending at `end` would cut, or null. */
+    auto cut = [&](int64_t end) -> const mm::RopeLayout::Run* {
+        if (end >= n_target) return nullptr;
+        const mm::RopeLayout::Run* run = pm.rope.run_at(end);
+        if (!run || run->tok == end || pm.items[(size_t)run->item].item->kind == mm::Kind::Audio)
+            return nullptr;
+        return run;
+    };
+    int64_t end = n_computed + want;
+    for (const mm::RopeLayout::Run* run = cut(end); run; run = cut(end)) {
+        const int64_t before = (int64_t)run->tok / Q * Q;
+        if (before <= n_computed) break;
+        end = before;
+    }
+    if (!cut(end)) return end - n_computed;
+    for (const mm::RopeLayout::Run* run = cut(end); run; run = cut(end))
+        end = std::min<int64_t>(n_target, ((int64_t)run->tok + run->n + Q - 1) / Q * Q);
+    if (end - n_computed <= budget) return end - n_computed;
+    return end - n_computed > cfg_.max_tok ? want : 0;
 }
 
 /* The tail checkpoint of a `target`-token prompt, or -1. Under --prefix-resume exact, where its
@@ -1478,9 +1517,12 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * to what really has to run. */
         const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
         const int64_t end = chunk_end(r, target);
-        want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at);
-        if (cap < budget && want > 0)
-            admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at);
+        want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at, &r);
+        /* A run read both ways (bidi_fit) the share cannot hold takes the step instead. */
+        if (want <= 0 && cap < budget && prog_->encoder.bidirectional)
+            want = plan_chunk(r.n_computed, end, budget, &ckpt, r.checkpoint_at, &r);
+        else if (cap < budget && want > 0)
+            admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at, &r);
     }
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
@@ -1829,10 +1871,13 @@ const RadBatch* Scheduler::step() {
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
                                          /*rows_only=*/shares == 0);
             const int64_t end = chunk_end(r, target);
-            want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at);
-            if (cap < budget && want > 0 && capped_at < 0) {
+            want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at, &r);
+            /* A run read both ways (bidi_fit) the share cannot hold takes the step instead. */
+            if (want <= 0 && cap < budget && prog_->encoder.bidirectional)
+                want = plan_chunk(r.n_computed, end, budget, &ckpt, r.checkpoint_at, &r);
+            else if (cap < budget && want > 0 && capped_at < 0) {
                 const int64_t full = plan_chunk(r.n_computed, end, budget, nullptr,
-                                                r.checkpoint_at);
+                                                r.checkpoint_at, &r);
                 if (want < full) { capped_at = (int32_t)plan_.e.size(); capped_full = full; }
             }
             /* A prefill with no room left does not end the walk: it takes nothing this step, but
@@ -2090,7 +2135,7 @@ const RadBatch* Scheduler::step() {
         if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
         int64_t ckpt = -1;
         const int64_t grown = e.ckpt_slot < 0 && limit > had
-            ? plan_chunk(r.n_computed, chunk_end(r, s.seq_len()), limit, &ckpt, r.checkpoint_at)
+            ? plan_chunk(r.n_computed, chunk_end(r, s.seq_len()), limit, &ckpt, r.checkpoint_at, &r)
             : had;
         if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;

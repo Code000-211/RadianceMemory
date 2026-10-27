@@ -339,6 +339,23 @@ typedef struct RadBatch {
     /* ABI 35: host mirror of positions, for a one-sequence prefill op whose exact KV bound is the
      * position immediately after its first query piece. Valid through the batch's issue pass. */
     const int32_t* positions_h;
+    /* ---- appended in ABI 35 (runs read both ways) */
+    /* The runs of a trunk pass whose rows attend to each other both ways
+     * (RadEncoderDecl::bidirectional): a picture's or a video frame's placeholders inside one
+     * sequence's chunk. The pass attends them causally like every other row; the plugin attends a
+     * run's rows again without the causal bound, over the keys before `bidi_used` (the position
+     * after the run's last token), in place of that result. The scheduler ends no chunk inside such
+     * a run, so its keys are this pass's or, after a prefix hit, the cache's; a run longer than any
+     * step is cut where its chunk ends, and that chunk's rows see the run up to the cut.
+     *
+     * host: n_bidi and, per run, its first row in this pass, its rows and the index of its sequence
+     * in the per-sequence arrays; device: [n_bidi] the keys a run's rows see. 0 runs on every other
+     * pass. */
+    int64_t        n_bidi;
+    const int32_t* bidi_row;           /* host */
+    const int32_t* bidi_n;             /* host */
+    const int32_t* bidi_seq;           /* host */
+    const int32_t* bidi_used;          /* device */
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

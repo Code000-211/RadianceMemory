@@ -135,6 +135,7 @@ void BatchBuilder::carve(Set& s, char* h) {
      * moves a rotary position off the token index. */
     pair(&s.h_rope,  &s.d_rope,  mm_on_ ? 3 * T : 0);
     pair(&s.h_mmrow, &s.d_mmrow, mm_on_ ? T : 0);
+    pair(&s.h_bidi,  &s.d_bidi,  bidi_on_ ? 4 * T : 0);
     /* Each row's adapter slot, carved only when the engine serves adapters, so an engine without
      * them lays the slab out as if the array did not exist. */
     pair(&s.h_lora,  &s.d_lora,  lora_on_ ? T : 0);
@@ -481,6 +482,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
               });
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
+    bidi_on_ = prog.encoder.modalities != 0 && prog.encoder.bidirectional != 0;
     lora_on_ = cfg.lora.enabled();
     pw_cap_ = prog.plugin_words;
     return RAD_OK;
@@ -945,6 +947,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
+    int64_t n_bidi = 0;
     bool lora_rows = false;
     int32_t cvec_rows = 0;
     int64_t n_pw = 0;
@@ -1032,6 +1035,23 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 const int64_t got = stage_mm_rows(e, k, shift, n_mm, s.h_mmrow);
                 if (got < 0) return nullptr;
                 n_mm += got;
+            }
+        }
+        /* The part of each picture's or video frame's run inside this chunk, read both ways
+         * (RadBatch::n_bidi), on a trunk pass: its rows see the keys up to the run's end, or the
+         * chunk's where a run longer than any step was cut (Scheduler::bidi_fit). */
+        if (bidi_on_ && plan.draft_pass == 0 && shift == 0 && e.req && e.req->media) {
+            const mm::PromptMedia& pm = *e.req->media;
+            const int64_t c0 = e.ctx_len, c1 = c0 + e.n_tokens, T = max_tok_;
+            for (const mm::RopeLayout::Run& run : pm.rope.runs) {
+                const int64_t a = std::max<int64_t>(run.tok, c0);
+                const int64_t b = std::min<int64_t>((int64_t)run.tok + run.n, c1);
+                if (a >= b || pm.items[(size_t)run.item].item->kind == mm::Kind::Audio) continue;
+                s.h_bidi[n_bidi]         = (int32_t)b;
+                s.h_bidi[T + n_bidi]     = (int32_t)(k + a - c0);
+                s.h_bidi[2 * T + n_bidi] = (int32_t)(b - a);
+                s.h_bidi[3 * T + n_bidi] = (int32_t)i;
+                ++n_bidi;
             }
         }
         if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0) {
@@ -1248,6 +1268,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.rope_mixed = rope_mixed;
         B.n_mm_rows = n_mm;
         B.mm_rows = n_mm ? on_rank(base, b0, s.d_mmrow) : nullptr;
+        B.n_bidi = n_bidi;
+        B.bidi_used = n_bidi ? on_rank(base, b0, s.d_bidi) : nullptr;
+        B.bidi_row  = n_bidi ? s.h_bidi + max_tok_ : nullptr;
+        B.bidi_n    = n_bidi ? s.h_bidi + 2 * max_tok_ : nullptr;
+        B.bidi_seq  = n_bidi ? s.h_bidi + 3 * max_tok_ : nullptr;
         B.mm_embd = n_mm ? mm_dev_[r] : nullptr;
         /* Null on a step with no adapter row: the core then issues no adapter op, and the step
          * runs the same pass as an engine serving no adapters. */
