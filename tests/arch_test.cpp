@@ -10761,6 +10761,89 @@ TEST(the_gemma4_12b_embeds_images_and_audio_without_an_encoder) {
     }
 }
 
+/* The 12B (and the 31B) read a picture's placeholders both ways (use_bidirectional_attention
+ * "vision") on the sliding layers; the global layers stay causal, as transformers' Gemma 4 masks
+ * and KerasHub's have it. Every sliding layer declares a second attention without the causal
+ * bound (its window two-sided), the encoder says so to the core (RadEncoderDecl::bidirectional),
+ * and on a pass with a run (RadBatch::n_bidi) each sliding layer attends the run's rows again over
+ * their sequence's cache up to the run's end, written over the causal result in the same rows.
+ * Without the config key, or with RADIANCE_MEDIA_BIDI=0, nothing of it. */
+TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
+    std::vector<const char*> keys(std::begin(k_gem12_keys), std::end(k_gem12_keys));
+    std::vector<const char*> vals(std::begin(k_gem12_vals), std::end(k_gem12_vals));
+    const char* mk[] = { "vision_config.model_type", "vision_config.mm_embed_dim",
+                         "vision_config.mm_posemb_size", "vision_config.model_patch_size",
+                         "use_bidirectional_attention" };
+    const char* mv[] = { "gemma4_unified_vision", "3840", "1120", "48", "vision" };
+    keys.insert(keys.end(), std::begin(mk), std::end(mk));
+    vals.insert(vals.end(), std::begin(mv), std::end(mv));
+    static const int32_t row[] = { 40 }, rows[] = { 10 }, seq[] = { 1 }, used[] = { 30 };
+    const int64_t L_sliding = 10;                    /* layers 5 and 11 are global */
+    for (int mode = 0; mode < 3; ++mode) {          /* 0 on, 1 no key, 2 RADIANCE_MEDIA_BIDI=0 */
+        for (bool fused : { false, true }) {
+            for (int world : { 1, 2 }) {
+                for (int rank = 0; rank < world; ++rank) {
+                    RadBuilder b;
+                    if (fused) {
+                        const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+                        b.encs = { { "attn_qkv.", e }, { "attn_o.", e }, { "ffn_gate_up.", e },
+                                   { "ffn_down.", e } };
+                    }
+                    RadModelMeta meta = gemma4_12b_meta();
+                    meta.n_kv = (int)keys.size() - (mode == 1 ? 1 : 0);
+                    meta.kv_key = keys.data(); meta.kv_val = vals.data();
+                    RadBuildCtx ctx = build_ctx(rank, world);
+                    ctx.max_enc_patches = 1120;
+                    if (mode == 2) setenv("RADIANCE_MEDIA_BIDI", "0", 1);
+                    const int rc = gemma4_bf16::declare(&b, &meta, &ctx);
+                    unsetenv("RADIANCE_MEDIA_BIDI");
+                    REQUIRE_EQ(rc, RAD_OK);
+                    const bool on = mode == 0;
+                    CHECK_EQ(b.encoder.bidirectional, on ? 1 : 0);
+                    int nc = 0;
+                    for (const auto& o : b.ops)
+                        if ((o.op == "attn_paged" || o.op == "attn_paged_qrow") && pint(&o, "causal") == 0) {
+                            ++nc;
+                            CHECK_EQ(pint(&o, "window"), 1024);
+                            CHECK_EQ(pint(&o, "head_dim"), 256);
+                        }
+                    CHECK_EQ(nc, on ? (int)L_sliding : 0);
+
+                    RadBatch batch = prefill_batch();
+                    batch.n_bidi = 1;
+                    batch.bidi_row = row; batch.bidi_n = rows; batch.bidi_seq = seq;
+                    batch.bidi_used = used;
+                    RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+                    gemma4_bf16::step(&c, &batch);
+                    CHECK_LINT(b, &c);
+                    CHECK(c.step_fail.empty());
+                    int again = 0;
+                    rad_op last_attn = 0;
+                    for (const auto& i : c.issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o || (o->op != "attn_paged" && o->op != "attn_paged_qrow")) continue;
+                        if (pint(o, "causal") == 1) { last_attn = i.op; continue; }
+                        ++again;
+                        CHECK(last_attn != 0);                       /* behind the causal pass */
+                        CHECK_EQ(i.n, 10);
+                        REQUIRE(i.opd.size() == 8);
+                        CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_KV);
+                        CHECK(i.opd[3].raw == used);
+                        CHECK_EQ(i.opd[3].rows, 1);
+                        CHECK_EQ(i.opd[2].rows, 1);                  /* the run's sequence's table */
+                        CHECK(i.opd[6].kind == RAD_OPK_NONE);
+                        const int64_t qd = (16 / world) * (pint(o, "head_dim"));
+                        CHECK_EQ(i.opd[7].offset, 40 * qd);          /* its rows of the output */
+                        CHECK_EQ(i.opd[7].rows, 10);
+                        last_attn = 0;
+                    }
+                    CHECK_EQ(again, on ? (int)L_sliding : 0);
+                }
+            }
+        }
+    }
+}
+
 /* ==================================================================== qwenimage21 */
 
 namespace {

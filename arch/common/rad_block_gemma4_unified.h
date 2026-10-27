@@ -27,6 +27,9 @@ namespace arch {
 
 struct Gemma4UnifiedVision {
     bool on = false;
+    /* The language model reads a picture's rows both ways (RadEncoderDecl::bidirectional); the
+     * plugin sets it before declare. */
+    bool bidirectional = false;
     int64_t P = 0, width = 0, patch_dim = 0, npos = 0, n_embd = 0;
     rad_weight w_ln1 = 0, w_ln1b = 0, w_in = 0, w_inb = 0, w_ln2 = 0, w_ln2b = 0, w_px = 0, w_py = 0;
     rad_weight w_pn = 0, w_pnb = 0, w_proj = 0;
@@ -139,6 +142,7 @@ struct Gemma4UnifiedVision {
         e.max_patches = P;
         e.n_embd      = n_embd;
         e.out         = b_out;
+        e.bidirectional = bidirectional ? 1 : 0;
         RAD_ARCH_TRY(rad_declare_encoder(b, &e));
         rad_note(b, "vision embedder (no tower): %lldx%lld patches of %lld values -> %lld, "
                     "positions %lld a side; %lld patches a pass -> %lld rows of %lld",

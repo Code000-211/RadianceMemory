@@ -24,7 +24,7 @@ plugin claims.
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
-| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
+| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, the E2B/E4B form at one rank, and the 12B (`gemma4_unified`, its image and audio embedders in place of a tower), with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
@@ -1543,6 +1543,32 @@ gemma-4-E2B-it) at one rank:
   `num_global_key_value_heads` null; it then takes `num_key_value_heads`.
 - The vision tower's clipped linears (`use_clipped_linears`) clamp each projection's input and
   output to the bounds the checkpoint stores (`rad_block_gemma4_vision.h`).
+
+**The 12B form.** Gemma 4 12B (`gemma4_unified`, served through the arch id's alias) has no vision
+tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces them:
+- A picture's patch is a whole 48 x 48 pooling window, its values u / 255 (the processor's Gemma 4
+  family with merge 1). The embedder is a LayerNorm over the patch, a linear with its bias, a
+  LayerNorm, the column's and the row's learned rows, a LayerNorm, the weightless RMS norm and a
+  projection. The LayerNorms take nn.LayerNorm's eps of 1e-5, which no config states. The position
+  table `[1120, 2, width]` is read as its two taps of dimension 1, computed at convert, so a
+  container needs a recipe rule to store them (`gemma4-12b-bf16`, `gemma4-12b-i8g`). One patch is
+  one row: `--mm-max-patches` counts rows here, and 1120 holds the largest picture.
+- An audio clip is frames of 640 samples (40 ms at 16 kHz) as they are, the last zero-padded, one
+  token each: a weightless RMS norm and a 640 -> width projection. A clip is cut at
+  `audio_seq_length` (750 frames, 30 s).
+- **A picture's rows read both ways.** With `use_bidirectional_attention: "vision"` (the 12B and the
+  31B) a picture's or video frame's placeholders attend to each other both ways on the sliding
+  layers; the global layers stay causal. That is transformers' Gemma 4 mask
+  (`create_masks_for_vision_model`), KerasHub's and vLLM's; transformers' `gemma4_unified` forward
+  overlays every layer, which differs little on most pictures. The scheduler ends no prefill chunk
+  inside such a run (`Scheduler::bidi_fit`), the trunk pass names its runs (`RadBatch::n_bidi`), and
+  each sliding layer attends a run's rows a second time with `attn_paged` at `causal` 0 over the
+  cache up to the run's end, written over their causal result. The window stays two-sided there:
+  a run longer than the window (1120 soft tokens against 1024) sees its later keys only up to a
+  window ahead, as vLLM bounds them, where transformers' mask bounds only the keys behind. Read
+  causally, the 12B answers pictures differently and often wrongly (on DocVQA, "The image does not
+  provide information" for an answer it reads off the page). `RADIANCE_MEDIA_BIDI=0` keeps every
+  layer causal.
 
 NVIDIA's DFlash drafter states `dflash_config.causal: false`, with every layer sliding; that flag
 sets the sliding layers' causality. The recipes are `gemma4-e4b-bf16-df`, `-w8a8-df`, `-w4a8` and
