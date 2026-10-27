@@ -22,6 +22,7 @@
 #include "mm/media.h"
 #include "mm/processor.h"
 #include "gemma4_golden.h"
+#include "gemma4u_golden.h"
 #include "glm5_golden.h"
 #include "imaging_golden.h"
 #include "lfm2_golden.h"
@@ -731,6 +732,182 @@ TEST(gemma4_frames_are_sampled_as_the_reference_does) {
                          (long long)g.total, g.fps, g.max_frames, off);
         CHECK_EQ(off, 0);
     }
+}
+
+/* ================================================================== Gemma 4 12B's processor
+ *
+ * gemma4u_golden.h: the 12B's processors with its processor_config.json's settings
+ * (Gemma4UnifiedImageProcessor, Gemma4UnifiedVideoProcessor, Gemma4UnifiedAudioFeatureExtractor). A
+ * patch is a whole 48 x 48 pooling window (merge 1), its values u / 255; the reference's patches are
+ * row-major, as merge 1 makes this processor's. */
+namespace {
+
+VisionConfig gemma4u_cfg(int32_t image_soft, int32_t video_soft) {
+    VisionConfig c = gemma4_cfg(image_soft, video_soft);
+    c.patch = kGemma4Patch * kGemma4Pool;
+    c.merge = 1;
+    c.unit_pixels = true;
+    c.max_patches = 1120;
+    return c;
+}
+
+}  /* namespace */
+
+/* A 48-pixel window as one patch sizes a picture as the 16-pixel patches pooled 3 x 3 do. */
+TEST(gemma4_unified_sizes_are_the_references) {
+    for (const GoldGemma4Size& g : kGoldGemma4Size) {
+        int64_t oh = 0, ow = 0;
+        std::string why;
+        const int rc = gemma4_size(g.h, g.w, kGemma4Patch * kGemma4Pool, 1, g.budget, &oh, &ow, &why);
+        if (g.oh == 0) {
+            CHECK(rc < 0);
+            continue;
+        }
+        CHECK_EQ(rc, RAD_OK);
+        CHECK_EQ(oh, g.oh);
+        CHECK_EQ(ow, g.ow);
+    }
+}
+
+TEST(gemma4_unified_pictures_patchify_as_the_reference_does) {
+    for (const GoldGemma4uPic& g : kGoldGemma4uPics) {
+        Processor p;
+        REQUIRE_EQ(p.init(gemma4u_cfg(g.budget, 70), [](const std::string&) {
+                              return std::vector<int32_t>{};
+                          }), RAD_OK);
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(g.f, g.h, g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->grid_h, g.grid_h);
+        CHECK_EQ(it->grid_w, g.grid_w);
+        REQUIRE_EQ(it->n_seg, 1);
+        CHECK_EQ(it->n_rows(), (int64_t)g.soft);
+        REQUIRE_EQ(it->patch_dim, (int64_t)3 * 48 * 48);
+        const std::vector<uint16_t> r = raster(*it, 0);
+        CHECK(r == it->pixels);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(r[(size_t)i], g.head[i]);
+        if (fnv(r) != g.fnv)
+            std::fprintf(stderr, "    picture %d x %d at %d soft tokens: patches differ\n", g.h, g.w,
+                         g.budget);
+        CHECK_EQ(fnv(r), g.fnv);
+        REQUIRE_EQ(it->expand.size(), (size_t)g.soft + 2);
+        CHECK_EQ(it->expand.front(), 255999);
+        CHECK_EQ(it->expand.back(), 258882);
+        CHECK_EQ((int64_t)std::count(it->expand.begin(), it->expand.end(), 258880), (int64_t)g.soft);
+    }
+}
+
+TEST(a_gemma4_unified_clip_patchifies_as_the_reference_does) {
+    Processor p;
+    REQUIRE_EQ(p.init(gemma4u_cfg(280, 70), [](const std::string&) {
+                          return std::vector<int32_t>{};
+                      }), RAD_OK);
+    Video v;
+    v.info.n_frames = 8;
+    v.info.fps = 1.0;
+    v.info.w = kGoldGemma4uClipW;
+    v.info.h = kGoldGemma4uClipH;
+    for (int32_t f : kGoldGemma4uClipFrames) {
+        v.index.push_back(f);
+        v.frames.push_back(frame(f, kGoldGemma4uClipH, kGoldGemma4uClipW));
+    }
+    std::shared_ptr<Item> it;
+    std::string why;
+    CHECK_OK(p.video_from(v, &it, &why));
+    REQUIRE(it != nullptr);
+    REQUIRE_EQ(it->n_seg, (int32_t)v.frames.size());
+    CHECK_EQ(it->grid_h, kGoldGemma4uClipGridH);
+    CHECK_EQ(it->grid_w, kGoldGemma4uClipGridW);
+    CHECK_EQ(it->seg_rows, kGoldGemma4uClipSoft);
+    if (fnv(it->pixels) != kGoldGemma4uClipFnv)
+        std::fprintf(stderr, "    unified clip: patches differ\n");
+    CHECK_EQ(fnv(it->pixels), kGoldGemma4uClipFnv);
+}
+
+/* The 12B's audio: frames of 640 samples as they are, the last zero-padded, one placeholder each
+ * between <boa> and <eoa>; read from what a converted container states. */
+TEST(a_gemma4_unified_clip_of_audio_is_its_samples_in_frames) {
+    const char* keys[] = { "audio_config.model_type", "audio_config.audio_embed_dim",
+                           "processor.feature_extractor.sampling_rate",
+                           "processor.feature_extractor.audio_samples_per_token",
+                           "processor.audio_seq_length", "audio_token_id", "boa_token_id",
+                           "eoa_token_index" };
+    const char* vals[] = { "gemma4_unified_audio", "640", "16000", "640", "750", "258881", "256000",
+                           "258883" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    mm::AudioConfig c;
+    std::string why;
+    REQUIRE_EQ(c.from_meta(m, &why), RAD_OK);
+    CHECK(c.family == mm::AudioFamily::Gemma4Unified);
+    CHECK_EQ(c.n_mels, 640);
+    CHECK_EQ(c.max_samples, (int64_t)480000);
+    CHECK_EQ(c.tok_end, 258883);
+    c.merge = 1;
+    c.max_frames = 750;
+    mm::Processor p;
+    REQUIRE_EQ(p.init_audio(c, &why), RAD_OK);
+    const int n = kGoldGemma4uAudioN;
+    std::vector<float> x((size_t)n);
+    for (int i = 0; i < n; ++i) x[(size_t)i] = (float)((double)((int64_t)i * 7919 % 2001 - 1000) / 1000.0);
+    std::shared_ptr<mm::Item> it;
+    REQUIRE_EQ(p.audio_from(x, &it, &why), RAD_OK);
+    REQUIRE(it != nullptr);
+    CHECK_EQ(it->grid_h, kGoldGemma4uAudioFrames);
+    CHECK_EQ(it->seg_rows, kGoldGemma4uAudioFrames);
+    CHECK_EQ(it->patch_dim, (int64_t)640);
+    CHECK_EQ(fnv(it->pixels), kGoldGemma4uAudioFnv);
+    REQUIRE_EQ(it->expand.size(), (size_t)kGoldGemma4uAudioFrames + 2);
+    CHECK_EQ(it->expand.front(), 256000);
+    CHECK_EQ(it->expand[1], 258881);
+    CHECK_EQ(it->expand.back(), 258883);
+    /* 30 s at most: a longer clip is cut there; a frame more than a pass holds is refused. */
+    std::vector<float> longer(480000 + 6400, 0.25f);
+    REQUIRE_EQ(p.audio_from(longer, &it, &why), RAD_OK);
+    CHECK_EQ(it->grid_h, 750);
+    c.max_frames = 100;
+    mm::Processor q;
+    REQUIRE_EQ(q.init_audio(c, &why), RAD_OK);
+    CHECK_EQ(q.audio_from(longer, &it, &why), RAD_E_INVAL);
+    /* No samples: <boa><eoa> and nothing to encode. */
+    REQUIRE_EQ(p.audio_from({}, &it, &why), RAD_OK);
+    CHECK(it->encoded);
+    CHECK_EQ(it->expand.size(), (size_t)2);
+}
+
+/* What a converted 12B container states for its pictures: Gemma 4's family with the window as the
+ * patch and u / 255 values, the budget from processor_config.json. */
+TEST(gemma4_unified_vision_config_from_the_container) {
+    const char* keys[] = { "vision_config.model_type", "vision_config.patch_size",
+                           "vision_config.pooling_kernel_size", "vision_config.model_patch_size",
+                           "image_token_id", "video_token_id", "boi_token_id", "eoi_token_id",
+                           "processor.image_processor.max_soft_tokens",
+                           "processor.video_processor.max_soft_tokens" };
+    const char* vals[] = { "gemma4_unified_vision", "16", "3", "48", "258880", "258884", "255999",
+                           "258882", "280", "70" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    CHECK_OK(c.from_meta(m, &why));
+    CHECK(c.family == Family::Gemma4);
+    CHECK(c.unit_pixels);
+    CHECK_EQ(c.patch, 48);
+    CHECK_EQ(c.merge, 1);
+    CHECK_EQ(c.patch_dim(), (int64_t)6912);
+    CHECK_EQ(c.image_soft_tokens, 280);
+    CHECK_EQ(c.video_soft_tokens, 70);
+    vals[0] = "gemma4_vision";
+    VisionConfig d;
+    CHECK_OK(d.from_meta(m, &why));
+    CHECK(!d.unit_pixels);
+    CHECK_EQ(d.patch, 16);
+    CHECK_EQ(d.merge, 3);
 }
 
 /* ================================================================== GLM-5.3's processor

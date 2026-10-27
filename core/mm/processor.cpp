@@ -244,10 +244,16 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         }
         return RAD_OK;
     }
-    if (mt && !std::strcmp(mt, "gemma4_vision")) {
+    /* Gemma 4 12B ("unified") has no tower: its embedder takes a whole 48 x 48 pooling window as
+     * one patch, so a patch is a row (merge 1), and its values are u / 255. The sizes are the
+     * same: a window is 48 pixels a side either way. */
+    const bool unified = mt && !std::strcmp(mt, "gemma4_unified_vision");
+    if (mt && (!std::strcmp(mt, "gemma4_vision") || unified)) {
         family   = Family::Gemma4;
-        patch    = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
-        merge    = (int32_t)rad_meta_geti(&m, "vision_config.pooling_kernel_size", 0);
+        unit_pixels = unified;
+        patch    = (int32_t)rad_meta_geti(&m, unified ? "vision_config.model_patch_size"
+                                                      : "vision_config.patch_size", 0);
+        merge    = unified ? 1 : (int32_t)rad_meta_geti(&m, "vision_config.pooling_kernel_size", 0);
         temporal = 1;
         if (patch <= 0 || merge <= 0) {
             if (why) *why = "the container states no vision tower geometry (vision_config."
@@ -267,7 +273,8 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         image_soft_tokens = (int32_t)rad_meta_geti(
             &m, "processor.image_processor.max_soft_tokens",
             rad_meta_geti(&m, "vision_soft_tokens_per_image",
-                          rad_meta_geti(&m, "vision_config.default_output_length", 280)));
+                          rad_meta_geti(&m, "vision_config.default_output_length",
+                                        rad_meta_geti(&m, "vision_config.num_soft_tokens", 280))));
         video_soft_tokens = (int32_t)rad_meta_geti(&m, "processor.video_processor.max_soft_tokens",
                                                    70);
         fps        = rad_meta_getf(&m, "processor.video_processor.fps", 1.0);
@@ -1071,7 +1078,8 @@ void patchify(const VisionConfig& c, const std::vector<const Frame*>& frames, It
  * processor's rescale u * (1/255). The processors AutoProcessor loads take that product in f32 for
  * pictures (Gemma4ImageProcessor) and in double, rounded to f32, for video (Gemma 4's and
  * EmbeddingGemma 2's video processors); `video` picks which, and the two differ for u = 127. One
- * frame per segment. */
+ * frame per segment. With `unit_pixels` (the 12B, merge 1: a row is one 48 x 48 window) the value
+ * is p itself, rounded to bf16. */
 void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& frames, bool video,
                      Item* it) {
     const int P = c.patch, M = c.merge;
@@ -1080,7 +1088,7 @@ void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& fra
     for (int v = 0; v < 256; ++v) {
         const float p = video ? (float)((double)v * (1.0 / 255.0))
                               : (float)v * (float)(1.0 / 255.0);
-        lut[v] = rad_f32_to_bf16(2.0f * (p - 0.5f));
+        lut[v] = rad_f32_to_bf16(c.unit_pixels ? p : 2.0f * (p - 0.5f));
     }
     const int64_t dim = it->patch_dim;
     it->pixels.assign((size_t)it->n_patch * (size_t)dim, 0);
@@ -2131,12 +2139,40 @@ static int qwen3asr_from_meta(const RadModelMeta& m, AudioConfig* c, std::string
     return RAD_OK;
 }
 
+/* Gemma4UnifiedAudioFeatureExtractor's framing (Gemma 4 12B): processor_config.json's
+ * `feature_extractor` and the clip cap `audio_seq_length` (in frames). The frame's width is what the
+ * embedder takes, so it stands in `n_mels` as a mel spectrum's bins do. */
+static int unified_from_meta(const RadModelMeta& m, AudioConfig* c, std::string* why) {
+    c->family       = AudioFamily::Gemma4Unified;
+    c->rate         = (int32_t)rad_meta_geti(&m, "processor.feature_extractor.sampling_rate", 16000);
+    c->frame_length = (int32_t)rad_meta_geti(
+        &m, "processor.feature_extractor.audio_samples_per_token",
+        rad_meta_geti(&m, "audio_config.audio_samples_per_token",
+                      rad_meta_geti(&m, "audio_config.audio_embed_dim", 0)));
+    c->hop          = c->frame_length;
+    c->n_mels       = c->frame_length;
+    c->max_samples  = rad_meta_geti(&m, "processor.audio_seq_length", 750) * c->frame_length;
+    c->tok_audio    = (int32_t)rad_meta_geti(&m, "audio_token_id", -1);
+    c->tok_start    = (int32_t)rad_meta_geti(&m, "boa_token_id", -1);
+    c->tok_end      = (int32_t)rad_meta_geti(&m, "eoa_token_id",
+                                             rad_meta_geti(&m, "eoa_token_index", -1));
+    if (c->rate <= 0 || c->frame_length <= 0 || c->max_samples <= 0 || c->tok_audio < 0 ||
+        c->tok_start < 0 || c->tok_end < 0) {
+        if (why) *why = "the container's audio framing is incomplete (sampling_rate, "
+                        "audio_samples_per_token, audio_seq_length, audio_token_id, boa_token_id, "
+                        "eoa_token_id)";
+        return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
 int AudioConfig::from_meta(const RadModelMeta& m, std::string* why) {
     const char* mt = rad_meta_gets(&m, "audio_config.model_type", "");
     if (mt && !std::strcmp(mt, "qwen3_asr_encoder")) return qwen3asr_from_meta(m, this, why);
+    if (mt && !std::strcmp(mt, "gemma4_unified_audio")) return unified_from_meta(m, this, why);
     if (!mt || std::strcmp(mt, "gemma4_audio")) {
         if (why) *why = "the container states no audio tower this processor knows (audio_config."
-                        "model_type gemma4_audio or qwen3_asr_encoder)";
+                        "model_type gemma4_audio, gemma4_unified_audio or qwen3_asr_encoder)";
         return RAD_E_NOTFOUND;
     }
     /* preprocessor_config.json's keys (`preprocessor.`), else processor_config.json's
@@ -2273,6 +2309,12 @@ int Processor::init_audio(const AudioConfig& cfg, std::string* why) {
         return refuse(RAD_E_INVAL, "the audio encoder's pass (" + std::to_string(cfg.max_frames) +
                                        " frames) is not whole rows of " +
                                        std::to_string(cfg.merge) + " frames");
+    /* The 12B's frames are samples: no window, no FFT, no mel bank. */
+    if (cfg.family == AudioFamily::Gemma4Unified) {
+        acfg_ = cfg;
+        audio_on_ = true;
+        return RAD_OK;
+    }
     const bool qwen = cfg.family == AudioFamily::Qwen3ASR;
     /* Gemma 4's FFT is radix 2; Qwen3-ASR's runs mixed radix over any length. */
     if (!qwen && (cfg.fft < 2 || (cfg.fft & (cfg.fft - 1)) != 0))
@@ -2481,11 +2523,44 @@ int Processor::audio_qwen3asr(const std::vector<float>& samples, std::shared_ptr
     return RAD_OK;
 }
 
+/* The 12B's clip (AudioFamily::Gemma4Unified): ceil(n / frame_length) frames of samples, the last
+ * zero-padded, each sample rounded to bf16 as the reference casts the frames for its embedder; one
+ * frame a placeholder. The reference cuts nothing; a clip past `max_samples` is cut there. */
+int Processor::audio_unified(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                             std::string* why) const {
+    const AudioConfig& c = acfg_;
+    const int64_t n = std::min<int64_t>((int64_t)samples.size(), c.max_samples);
+    const int64_t fl = c.frame_length, rows = (n + fl - 1) / fl;
+    if (rows * c.merge > c.max_frames) {
+        if (why) *why = "the clip is more frames than one audio encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Audio;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)rows;
+    it->grid_w = 1;
+    it->patch_dim = fl;
+    it->n_patch = rows;
+    it->valid = (int32_t)rows;
+    it->rows_h = (int32_t)rows;
+    it->rows_w = 1;
+    it->seg_rows = (int32_t)rows;
+    it->n_seg = rows > 0 ? 1 : 0;
+    it->pixels.assign((size_t)(rows * fl), 0);
+    for (int64_t i = 0; i < n; ++i) it->pixels[(size_t)i] = rad_f32_to_bf16(samples[(size_t)i]);
+    one_run(it.get(), c.tok_start, rows, c.tok_audio, c.tok_end);
+    if (rows == 0) it->encoded = true;
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::audio_from(const std::vector<float>& samples, std::shared_ptr<Item>* out,
                           std::string* why) const {
     if (!audio_on_) { if (why) *why = "this program declares no audio encoder"; return RAD_E_UNSUPPORTED; }
     const AudioConfig& c = acfg_;
     if (c.family == AudioFamily::Qwen3ASR) return audio_qwen3asr(samples, out, why);
+    if (c.family == AudioFamily::Gemma4Unified) return audio_unified(samples, out, why);
     const int64_t n = std::min<int64_t>((int64_t)samples.size(), c.max_samples);
     const int64_t real = c.real_frames(n);
     const int64_t rows = (real + c.merge - 1) / c.merge;

@@ -3205,7 +3205,13 @@ int Engine::run_server() {
             return rc;
         }
         o.allow_audio = true;
-        if (mm::decoder_available())
+        if (mm::decoder_available() && ac.family == mm::AudioFamily::Gemma4Unified)
+            RAD_INFO("media: audio through '%s'; a clip is cut at %.3g s, a token is a frame of %d "
+                     "samples (%d ms); %lld frames a pass",
+                     ranks_[0]->program.audio_encoder_name.c_str(),
+                     (double)mm_proc->audio_config().max_samples / (double)ac.rate, ac.frame_length,
+                     ac.frame_length * 1000 / ac.rate, (long long)aend.max_patches);
+        else if (mm::decoder_available())
             RAD_INFO("media: audio through '%s'; a clip is cut at %.3g s, %d mel bins a %d ms frame, "
                      "%d frames a token; %lld frames a pass",
                      ranks_[0]->program.audio_encoder_name.c_str(),

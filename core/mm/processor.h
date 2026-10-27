@@ -50,6 +50,8 @@ enum class Kind { Image, Video, Audio };
  *           channel) as 2 * (u / 255) - 1, the reference model's own input scaling; a video is
  *           frames sampled at `fps` (at most `max_frames`, thinned evenly), each its own segment
  *           at the per-frame budget, each spelled <boi> placeholders <eoi> with no timestamp.
+ *           Gemma 4 12B ("unified", no tower) is the same with a whole pooling window as one
+ *           patch (patch = 48, merge 1) and its values u / 255 (`unit_pixels`).
  *   Lfm2    LFM2-VL's: a picture within its token budget (times a tolerance) is resized whole --
  *           sides multiples of patch * merge, pixels within the budget's band -- and one past it
  *           is cut into tile x tile crops, min_tiles..max_tiles of them in the ratio nearest its
@@ -88,6 +90,8 @@ struct VisionConfig {
     /* Gemma4: soft tokens (output rows) an image and a video frame may take. One of 70, 140,
      * 280, 560, 1120, the budgets the model was trained at. */
     int32_t image_soft_tokens = 0, video_soft_tokens = 0;
+    /* Gemma4: patch values u / 255 rather than 2 * (u / 255) - 1 (the 12B's embedder). */
+    bool    unit_pixels = false;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
     /* Glm5Next: the band an image's canvas falls in, in output rows (tokens). */
@@ -165,6 +169,9 @@ struct ImageMode {
  *             through an fft-point FFT, magnitudes through an HTK mel bank, log(x + mel_floor).
  *             The clip's real frames, then zero frames to whole output rows.
  *
+ *   Gemma4Unified  Gemma4UnifiedAudioFeatureExtractor (the 12B's): no spectrum; a frame is
+ *             `frame_length` samples as they are, the last zero-padded, one frame a row.
+ *
  *   Qwen3ASR  Qwen3ASRFeatureExtractor (Whisper's): a clip shorter than `min_samples` is
  *             zero-padded to it; frames are torch.stft's, centred with a reflected n_fft / 2 at
  *             each end, a periodic Hann window and power spectra, the last frame dropped, so n
@@ -176,7 +183,7 @@ struct ImageMode {
  *             padding, and, where that exceeds a whole chunk, frames past it that the encoder
  *             reads as zero. Plane 1 of the coordinates marks those (RadBatch::enc_coord), which
  *             keeps one chunk's convolution from seeing the next. */
-enum class AudioFamily { Gemma4, Qwen3ASR };
+enum class AudioFamily { Gemma4, Qwen3ASR, Gemma4Unified };
 
 /* Audio features, configured from the container: Gemma 4's framing from `preprocessor.*` (the
  * checkpoint's preprocessor_config.json), Qwen3-ASR's from `processor.feature_extractor.*`
@@ -434,6 +441,8 @@ private:
     bool         audio_on_ = false;
     int audio_qwen3asr(const std::vector<float>& samples, std::shared_ptr<Item>* out,
                        std::string* why) const;
+    int audio_unified(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                      std::string* why) const;
 
     std::vector<float>  hann_;          /* the window, float32 as the reference stores it */
     std::vector<double> mel_;           /* [n_mels, fft/2 + 1]: filter b's weight on bin k */
