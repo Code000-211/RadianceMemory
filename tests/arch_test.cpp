@@ -10636,6 +10636,131 @@ TEST(nomicbert_probe_reads_the_model_type) {
              RAD_E_UNSUPPORTED);
 }
 
+/* Gemma 4 12B's media embedders (rad_block_gemma4_unified.h) in place of the tower and the
+ * conformer: a picture patch is a 48 x 48 window and an audio frame 640 samples, each one row. The
+ * position table [npos, 2, width] is read as its taps 0 (column) and 1 (row) of dimension 1; a
+ * vision pass is LayerNorm, the dense with its bias, LayerNorm, the two position rows (the column
+ * from coordinate plane 1, the row from plane 0) added in, LayerNorm (eps 1e-5, no config states it),
+ * the weightless RMS norm and the projection; an audio pass the norm and its projection. Every rank
+ * runs both whole and both lint clean; the probe says one patch a row and 750 frames. */
+TEST(the_gemma4_12b_embeds_images_and_audio_without_an_encoder) {
+    std::vector<const char*> keys(std::begin(k_gem12_keys), std::end(k_gem12_keys));
+    std::vector<const char*> vals(std::begin(k_gem12_vals), std::end(k_gem12_vals));
+    const char* mk[] = { "vision_config.model_type", "vision_config.mm_embed_dim",
+                         "vision_config.mm_posemb_size", "vision_config.model_patch_size",
+                         "vision_config.output_proj_dims", "vision_config.rms_norm_eps",
+                         "vision_config.patch_size", "vision_config.pooling_kernel_size",
+                         "audio_config.model_type", "audio_config.audio_embed_dim",
+                         "audio_config.rms_norm_eps", "processor.feature_extractor.sampling_rate",
+                         "processor.feature_extractor.audio_samples_per_token",
+                         "processor.audio_seq_length" };
+    const char* mv[] = { "gemma4_unified_vision", "3840", "1120", "48", "3840", "1e-06", "16", "3",
+                         "gemma4_unified_audio", "640", "1e-06", "16000", "640", "750" };
+    keys.insert(keys.end(), std::begin(mk), std::end(mk));
+    vals.insert(vals.end(), std::begin(mv), std::end(mv));
+    RadModelMeta meta = gemma4_12b_meta();
+    meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+
+    RadArchProbe pr{};
+    REQUIRE_EQ(gemma4_bf16::probe(&meta, &pr), RAD_OK);
+    CHECK_EQ(pr.enc_merge, 1);
+    CHECK_EQ(pr.audio_frames, 750);
+
+    for (int world : { 1, 2, 4 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_enc_patches = 1120;
+            ctx.max_audio_frames = 750;
+            REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK_EQ(b.encoder_name, std::string("vision"));
+            CHECK_EQ(b.encoder.patch_dim, 6912);
+            CHECK_EQ(b.encoder.merge, 1);
+            CHECK_EQ(b.encoder.max_patches, 1120);
+            CHECK_EQ(b.encoder.n_embd, 3840);
+            CHECK_EQ(b.audio_encoder_name, std::string("audio"));
+            CHECK_EQ(b.audio_encoder.patch_dim, 640);
+            CHECK_EQ(b.audio_encoder.merge, 1);
+            CHECK_EQ(b.audio_encoder.max_patches, 750);
+            CHECK_EQ(count_op(b, "scatter_rows"), 1);
+            for (int t = 0; t < 2; ++t) {
+                const RecMap* pos = find_map(b, t ? "v.pos_y.weight" : "v.pos_x.weight");
+                REQUIRE(pos != nullptr);
+                CHECK_EQ(pos->mode, (int)RAD_MAP_TAP);
+                CHECK_EQ(pos->concat_dim, 1);
+                CHECK(pos->src == std::vector<std::string>{ "model.vision_embedder.pos_embedding" });
+                REQUIRE_EQ(pos->src_index.size(), (size_t)1);
+                CHECK_EQ(pos->src_index[0], t);
+                const RecWeight* w = find_w(b, t ? "v.pos_y.weight" : "v.pos_x.weight");
+                REQUIRE(w != nullptr);
+                CHECK_EQ(w->d.shape[0], 1120);
+                CHECK_EQ(w->d.shape[1], 3840);
+            }
+            const struct { const char* d; const char* s; } src[] = {
+                { "v.ln1.weight", "model.vision_embedder.patch_ln1.weight" },
+                { "v.ln1.bias", "model.vision_embedder.patch_ln1.bias" },
+                { "v.in.weight", "model.vision_embedder.patch_dense.weight" },
+                { "v.in.bias", "model.vision_embedder.patch_dense.bias" },
+                { "v.ln2.weight", "model.vision_embedder.patch_ln2.weight" },
+                { "v.ln2.bias", "model.vision_embedder.patch_ln2.bias" },
+                { "v.pn.weight", "model.vision_embedder.pos_norm.weight" },
+                { "v.pn.bias", "model.vision_embedder.pos_norm.bias" },
+                { "v.embed.weight", "model.embed_vision.embedding_projection.weight" },
+                { "a.embed.weight", "model.embed_audio.embedding_projection.weight" } };
+            for (const auto& e : src) {
+                const RecMap* mp = find_map(b, e.d);
+                REQUIRE(mp != nullptr);
+                CHECK(mp->src == std::vector<std::string>{ e.s });
+                CHECK(find_w(b, e.d) != nullptr);
+            }
+            const RecWeight* dense = find_w(b, "v.in.weight");
+            REQUIRE(dense != nullptr);
+            CHECK_EQ(dense->d.shape[0], 3840);
+            CHECK_EQ(dense->d.shape[1], 6912);
+            CHECK_EQ(dense->d.shard, (int)RAD_SHARD_NONE);
+            CHECK(find_w(b, "v.blk.0.qkv") == nullptr);           /* no tower */
+            for (const auto& o : b.ops)
+                if (o.op == "layernorm") CHECK_NEAR(pflt(&o, "eps"), 1e-5, 0.0);
+
+            const auto vis = enc_pass(RAD_MM_IMAGE, 280, 6912);
+            RadCtx cv{ .b = &b, .batch = &vis->b };
+            cv.rank = rank; cv.world = world;
+            gemma4_bf16::step(&cv, &vis->b);
+            CHECK(cv.step_fail.empty());
+            CHECK_LINT(b, &cv);
+            const std::vector<std::string> want = { "layernorm", "gemm_nt_bias", "layernorm",
+                                                    "embed_lookup", "embed_lookup", "add", "add",
+                                                    "layernorm", "rmsnorm", "gemm_nt" };
+            CHECK_EQ(join(issued_ops(b, cv)), join(want));
+            REQUIRE_EQ(cv.issues.size(), want.size());
+            CHECK(cv.issues[0].opd[0].raw == vis->pix.data());
+            CHECK(cv.issues[3].opd[0].raw == vis->coord.data() + 280);   /* the column */
+            CHECK(cv.issues[4].opd[0].raw == vis->coord.data());         /* the row */
+            CHECK_EQ(cv.issues[3].opd[1].handle, (uint32_t)gemma4_bf16::g_model[rank].uvis.w_px);
+            CHECK_EQ(cv.issues[4].opd[1].handle, (uint32_t)gemma4_bf16::g_model[rank].uvis.w_py);
+            CHECK_EQ(cv.issues.back().n, 280);
+            CHECK_EQ(cv.issues.back().opd.back().handle, b.encoder.out);
+
+            const auto aud = enc_pass(RAD_MM_AUDIO, 125, 640);
+            RadCtx ca{ .b = &b, .batch = &aud->b };
+            ca.rank = rank; ca.world = world;
+            gemma4_bf16::step(&ca, &aud->b);
+            CHECK(ca.step_fail.empty());
+            CHECK_LINT(b, &ca);
+            CHECK_EQ(join(issued_ops(b, ca)), join({ "rmsnorm", "gemm_nt" }));
+            CHECK_EQ(ca.issues.back().n, 125);
+            CHECK_EQ(ca.issues.back().opd.back().handle, b.audio_encoder.out);
+
+            /* More patches than declared is refused, issuing nothing. */
+            const auto big = enc_pass(RAD_MM_IMAGE, 1121, 6912);
+            RadCtx cb{ .b = &b, .batch = &big->b };
+            gemma4_bf16::step(&cb, &big->b);
+            CHECK(!cb.step_fail.empty());
+            CHECK(cb.issues.empty());
+        }
+    }
+}
+
 /* ==================================================================== qwenimage21 */
 
 namespace {

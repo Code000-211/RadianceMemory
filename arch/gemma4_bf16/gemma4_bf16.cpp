@@ -1,5 +1,6 @@
 /* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h) and,
- * for E2B/E4B, its audio encoder (rad_block_gemma4_audio.h).
+ * for E2B/E4B, its audio encoder (rad_block_gemma4_audio.h); for the 12B ("unified"), its image and
+ * audio embedders in their place (rad_block_gemma4_unified.h).
  *
  * Two attention classes over one residual stream, alternating by layer. A "sliding" layer is
  * sliding-window attention over head_dim 256 with a v projection and standard RoPE; a "global"
@@ -17,6 +18,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_audio.h>
+#include <arch/rad_block_gemma4_unified.h>
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
@@ -1890,6 +1892,8 @@ struct Model {
      * embeddings. */
     Gemma4Vision vis{};
     Gemma4Audio  aud{};
+    Gemma4UnifiedVision uvis{};   /* the 12B's embedders, in place of the tower and encoder */
+    Gemma4UnifiedAudio  uaud{};
     rad_op       op_mm = 0;
 
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
@@ -2406,8 +2410,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the lookup and before its all-reduce (RadBatch::mm_embd: rank 0 holds the rows, every other
      * rank zeros). The reference scales token embeddings by sqrt(n_embd) and scatters the media
      * features in unscaled. */
-    if ((Gemma4Vision::present(meta) && ctx->max_enc_patches > 0) ||
-        (Gemma4Audio::present(meta) && ctx->max_audio_frames > 0))
+    if (((Gemma4Vision::present(meta) || Gemma4UnifiedVision::present(meta)) &&
+         ctx->max_enc_patches > 0) ||
+        ((Gemma4Audio::present(meta) || Gemma4UnifiedAudio::present(meta)) &&
+         ctx->max_audio_frames > 0))
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                           RAD_STR("dtype", "bf16")),
@@ -2825,6 +2831,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(m.aud.declare(b, meta, ctx, nm, g.n_embd,
                                    (int)(m.n_main + head_groups) + (int)m.vis.L.size(), "model.",
                                    "gemma4_bf16"));
+        RAD_ARCH_TRY(m.uvis.declare(b, meta, ctx, nm, g.n_embd, "gemma4_bf16"));
+        RAD_ARCH_TRY(m.uaud.declare(b, meta, ctx, nm, g.n_embd, "gemma4_bf16"));
     }
 
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
@@ -3052,8 +3060,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     /* An encoder pass runs only its encoder. */
     if (batch->enc) {
-        if (batch->enc == RAD_MM_AUDIO) m.aud.step(c, batch);
-        else                            m.vis.step(c, batch);
+        if (batch->enc == RAD_MM_AUDIO) {
+            if (m.uaud.on) m.uaud.step(c, batch);
+            else           m.aud.step(c, batch);
+        } else if (m.uvis.on) {
+            m.uvis.step(c, batch);
+        } else {
+            m.vis.step(c, batch);
+        }
         return;
     }
     /* A draft pass runs only the draft model. The trunk already left its final-normed hidden state
@@ -3194,12 +3208,15 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (k > 0) out->enc_merge = k * k;
     }
     if (Gemma4Audio::present(meta)) out->audio_frames = Gemma4Audio::frames_for(meta);
+    /* The 12B's embedders: a patch and an audio frame are a row each. */
+    if (Gemma4UnifiedVision::present(meta)) out->enc_merge = 1;
+    if (Gemma4UnifiedAudio::present(meta)) out->audio_frames = Gemma4UnifiedAudio::frames_for(meta);
     return RAD_OK;
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text, images and E2B/E4B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
+                "Gemma 4 dense (text, images, E2B/E4B/12B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "
                 "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
                 "logits; Google's assistant head, z-lab's DFlash drafter or a DFlash2 drafter")

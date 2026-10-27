@@ -70,6 +70,7 @@ struct RecMap {
     int                      mode = 0;
     std::vector<std::string> src;
     int                      concat_dim = 0;
+    std::vector<int>         src_index;   /* RadNameMap::src_index, one per source */
 };
 struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false;
                   bool dense = false; };
@@ -278,7 +279,10 @@ extern "C" int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
     r.declared   = m->declared;
     r.mode       = m->mode;
     r.concat_dim = m->concat_dim;
-    for (int i = 0; i < m->n_src; ++i) r.src.push_back(m->src[i]);
+    for (int i = 0; i < m->n_src; ++i) {
+        r.src.push_back(m->src[i]);
+        r.src_index.push_back(m->src_index[i]);
+    }
     b->maps.push_back(r);
     return RAD_OK;
 }
