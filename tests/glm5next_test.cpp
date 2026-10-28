@@ -1024,8 +1024,8 @@ TEST(glm53_refusals_name_what_was_refused) {
         return err;
     };
     RadBuildCtx c = ok;
-    c.kv_dtype = RAD_F8E4M3;
-    CHECK(has(refusal(meta, c), "--kv-cache-dtype fp8"));
+    c.kv_dtype = RAD_F16;
+    CHECK(has(refusal(meta, c), "--kv-cache-dtype f16"));
     c = ok;
     c.max_spec = 32;
     CHECK(has(refusal(meta, c), "--num-speculative-tokens 32"));
@@ -1052,6 +1052,70 @@ TEST(glm53_refusals_name_what_was_refused) {
         CHECK(rc < 0);
         CHECK(has(err, "blk.1.attn_beta.weight"));
         CHECK(has(err, "plain bf16"));
+    }
+}
+
+/* --kv-cache-dtype fp8 narrows the latent attention cache alone to E4M3: its group, every latent
+ * store (plain and streamed) and every latent attention (head form, row form, the MTP layer's)
+ * name fp8_e4m3, and the index tail, DSA index and KDA groups keep their dtypes. Under bf16 the
+ * attention states no kv_dtype, the op it always declared. */
+TEST(glm53_fp8_kv_cache_narrows_the_latent_group_only) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    for (int kv_dtype : { (int)RAD_DT_INVALID, (int)RAD_BF16, (int)RAD_F8E4M3 }) {
+        const bool narrow = kv_dtype == RAD_F8E4M3;
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                   { "mtp.blk.45.ffn_down_exps", fp8 },
+                   { "ffn_gate_up_exps", mx },
+                   { "ffn_down_exps", mx },
+                   { "ffn_gate_up_shexp", mx },
+                   { "ffn_down_shexp", mx },
+                   { "ffn_gate_up.weight", fp8 },
+                   { "ffn_down.weight", fp8 } };
+        RadBuildCtx build{};
+        build.rank = 0;
+        build.world_size = 4;
+        build.max_tok = 512;
+        build.max_seqs = 4;
+        build.max_ctx = 4096;
+        build.max_spec = 3;
+        build.tp_attn_rows = 1;
+        build.kv_dtype = kv_dtype;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+        std::map<std::string, uint32_t> dtypes;
+        for (const auto& g : b.kv_groups) dtypes[g.name] = g.d.dtype;
+        CHECK_EQ(dtypes["kv_latent"], narrow ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16);
+        CHECK_EQ(dtypes["kv_index_tail"], (uint32_t)RAD_BF16);
+        CHECK_EQ(dtypes["kv_dsa_index"], (uint32_t)RAD_U8);
+        CHECK_EQ(dtypes["kv_kda"], (uint32_t)RAD_F32);
+        CHECK_EQ(dtypes["kv_kda_conv"], (uint32_t)RAD_BF16);
+        int stores = 0, attns = 0;
+        for (const auto& o : b.ops) {
+            if (o.op == "kv_store" || o.op == "kv_store_streamed") {
+                ++stores;
+                CHECK_EQ(pstr(&o, "kv_dtype"), narrow ? "fp8_e4m3" : "bf16");
+            }
+            if (o.op == "mla_attn") {
+                ++attns;
+                CHECK_EQ(pstr(&o, "kv_dtype"), narrow ? "fp8_e4m3" : "<absent>");
+            }
+        }
+        // 11 MLA layers and the MTP layer, each a store and a head-form attention; 11 row forms.
+        CHECK(stores >= 12);
+        CHECK_EQ(attns, 12 + 11);
     }
 }
 

@@ -271,7 +271,8 @@ static int kv_groups(RadBuilder* b, Model& m) {
     auto& nm = m.nm;
     RadKVGroupDecl d{};
     d.kind = RAD_KV_FULL;
-    d.dtype = RAD_BF16;
+    // bf16, or E4M3 under --kv-cache-dtype fp8 (geometry); the other groups keep their own.
+    d.dtype = rad_dtype_parse(g.kv_dtype);
     d.n_head_kv = 1;
     d.head_dim = 256;
     m.latent = rad_decl_kv_group(b, nm.f("kv_latent"), &d);
@@ -435,6 +436,9 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     g.max_logit_rows = std::min<int64_t>(g.max_tok, g.max_seqs * (g.max_spec + 1));
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
+    /* --kv-cache-dtype names the latent cache's dtype only (kv_groups); declare refuses all but
+     * bf16 and fp8. */
+    g.kv_dtype = rad_dtype_name(rad_kv_cache_dtype(ctx, RAD_BF16));
     g.wire_exact = !ctx->tp_wire_lossy;
     g.wire_min_bytes = ctx->tp_wire_min_bytes;
     return g.max_tok < 1 || g.max_ctx < 1 || g.max_seqs < 1 || g.eps <= 0 ? RAD_E_INVAL : RAD_OK;
@@ -473,11 +477,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ctx->max_spec);
         return RAD_E_UNSUPPORTED;
     }
-    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16) {
-        fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin keeps its latent "
-                        "attention, index tail and KDA caches in bf16 and has no fp8 cache, so "
-                        "run it with --kv-cache-dtype bf16\n",
-                ctx->kv_dtype == RAD_F8E4M3 ? "fp8" : rad_dtype_name(ctx->kv_dtype));
+    /* fp8 narrows the latent attention cache to E4M3 at a descale of 1 (kv_groups); the index
+     * tail, the DSA index and the KDA caches keep their dtypes. */
+    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_F8E4M3) {
+        fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin serves its latent "
+                        "attention cache in bf16 or fp8 only\n",
+                rad_dtype_name(ctx->kv_dtype));
         return RAD_E_UNSUPPORTED;
     }
     auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];

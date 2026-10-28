@@ -19,6 +19,7 @@
 #include "rad_glm_tp.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace rad {
@@ -27,6 +28,25 @@ struct MlaLatent {
     struct Config {
         int64_t heads = 16, head_dim = 256, latent_dim = 512, blocks = 513;
     };
+    /* The attention over the latent cache, `rows` rows of `heads` heads. The cache is Geom::kv_dtype
+     * (bf16, or fp8_e4m3 under --kv-cache-dtype fp8); `kv_dtype` is stated only for a cache that is
+     * not bf16, so a bf16 build declares the op it always did. */
+    static rad_op attn_op(RadBuilder* b, const Geom& g, int64_t rows, int64_t heads,
+                          int64_t blocks, double scale) {
+        if (g.kv_dtype && std::strcmp(g.kv_dtype, "bf16"))
+            return RAD_OP(b, "mla_attn",
+                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("latent_dim", 512),
+                                     RAD_INT("heads", heads), RAD_INT("blocks", blocks),
+                                     RAD_INT("block_size", 4), RAD_F64("scale", scale),
+                                     RAD_STR("dtype", "bf16"), RAD_STR("kv_dtype", g.kv_dtype)),
+                          RAD_NOWEIGHTS);
+        return RAD_OP(b, "mla_attn",
+                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("latent_dim", 512),
+                                 RAD_INT("heads", heads), RAD_INT("blocks", blocks),
+                                 RAD_INT("block_size", 4), RAD_F64("scale", scale),
+                                 RAD_STR("dtype", "bf16")),
+                      RAD_NOWEIGHTS);
+    }
     struct Wire {
         rad_buf q = 0, q_latent = 0, attn_latent = 0, out = 0, selected = 0, length = 0;
         /* qsa_select's entry count (selected_count), one int a row: the streamed resolve's `nsel`.
@@ -68,16 +88,10 @@ struct MlaLatent {
                               RAD_STR("mode", "absorb"), RAD_STR("dtype", "bf16")),
                    RAD_WEIGHTS(projection)),
             { w.q }, { w.q_latent });
-        op_attn =
-            rw(b,
-               RAD_OP(b, "mla_attn",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("latent_dim", c.latent_dim),
-                                 RAD_INT("heads", c.heads), RAD_INT("blocks", c.blocks),
-                                 RAD_INT("block_size", 4),
-                                 RAD_F64("scale", 1.0 / std::sqrt((double)c.head_dim)),
-                                 RAD_STR("dtype", "bf16")),
-                      RAD_NOWEIGHTS),
-               { w.q_latent, w.selected, w.length }, { w.attn_latent });
+        op_attn = rw(b,
+                     attn_op(b, g, g.max_tok, c.heads, c.blocks,
+                             1.0 / std::sqrt((double)c.head_dim)),
+                     { w.q_latent, w.selected, w.length }, { w.attn_latent });
         if (!op_attn || rad_kv_block_size(b, group) != 4) return RAD_E_INVAL;
         op_expand = rw(
             b,
@@ -172,12 +186,13 @@ struct GlmMla {
         RAD_ARCH_TRY(q_b.declare(b, nm, g, nm.f("blk.%d.attn_q_b", l), GlmTp::mla_width(g.world),
                                  1536, RAD_SHARD_ROW, wg, { nm.ckpt("%s.q_b_proj.weight", prefix) },
                                  w.q_low, w.core.q));
-        // Cache stores contiguous halves of the normalized latent, with no duplicated K/V.
+        /* Cache stores contiguous halves of the normalized latent, with no duplicated K/V. An E4M3
+         * cache (Geom::kv_dtype) stores at kv_store's default descale of 1, which mla_attn reads. */
         op_store = rw(b,
                       RAD_OP(b, "kv_store",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", 256),
                                         RAD_INT("n_head_kv", 1), RAD_INT("block_size", 4),
-                                        RAD_STR("kv_dtype", "bf16")),
+                                        RAD_STR("kv_dtype", g.kv_dtype)),
                              RAD_NOWEIGHTS),
                       { w.latent }, {});
         if (!op_store) return RAD_E_INVAL;
@@ -200,7 +215,7 @@ struct GlmMla {
                                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                                   RAD_INT("head_dim", 256), RAD_INT("n_head_kv", 1),
                                                   RAD_INT("block_size", 4),
-                                                  RAD_STR("kv_dtype", "bf16")),
+                                                  RAD_STR("kv_dtype", g.kv_dtype)),
                                        RAD_NOWEIGHTS),
                                 { w.latent }, {});
         /* Issued in finish, after this layer's indexer selects and before the attention reads
@@ -239,15 +254,8 @@ struct GlmMla {
                       { in }, { out });
         };
         op_rows_absorb = project("absorb", r.q, r.q_latent);
-        op_rows_attn =
-            rw(b,
-               RAD_OP(b, "mla_attn",
-                      RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("latent_dim", 512),
-                                 RAD_INT("heads", 64), RAD_INT("blocks", core.c.blocks),
-                                 RAD_INT("block_size", 4), RAD_F64("scale", 1.0 / std::sqrt(256.0)),
-                                 RAD_STR("dtype", "bf16")),
-                      RAD_NOWEIGHTS),
-               { r.q_latent, w.core.selected, w.core.length }, { r.attn_latent });
+        op_rows_attn = rw(b, MlaLatent::attn_op(b, g, R, 64, core.c.blocks, 1.0 / std::sqrt(256.0)),
+                          { r.q_latent, w.core.selected, w.core.length }, { r.attn_latent });
         op_rows_expand = project("expand", r.attn_latent, r.attn.x);
         RAD_ARCH_TRY(rows_quant.declare(b, g, r.attn, 16384));
         rows_output.stored = nm.f("blk.%d.attn_output.weight", layer);
