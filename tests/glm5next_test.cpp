@@ -611,8 +611,12 @@ TEST(
             CHECK_EQ(std::count(ops.begin(), ops.end(), "mhc_pre"), 90);
             CHECK_EQ(std::count(ops.begin(), ops.end(), "kda_update"), 34);
             CHECK_EQ(std::count(ops.begin(), ops.end(), "mla_attn"), 11);
-            // Two rows stay under the split threshold: 42 routers and 11 index heads, replicated.
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt_f32"), 53);
+            // Two rows stay under the split threshold, and their history fits the selection
+            // (DsaCache::takes_all): the 42 routers run, the 11 index heads and scorers do not.
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt_f32"), 42);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "dsa_query"), 0);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "dsa_score"), 0);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "qsa_select"), 11);
             CHECK_EQ(std::count(ops.begin(), ops.end(), "all_gather"), 0);
             // The split is declared on every rank whatever its step size; only rank 0 issues it here.
             const bool split = world > 1;
@@ -668,9 +672,11 @@ TEST(
                     // 512 rows reach the split: each router runs on its column slice, each mHC
                     // read on its chunks, each indexer, its head gates included, on its run
                     // of query rows, and each MLA on its run of rows, all gathered but the
-                    // gates; at TP1 nothing changes.
+                    // gates. At TP1 the step does not split, and 512 tokens of history fit the
+                    // selection, so the index heads do not run.
                     const auto long_ops = issued_ops(b, ctx);
-                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"), 53);
+                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"),
+                             world > 1 ? 53 : 42);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_gather"),
                              world > 1 ? 42 + 90 + 22 + 11 : 0);
                     // 1 embedding, 45 attention and 45 expert reductions, less the 11 MLA ones.
@@ -859,8 +865,19 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
             CHECK_EQ(gathered, 1);
             CHECK_EQ(replicated, 0);
             CHECK_EQ(fronts, 4);
-            // Under the threshold every rank scores and selects the whole step.
-            auto small = kit(b, {}, { 255 });
+            // Under the threshold every rank scores and selects the whole step. 3000 tokens of
+            // history reach 815 blocks, past the selection, and 255 rows of them stay under
+            // kSplitWork.
+            auto small = kit(b, {}, { 255 }, 3000);
+            {
+                const int64_t pitch = 1024;
+                small->table.resize((size_t)pitch);
+                for (int64_t i = 0; i < pitch; ++i) small->table[(size_t)i] = (int32_t)i;
+                for (auto& g : small->kv) {
+                    g.block_table = small->table.data();
+                    g.block_table_pitch = g.max_blocks = pitch;
+                }
+            }
             auto under = run_passes(b, glm5next::step, { small.get() }, rank, world);
             CHECK_PASSES(b, under);
             int whole = 0;
@@ -874,6 +891,26 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
                 if (issue.op == index.op_head) CHECK_EQ(issue.n, 255);
             }
             CHECK_EQ(whole, 1);
+            // Without that history every row selects all its blocks: no rank runs the query side
+            // or scores, and the selection reads zeros over the selection's width.
+            auto fits = kit(b, {}, { 255 });
+            auto all = run_passes(b, glm5next::step, { fits.get() }, rank, world);
+            CHECK_PASSES(b, all);
+            int unscored = 0, picks = 0;
+            for (const auto& issue : all[0]->issues) {
+                CHECK(issue.op != cache.op_score && issue.op != cache.op_score_part &&
+                      issue.op != cache.op_query && issue.op != index.op_query_copy &&
+                      issue.op != index.op_head && issue.op != index.query.op);
+                if (issue.op == cache.op_unscored) {
+                    ++unscored;
+                    CHECK_EQ(issue.n, 255);
+                    CHECK_EQ(issue.opd[0].handle, w.score);
+                    CHECK_EQ(issue.opd[0].cols, cache.unscored_cols());
+                }
+                picks += issue.op == cache.op_select;
+            }
+            CHECK_EQ(unscored, 1);
+            CHECK_EQ(picks, 1);
             // A verify of eight sequences at 32k of context (48 rows x 8014 blocks) splits too, a
             // single sequence's six rows do not; a rank whose run lies past the step still writes
             // the runs it gathers.
@@ -1322,54 +1359,84 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
                        RAD_OK);
         CHECK_EQ(b.kv_groups[index - 1].d.dtype, RAD_U8);
         CHECK_EQ(b.kv_groups[index - 1].d.head_dim, 17);
-        int32_t ibt[16]{}, abt[16]{}, sidx[12]{}, cu[] = { 0, 3, 8 }, pos[8]{};
-        RadKVGroupBatch kv[3]{};
-        kv[0].group = index;
-        kv[0].block_table = ibt;
-        kv[0].block_table_pitch = 8;
-        kv[1].group = tail;
-        kv[1].state_index = sidx;
-        kv[1].state_index_pitch = 6;
-        kv[2].group = attn;
-        kv[2].block_table = abt;
-        kv[2].block_table_pitch = 8;
-        RadBatch batch{};
-        batch.n_tok = 8;
-        batch.n_seq = 2;
-        batch.n_spec = 2;
-        batch.kv = kv;
-        batch.n_kv_groups = 3;
-        batch.positions = pos;
-        batch.cu_seqlens = cu;
-        batch.max_ctx_len = 64;   // Mixed-row bound exceeds the eight physical table columns.
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.batch = &batch;
-        if (front) {
-            indexer.step(&ctx, &batch);
-            REQUIRE_EQ(ctx.issues.size(), (size_t)12);
-            CHECK_EQ(ctx.issues[1].op, indexer.op_query_copy);
-            CHECK_EQ(ctx.issues[1].opd[1].rows, 256);
-            CHECK_EQ(ctx.issues[3].op, indexer.op_norm);
-            CHECK_EQ(ctx.issues[4].opd[0].offset, 128);
-            CHECK_EQ(ctx.issues[5].op, indexer.op_head);
-            ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 6);
-        } else
-            block.step(&ctx, &batch);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)6);
-        CHECK_EQ(ctx.issues[0].n, 256);
-        CHECK(ctx.issues[1].opd[5].raw == ibt);
-        CHECK_EQ(ctx.issues[1].opd[4].cols, 6);
-        CHECK_EQ(ctx.issues[2].op, block.op_pool);
-        CHECK_EQ(ctx.issues[2].opd[5].handle, index);
-        CHECK_EQ(ctx.issues[3].op, block.op_tail);
-        CHECK_EQ(ctx.issues[4].opd[0].rows, 256);
-        CHECK_EQ(ctx.issues[4].opd[3].handle, index);
-        CHECK_EQ(ctx.issues[4].opd[4].kind, RAD_OPK_NONE);
-        CHECK(ctx.issues[4].opd[5].raw == ibt);
-        CHECK_EQ(ctx.issues[4].opd[8].cols, 8);
-        CHECK_EQ(ctx.issues[5].opd[0].cols, 8);
-        CHECK(ctx.issues[5].opd[1].raw == abt);
+        /* Eight table columns cap the live reach below the selection, so every row takes all its
+         * blocks (DsaCache::takes_all); 4000 tokens of history over 1024 columns reach 1004 blocks,
+         * past it, and score. */
+        for (const int64_t pitch : { 8, 1024 }) {
+            const bool scores = pitch > 8;
+            std::vector<int32_t> ibt((size_t)(2 * pitch)), abt((size_t)(2 * pitch));
+            int32_t sidx[12]{}, cu[] = { 0, 3, 8 }, pos[8]{};
+            RadKVGroupBatch kv[3]{};
+            kv[0].group = index;
+            kv[0].block_table = ibt.data();
+            kv[0].block_table_pitch = pitch;
+            kv[1].group = tail;
+            kv[1].state_index = sidx;
+            kv[1].state_index_pitch = 6;
+            kv[2].group = attn;
+            kv[2].block_table = abt.data();
+            kv[2].block_table_pitch = pitch;
+            RadBatch batch{};
+            batch.n_tok = 8;
+            batch.n_seq = 2;
+            batch.n_spec = 2;
+            batch.kv = kv;
+            batch.n_kv_groups = 3;
+            batch.positions = pos;
+            batch.cu_seqlens = cu;
+            // At eight columns the mixed-row bound exceeds the physical table.
+            batch.max_ctx_len = scores ? 4000 : 64;
+            const int64_t live = scores ? 1004 : 8;
+            CHECK_EQ(block.live_blocks(&batch), live);
+            CHECK_EQ(block.takes_all(&batch), !scores);
+            RadCtx ctx;
+            ctx.b = &b;
+            ctx.batch = &batch;
+            if (front) {
+                indexer.step(&ctx, &batch);
+                if (scores) {
+                    REQUIRE_EQ(ctx.issues.size(), (size_t)12);
+                    CHECK_EQ(ctx.issues[1].op, indexer.op_query_copy);
+                    CHECK_EQ(ctx.issues[1].opd[1].rows, 256);
+                    CHECK_EQ(ctx.issues[3].op, indexer.op_norm);
+                    CHECK_EQ(ctx.issues[4].opd[0].offset, 128);
+                    CHECK_EQ(ctx.issues[5].op, indexer.op_head);
+                    ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 6);
+                } else {
+                    // The key side alone: key and gate projection, norm, gate copy.
+                    REQUIRE_EQ(ctx.issues.size(), (size_t)8);
+                    CHECK_EQ(ctx.issues[1].op, indexer.op_norm);
+                    CHECK_EQ(ctx.issues[2].op, indexer.op_gate_copy);
+                    ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 3);
+                }
+            } else
+                block.step(&ctx, &batch);
+            const size_t q = scores ? 1 : 0;   // the query quantiser leads a scored step
+            REQUIRE_EQ(ctx.issues.size(), 5 + q);
+            if (scores) CHECK_EQ(ctx.issues[0].n, 256);
+            CHECK(ctx.issues[q].opd[5].raw == ibt.data());
+            CHECK_EQ(ctx.issues[q].opd[4].cols, 6);
+            CHECK_EQ(ctx.issues[q + 1].op, block.op_pool);
+            CHECK_EQ(ctx.issues[q + 1].opd[5].handle, index);
+            CHECK_EQ(ctx.issues[q + 2].op, block.op_tail);
+            const auto& fill = ctx.issues[q + 3];
+            if (scores) {
+                CHECK_EQ(fill.op, block.op_score);
+                CHECK_EQ(fill.opd[0].rows, 256);
+                CHECK_EQ(fill.opd[3].handle, index);
+                CHECK_EQ(fill.opd[4].kind, RAD_OPK_NONE);
+                CHECK(fill.opd[5].raw == ibt.data());
+                CHECK_EQ(fill.opd[8].cols, live);
+            } else {
+                CHECK_EQ(fill.op, block.op_unscored);
+                CHECK_EQ(fill.n, 8);
+                CHECK_EQ(fill.opd[0].handle, w.score);
+                CHECK_EQ(fill.opd[0].cols, 513);
+            }
+            CHECK_EQ(ctx.issues[q + 4].op, block.op_select);
+            CHECK_EQ(ctx.issues[q + 4].opd[0].cols, live);
+            CHECK(ctx.issues[q + 4].opd[1].raw == abt.data());
+        }
     }
 }
 
@@ -1680,11 +1747,11 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
      * change -- the merge re-recorded them for main's builder plus this branch's file-direct
      * expert ops, and the graphs again when the routing counts became RAD_BUF_PERSIST (the
      * steps did not change). */
-    const Case cases[] = { { 1, 0x74395d49106a3042ull, 0x68ffc03d2b640d51ull },
+    const Case cases[] = { { 1, 0x5881752504ad8dbaull, 0x017c2cbd833d9737ull },
                            /* World 8 is this branch's expert-parallel graph (288/world whole
                             * experts, file-direct), so its pins differ from main's. */
-                           { 8, 0x1a0da8de6bd0be62ull, 0x1b80576ba8f1ecc7ull },
-                           { 8, 0xe3751c4cc46e027aull, 0xed8cc595e8eeb593ull, true } };
+                           { 8, 0x220a154a1928ee7aull, 0xc315b28cdda60809ull },
+                           { 8, 0x5b97f4fd6b4eeb36ull, 0x2a82ce055211fc15ull, true } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
