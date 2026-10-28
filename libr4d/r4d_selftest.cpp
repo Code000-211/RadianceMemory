@@ -18520,6 +18520,10 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
     std::vector<RadParam> ps = { PI("M", rows),        PI("latent_dim", 512), PI("heads", heads),
                                  PI("blocks", blocks), PI("block_size", 4),   PF("scale", 0.0625),
                                  PS("dtype", "bf16") };
+    /* An *_fp8kv row reads an E4M3 cache: the oracle shapes it from `kv_dtype` and reads the same
+     * codes, so the comparison is of the attention alone, at the bf16 rows' tolerance. */
+    const bool fp8kv = std::strstr(name, "fp8kv") != nullptr;
+    if (fp8kv) ps.push_back(PS("kv_dtype", "fp8_e4m3"));
     std::vector<RadTensor> host, device;
     std::vector<std::vector<uint8_t>> bytes(5);
     std::vector<void*> allocations;
@@ -18569,6 +18573,9 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
                                 1000;
                             if (t.dtype == RAD_BF16)
                                 ((uint16_t*)t.data)[off] = h_to_bf16(i == 0 ? v * 0.25f : v);
+                            else if (t.dtype == RAD_F8E4M3)
+                                /* Codes over most of E4M3's exponents, subnormals included. */
+                                ((uint8_t*)t.data)[off] = rad_f32_to_fp8e4m3(v * v * v * 8.0f);
                             else if (fill == MlaFill::full)
                                 ((int32_t*)t.data)[off] =
                                     i == 2 ? (int)(r * blocks + a1) : (int)(blocks * 4);
@@ -33500,6 +33507,51 @@ static void device_phase(const Plugin& pl) {
             for (int64_t heads : { 8, 16 })
                 mla_check(pl, requests, heads, 513, "mla_attn_bf16", MlaFill::full);
         mla_check(pl, 7, 8, 65, "mla_attn_bf16", MlaFill::topk, nullptr, 0, 16);
+    }
+    /* The E4M3-cache twins: each kernel form of its bf16 row, on the same operands with the cache
+     * as E4M3 codes. The comparison partner is the twin of the row the bf16 case compares with. */
+    if (sel("mla_attn_fp8kv")) {
+        mla_check(pl, 1, 1, 3, "mla_attn_fp8kv");
+        mla_check(pl, 7, 16, 17, "mla_attn_fp8kv");
+        mla_check(pl, 4, 16, 513, "mla_attn_fp8kv");
+        mla_check(pl, 1, 64, 17, "mla_attn_fp8kv");
+        mla_check(pl, 33, 8, 17, "mla_attn_fp8kv");
+        mla_check(pl, 4, 8, 513, "mla_attn_fp8kv", MlaFill::full);
+        mla_check(pl, 7, 8, 65, "mla_attn_fp8kv", MlaFill::topk, nullptr, 0, 16);
+    }
+    if (sel("mla_attn_matrix_fp8kv")) {
+        mla_check(pl, 7, 16, 17, "mla_attn_matrix_fp8kv");
+        mla_check(pl, 4, 16, 513, "mla_attn_matrix_fp8kv");
+        mla_check(pl, 1, 64, 17, "mla_attn_matrix_fp8kv");
+        mla_check(pl, 4, 12, 17, "mla_attn_matrix_fp8kv");
+        for (int requests : { 1, 4, 7, 33 })
+            mla_check(pl, requests, 8, 513, "mla_attn_matrix_fp8kv", MlaFill::ragged,
+                      "mla_attn_fp8kv");
+        mla_check(pl, 7, 8, 513, "mla_attn_matrix_fp8kv", MlaFill::full, "mla_attn_fp8kv");
+        mla_check(pl, 33, 8, 513, "mla_attn_matrix_fp8kv", MlaFill::prefill, "mla_attn_fp8kv");
+        mla_check(pl, 128, 8, 513, "mla_attn_matrix_fp8kv", MlaFill::prefill, "mla_attn_fp8kv");
+        mla_check(pl, 7, 8, 65, "mla_attn_matrix_fp8kv", MlaFill::topk, "mla_attn_fp8kv", 0, 16);
+        mla_check(pl, 33, 8, 513, "mla_attn_matrix_fp8kv", MlaFill::topk, "mla_attn_fp8kv", 0,
+                  16);
+        /* Past the union's lists, the positional pairing. */
+        mla_check(pl, 7, 8, 521, "mla_attn_matrix_fp8kv", MlaFill::prefill, nullptr);
+        /* The element-wise key load. */
+        mla_check(pl, 33, 16, 17, "mla_attn_matrix_fp8kv", MlaFill::ragged, nullptr, 1);
+        mla_check(pl, 7, 8, 513, "mla_attn_matrix_fp8kv", MlaFill::prefill, nullptr, 1);
+    }
+    if (sel("mla_attn_rows_fp8kv")) {
+        for (int requests : { 1, 7, 33 })
+            for (int64_t blocks : { 17, 513 })
+                mla_check(pl, requests, 64, blocks, "mla_attn_rows_fp8kv", MlaFill::ragged,
+                          "mla_attn_matrix_fp8kv", requests < 32 ? 3 : 0);
+        mla_check(pl, 33, 64, 513, "mla_attn_rows_fp8kv", MlaFill::prefill,
+                  "mla_attn_matrix_fp8kv");
+        mla_check(pl, 33, 64, 65, "mla_attn_rows_fp8kv", MlaFill::topk, "mla_attn_matrix_fp8kv",
+                  0, 16);
+        /* Under 32 rows the rule's matrix kernel; the element-wise load; 32 heads a workgroup. */
+        mla_check(pl, 7, 64, 513, "mla_attn_rows_fp8kv", MlaFill::full);
+        mla_check(pl, 7, 64, 513, "mla_attn_rows_fp8kv", MlaFill::prefill, nullptr, 1);
+        mla_check(pl, 33, 64, 65, "mla_attn_rows_fp8kv", MlaFill::topk, nullptr, 2, 16);
     }
     if (sel("mla_project_bf16")) {
         for (const char* mode : { "absorb", "expand" }) {
