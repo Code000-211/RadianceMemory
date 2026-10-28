@@ -1932,9 +1932,10 @@ static const RadParamSpec pSwigluClampedQuant[] = { P_INT("M"), P_INT("n"), P_F6
                                                     P_INT("group"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"),
                                          P_INTO("block_size") };
+/* `kv_dtype` is the latent cache's: absent or bf16, or fp8_e4m3 (kv_store_fp8 at descale 1). */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"),      P_INT("latent_dim"), P_INT("heads"),
                                          P_INT("blocks"), P_INT("block_size"), P_F64("scale"),
-                                         P_STR("dtype") };
+                                         P_STR("dtype"),  P_STRO("kv_dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
                                             P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
 static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
@@ -5054,6 +5055,29 @@ static const RadConstraint cMlaRows[] = { C_GE("M", 1),         C_LE("M", 65535)
                                           C_EQ("latent_dim", 512), C_EQ("heads", 64),
                                           C_GE("blocks", 1),       C_EQ("block_size", 4),
                                           C_IN("dtype", "bf16") };
+/* The three rows over an E4M3 latent cache: each bf16 row's constraints and kv_dtype fp8_e4m3,
+ * ranked above all three bf16 rows (which state no kv_dtype and would otherwise also match), in
+ * the bf16 rows' order among themselves. The kernels are the bf16 rows' with the key load
+ * decoding E4M3 (r4d_mla.hip). */
+static const RadConstraint cMlaAttnFp8[] = {
+    C_GE("M", 1),      C_LE("M", 65535),  C_EQ("latent_dim", 512), C_GE("heads", 1),
+    C_LE("heads", 64), C_GE("blocks", 1), C_EQ("block_size", 4),   C_IN("dtype", "bf16"),
+    C_IN("kv_dtype", "fp8_e4m3")
+};
+static const RadConstraint cMlaMatrixFp8[] = { C_GE("M", 1),
+                                               C_LE("M", 65535),
+                                               C_EQ("latent_dim", 512),
+                                               C_GE("heads", 8),
+                                               C_LE("heads", 64),
+                                               C_DIV("heads", 8),
+                                               C_GE("blocks", 1),
+                                               C_EQ("block_size", 4),
+                                               C_IN("dtype", "bf16"),
+                                               C_IN("kv_dtype", "fp8_e4m3") };
+static const RadConstraint cMlaRowsFp8[] = { C_GE("M", 1),         C_LE("M", 65535),
+                                             C_EQ("latent_dim", 512), C_EQ("heads", 64),
+                                             C_GE("blocks", 1),       C_EQ("block_size", 4),
+                                             C_IN("dtype", "bf16"),   C_IN("kv_dtype", "fp8_e4m3") };
 /* `n` is bounded by LDS: nh (hc*n) and ne (n) are both bf16 and live through the second phase;
  * 28672 elements is that budget at hc 4. */
 static const RadConstraint cMtpEnter[] = {
@@ -6597,6 +6621,27 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, heads<=64, block_size=4", "bf16 Q/cache/output, f32 softmax and partials",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttn), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn, r4d_rad_mla_attn_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn },
+{ "mla_attn_rows_fp8kv", "mla_attn", "attn",
+  "mla_attn_rows_bf16 over an E4M3 latent cache, each key decoded exactly to bf16 at the load",
+  "latent_dim=512, heads=64, block_size=4",
+  "bf16 Q/output, fp8-e4m3 cache at descale 1; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 5, ROW(cMlaRowsFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_rows_fp8kv, r4d_rad_mla_attn_matrix_scratch, nullptr,
+  nullptr, r4d_shape_mla_attn },
+{ "mla_attn_matrix_fp8kv", "mla_attn", "attn",
+  "mla_attn_matrix_bf16 over an E4M3 latent cache, each key decoded exactly to bf16 at the load",
+  "latent_dim=512, heads a multiple of 8 (heads%16==8 pairs two requests a tile), block_size=4",
+  "bf16 Q/output, fp8-e4m3 cache at descale 1; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 4, ROW(cMlaMatrixFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_matrix_fp8kv, r4d_rad_mla_attn_matrix_scratch, nullptr,
+  nullptr, r4d_shape_mla_attn },
+{ "mla_attn_fp8kv", "mla_attn", "attn",
+  "mla_attn_bf16 over an E4M3 latent cache, each key decoded exactly at the load",
+  "latent_dim=512, heads<=64, block_size=4",
+  "bf16 Q/output, fp8-e4m3 cache at descale 1, f32 softmax and partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 3, ROW(cMlaAttnFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_fp8kv, r4d_rad_mla_attn_scratch, nullptr, nullptr,
   r4d_shape_mla_attn },
 { "gemm_fp8a8_f32scale", "gemm_nt_q", "gemm", "FP8 WMMA with canonical F32 block scales",
   "N and K multiples of 128; pitched activations and row-major weights", "E4M3 codes, F32 scales, BF16 output",

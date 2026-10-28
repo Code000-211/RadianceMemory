@@ -5,6 +5,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_fp8_wmma.h"
 #include "r4d_gdn_wmma.h"
 #include <algorithm>
 #include <climits>
@@ -155,7 +156,49 @@ __device__ void load_latent(const uint16_t* p, float (&v)[16]) {
         for (int j = 0; j < 16; ++j) v[j] = bf16_to_f32(p[j]);
     }
 }
-__global__ __launch_bounds__(128) void attend(const uint16_t* q, const uint16_t* kv, const int* bt,
+/* The latent cache is bf16, or E4M3 as kv_store_fp8 writes it at its default descale of 1, so a
+ * code is the value itself. Every E4M3 value is a bf16 (three mantissa bits against seven, an
+ * exponent range bf16 contains), so an fp8 key decodes exactly to the bf16 the tiles hold and every
+ * kernel's arithmetic past the load is its bf16 instance's. The loads below are overloaded on the
+ * cache's element type; at uint16_t each is the plain load the bf16 kernels always made. */
+template <bool HI>
+__device__ __forceinline__ uint32_t e4m3x2_bf16(uint32_t w) {
+    const v2f f = r4d_fp8::e4m3_pk<HI>(w);
+    return (__float_as_uint(f.x) >> 16) | (__float_as_uint(f.y) & 0xffff0000u);
+}
+__device__ __forceinline__ void load_latent(const uint8_t* p, float (&v)[16]) {
+    if (!((uintptr_t)p & 15)) {
+        const uint4 a = *(const uint4*)p;
+        const uint32_t packed[4] = { a.x, a.y, a.z, a.w };
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const v2f lo = r4d_fp8::e4m3_pk<false>(packed[j]),
+                      hi = r4d_fp8::e4m3_pk<true>(packed[j]);
+            v[4 * j] = lo.x;
+            v[4 * j + 1] = lo.y;
+            v[4 * j + 2] = hi.x;
+            v[4 * j + 3] = hi.y;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) v[j] = r4d_fp8::e4m3(p[j]);
+    }
+}
+/* Eight consecutive cache elements as four bf16 pairs: one 16-byte load at bf16, one 8-byte load
+ * at E4M3. The caller keeps the 16-byte alignment the bf16 load needs, which covers the E4M3 one. */
+__device__ __forceinline__ uint4 load8(const uint16_t* p) { return *(const uint4*)p; }
+__device__ __forceinline__ uint4 load8(const uint8_t* p) {
+    const uint2 raw = *(const uint2*)p;
+    return make_uint4(e4m3x2_bf16<false>(raw.x), e4m3x2_bf16<true>(raw.x),
+                      e4m3x2_bf16<false>(raw.y), e4m3x2_bf16<true>(raw.y));
+}
+/* One cache element as bf16 bits. */
+__device__ __forceinline__ uint16_t elem(const uint16_t* p) { return *p; }
+__device__ __forceinline__ uint16_t elem(const uint8_t* p) {
+    return (uint16_t)(__float_as_uint(r4d_fp8::e4m3(*p)) >> 16);
+}
+template <typename K>
+__global__ __launch_bounds__(128) void attend(const uint16_t* q, const K* kv, const int* bt,
                                               const int* len, uint16_t* out, float* scratch,
                                               Meta m) {
     const int lane = threadIdx.x & 31, head = blockIdx.y * 4 + (threadIdx.x >> 5), r = blockIdx.x,
@@ -424,9 +467,10 @@ constexpr int kUnionBlocks = 520, kUnionSlots = 1024;
 __device__ __forceinline__ unsigned union_slot(int page) {
     return ((unsigned)page * 2654435761u) >> 22;
 }
-/* STATS is its own instance: counting inside the loop costs the paired tile spilled VGPRs. */
-template <bool PAIR, bool WIDE, bool UNION, bool STATS>
-__global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const uint16_t* kv,
+/* STATS is its own instance: counting inside the loop costs the paired tile spilled VGPRs. K is
+ * the cache's element (uint16_t bf16, uint8_t E4M3). */
+template <typename K, bool PAIR, bool WIDE, bool UNION, bool STATS>
+__global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const K* kv,
                                                      const int* bt, const int* len, uint16_t* out,
                                                      float* scratch, Meta m) {
     static_assert(PAIR || !UNION, "the union pairs two requests");
@@ -614,7 +658,7 @@ __global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const ui
                 for (int j = 0; j < 8; ++j) {
                     const int flat = tid + j * 128;
                     const long at = source[flat >> 6];
-                    part[j] = *(const uint4*)(kv + (at >= 0 ? at : 0) + (flat & 63) * 8);
+                    part[j] = load8(kv + (at >= 0 ? at : 0) + (flat & 63) * 8);
                     if (at < 0) part[j] = make_uint4(0, 0, 0, 0);
                 }
 #pragma unroll
@@ -625,7 +669,8 @@ __global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const ui
             } else {
                 for (int j = tid; j < 16 * 512; j += 128) {
                     const int token = j / 512, col = j % 512;
-                    keys[token * 520 + col] = source[token] >= 0 ? kv[source[token] + col] : 0;
+                    keys[token * 520 + col] =
+                        source[token] >= 0 ? elem(kv + source[token] + col) : 0;
                 }
             }
             __syncthreads();
@@ -734,8 +779,8 @@ __global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const ui
  * The next chunk's keys are fetched into registers while the current one is multiplied, so a
  * chunk costs two barriers. */
 constexpr int kRowsPitch = 520;
-template <int HG, bool WIDE>
-__global__ __launch_bounds__(HG * 128) void attend_rows(const uint16_t* q, const uint16_t* kv,
+template <typename K, int HG, bool WIDE>
+__global__ __launch_bounds__(HG * 128) void attend_rows(const uint16_t* q, const K* kv,
                                                         const int* bt, const int* len,
                                                         uint16_t* out, float* scratch, Meta m) {
     constexpr int NT = HG * 128, LOADS = 16 * 64 / NT;
@@ -777,13 +822,15 @@ __global__ __launch_bounds__(HG * 128) void attend_rows(const uint16_t* q, const
             const bool ok = page >= 0 && page < m.pages;
             const long at = ok ? (long)page * m.kp + (token % m.bs) * m.kt + piece * 8 : 0;
             if constexpr (WIDE) {
-                staged[j] = *(const uint4*)(kv + at);
+                staged[j] = load8(kv + at);
                 if (!ok) staged[j] = make_uint4(0, 0, 0, 0);
             } else {
                 uint32_t w[4];
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
-                    w[i] = ok ? (uint32_t)kv[at + 2 * i] | (uint32_t)kv[at + 2 * i + 1] << 16 : 0u;
+                    w[i] = ok ? (uint32_t)elem(kv + at + 2 * i) |
+                                    (uint32_t)elem(kv + at + 2 * i + 1) << 16
+                              : 0u;
                 staged[j] = make_uint4(w[0], w[1], w[2], w[3]);
             }
             staged_ok = ok ? staged_ok | 1u << j : staged_ok & ~(1u << j);
@@ -931,11 +978,13 @@ void report_stats(RadStream stream) {
                  "%llu second passes (%.3fx)\n",
                  device, v[0], v[2], v[1], (double)v[0] / (double)v[2]);
 }
-template <bool MATRIX>
+/* K is the cache's element: uint16_t for a bf16 cache, uint8_t for an E4M3 one. */
+template <bool MATRIX, typename K = uint16_t>
 int body(const RadArgs* a, RadStream stream) {
+    constexpr uint32_t KV = sizeof(K) == 1 ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     const auto &q = a->t[0], &kv = a->t[1], &bt = a->t[2], &len = a->t[3], &o = a->t[4];
-    if (q.dtype != RAD_BF16 || kv.dtype != RAD_BF16 || o.dtype != RAD_BF16 || bt.dtype != RAD_I32 ||
+    if (q.dtype != RAD_BF16 || kv.dtype != KV || o.dtype != RAD_BF16 || bt.dtype != RAD_I32 ||
         len.dtype != RAD_I32)
         return RAD_E_DTYPE;
     for (int i = 0; i < 5; ++i)
@@ -977,8 +1026,8 @@ int body(const RadArgs* a, RadStream stream) {
     int rc;
     if constexpr (MATRIX) {
 #define MATRIX_EMIT(P, W, U, S, X, Y)                                                              \
-    R4D_EMIT(stream, (attend_matrix<P, W, U, S>), dim3(X, Y, m.splits), dim3(128), 0,              \
-             (const uint16_t*)q.data, (const uint16_t*)kv.data, (const int*)bt.data,               \
+    R4D_EMIT(stream, (attend_matrix<K, P, W, U, S>), dim3(X, Y, m.splits), dim3(128), 0,           \
+             (const uint16_t*)q.data, (const K*)kv.data, (const int*)bt.data,                      \
              (const int*)len.data, (uint16_t*)o.data, (float*)a->scratch, m)
 #define MATRIX_LAUNCH(P, W, U, X, Y)                                                               \
     (stats ? MATRIX_EMIT(P, W, U, true, X, Y) : MATRIX_EMIT(P, W, U, false, X, Y))
@@ -994,8 +1043,8 @@ int body(const RadArgs* a, RadStream stream) {
 #undef MATRIX_LAUNCH
 #undef MATRIX_EMIT
     } else
-        rc = R4D_EMIT(stream, attend, dim3(m.rows, (m.heads + 3) / 4, m.splits), dim3(128), 0,
-                      (const uint16_t*)q.data, (const uint16_t*)kv.data, (const int*)bt.data,
+        rc = R4D_EMIT(stream, attend<K>, dim3(m.rows, (m.heads + 3) / 4, m.splits), dim3(128), 0,
+                      (const uint16_t*)q.data, (const K*)kv.data, (const int*)bt.data,
                       (const int*)len.data, (uint16_t*)o.data, (float*)a->scratch, m);
     if (rc == RAD_OK && splits > 1)
         rc = R4D_EMIT(stream, merge, dim3(m.rows, (m.heads + 3) / 4), dim3(128), 0,
@@ -1013,10 +1062,12 @@ int g_mla_rows_form = 0;
  * the matrix row's four tiles a row and its splits are faster (r4d_selftest --case
  * mla_attn_rows_bf16, M 7: 0.5x). */
 constexpr long kRowsMin = 32;
+template <typename K = uint16_t>
 int rows_body(const RadArgs* a, RadStream stream) {
+    constexpr uint32_t KV = sizeof(K) == 1 ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     const auto &q = a->t[0], &kv = a->t[1], &bt = a->t[2], &len = a->t[3], &o = a->t[4];
-    if (q.dtype != RAD_BF16 || kv.dtype != RAD_BF16 || o.dtype != RAD_BF16 || bt.dtype != RAD_I32 ||
+    if (q.dtype != RAD_BF16 || kv.dtype != KV || o.dtype != RAD_BF16 || bt.dtype != RAD_I32 ||
         len.dtype != RAD_I32)
         return RAD_E_DTYPE;
     for (int i = 0; i < 5; ++i)
@@ -1037,7 +1088,7 @@ int rows_body(const RadArgs* a, RadStream stream) {
         return RAD_E_SHAPE;
     if (heads % 32) return RAD_E_UNSUPPORTED;
     const int form = g_mla_rows_form;
-    if (form == 4 || (!form && q.shape[0] < kRowsMin)) return body<true>(a, stream);
+    if (form == 4 || (!form && q.shape[0] < kRowsMin)) return body<true, K>(a, stream);
     const int group_heads = heads % 64 || form == 2 ? 32 : 64;
     const long rows = q.shape[0], groups = heads / group_heads, jobs = rows * groups;
     /* Short batches split the history until 64 workgroups run, two to each of the R9700's 32
@@ -1053,8 +1104,8 @@ int rows_body(const RadArgs* a, RadStream stream) {
             o.stride[1],  (int)q.shape[0],  (int)heads,    (int)bt.shape[1],
             (int)bs,      (int)kv.shape[0], splits,        scale };
 #define ROWS_EMIT(HG, W)                                                                           \
-    R4D_EMIT(stream, (attend_rows<HG, W>), dim3(m.rows, (unsigned)groups, m.splits),             \
-             dim3(HG * 128), 0, (const uint16_t*)q.data, (const uint16_t*)kv.data,               \
+    R4D_EMIT(stream, (attend_rows<K, HG, W>), dim3(m.rows, (unsigned)groups, m.splits),          \
+             dim3(HG * 128), 0, (const uint16_t*)q.data, (const K*)kv.data,                      \
              (const int*)bt.data, (const int*)len.data, (uint16_t*)o.data, (float*)a->scratch, m)
     int rc;
     if (group_heads == 64)
@@ -1076,6 +1127,16 @@ extern "C" int r4d_rad_mla_attn_matrix(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_mla_attn_rows(const RadArgs* a, RadStream stream) {
     return rows_body(a, stream);
+}
+/* The same three rows over an E4M3 latent cache (kv_dtype fp8_e4m3). */
+extern "C" int r4d_rad_mla_attn_fp8kv(const RadArgs* a, RadStream stream) {
+    return body<false, uint8_t>(a, stream);
+}
+extern "C" int r4d_rad_mla_attn_matrix_fp8kv(const RadArgs* a, RadStream stream) {
+    return body<true, uint8_t>(a, stream);
+}
+extern "C" int r4d_rad_mla_attn_rows_fp8kv(const RadArgs* a, RadStream stream) {
+    return rows_body<uint8_t>(a, stream);
 }
 extern "C" int r4d_rad_mla_project(const RadArgs* a, RadStream stream) {
     return project_body(a, stream);

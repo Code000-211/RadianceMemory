@@ -743,7 +743,9 @@ extern "C" int r4d_shape_mla_attn(const RadParam* p, int n_p, int operand, RadOp
     const int64_t B = pi(p, n_p, "blocks"), bs = pi(p, n_p, "block_size"),
                   pages = std::max((int64_t)2, B * M);
     const uint32_t dt = dt_act(p, n_p, "dtype");
-    const RadOpdDesc l[] = { opd(dt, M, H, D), opd(dt, pages, 1, bs, D), opd_idx(M, B, pages),
+    /* The cache is the query's dtype unless `kv_dtype` names another (fp8_e4m3). */
+    const uint32_t kv = r4d_pgets(p, n_p, "kv_dtype") ? dt_act(p, n_p, "kv_dtype") : dt;
+    const RadOpdDesc l[] = { opd(dt, M, H, D), opd(kv, pages, 1, bs, D), opd_idx(M, B, pages),
                              opd_idx(M, 0, 0, B * bs), opd(dt, M, H, D) };
     R4D_PICK(l);
 }

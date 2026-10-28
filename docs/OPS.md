@@ -3027,7 +3027,7 @@ order, not a slow one.
 | `dsa_pool` | `M`(range) `n` `ratio` `dtype` `block_size`/opt | `kg`, `ape`w → `q`, `scale`; `page`?, `cache`:inout? |
 | `dsa_query` | `M`(range) `n` `dtype` | `x` → `q`, `scale` |
 | `dsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `row_part`/opt | `q`, `q_scale`, `gate`, `k`, `k_scale`?, `bt`, `cu`, `nc` → `score`, `cu_part`? |
-| `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `kv`, `bt`, `length` → `out` |
+| `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` `kv_dtype`/opt | `q`, `kv`, `bt`, `length` → `out` |
 | `mla_attn_paged` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`?, `kv`, `block_table`, `seqused`, `cu_seqlens`, `gate`? → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
@@ -3353,7 +3353,9 @@ fold only after each head's ReLU.
 the tail) and is the causal bound: no slot at or past it is read. A missing or out-of-range page
 contributes nothing, and a row with no visible key outputs zero. The softmax is f32 and `out` is
 rounded once. `scale` is positive and finite and comes from the original query/key head width,
-not the latent width (GLM: `1/sqrt(256)` against a latent of 512).
+not the latent width (GLM: `1/sqrt(256)` against a latent of 512). `kv_dtype`, when given, is the
+cache's dtype and may differ from `dtype`: `fp8_e4m3` is a cache `kv_store` wrote at its default
+descale of 1, so each code is read as the value itself.
 
 libr4d has three `mla_attn` rows, all at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
 matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
@@ -3380,6 +3382,11 @@ runs the matrix row's kernel instead. It also takes multiples of 32 heads (two g
 workgroup), which no constraint routes to it. GLM-5.3 splits a prefill's MLA by rows under tensor
 parallelism, so each rank holds all 64 heads of its rows (ARCHITECTURES.md, `glm5next`).
 
+Each of the three has an E4M3-cache twin (`mla_attn_fp8kv`, `mla_attn_matrix_fp8kv`,
+`mla_attn_rows_fp8kv`) on the same constraints plus `kv_dtype` `fp8_e4m3`, ranked above all three
+bf16 rows and in their order. The kernels are the bf16 rows' with the key load decoding E4M3:
+every E4M3 value is a bf16, so the decoded tile is exact and the rest of the arithmetic is the bf16
+instance's. The bf16 rows state no `kv_dtype` and their launchers refuse an E4M3 cache.
 `mla_attn_paged` is the dense, causal form for a model whose MLA keeps a rotary part beside the
 latent (Ling-3.0: latent 512, rotary 64, every key visible). A token's cache row is the normed
 latent followed by the rotated key part, `latent_dim + rope_dim` wide; it is stored as one KV head
