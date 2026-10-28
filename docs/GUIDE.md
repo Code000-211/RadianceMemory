@@ -929,8 +929,9 @@ takes the model's training context.
 `--kv-cache-dtype fp8` is an E4M3 cache with per-(sequence, head) descales. It halves what a token of
 context costs, which at a production context is most of the pool. It is a real quantisation that
 changes the output slightly, so it is only ever set explicitly. Every architecture serves both
-widths except GLM-5.3-Flash (`glm5next`), whose latent-attention cache is bf16 only and which refuses
-`fp8` at startup. The flag sets every attention cache of the deployment, a drafter's (DSpark,
+widths. On GLM-5.3-Flash (`glm5next`) `fp8` narrows the latent-attention cache alone, to E4M3 at a
+descale of 1 (half its bf16 size); the DSA index, its key tail and the KDA caches keep their own
+widths. The flag sets every attention cache of the deployment, a drafter's (DSpark,
 DFlash2) included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
 widths.
 

@@ -755,12 +755,14 @@ Traps:
 - **MTP concatenates the normalized embedding first,** the normalized previous hidden second.
 - **No RoPE anywhere** (`qk_rope_head_dim` 0); the indexer's only rotation is the Hadamard.
 
-**KV groups.** Five, all bf16 or wider; a `--kv-cache-dtype` other than bf16 is refused at
-declare.
+**KV groups.** Five. `--kv-cache-dtype fp8` narrows `kv_latent` alone to E4M3, stored at
+`kv_store`'s default descale of 1 and read by the `mla_attn` fp8kv rows (docs/OPS.md); the other
+four keep the dtypes below whatever the flag, and a cache dtype other than bf16 or fp8 is refused
+at declare.
 
 | group | kind | per layer | layers |
 |---|---|---|---|
-| `kv_latent` | `RAD_KV_FULL`, bf16, 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
+| `kv_latent` | `RAD_KV_FULL`, bf16 (E4M3 under fp8), 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
 | `kv_dsa_index` | `RAD_KV_FULL`, u8, block 4 | one page a pooled key: 128 E4M3 codes and their f32 scale (`dsa_pool`'s cache form) | 11 MLA + MTP |
 | `kv_index_tail` | `RAD_KV_LINEAR`, bf16, `[4 + spec, 256]` | the key and gate rows not yet pooled; the ring is wider by the draft depth so a rejected draft rolls back | 11 MLA + MTP |
 | `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 64 / tp heads a rank | 34 KDA |
@@ -770,7 +772,7 @@ The latent and the index are replicated: every rank keeps the whole latent cache
 declares both so (`rad_kv_group_replicated`), which lets the host tier (`--prefix-cache-mib`) hold
 each once a slot: 49.59 KiB a 4-token block at any rank count (`kv_latent` 48.00 KiB over its 12
 layers, `kv_dsa_index` 1.59 KiB), 12.4 KiB a token, where a copy per rank would make a slot
-396.75 KiB at eight. The model is a hybrid, so a prefix-cache hit is usable only from a state
+396.75 KiB at eight. Under fp8 `kv_latent` is 24.00 KiB a block, 6.4 KiB a token in all. The model is a hybrid, so a prefix-cache hit is usable only from a state
 checkpoint at or below it, and `--checkpoint-interval` decides how much of a shared system prompt
 is reused.
 
