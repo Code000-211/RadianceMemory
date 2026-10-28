@@ -597,6 +597,34 @@ TEST(mla_attention_reads_one_latent_and_masks_the_last_selected_page) {
     CHECK_EQ(out.at(1), 0);
 }
 
+/* An E4M3 cache (kv_dtype fp8_e4m3, kv_store_fp8 at descale 1) is read as the codes' values: the
+ * first case above with the latent as E4M3 codes and a bf16 query and output. */
+TEST(mla_attention_reads_an_e4m3_latent_cache_as_its_values) {
+    T q(RAD_BF16, { 1, 1, 2 }), kv(RAD_F8E4M3, { 2, 1, 2, 2 }), bt(RAD_I32, { 1, 2 });
+    T len(RAD_I32, { 1 }), out(RAD_BF16, { 1, 1, 2 });
+    q.f({ 0, 0 });
+    kv.f({ 3, 5, 448, -448, 1, 0, 0, 1 });
+    bt.n({ 1, 0 });
+    len.n({ 3 });
+    A a;
+    a.t(q)
+        .t(kv)
+        .t(bt)
+        .t(len)
+        .t(out)
+        .i("M", 7)
+        .i("latent_dim", 2)
+        .i("heads", 1)
+        .i("blocks", 2)
+        .i("block_size", 2)
+        .d("scale", 1)
+        .s("dtype", "bf16")
+        .s("kv_dtype", "fp8_e4m3");
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 4.0 / 3, 1e-2);
+    CHECK_EQ(out.at(1), 2);
+}
+
 TEST(dsa_score_relu_is_per_head_before_signed_weights_and_masks_invalid_history) {
     T q(RAD_F8E4M3, { 2, 2, 2 }), qs(RAD_F32, { 2, 2 }), gate(RAD_F32, { 2, 2 });
     T k(RAD_F8E4M3, { 3, 2 }), ks(RAD_F32, { 3 }), bt(RAD_I32, { 2, 3 });

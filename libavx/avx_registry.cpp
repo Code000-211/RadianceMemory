@@ -166,8 +166,9 @@ static const RadOperandSpec oLiliWalk[] = { OPD("edges"), OPD("aout"), OPD("cand
 
 static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
+/* `kv_dtype`: the latent cache's dtype when it is not the query's (fp8_e4m3, at descale 1). */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT("heads"),
-    P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+    P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"), P_STRO("kv_dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
     P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };

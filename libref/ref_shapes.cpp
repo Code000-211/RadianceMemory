@@ -929,9 +929,12 @@ int ref_mla_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
                   pages = std::max((int64_t)2, B * M);
     if (M < 1 || D < 1 || D > 2048 || H < 1 || B < 1 || bs < 1) return RAD_E_UNSUPPORTED;
     const uint32_t dtype = act_dt(p, n_p);
+    /* The cache is the query's dtype unless `kv_dtype` names another (fp8_e4m3). */
+    const char* kvs = gs(p, n_p, "kv_dtype");
+    const uint32_t kv = kvs && dt_parse(kvs) != (uint32_t)RAD_DT_INVALID ? dt_parse(kvs) : dtype;
     Opd o;
     o.t(dtype, { M, H, D });
-    o.t(dtype, { pages, 1, bs, D });
+    o.t(kv, { pages, 1, bs, D });
     o.t_idx({ M, B }, pages, -1, 0);
     o.t_idx({ M }, 0, B * bs, 0);
     o.t(dtype, { M, H, D });
