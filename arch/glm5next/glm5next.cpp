@@ -211,6 +211,7 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
      * at 64k of context the whole step's plane would be 256 MiB. */
     const int64_t scored = g.world > 1 ? std::min(T, std::max(part, GlmTp::kSplitRows)) : T;
     c.score = decl_b(b, nm.f("index_scores"), RAD_F32, { scored, blocks });
+    c.unscored = decl_b(b, nm.f("index_unscored"), RAD_F32, { T, std::min<int64_t>(513, blocks) });
     c.selected = m.aw.core.selected;
     c.length = m.aw.core.length;
     c.nsel = decl_b(b, nm.f("selected_count"), RAD_I32, { T });

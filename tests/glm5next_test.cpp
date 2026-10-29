@@ -665,6 +665,21 @@ TEST(
                 batch.out_ids = &last;
                 batch.draft_pass = 0;
                 batch.max_q_len = 512;
+                {
+                    // 512 rows whose history fits the selection: the indexer takes every
+                    // block and does not split, so no index head runs and nothing of its is
+                    // gathered, while the routers, mHC reads and MLA still split.
+                    ctx.issues.clear();
+                    glm5next::step(&ctx, &batch);
+                    CHECK(ctx.step_fail.empty());
+                    const auto fit_ops = issued_ops(b, ctx);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "gemm_nt_f32"), 42);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "dsa_score"), 0);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "qsa_select"), 11);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "all_gather"),
+                             world > 1 ? 42 + 90 + 11 : 0);
+                }
+                batch.max_ctx_len = 3000;   // live blocks past the top-k: the indexer scores
                 ctx.issues.clear();
                 glm5next::step(&ctx, &batch);
                 CHECK(ctx.step_fail.empty());
@@ -672,11 +687,9 @@ TEST(
                     // 512 rows reach the split: each router runs on its column slice, each mHC
                     // read on its chunks, each indexer, its head gates included, on its run
                     // of query rows, and each MLA on its run of rows, all gathered but the
-                    // gates. At TP1 the step does not split, and 512 tokens of history fit the
-                    // selection, so the index heads do not run.
+                    // gates. At TP1 the step does not split, and the indexer scores whole.
                     const auto long_ops = issued_ops(b, ctx);
-                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"),
-                             world > 1 ? 53 : 42);
+                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"), 53);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_gather"),
                              world > 1 ? 42 + 90 + 22 + 11 : 0);
                     // 1 embedding, 45 attention and 45 expert reductions, less the 11 MLA ones.
@@ -807,8 +820,39 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
             CHECK_EQ(b.bufs[w.selected - 1].d.shape[0], world * most);
             CHECK_EQ(b.bufs[w.codes - 1].d.shape[0], world * most * 32);
             CHECK_EQ(b.bufs[w.sel_part - 1].d.shape[0], most);
-            // Two decode rows beside a 498-row chunk: 500 rows, runs of R.
-            auto k = kit(b, { 1, 1 }, { 498 }, 100);
+            // Wide page tables, so that live blocks follow the history past the selection.
+            auto widen = [](Kit& kt) {
+                const int64_t pitch = 1024;
+                kt.table.resize((size_t)(kt.b.n_seq * pitch));
+                for (int64_t i = 0; i < kt.b.n_seq * pitch; ++i) kt.table[(size_t)i] = (int32_t)i;
+                for (auto& g : kt.kv) {
+                    g.block_table = kt.table.data();
+                    g.block_table_pitch = g.max_blocks = pitch;
+                }
+            };
+            {
+                // 500 rows whose history fits the selection take every block without splitting:
+                // each rank selects the whole step from the unscored plane, and nothing gathers.
+                auto fit = kit(b, { 1, 1 }, { 498 }, 100);
+                widen(*fit);
+                auto fits = run_passes(b, glm5next::step, { fit.get() }, rank, world);
+                CHECK_PASSES(b, fits);
+                int all = 0;
+                for (const auto& issue : fits[0]->issues) {
+                    CHECK(issue.op != cache.op_score_part && issue.op != cache.op_gather_sel &&
+                          issue.op != cache.op_score);
+                    if (issue.op == cache.op_select_all) {
+                        ++all;
+                        CHECK_EQ(issue.n, 500);
+                        CHECK_EQ(issue.opd[0].handle, w.unscored);
+                    }
+                }
+                CHECK_EQ(all, 1);
+            }
+            // Two decode rows beside a 498-row chunk of 3000 tokens of history: 500 rows that
+            // score, in runs of R.
+            auto k = kit(b, { 1, 1 }, { 498 }, 3000);
+            widen(*k);
             const int64_t T = 500, R = DsaCache::part_rows(T, world), r0 = rank * R,
                           have = std::min(R, T - r0);
             auto passes = run_passes(b, glm5next::step, { k.get() }, rank, world);
@@ -904,10 +948,11 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
                 if (issue.op == cache.op_unscored) {
                     ++unscored;
                     CHECK_EQ(issue.n, 255);
-                    CHECK_EQ(issue.opd[0].handle, w.score);
-                    CHECK_EQ(issue.opd[0].cols, cache.unscored_cols());
+                    CHECK_EQ(issue.opd[0].handle, w.unscored);
+                    CHECK_EQ(b.bufs[w.unscored - 1].d.shape[1], cache.unscored_cols());
                 }
-                picks += issue.op == cache.op_select;
+                CHECK(issue.op != cache.op_select);
+                picks += issue.op == cache.op_select_all;
             }
             CHECK_EQ(unscored, 1);
             CHECK_EQ(picks, 1);
@@ -1331,6 +1376,7 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
         w.pooled = decl_b(&b, "pooled", RAD_F8E4M3, { 12, 128 });
         w.pool_scale = decl_b(&b, "pool_scale", RAD_F32, { 12, 1 });
         w.score = decl_b(&b, "score", RAD_F32, { 32, 1024 });
+        w.unscored = decl_b(&b, "unscored", RAD_F32, { 32, 513 });
         w.selected = decl_b(&b, "sel", RAD_I32, { 32, 513 });
         w.nsel = decl_b(&b, "nsel", RAD_I32, { 32 });
         w.length = decl_b(&b, "len", RAD_I32, { 32 });
@@ -1430,10 +1476,11 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
             } else {
                 CHECK_EQ(fill.op, block.op_unscored);
                 CHECK_EQ(fill.n, 8);
-                CHECK_EQ(fill.opd[0].handle, w.score);
-                CHECK_EQ(fill.opd[0].cols, 513);
+                CHECK_EQ(fill.opd[0].handle, w.unscored);
+                CHECK_EQ(fill.opd[0].rows, 8);
             }
-            CHECK_EQ(ctx.issues[q + 4].op, block.op_select);
+            CHECK_EQ(ctx.issues[q + 4].op, scores ? block.op_select : block.op_select_all);
+            CHECK_EQ(ctx.issues[q + 4].opd[0].handle, scores ? w.score : w.unscored);
             CHECK_EQ(ctx.issues[q + 4].opd[0].cols, live);
             CHECK(ctx.issues[q + 4].opd[1].raw == abt.data());
         }
@@ -1747,11 +1794,11 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
      * change -- the merge re-recorded them for main's builder plus this branch's file-direct
      * expert ops, and the graphs again when the routing counts became RAD_BUF_PERSIST (the
      * steps did not change). */
-    const Case cases[] = { { 1, 0x5881752504ad8dbaull, 0x017c2cbd833d9737ull },
+    const Case cases[] = { { 1, 0xce4368c09bfdbbeeull, 0x19679d4fcc0321ebull },
                            /* World 8 is this branch's expert-parallel graph (288/world whole
                             * experts, file-direct), so its pins differ from main's. */
-                           { 8, 0x220a154a1928ee7aull, 0xc315b28cdda60809ull },
-                           { 8, 0x5b97f4fd6b4eeb36ull, 0x2a82ce055211fc15ull, true } };
+                           { 8, 0x553f81a93cec76bfull, 0x17f0a90d3bed9713ull },
+                           { 8, 0x9685be82c8d55813ull, 0x75e775f0568636b5ull, true } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
@@ -2298,7 +2345,9 @@ TEST(glm53_streamed_decode_resolves_after_select_and_before_attention_with_the_e
     };
     auto check_layer_order = [&](const glm5next::Layer& l) {
         const size_t store = find_issue(l.mla.op_store_stream);
-        const size_t sel   = find_issue(l.index.cache.op_select);
+        // A short history takes every block (DsaCache::takes_all), a long one scores.
+        const size_t sel   = std::min(find_issue(l.index.cache.op_select),
+                                      find_issue(l.index.cache.op_select_all));
         const size_t res_i = find_issue(l.mla.op_resolve);
         const size_t attn  = find_issue(l.mla.core.op_attn);
         REQUIRE(store != SIZE_MAX);
