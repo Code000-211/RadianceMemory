@@ -140,6 +140,7 @@ struct Plugin {
     void (*pin_qsa)(int) = nullptr;
     void (*pin_moe)(int) = nullptr;
     void (*pin_fk)(int) = nullptr;
+    void (*pin_mx_small)(int) = nullptr;   /* optional: absent from an older libr4d */
     void (*pin_dtile)(int) = nullptr;
     void (*pin_gather)(int) = nullptr;
     void (*pin_ddec)(int) = nullptr;
@@ -212,6 +213,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_qsa_score_pin_form", &pl->pin_qsa);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
+    pl->pin_mx_small = (void (*)(int))dlsym(pl->h, "r4d_moe_mxfp4_pin_small");
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_tile", &pl->pin_dtile);
     okall &= sym(pl->h, "r4d_moe_gather_pin_form", &pl->pin_gather);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
@@ -19869,6 +19871,9 @@ static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters 
 
 /* The MXFP4 expert GEMM at GLM's TP8 slices (mx_experts_check's model shapes 3 and 4): gate_up
  * 512 x 4096 over token rows (parts 2), down 4096 x 256 over sorted rows, over an M-token chunk.
+ * With tp 4 the TP4 slices instead, gate_up 1024 x 4096 and down 4096 x 512, where the rule's
+ * form is timed beside the small-M form pinned at both tilings (r4d_moe_mxfp4_pin_small) and the
+ * outputs compared byte for byte; the layer total counts the rule's form only.
  *
  * Routing is uniform with top_k distinct experts a token, as a trained router spreads load at
  * decode, or skewed (`skew`): a Gamma load per expert with the given coefficient of variation
@@ -19883,7 +19888,7 @@ static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters 
  * re-read an expert once per group its run spans, the expert-major and small-M forms once per 16
  * of its rows, and the P64 and GLM prefill forms once per job. */
 static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_t top_k,
-                    bool f8 = false, const char* skew = nullptr) {
+                    bool f8 = false, const char* skew = nullptr, int tp = 8) {
     if (iters <= 0) iters = 100;
     if (Mtok < 1 || E < 2 || E > 512 || top_k < 1 || top_k > E) {
         std::printf("--perfmx: M >= 1, 2 <= experts <= 512 and 1 <= top_k <= experts\n");
@@ -19981,27 +19986,31 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
                                     ? std::string("uniform")
                                     : fmt("%s %.2f", kind == 'g' ? "Gamma CV" : "Zipf s", sk);
     std::printf(
-        "%s at GLM's TP8 slices, a %lld-token chunk: Tr=%lld routed rows, "
+        "%s at GLM's TP%d slices, a %lld-token chunk: Tr=%lld routed rows, "
         "top %lld of %lld experts (%s), %lld touched, a run 1..%lld rows, %.1f mean, CV %.2f, "
         "%lld under 16; %s, %d launches\n",
-        rname, (long long)Mtok, (long long)Tr, (long long)top_k, (long long)E, routing.c_str(),
+        rname, tp, (long long)Mtok, (long long)Tr, (long long)top_k, (long long)E, routing.c_str(),
         (long long)touched, (long long)rmax, mean, cv, (long long)under16,
         g_cold > 0
             ? fmt("cold (%lld MiB read before each, median)", (long long)(g_cold >> 20)).c_str()
             : "warm (back to back, mean)",
         iters);
 
-    /* body()'s glm_prefill: the measured GLM slices, at which the prefill forms serve. */
-    const bool glm = !f8 && E == 288 && top_k == 8;
+    /* body()'s glm_prefill: the measured GLM slices, at which the prefill forms serve; t8 its
+     * tp8, the slices the P64 and small-M forms were measured at. */
+    const bool glm = !f8 && E == 288 && top_k == 8, t8 = glm && tp == 8;
 
     struct Proj {
         const char* name;
         int64_t N, K, parts;
         bool srt;
     };
-    const Proj projs[2] = { { "gate_up", 512, 4096, 2, false }, { "down", 4096, 256, 1, true } };
+    const Proj tp8_projs[2] = { { "gate_up", 512, 4096, 2, false }, { "down", 4096, 256, 1, true } };
+    const Proj tp4_projs[2] = { { "gate_up", 1024, 4096, 2, false }, { "down", 4096, 512, 1, true } };
+    const Proj* projs = tp == 4 ? tp4_projs : tp8_projs;
     double rule_us = 0.0, rule_bytes = 0.0;
-    for (const Proj& P : projs) {
+    for (int pi = 0; pi < 2; ++pi) {
+        const Proj& P = projs[pi];
         const int64_t N = P.N, K = P.K, Ma = P.srt ? Tr : Mtok;
         /* Per expert: E2M1 codes and an E8M0 byte per 32, or E4M3 codes and an f32 per 128 x 128. */
         const int64_t cb = f8 ? N * K : N * K / 2, sb = f8 ? N / 128 * (K / 128) * 4 : N * K / 32;
@@ -20103,14 +20112,23 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
         a.world_size = 1;
         const double flop = 2.0 * (double)Tr * (double)N * (double)K;
         const size_t ybytes = (size_t)(Tr * N) * 2;
-        {
+        /* Off the TP8 slices, with the pin exported, the rule's form and the small-M form where
+         * its row bound admits it, timed in turn: their outputs must agree byte for byte. */
+        const bool small_fits = glm && Tr <= (P.srt ? 32 : 384);
+        std::vector<int> forms = { 0 };
+        if (glm && !t8 && Tr <= 384 && pl.pin_mx_small) forms = { 0, 2, 1 };
+        if (forms.size() > 1 && K > 256) forms.push_back(3);
+        std::vector<uint16_t> first;
+        for (const int form : forms) {
+            if (pl.pin_mx_small) pl.pin_mx_small(form);
             const bool pwide = Tr >= 24576;
             const int64_t pbm = pwide || (K > 256 && Tr >= 12288) ? 64 : 32;
             const bool p64 =
-                glm && Tr >= (P.srt ? 5760 : 769) && (Tr + pbm - 1) / pbm + E <= 65535;
-            const bool small = (glm && Tr <= (P.srt ? 32 : 384)) ||
-                               (f8 && E == 288 && top_k == 8 && !P.srt && Tr <= 384);
-            const bool expert = !p64 && !small && (f8 || Tr <= (glm ? (P.srt ? 6143 : 768) : 511));
+                t8 && Tr >= (P.srt ? 5760 : 769) && (Tr + pbm - 1) / pbm + E <= 65535;
+            const bool small =
+                (form == 1 || form == 3 ? Tr <= 384 : form != 2 && t8 && small_fits) ||
+                (f8 && E == 288 && top_k == 8 && !P.srt && Tr <= 384);
+            const bool expert = !p64 && !small && (f8 || Tr <= (t8 ? (P.srt ? 6143 : 768) : 511));
             const bool pipe = !p64 && !small && !expert && glm;
             const int64_t jr = p64 ? pbm : pipe ? 32 : 16;
             int64_t streams = 0;
@@ -20120,21 +20138,22 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
             else
                 for (int64_t i = 0; i < Tr; ++i)
                     streams += i % 16 == 0 || owner[(size_t)i] != owner[(size_t)(i - 1)];
+            const bool tile4 = K <= 256 || form == 3;
             const std::string label =
                 p64 ? fmt("P64 BM%lld BN%d K%d", (long long)pbm, pwide ? 128 : 64,
                           K > 256 && !pwide ? 256 : 128) +
                           (K <= 256 ? " x4, A resident" : "") + (pwide ? ", LDS out" : "")
-                : small  ? fmt("small-M K%d x%d tiles", K <= 256 ? 256 : 512, K <= 256 ? 4 : 1)
+                : small  ? fmt("small-M K%d x%d tiles", tile4 ? 256 : 512, tile4 ? 4 : 1)
                 : expert ? fmt("expert-major K%d x%d tiles", K <= 256 ? 128 : 256,
                                K <= 256 || (f8 && Tr < 128) ? 4 : 1)
                 : pipe   ? std::string("GLM prefill form, jobs of 32 rows")
                          : std::string("row groups of 16");
+            const std::string shown = form ? label + " (pinned)" : label + " (rule)";
             st_memset(d_y, 0xff, ybytes);
             const int rc = r->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
-                std::printf("    %-46s rc=%d (not served)\n", label.c_str(), rc);
-                dfree_all();
-                continue;
+                std::printf("    %-46s rc=%d (not served)\n", shown.c_str(), rc);
+                break;   /* the buffers are freed after the forms */
             }
             {
                 hipEvent_t w0, w1;
@@ -20152,12 +20171,22 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
                 st_ev_destroy(w1);
             }
             const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-            rule_us += us;
-            rule_bytes += touched * slice;
-            std::printf("    %-46s %9.1f us  %7.1f GB/s touched  %5.2fx streamed  %6.1f TFLOP/s\n",
-                        label.c_str(), us, touched * slice / (us * 1e3),
-                        touched ? (double)streams / (double)touched : 0.0, flop / (us * 1e6));
+            if (form == forms.front()) {   /* the rule's form, or at TP4 the expert-major one */
+                rule_us += us;
+                rule_bytes += touched * slice;
+            }
+            std::vector<uint16_t> got((size_t)(Tr * N));
+            st_memcpy(got.data(), d_y, ybytes, hipMemcpyDeviceToHost);
+            const bool same = first.empty() || got == first;
+            if (first.empty()) first = std::move(got);
+            std::printf("    %-46s %9.1f us  %7.1f GB/s touched  %5.2fx streamed  %6.1f TFLOP/s%s\n",
+                        shown.c_str(), us, touched * slice / (us * 1e3),
+                        touched ? (double)streams / (double)touched : 0.0, flop / (us * 1e6),
+                        forms.size() < 2 || form == forms[0] ? ""
+                        : same ? "  (bytes match)" : "  OUTPUT DIFFERS");
+            if (!same) ++g_fail;
         }
+        if (pl.pin_mx_small) pl.pin_mx_small(0);
         dfree_all();
     }
     if (rule_us > 0)
@@ -34307,6 +34336,9 @@ static void usage(void) {
                 "             one card, here and in the eight-rank exact all-reduces' cases.\n"
                 "  --perfmxf8 M [iters] [experts] [top_k] [skew]:  the same at the FP8 experts with f32\n"
                 "             block scales (moe_gemm_fp8a8_f32scale, GLM's MTP layer).\n"
+                "  --perfmx-tp 4:  --perfmx at GLM's TP4 slices (gate_up 1024 x 4096, down 4096 x 512),\n"
+                "             the rule's form and, where its row bound admits it, the small-M form\n"
+                "             pinned (r4d_moe_mxfp4_pin_small), their outputs compared byte for byte.\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
                 "             mhc_post at GLM's shape, 16-byte rows against pitched ones.\n"
                 "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
@@ -34398,6 +34430,7 @@ int main(int argc, char** argv) {
     const char* ar8_w = nullptr;
     long long mx_m = 0, mx_e = 288, mx_k = 8;
     const char* mx_skew = nullptr;
+    int mx_tp = 8;
     bool mx_f8 = false;
     int mx_it = 100;
     long long mhc_m = 0;
@@ -34626,6 +34659,11 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_skew = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfmx-tp")) {
+            /* --perfmx at GLM's TP4 slices (gate_up 1024 x 4096, down 4096 x 512) instead. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            mx_tp = (int)std::strtol(argv[++i], nullptr, 0);
+            if (mx_tp != 4 && mx_tp != 8) { usage(); return 2; }
         } else if (!std::strcmp(argv[i], "--perflogits")) {
             /* Both bf16 head rows at GLM-5.3's TP8 slice over M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -34844,7 +34882,7 @@ int main(int argc, char** argv) {
     if (mx_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        mx_perf(pl, mx_m, mx_it, mx_e, mx_k, mx_f8, mx_skew);
+        mx_perf(pl, mx_m, mx_it, mx_e, mx_k, mx_f8, mx_skew, mx_tp);
         dfree_all();
 #else
         skip("MXFP4 expert GEMM timing", "built without HIP");
