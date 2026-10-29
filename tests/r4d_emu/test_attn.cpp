@@ -223,6 +223,12 @@ int main(int argc, char** argv) {
         {"wmma h256 gqa4 noncausal w20 missing-block", 256, 4, 1, false, false, true, false, 20, {80, 70}, {200, 70}, 3, 0, 0, 0, 1},
         {"wmma h256 gqa8 causal q-pitch slice", 256, 8, 1, false, true, false, false, 0, {64}, {64}, -1, 0, 0, 512, 1},
         {"wmma h256 gqa1 causal w5 fp8", 256, 1, 1, true, true, false, false, 5, {96}, {150}, -1, 0, 0, 0, 1},
+        /* Gemma 4's picture runs, read again non-causally up to the run's end: 280 rows after a short
+         * prefix, after one the window cuts, q at the fused plane's pitch, a run's tail after a prefix hit */
+        {"wmma h256 gqa2 picture 280 of 300", 256, 2, 2, false, false, false, false, 1024, {280}, {300}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa2 picture 280 of 1500 fp8", 256, 2, 2, true, false, false, true, 1024, {280}, {1500}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa2 picture q-pitch slice", 256, 2, 2, false, false, false, false, 1024, {96}, {120}, -1, 0, 0, 512, 1},
+        {"h256 gqa2 picture tail split", 256, 2, 2, false, false, false, false, 1024, {10}, {1300}, -1, 0, s256, 0, 0},
         /* and what must stay scalar: a verify batch, many sequences, a few rows each */
         {"scalar: 8 x verify16, ragged", 512, 4, 1, false, true, true, false, 0, {16, 16, 16, 16, 16, 16, 16, 16},
          {40, 50, 60, 70, 80, 90, 100, 110}, -1, 262144, s512, 0, 0},
