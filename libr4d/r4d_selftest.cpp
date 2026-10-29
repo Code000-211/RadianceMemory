@@ -20125,8 +20125,10 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
             const int64_t pbm = pwide || (K > 256 && Tr >= 12288) ? 64 : 32;
             const bool p64 =
                 t8 && Tr >= (P.srt ? 5760 : 769) && (Tr + pbm - 1) / pbm + E <= 65535;
+            const bool t4_small = glm && !t8 && Tr <= 384 && (P.srt || Tr > top_k);
             const bool small =
-                (form == 1 || form == 3 ? Tr <= 384 : form != 2 && t8 && small_fits) ||
+                (form == 1 || form == 3 ? Tr <= 384
+                                        : form != 2 && ((t8 && small_fits) || t4_small)) ||
                 (f8 && E == 288 && top_k == 8 && !P.srt && Tr <= 384);
             const bool expert = !p64 && !small && (f8 || Tr <= (t8 ? (P.srt ? 6143 : 768) : 511));
             const bool pipe = !p64 && !small && !expert && glm;
@@ -20138,7 +20140,7 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
             else
                 for (int64_t i = 0; i < Tr; ++i)
                     streams += i % 16 == 0 || owner[(size_t)i] != owner[(size_t)(i - 1)];
-            const bool tile4 = K <= 256 || form == 3;
+            const bool tile4 = K <= 256 || form == 3 || (form == 0 && !t8 && P.srt);
             const std::string label =
                 p64 ? fmt("P64 BM%lld BN%d K%d", (long long)pbm, pwide ? 128 : 64,
                           K > 256 && !pwide ? 256 : 128) +
