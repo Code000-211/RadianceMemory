@@ -2614,6 +2614,7 @@ struct DmaQueue {
      * a queue while the engine runs on, and a ring the host thinks full would wait forever. */
     volatile uint32_t*  fin = nullptr;
     uint32_t            lists = 0;               /* lists handed over; list k ends at ends[k % kDmaEnds] */
+    uint64_t            seen = 0;                /* the most the room check has known read, under the lock */
     std::unique_ptr<uint64_t[]> ends;
 };
 constexpr uint32_t kDmaEnds = 4096;
@@ -2858,22 +2859,26 @@ inline uint64_t dma_read(const DmaQueue* q) {
     uint64_t r = *q->rptr;
     if (q->fin) {
         const uint32_t k = *q->fin;
-        if (k) r = std::max(r, q->ends[k % kDmaEnds]);
+        /* ends[k % kDmaEnds] is list k's only while fewer than kDmaEnds lists are behind it. */
+        if (k && q->lists - k < kDmaEnds) r = std::max(r, q->ends[k % kDmaEnds]);
     }
-    return r;
+    return std::max(r, q->seen);
 }
 
 /* Writes `n` dwords to the ring; queue lock held. A packet never straddles the ring end: the tail
  * is padded with single-dword NOPs. The ring holds a few hundred layers' lists, so waiting for
  * room means the host is that far ahead of a stalled engine. */
 int dma_put(DmaQueue* q, const uint32_t* dw, uint64_t n) {
+    /* What was once known read stays read: a list number whose ends slot a later list has taken
+     * cannot be used any more, and the read pointer alone may be behind it. */
+    q->seen = dma_read(q);
     const uint64_t cap = kDmaRingBytes / 4;
     uint64_t at = (q->w / 4) & (cap - 1);
     const uint64_t pad = at + n > cap ? cap - at : 0;
     const uint64_t need = (pad + n) * 4;
     if (q->w + need - dma_read(q) > kDmaRingBytes) {
         Stall st("a full DMA ring");
-        while (q->w + need - dma_read(q) > kDmaRingBytes) {
+        while (q->w + need - (q->seen = dma_read(q)) > kDmaRingBytes) {
             if (G().faulted.load(std::memory_order_relaxed)) {
                 device_set_error("rad_memcpy_list_async: a queue faulted while the DMA ring was full");
                 return RAD_E_DEVICE;
