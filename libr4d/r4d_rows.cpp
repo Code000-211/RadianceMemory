@@ -3185,9 +3185,9 @@ static const RadOpSchema kSchemas[] = {
            "op, not gelu, because gated feed-forwards are trained with the tanh form and the "
            "unary gelu is the exact erf one."),
     SCHEMA("act_mul", pActMul, oBinary,
-           "y = act(a) * b, the activation (silu, gelu, gelu_tanh, sigmoid or quick_gelu) rounded "
-           "to y's dtype before "
-           "the product: silu_mul with its two halves in two operands."),
+           "y = act(a) * b, the activation (silu, gelu, gelu_tanh, sigmoid, quick_gelu or relu) "
+           "rounded to y's dtype before the product: silu_mul with its two halves in two "
+           "operands."),
     SCHEMA("seg_mean", pSegMean, oSegMean,
            "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
            "and rounded once; an empty segment is zeros."),

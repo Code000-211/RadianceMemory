@@ -1023,7 +1023,8 @@ static const RadOpSchema kSchemas[] = {
 { "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
   "y = x * w, `w` a weight of one element or one row, broadcast; f32 product rounded once." },
 { "act_mul", ARR(pActMul), ARR(oBinary),
-  "y = act(a) * b, act silu / gelu / gelu_tanh, the activation rounded to y's dtype first." },
+  "y = act(a) * b, act silu / gelu / gelu_tanh / sigmoid / quick_gelu / relu, the activation "
+  "rounded to y's dtype first." },
 { "seg_mean_bf16_sum", ARR(pSegMean), ARR(oSegMean),
   "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),

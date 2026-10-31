@@ -133,6 +133,7 @@ static inline float act_of(int act, float g, uint32_t dt) {
     if (act == 0) return g / (1.0f + sc_exp(-g));
     if (act == 1) return 0.5f * g * (1.0f + sc_erf(g * 0.70710678118654752f));
     if (act == 3) return 1.0f / (1.0f + sc_exp(-g));
+    if (act == 5) return g > 0.0f ? g : 0.0f;
     if (act == 4)   // quick_gelu: sigmoid of the 1.702*g the unfused mul would have stored
         return 1.0f / (1.0f + sc_exp(-round1(dt, g * round1(RAD_BF16, 1.702f))));
     const float k0 = 0.7978845608028654f, k1 = 0.044715f;
@@ -169,8 +170,8 @@ AVX_KERNEL(act_mul) {
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(A) < rows * n || numel(B) < rows * n) return RAD_E_SHAPE;
-    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" };
-    const int act = p_enum(a, "act", kActs, 5, -1);
+    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu", "relu" };
+    const int act = p_enum(a, "act", kActs, 6, -1);
     if (act < 0) return RAD_E_INVAL;
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)

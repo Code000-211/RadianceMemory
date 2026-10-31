@@ -3597,8 +3597,20 @@ TEST(op_act_mul) {
     CHECK_NEAR(y.at(1), gt(-2) * 4, 1e-5);
     CHECK_NEAR(y.at(2), gt(0.5f) * -1, 1e-5);
     CHECK_NEAR(y.at(3), 0.0f, 1e-6);
-    A bad; bad.t(g).t(u).t(y).i("M", 2).i("n", 2).s("act", "relu").s("dtype", "f32");
+    A bad; bad.t(g).t(u).t(y).i("M", 2).i("n", 2).s("act", "tanh").s("dtype", "f32");
     CHECK(run("act_mul", bad) < 0);
+}
+
+/* act_mul's relu over one tensor in both operands: relu(x)^2, zero below. */
+TEST(op_act_mul_relu_of_one_tensor_squares_it) {
+    T x(RAD_F32, {1, 4}); x.f({ 3, -2, 0.5f, 0 });
+    T y(RAD_F32, {1, 4});
+    A a; a.t(x).t(x).t(y).i("M", 1).i("n", 4).s("act", "relu").s("dtype", "f32");
+    CHECK_OK(run("act_mul", a));
+    CHECK_NEAR(y.at(0), 9.0f, 1e-6);
+    CHECK_NEAR(y.at(1), 0.0f, 1e-6);
+    CHECK_NEAR(y.at(2), 0.25f, 1e-6);
+    CHECK_NEAR(y.at(3), 0.0f, 1e-6);
 }
 
 /* seg_mean: one row per segment, an empty segment a zero row. */

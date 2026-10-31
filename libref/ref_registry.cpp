@@ -1259,9 +1259,10 @@ static const RadOpSchema kSchemas[] = {
   "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
   "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once." },
 { "act_mul", ARR(pActMul), ARR(oBinary),
-  "y = act(a) * b, `act` \"silu\", \"gelu\" (exact erf), \"gelu_tanh\" or \"sigmoid\". The activation is "
-  "rounded to y's dtype before the product, which is the unfused pair. `a` and `b` may be column "
-  "slices of one fused row." },
+  "y = act(a) * b, `act` \"silu\", \"gelu\" (exact erf), \"gelu_tanh\", \"sigmoid\", \"quick_gelu\" or "
+  "\"relu\" (relu(x)^2 with one tensor in both operands). The activation is rounded to y's dtype "
+  "before the product, which is the unfused pair. `a` and `b` may be column slices of one fused "
+  "row." },
 { "seg_mean_bf16_sum", ARR(pSegMean), ARR(oSegMean),
   "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),

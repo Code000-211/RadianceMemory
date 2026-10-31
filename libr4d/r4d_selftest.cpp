@@ -31107,7 +31107,7 @@ static void device_phase(const Plugin& pl) {
         const RadKernelInfo* r = find(pl, "act_mul_bf16");
         if (!r) ok("act_mul_bf16", false, "row absent");
         else
-            for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" }) {
+            for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu", "relu" }) {
                 std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 5, 645 }),
                                               T(nullptr, RAD_BF16, { 5, 645 }),
                                               T(nullptr, RAD_BF16, { 5, 645 }) };

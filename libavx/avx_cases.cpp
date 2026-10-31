@@ -58,7 +58,7 @@ std::vector<Case> build_cases() {
         add("scale",         { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("softmax",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("gather_rows", { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
-        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" })
+        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu", "relu" })
             add("act_mul", { HI("M", 6), HI("n", 645), HS("act", act), HS("dtype", dt) },
                 EB(6, 645, w, 3));
         add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt) }, EB(9, 645, w, 2));

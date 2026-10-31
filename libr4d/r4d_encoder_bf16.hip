@@ -28,6 +28,7 @@ __device__ __forceinline__ float act_of(float g) {
     if (ACT == 0) return g / (1.0f + expf(-g));
     if (ACT == 1) return 0.5f * g * (1.0f + erff(g * 0.70710678118654752f));
     if (ACT == 3) return 1.0f / (1.0f + expf(-g));
+    if (ACT == 5) return fmaxf(g, 0.0f);
     if (ACT == 4)   // quick_gelu: sigmoid of the bf16-rounded 1.702*g, as the unfused mul stores it
         return 1.0f / (1.0f + expf(-bf2f(f32_to_bf16(g * bf2f(f32_to_bf16(1.702f))))));
     return 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
@@ -782,11 +783,11 @@ __global__ __launch_bounds__(kLrThreads) void attn_local_rel_kernel(
 
 // ============================================================== launchers
 
-// act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))).
+// act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))), 5 relu.
 extern "C" int r4d_act_mul_bf16(long a, long b, long y, int M, int n, int act, int a_ld, int b_ld,
                                 int y_ld, long stream) {
     if (!a || !b || !y) return -1;
-    if (M <= 0 || n <= 0 || act < 0 || act > 4) return -2;
+    if (M <= 0 || n <= 0 || act < 0 || act > 5) return -2;
     const dim3 grid((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M));
 #define R4D_AM(A)                                                                               \
     hipLaunchKernelGGL(act_mul_kernel<A>, grid, dim3(kThreads), 0, (hipStream_t)stream,         \
@@ -796,7 +797,8 @@ extern "C" int r4d_act_mul_bf16(long a, long b, long y, int M, int n, int act, i
     else if (act == 1) R4D_AM(1);
     else if (act == 2) R4D_AM(2);
     else if (act == 3) R4D_AM(3);
-    else               R4D_AM(4);
+    else if (act == 4) R4D_AM(4);
+    else               R4D_AM(5);
 #undef R4D_AM
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -1138,6 +1140,7 @@ extern "C" int r4d_rad_act_mul(const RadArgs* a, RadStream s) {
     else if (act && !std::strcmp(act, "gelu_tanh")) ai = 2;
     else if (act && !std::strcmp(act, "sigmoid")) ai = 3;
     else if (act && !std::strcmp(act, "quick_gelu")) ai = 4;
+    else if (act && !std::strcmp(act, "relu")) ai = 5;
     if (ai < 0) return R4D_NO(RAD_E_INVAL);
     const long long n = r4d_geti_or(a, "n", r4d_dim(Y, (int)Y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
