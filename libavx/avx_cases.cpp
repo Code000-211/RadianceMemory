@@ -674,6 +674,10 @@ std::vector<Case> build_cases() {
          * avx_check's hand-built case. */
         add("grid_embed_aa", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
         add("grid_embed_aa", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
+        add("grid_embed_cpe", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
+        add("grid_embed_cpe", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
+        add("grid_embed_cpe", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 3),
+                                HS("dtype", dt) });
     }
 
     /* LiLiCorr's lattice ops, at its geometry (7 positions of 8 candidates, 8 heads) narrowed in

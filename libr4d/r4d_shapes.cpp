@@ -372,6 +372,16 @@ extern "C" int r4d_shape_grid_embed(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* grid_embed's operands plus the prefix rows (RADIO's class and register tokens). */
+extern "C" int r4d_shape_grid_embed_cpe(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), side = pi(p, n_p, "side");
+    const int64_t npre = rad_param_geti(p, n_p, "n_prefix", 1);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, side * side, n), opd_idx(4, M, side),
+                             opd(D, npre > 0 ? npre : 1, n) };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
     const uint32_t D = dt_act(p, n_p, "dtype");

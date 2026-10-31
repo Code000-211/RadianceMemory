@@ -2203,6 +2203,16 @@ static const RadOperandSpec oGridEmbed[] = {
     { "table", RAD_OPD_WEIGHT, 0 },
     { "coord", RAD_OPD_IN,     0 },
 };
+static const RadParamSpec pGridEmbedCpe[] = {
+    P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+    { "n_prefix", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oGridEmbedCpe[] = {
+    { "x",      RAD_OPD_INOUT,  0 },
+    { "table",  RAD_OPD_WEIGHT, 0 },
+    { "coord",  RAD_OPD_IN,     0 },
+    { "prefix", RAD_OPD_WEIGHT, 1 },
+};
 static const RadParamSpec pGemmBias[] = {
     P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
     { "act", RAD_P_STR, RAD_OPTIONAL },
@@ -3291,6 +3301,12 @@ static const RadOpSchema kSchemas[] = {
            "position embedding: per axis a triangle filter on half-pixel centres, widened by the "
            "scale when shrinking, its in-table taps normalised. Separable, f32, rounded once "
            "before the add; coordinates clamp into their grid."),
+    SCHEMA("grid_embed_cpe", pGridEmbedCpe, oGridEmbedCpe,
+           "x += the side x side table resampled as torch's F.interpolate(bilinear, "
+           "align_corners=False) -- no antialias -- onto a square of side max(grid height, grid "
+           "width), of which the grid keeps the top-left part: RADIO's cropped position embedding. "
+           "Two taps an axis, the row blended first; f32, rounded once before the add. A row "
+           "whose row coordinate is negative gets the learned prefix row its column names."),
     SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
            "y = res + act(a @ b^T + bias), rounded to bf16 after the biased product, after the "
            "activation and after the residual -- the unfused chain's three tensors."),
@@ -4680,6 +4696,10 @@ static const RadConstraint cCastNarrow[] = {
  * predicate -- "bf16, and nothing else" -- is unchanged. */
 static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
+};
+/* head_dim 80 without GQA: C-RADIO's ViT heads (Nemotron-3.5-Bolt's vision tower), bidirectional. */
+static const RadConstraint cAttnDenseH80[] = {
+    C_EQ("head_dim", 80), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };
 /* head_dim 256 without GQA, sequences past the small kernel's. */
 static const RadConstraint cAttnDenseH256G1[] = {
@@ -6428,6 +6448,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_grid_embed_aa, nullptr, nullptr, nullptr,
   r4d_shape_grid_embed },
 
+{ "grid_embed_cpe_bf16", "grid_embed_cpe", "elem",
+  "a learned position grid resampled half-pixel bilinear onto a square and cropped (RADIO's CPE)",
+  "any n and side; coord [4, M] dense; one workgroup a row",
+  "bf16 x, bf16 or f32 table, i32 coord, f32 taps",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGridEmbed), NOTUNE,
+  nullptr, nullptr, r4d_rad_grid_embed_cpe, nullptr, nullptr, nullptr,
+  r4d_shape_grid_embed_cpe },
+
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
   "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
@@ -7976,6 +8005,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 query / key / value / out, f16 operands, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH64), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense },
+
+{ "attn_dense_h80_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "
+  "blocks, or causal with an optional window behind",
+  "head_dim 80, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
+  "fused projection allowed)",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH80), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense },
 
 { "attn_dense_h256_bf16", "attn_dense", "attn",

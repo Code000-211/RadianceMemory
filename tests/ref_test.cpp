@@ -1225,7 +1225,7 @@ TEST(op_vocabulary) {
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
-        "grid_embed_aa",
+        "grid_embed_aa", "grid_embed_cpe",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
         "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
@@ -2022,6 +2022,54 @@ TEST(op_grid_embed_aa_is_torchs_antialiased_bilinear) {
         CHECK_OK(run("grid_embed_aa", a));
         for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 2e-5);
     }
+}
+
+/* RADIO's cropped position embedding, against torch's F.interpolate(bilinear, align_corners=False)
+ * onto a d x d square cropped to the grid (values from torch 2.11). A 3 x 5 grid upsamples the
+ * 4 x 4 table to 5 x 5 and keeps three rows; a 2 x 2 grid downsamples it, which antialias would
+ * change, so the two cases tell this op from grid_embed_aa. */
+TEST(op_grid_embed_cpe_is_torchs_bilinear_on_a_square_cropped) {
+    const int side = 4, n = 2;
+    T tab(RAD_F32, {side * side, n});
+    tab.f({ -5.0f, -1.75f, 2.0f, 5.25f, -2.0f, 1.25f, 5.0f, -2.75f, 1.0f, 4.25f, -3.0f, 0.25f,
+            4.0f, -3.75f, 0.0f, 3.25f, -4.0f, -0.75f, 3.0f, -4.75f, -1.0f, 2.25f, -5.0f, -1.75f,
+            2.0f, 5.25f, -2.0f, 1.25f, 5.0f, -2.75f, 1.0f, 4.25f });
+    struct G { int h, w; std::vector<float> want; };
+    const G cases[] = {
+        { 3, 5, { -5.0f, -1.75f, -0.1f, 3.15f, 0.0f, 3.25f, 0.1f, 0.05f, 5.0f, -2.75f, -0.8f,
+                  2.45f, -1.29f, 1.96f, 0.35f, -0.25f, 1.99f, -1.14f, 1.5f, 1.45f, -1.5f, 1.75f,
+                  -0.45f, -1.05f, 0.75f, -1.5f, 0.3f, -0.3f, -2.5f, 0.75f } },
+        { 2, 2, { -1.25f, 2.0f, 1.75f, -0.5f, -0.25f, 0.25f, 0.0f, 0.5f } },
+    };
+    for (const G& g : cases) {
+        const int M = g.h * g.w;
+        T x(RAD_F32, {M, n});
+        std::vector<float> zero((size_t)(M * n), 0.0f);
+        x.f(zero);
+        T crd(RAD_I32, {4, M});
+        std::vector<int64_t> c((size_t)(4 * M));
+        for (int r = 0; r < M; ++r) {
+            c[(size_t)r] = r / g.w;
+            c[(size_t)(M + r)] = r % g.w;
+            c[(size_t)(2 * M + r)] = g.h;
+            c[(size_t)(3 * M + r)] = g.w;
+        }
+        crd.n(c);
+        A a; a.t(x).t(tab).t(crd).i("M", M).i("n", n).i("side", side).s("dtype", "f32");
+        CHECK_OK(run("grid_embed_cpe", a));
+        for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 2e-5);
+    }
+    /* The rows ahead of a segment's patches: row coordinate -1, the column naming the prefix row.
+     * Two of them, then the 2 x 2 grid's (1, 0), which still takes the resampled table. */
+    T pre(RAD_F32, {2, n}); pre.f({ 10.0f, 11.0f, 20.0f, 21.0f });
+    T x(RAD_F32, {3, n}); x.f({ 0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f });
+    T crd(RAD_I32, {4, 3}); crd.n({ -1, -1, 1,   1, 0, 0,   2, 2, 2,   2, 2, 2 });
+    A a; a.t(x).t(tab).t(crd).t(pre).i("M", 3).i("n", n).i("side", side).i("n_prefix", 2)
+            .s("dtype", "f32");
+    CHECK_OK(run("grid_embed_cpe", a));
+    CHECK_NEAR(x.at(0), 20.5f, 1e-6); CHECK_NEAR(x.at(1), 21.5f, 1e-6);   /* 0.5 + prefix row 1 */
+    CHECK_NEAR(x.at(2), 10.0f, 1e-6); CHECK_NEAR(x.at(3), 11.0f, 1e-6);   /* prefix row 0 */
+    CHECK_NEAR(x.at(4), -0.25f, 2e-5); CHECK_NEAR(x.at(5), 0.25f, 2e-5);  /* torch's (1, 0) */
 }
 
 /* LFM2's short convolution: ple_conv's window at dilation one, with no activation. */
@@ -10244,6 +10292,7 @@ std::vector<Geo> geometries() {
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("grid_embed_cpe", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("lili_cand", "M", 3, a.i("M", R).i("k", 4).i("world", 1).i("steps", 3).i("n", 8)
                                 .s("dtype", "f32")),
         G("lili_attn", "M", 8, a.i("M", R).i("steps", 2).i("k", 2).i("n_head", 2).i("head_dim", 4)

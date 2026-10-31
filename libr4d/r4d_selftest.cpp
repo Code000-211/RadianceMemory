@@ -10108,6 +10108,40 @@ void attn_dense_gqa_cases(const Plugin& pl) {
         }
 }
 
+/* attn_dense_h80_bf16: C-RADIO's tower, 16 heads of 80 over a fused [q|k|v] row, two images. */
+void attn_dense_h80_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "attn_dense_h80_bf16");
+    if (!r) { ok("attn_dense_h80_bf16", false, "row absent"); return; }
+    const int64_t hd = 80, nh = 16, w = nh * hd, total = 333;
+    const std::vector<int32_t> cu = { 0, 197, 333 };
+    std::vector<float> qkv = randv((size_t)(total * 3 * w), 1.0f);
+    for (float& x : qkv) x = bfr(x);
+    void* d = up_bf16(qkv);
+    auto col = [&](int c) {
+        RadTensor t = T((char*)d + c * w * 2, RAD_BF16, { total, w });
+        t.stride[0] = 3 * w;
+        return t;
+    };
+    void* dout = dalloc((size_t)(total * w) * 2);
+    const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 3 }),
+                               T(dout, RAD_BF16, { total, w }) },
+                          { PI("M", total), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
+                            PS("dtype", "bf16"), PI("max_seqlen", 197) });
+    if (rc != RAD_OK) { ok("attn_dense_h80_bf16", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> q((size_t)(total * w)), k((size_t)(total * w)), v((size_t)(total * w));
+    for (int64_t i = 0; i < total; ++i)
+        for (int64_t t = 0; t < w; ++t) {
+            q[(size_t)(i * w + t)] = qkv[(size_t)(i * 3 * w + t)];
+            k[(size_t)(i * w + t)] = qkv[(size_t)(i * 3 * w + w + t)];
+            v[(size_t)(i * w + t)] = qkv[(size_t)(i * 3 * w + 2 * w + t)];
+        }
+    std::vector<float> want((size_t)(total * w));
+    for (int e = 0; e < 2; ++e)
+        host_attn(q, k, v, w, w, nh, nh, hd, cu[(size_t)e], cu[(size_t)e + 1], cu[(size_t)e],
+                  cu[(size_t)e + 1], false, &want);
+    check("attn_dense_h80_bf16 16 heads over two images", down_bf16(dout, want.size()), want, 2e-2);
+}
+
 /* One wide head over every pixel, 384 and 512. */
 void attn_wide_cases(const Plugin& pl) {
     for (const int64_t hd : { 384, 512 }) {
@@ -32981,6 +33015,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("attn_cross_h128_bf16")) g3::attn_cross_cases(pl, 128);
     if (sel("attn_cross_h64_bf16")) g3::attn_cross_cases(pl, 64);
     if (sel("attn_dense_gqa")) g3::attn_dense_gqa_cases(pl);
+    if (sel("attn_dense_h80_bf16")) g3::attn_dense_h80_cases(pl);
     if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl);
     if (sel("rms_mod_bf16") || sel("rms_mod_quant_fp8_bf16")) g3::rms_mod_forms(pl);
     if (sel("timestep_embed_bf16")) g3::timestep_round_cases(pl);

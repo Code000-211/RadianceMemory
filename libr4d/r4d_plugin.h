@@ -902,6 +902,7 @@ int r4d_rad_rope_rows       (const RadArgs*, RadStream);
 int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);
 int r4d_rad_grid_embed_aa    (const RadArgs*, RadStream);
+int r4d_rad_grid_embed_cpe   (const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_bias    (const RadArgs*, RadStream);
 /* gemm_nt_bias at f32 (r4d_gemm_f32_nt_bias.hip). */
 int r4d_rad_gemm_f32_nt_bias(const RadArgs*, RadStream);
@@ -969,6 +970,7 @@ int r4d_shape_mul_weight     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_grid_embed_cpe (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gemm_nt_bias   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_unary          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);

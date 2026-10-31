@@ -85,6 +85,7 @@ int         avx_par_force(int threads);
     X(mla_attn)                                                                                   \
     X(mla_attn_paged)                                                                             \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
+    X(grid_embed_cpe)                                                                             \
     X(lili_cand)            X(lili_attn)            X(lili_factor)          X(lili_walk)          \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \

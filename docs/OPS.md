@@ -205,6 +205,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
+| `grid_embed_cpe` | `M`(range) `n` `side` `dtype` `n_prefix`/opt | `x`:inout, `table`w, `coord`, `prefix`w? |
 | `add` | `M`(range) `n` `dtype` `div`:f64/opt | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
@@ -341,6 +342,14 @@ dtype before the add.
 half-pixel centres, widened by the scale when the grid is smaller than the table, its in-table taps
 normalised to sum to one; separable, f32, rounded once. A different function from `grid_embed`'s,
 so a different op rather than a mode a library could ignore.
+
+**`grid_embed_cpe`** is RADIO's cropped position embedding: the table resampled with
+`F.interpolate(mode="bilinear", align_corners=False)` and no antialias onto a square whose side is
+the grid's larger one, of which the grid keeps the top-left `h x w`. Per axis two taps at
+`(i + 0.5) * side / d - 0.5`, clamped at 0 and into the table, blended along the row first as torch's
+kernel does; f32, rounded once before the add. A row whose row coordinate is negative is one of
+`n_prefix` learned rows a segment carries ahead of its patches (RADIO's class and register tokens),
+the column naming which: it gets `prefix[k]` instead.
 
 ### Hyper-connections
 

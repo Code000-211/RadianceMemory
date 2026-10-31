@@ -249,6 +249,73 @@ int ref_grid_embed_aa(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* grid_embed_cpe: RADIO's cropped position embedding (CPE). The table resampled as torch's
+ * F.interpolate(mode="bilinear", align_corners=False) -- without antialias -- onto a square of side
+ * d = max(grid height, grid width), of which the grid keeps the top-left h x w. Per axis two taps at
+ * src = (i + 0.5) * side / d - 0.5, clamped at 0, the upper tap clamped into the table, and blended
+ * along the row first as torch's bilinear kernel does. f32, rounded once before the add. */
+static void cpe_taps(int64_t at, int64_t d, int64_t side, int64_t t[2], float w[2]) {
+    if (d < 1) d = 1;
+    at = at < 0 ? 0 : (at >= d ? d - 1 : at);
+    float src = (float)side / (float)d * ((float)at + 0.5f) - 0.5f;
+    if (src < 0.0f) src = 0.0f;
+    int64_t i0 = (int64_t)src;
+    if (i0 > side - 1) i0 = side - 1;
+    t[0] = i0;
+    t[1] = i0 < side - 1 ? i0 + 1 : i0;
+    w[1] = src - (float)i0;
+    w[0] = 1.0f - w[1];
+}
+
+int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
+    const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
+    const int64_t side = p_int(a, "side", 0);
+    if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
+        return RAD_E_SHAPE;
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    const int64_t ts = laststride(tab);
+    /* The prefix rows, when n_prefix names some; without it the operand is not read. */
+    const int64_t npre = p_int(a, "n_prefix", 0);
+    const RadTensor* pre = npre > 0 && a->n_t > 3 && a->t[3].data ? &a->t[3] : nullptr;
+    if (npre > 0 && (!pre || numel(pre) < npre * n)) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(rows * n * 4)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t g[4];
+        for (int c = 0; c < 4; ++c) g[c] = ld_int(crd->dtype, crd->data, c * cs + r * ms);
+        const int64_t xb0 = rowoff(x, r, n), xs0 = laststride(x);
+        if (g[0] < 0) {
+            /* A row ahead of its segment's patches: the learned row its column names. */
+            const int64_t k = g[1] < 0 ? 0 : (g[1] >= npre ? npre - 1 : g[1]);
+            for (int64_t i = 0; npre > 0 && i < n; ++i) {
+                const float pe = round_dt(x->dtype, ldt(pre, rowoff(pre, k, n) + i * laststride(pre)));
+                stt(x, xb0 + i * xs0, ldt(x, xb0 + i * xs0) + pe);
+            }
+            continue;
+        }
+        const int64_t d = g[2] > g[3] ? g[2] : g[3];
+        int64_t th[2], tw[2];
+        float wh[2], ww[2];
+        cpe_taps(g[0], d, side, th, wh);
+        cpe_taps(g[1], d, side, tw, ww);
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        auto at = [&](int64_t y, int64_t c, int64_t i) {
+            return ldt(tab, rowoff(tab, y * side + c, n) + i * ts);
+        };
+        for (int64_t i = 0; i < n; ++i) {
+            const float r0 = ww[0] * at(th[0], tw[0], i) + ww[1] * at(th[0], tw[1], i);
+            const float r1 = ww[0] * at(th[1], tw[0], i) + ww[1] * at(th[1], tw[1], i);
+            const float pe = round_dt(x->dtype, wh[0] * r0 + wh[1] * r1);
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ add / mul */
 /* Elementwise over the output's extent. `b` may be a single row of exactly `n` elements, which
  * broadcasts along rows (a bias add); nothing else broadcasts, so a shape bug cannot pass as a

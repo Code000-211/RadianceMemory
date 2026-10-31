@@ -544,6 +544,18 @@ void shape_cases(std::vector<Hand>& hs) {
           .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
         hs.push_back(std::move(ga));
 
+        /* RADIO's cropped resample: two prefix rows (row -1, the column naming which), three of a
+         * 3 x 5 grid upsampling the 4 x 4 table and one of a 2 x 2 grid shrinking it. */
+        static const int32_t kCpeCrd[4][6] = { { -1, -1, 0, 2, 1, 0 }, { 0, 2, 0, 4, 3, 1 },
+                                               { 3, 3, 3, 3, 3, 2 }, { 5, 5, 5, 5, 5, 2 } };
+        Hand gc("prefix rows and a 4 x 4 table onto 3 x 5 and 2 x 2 grids", "grid_embed_cpe", 1e-6);
+        gc.dense(RAD_F32, { 6, N }, hfill(61), true)
+          .dense(RAD_F32, { 16, N }, hfill(62))
+          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kCpeCrd[i / 6][i % 6]; })
+          .dense(RAD_F32, { 3, N }, hfill(63))
+          .pi("M", 6).pi("n", N).pi("side", 4).pi("n_prefix", 3).ps("dtype", "f32");
+        hs.push_back(std::move(gc));
+
         /* LiLiCorr's candidates over two ranks' sample_logprobs rows: a merge that interleaves the
          * ranks, an equal value on both (the lower id first), a rank with an unfilled slot. Rows
          * of (max, sum, 4 (id, logit) pairs descending) a rank, k = 4, steps 3, n = 24. */

@@ -172,6 +172,12 @@ static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT
 /* A learned position table resampled to each row's grid and added in (a vision tower's). */
 static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+/* grid_embed_cpe adds the rows a segment carries ahead of its patches (n_prefix, `prefix`). */
+static const RadParamSpec pGridEmbedCpe[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+                                              P_INTO("n_prefix") };
+static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"),
+                                                WGT_O("prefix") };
+
 /* LiLiCorr's correlator (ref_lili.cpp). */
 static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
                                           P_INT("n"), P_STR("dtype"), P_F64O("eps"),
@@ -1220,6 +1226,12 @@ static const RadOpSchema kSchemas[] = {
   "antialias=True) resamples it to the row's grid -- SigLIP2's position embedding: per axis a "
   "triangle filter on half-pixel centres, widened by the scale when shrinking, its in-table taps "
   "normalised. Separable, f32, rounded once before the add; coordinates clamp into their grid." },
+{ "grid_embed_cpe", ARR(pGridEmbedCpe), ARR(oGridEmbedCpe),
+  "x += the side x side table resampled as torch's F.interpolate(bilinear, align_corners=False) -- "
+  "no antialias -- onto a square of side max(grid height, grid width), of which the grid keeps the "
+  "top-left part: RADIO's cropped position embedding (CPE). Per axis two taps at (i + 0.5) * side / "
+  "d - 0.5, clamped at 0 and into the table, blended along the row first; f32, rounded once before "
+  "the add. A row whose coordinate row is negative is the k-th of `n_prefix` learned rows ahead of its segment (RADIO's class and register tokens), k its column: it gets `prefix[k]` instead, rounded the same way." },
 { "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
   "LiLiCorr's candidates. `stats` [M, world * (2 + 2k)] f32 is each rank's sample_logprobs row, "
   "row-interleaved; the ranks merge to the log-normaliser and the k largest pairs by value, ties to "
@@ -2363,6 +2375,9 @@ SIMPLE("ref_grid_embed", "grid_embed", "elem",
 SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        ref_grid_embed_aa),
+SIMPLE("ref_grid_embed_cpe", "grid_embed_cpe", "elem",
+       "half-pixel bilinear resample of a position grid onto a square, cropped, added in", DT_FLOAT,
+       ref_grid_embed_cpe),
 SIMPLE("ref_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features",
        DT_FLOAT, ref_lili_cand),
 SIMPLE("ref_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",

@@ -144,6 +144,9 @@ static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+static const RadParamSpec pGridEmbedCpe[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+                                                P_INTO("n_prefix") };
+static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"), WGT_O("prefix") };
 /* LiLiCorr's correlator (avx_lili.cpp; libref/ref_lili.cpp has the contracts). */
 static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
                                           P_INT("n"), P_STR("dtype"), P_F64O("eps"),
@@ -1016,6 +1019,10 @@ static const RadOpSchema kSchemas[] = {
   "[h | a | h * a] a lattice row, a its sequence's anchor." },
 { "lili_walk", ARR(pLiliWalk), ARR(oLiliWalk),
   "LiLiCorr's normalised edge scores and their greedy walk." },
+{ "grid_embed_cpe", ARR(pGridEmbedCpe), ARR(oGridEmbedCpe),
+  "x += the table resampled half-pixel bilinear (no antialias) onto a square of the grid's larger "
+  "side and cropped to the grid: RADIO's cropped position embedding. A row with a negative row "
+  "coordinate gets the learned prefix row its column names." },
 { "add", ARR(pAdd), ARR(oBinary),
   "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows. With "
   "`div`, y = rd(rd(a + b) / div), bit for bit libref's." },
@@ -1681,6 +1688,9 @@ SIMPLE("avx_grid_embed", "grid_embed", "elem",
 SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        L(grid_embed_aa)),
+SIMPLE("avx_grid_embed_cpe", "grid_embed_cpe", "elem",
+       "half-pixel bilinear resample of a position grid onto a square, cropped, added in", DT_FLOAT,
+       L(grid_embed_cpe)),
 SIMPLE("avx_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features", DT_FLOAT,
        L(lili_cand)),
 SIMPLE("avx_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",

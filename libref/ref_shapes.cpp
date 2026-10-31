@@ -509,6 +509,20 @@ int ref_grid_embed_aa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return o.finish("grid_embed_aa", operand, out);
 }
 
+/* grid_embed's operands plus the prefix rows; coordinates drawn over the table's side. */
+int ref_grid_embed_cpe_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), side = gi(p, n_p, "side", 0);
+    const int64_t npre = gi(p, n_p, "n_prefix", 0);
+    if (M <= 0 || n <= 0 || side <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });              /* x, INOUT */
+    o.t(D, { side * side, n });    /* table */
+    o.t_idx({ 4, M }, side, -1, 0);
+    o.t(D, { npre > 0 ? npre : 1, n });   /* prefix */
+    return o.finish("grid_embed_cpe", operand, out);
+}
+
 /* LiLiCorr's ops. lili_cand declines: its stats rows (sample_logprobs' sorted pairs and positive
  * sums) are no draw; avx_check_hand.cpp builds them. The others draw freely. */
 int ref_lili_cand_shape(const RadParam*, int, int, RadOpdDesc*) { return RAD_E_UNSUPPORTED; }
