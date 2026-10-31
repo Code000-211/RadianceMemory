@@ -682,6 +682,10 @@ struct SamplingParams {
      * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
      * no-whitelist form. */
     std::vector<int32_t> ngram_whitelist;
+    /* Token ids this request never samples (generation_config.json's suppress_tokens: Gemma 4's
+     * end-of-image and end-of-audio markers). Global ids, duplicates ignored; empty is off. The
+     * sampler takes them out of the row as it does a grammar's mask. */
+    std::vector<int32_t> suppress_tokens;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers

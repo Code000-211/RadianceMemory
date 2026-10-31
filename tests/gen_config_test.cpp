@@ -258,4 +258,31 @@ TEST(gen_config_reads_the_ngram_ban) {
     CHECK_EQ(greedy.onto(SamplingParams{}).ngram_ban_n, 0);
 }
 
+TEST(gen_config_reads_suppress_tokens) {
+    /* Gemma 4's generation_config.json: the end-of-image and end-of-audio markers. */
+    GenSampling g;
+    CHECK(gen_sampling_parse(R"({"temperature": 1.0, "suppress_tokens": [258883, 258882]})",
+                             "test", &g));
+    CHECK_EQ((int)g.suppress.size(), 2);
+    CHECK_EQ(g.suppress[0], 258883);
+    CHECK_EQ(g.suppress[1], 258882);
+    const SamplingParams sp = g.onto(SamplingParams{});
+    CHECK_EQ((int)sp.suppress_tokens.size(), 2);
+    CHECK(SamplingParams{}.suppress_tokens.empty());
+
+    /* The container's flattened copy: the array as a space-separated string. */
+    GenSampling kv;
+    CHECK(gen_sampling_from_kv(kv_of({ { "suppress_tokens", "258883 258882" } }), &kv));
+    CHECK_EQ((int)kv.suppress.size(), 2);
+    CHECK_EQ(kv.suppress[1], 258882);
+
+    /* An entry that is no id is dropped on its own, and a non-array is dropped whole. */
+    GenSampling bad;
+    CHECK(gen_sampling_parse(R"({"top_k": 64, "suppress_tokens": [7, -1, "x", 9]})", "test", &bad));
+    CHECK_EQ((int)bad.suppress.size(), 2);
+    GenSampling flat;
+    CHECK(gen_sampling_parse(R"({"top_k": 64, "suppress_tokens": 7})", "test", &flat));
+    CHECK(flat.suppress.empty());
+}
+
 RAD_TEST_MAIN()

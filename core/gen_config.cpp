@@ -39,6 +39,7 @@ SamplingParams GenSampling::onto(SamplingParams base) const {
     if (ngram_ban_n >= 0)    base.ngram_ban_n = ngram_ban_n;
     if (ngram_window >= 0)   base.ngram_window = ngram_window;
     if (!ngram_whitelist.empty()) base.ngram_whitelist = ngram_whitelist;
+    if (!suppress.empty())   base.suppress_tokens = suppress;
     return base;
 }
 
@@ -156,6 +157,23 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
             out->ngram_whitelist.push_back((int)id);
         }
     }
+
+    /* transformers' suppress_tokens, a JSON array of ids. Dropped entry by entry like the
+     * whitelist above. */
+    it = j.find("suppress_tokens");
+    if (it != j.end() && !it->is_array()) {
+        RAD_WARN("%s states suppress_tokens that is not an array; ignoring it", src);
+    } else if (it != j.end()) {
+        for (const auto& v : *it) {
+            const int64_t id = v.is_number_integer() ? v.get<int64_t>() : -1;
+            if (id < 0 || id > INT32_MAX) {
+                RAD_WARN("%s states a suppress_tokens entry outside [0, %d]; ignoring it",
+                         src, INT32_MAX);
+                continue;
+            }
+            out->suppress.push_back((int)id);
+        }
+    }
     return out->any();
 }
 
@@ -175,7 +193,7 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
     nlohmann::json j = nlohmann::json::object();
     static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k",
                                            "no_repeat_ngram_size", "no_repeat_ngram_window_size",
-                                           "no_repeat_ngram_whitelist" };
+                                           "no_repeat_ngram_whitelist", "suppress_tokens" };
     for (const char* k : kFields) {
         const char* v = get(k);
         if (!v || !*v) continue;
@@ -193,6 +211,18 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
                 RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
                          "array of ids (%s); ignoring it", k, v, e.what());
             }
+            continue;
+        }
+        if (std::strcmp(k, "suppress_tokens") == 0) {
+            /* An array of scalars is flattened to a space-separated string (flatten_json). */
+            nlohmann::json ids = nlohmann::json::array();
+            char* p = const_cast<char*>(v);
+            for (char* e = nullptr;; p = e) {
+                const long long id = std::strtoll(p, &e, 10);
+                if (e == p) break;
+                ids.push_back(id);
+            }
+            j[k] = std::move(ids);
             continue;
         }
         char* end = nullptr;

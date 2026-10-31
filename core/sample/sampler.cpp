@@ -980,6 +980,7 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
 
             if (budget && think.inside() && think.body >= sp.thinking_budget)
                 force_close(p, row, sp.reasoning.close);
+            if (!sp.suppress_tokens.empty()) suppress(p, row, sp.suppress_tokens);
 
             if (want_lp) {
                 /* Temperature the candidate value carries: early and late, each counted only
@@ -1036,6 +1037,19 @@ void Sampler::force_close(DeviceSampleParams& p, int64_t row, int32_t close) {
     if (local) dst[at >> 5] |= 1u << (uint32_t)(at & 31);
     p.mask_row = (int32_t)row;
     p.flags |= RAD_SP_MASK;
+}
+
+void Sampler::suppress(DeviceSampleParams& p, int64_t row, const std::vector<int32_t>& ids) {
+    uint32_t* dst = mask_stage_ + row * mask_words_;
+    if (!(p.flags & RAD_SP_MASK)) {
+        std::memset(dst, 0xff, (size_t)mask_words_ * 4);
+        p.mask_row = (int32_t)row;
+        p.flags |= RAD_SP_MASK;
+    }
+    for (int32_t id : ids) {
+        const int64_t at = (int64_t)id - cfg_.vocab_off;
+        if (at >= 0 && at < cfg_.n_vocab_local) dst[at >> 5] &= ~(1u << (uint32_t)(at & 31));
+    }
 }
 
 int Sampler::build_greedy(int64_t n) {

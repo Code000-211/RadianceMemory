@@ -267,6 +267,9 @@ private:
      * inside the block. A grammar mask on the row wins: the close is forced only where the
      * grammar admits it, otherwise at a later position. */
     void force_close(DeviceSampleParams& p, int64_t row, int32_t close);
+    /* Take `ids` out of the row: from the grammar's mask where it has one, from a full row where
+     * not. */
+    void suppress(DeviceSampleParams& p, int64_t row, const std::vector<int32_t>& ids);
 
     SamplerConfig    cfg_{};
     const VocabView* vocab_ = nullptr;
