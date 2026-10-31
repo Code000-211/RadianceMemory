@@ -983,6 +983,8 @@ private:
                  const std::vector<Drawn>& in, uint64_t input_hash, const Run& run);
     bool lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
                  const Drawn& d, Bytes* laid, RadTensor* desc);
+    bool lay_out_table(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
+                       Bytes* laid, RadTensor* desc);
     int  record_case(const KfCase& base, KfCase* out, std::string* why);
     int  rerecord();
     int  record_rows();
@@ -1364,7 +1366,8 @@ static bool lays_out_weight(const KernelRow* row, const Geometry& g, const KfCas
     if (!info || !info->layout) return false;
     for (size_t k = 0; k < c.opd.size(); ++k) {
         const KfOperand& d = c.opd[k];
-        if (d.absent || d.role != RAD_OPD_WEIGHT || !d.has_enc) continue;
+        if (d.absent || (d.role != RAD_OPD_WEIGHT && d.role != RAD_OPD_WTAB) || !d.has_enc)
+            continue;
         RadTensor pt[RAD_ENC_MAX_PLANES];
         const int n = (int)d.sel.size();
         if (n < 1 || n > RAD_ENC_MAX_PLANES) continue;
@@ -1404,6 +1407,34 @@ bool Replay::lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const
         return false;
     }
     kf_describe_laid(c.opd[k], lay, laid->data(), desc);
+    return true;
+}
+
+/* The same for a weight table whose kernel lays out each expert: the experts' planes as the draw
+ * made them (kf_draw_entry_planes), each laid out, stacked. `laid` empty: the row reads the table
+ * as decoded. */
+bool Replay::lay_out_table(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
+                           Bytes* laid, RadTensor* desc) {
+    PhaseTimer pt(&ph_, kb::PH_LAYOUT);
+    laid->clear();
+    const KfOperand& d = c.opd[k];
+    if (!d.has_enc || d.undrawn) return true;
+    RadLayout lay{};
+    const int lrc = kf_lay_table(run.row->info, run.g.params(), run.g.n_params(), (int)k, d,
+                                 [&](int64_t e, std::vector<Bytes>* pl) {
+                                     kf_draw_entry_planes(d, k, e, pl);
+                                     return (int)RAD_OK;
+                                 },
+                                 &lay, laid);
+    if (lrc == RAD_E_UNSUPPORTED) { laid->clear(); return true; }
+    if (lrc < 0) {
+        const char* opd_name = schema->operands[k].name ? schema->operands[k].name : "?";
+        nm_.skipped[c.op + "  (" + run.lib + "/" + run.row->info->name + " cannot lay out the " +
+                    "table '" + opd_name + "' from " + enc_name(d.enc) + ": " +
+                    rad_strerror(lrc) + ")"]++;
+        return false;
+    }
+    kf_describe_laid(d, lay, laid->data(), desc);
     return true;
 }
 
@@ -1504,11 +1535,18 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                     }
                     continue;
                 }
-                if (!guarded_alloc(dev[k], (int64_t)src.size(), stream)) {
+                Bytes laid;
+                if (c.opd[k].role == RAD_OPD_WTAB &&
+                    !lay_out_table(c, k, schema, run, &laid, &t[k])) {
+                    ++st_.skipped; release(); return;
+                }
+                const Bytes& up = laid.empty() ? src : laid;
+                if (!guarded_alloc(dev[k], (int64_t)up.size(), stream)) {
                     nm_.skipped[c.op + "  (no device memory for this case)"]++;
                     ++st_.skipped; release(); return;
                 }
-                if (rad_memcpy_async(dev[k].p, src.data(), dev[k].bytes, stream) < 0) {
+                if (rad_memcpy_async(dev[k].p, up.data(), dev[k].bytes, stream) < 0 ||
+                    (!laid.empty() && rad_stream_sync(stream) < 0)) {
                     ++st_.skipped; release(); return;
                 }
                 t[k].data = dev[k].p;
@@ -1518,11 +1556,12 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
             /* Host: weights laid out in place, written operands copied, inputs shared. */
             for (size_t k = 0; k < n_opd; ++k) {
                 if (c.opd[k].absent || !in[k].bytes) continue;
-                if (c.opd[k].role == RAD_OPD_WEIGHT) {
+                if (c.opd[k].role == RAD_OPD_WEIGHT || c.opd[k].role == RAD_OPD_WTAB) {
                     Bytes laid;
-                    if (!lay_out(c, k, schema, run, in[k], &laid, &t[k])) {
-                        ++st_.skipped; return;
-                    }
+                    const bool ok = c.opd[k].role == RAD_OPD_WEIGHT
+                                        ? lay_out(c, k, schema, run, in[k], &laid, &t[k])
+                                        : lay_out_table(c, k, schema, run, &laid, &t[k]);
+                    if (!ok) { ++st_.skipped; return; }
                     if (!laid.empty()) { own[k].swap(laid); t[k].data = own[k].data(); }
                     continue;
                 }
@@ -3020,6 +3059,49 @@ int main(int argc, char** argv) {
                         }
                         if (read) from_container = true;
                         else kf_draw(kop, k, M, kf_vocab_rows(kop), 0, &bufs[k]);
+                        /* A kernel that lays its experts out (libr4d's 4-bit ones) reads each
+                         * expert's arrangement of the same planes, stacked; the oracle reads the
+                         * table they decode to. */
+                        if (kop[k].has_enc && !kop[k].undrawn) {
+                            const char* opd_name = o.schema->operands[k].name
+                                                       ? o.schema->operands[k].name : "?";
+                            auto planes = [&](int64_t e, std::vector<std::vector<uint8_t>>* pl) {
+                                if (!read) {
+                                    kf_draw_entry_planes(kop[k], k, e, pl);
+                                    return (int)RAD_OK;
+                                }
+                                const WeightInfo& wi = prog.weights[run[(size_t)e]];
+                                const RadFileEntry* fe = f.find(wi.source);
+                                if (!fe) return (int)RAD_E_NOTFOUND;
+                                pl->clear();
+                                for (int j = 0; j < wi.n_sel; ++j) {
+                                    const RadFilePlane& fp = f.plane(*fe, wi.sel[j]);
+                                    const uint8_t* src = (const uint8_t*)f.data(fp);
+                                    pl->emplace_back(src, src + fp.bytes);
+                                }
+                                return (int)RAD_OK;
+                            };
+                            RadLayout lay{};
+                            std::vector<uint8_t> laid;
+                            const int lrc = kf_lay_table(r.row->info, g.params(), g.n_params(),
+                                                         (int)k, kop[k], planes, &lay, &laid);
+                            if (lrc == RAD_OK) {
+                                ref_out[k] = bufs[k];
+                                t_ref[k] = mk(ref_out[k]);
+                                bufs[k].swap(laid);
+                                kf_describe_laid(kop[k], lay, bufs[k].data(), &t_test[k]);
+                                continue;
+                            }
+                            if (lrc != RAD_E_UNSUPPORTED) {
+                                skipped_ops[o.op + "  (" + std::string(r.row->info->name) +
+                                            " cannot lay out the table '" + opd_name +
+                                            "' from " +
+                                            enc_name(kop[k].enc) + ": " + rad_strerror(lrc) +
+                                            ")"]++;
+                                unusable = true;
+                                break;
+                            }
+                        }
                     } else if (role == RAD_OPD_IN || role == RAD_OPD_INOUT) {
                         /* The fixture's draw, the single implementation recorder and replay
                          * share. */
