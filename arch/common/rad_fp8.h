@@ -1819,6 +1819,23 @@ struct DenseFP8 {
         RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
         return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
     }
+    /* This rank's rows [lo, hi) of a RAD_SHARD_ROW weight where the even shard is the wrong cut: a
+     * KV head replicated over ranks (Geom::kv_off), the same rows on every rank that shares it.
+     * Call after declare(), whose N is already hi - lo. The fp8 scale plane takes the span in its
+     * 128-row blocks; the MXFP4 and M2XFP4 planes are one row a weight row, as in LinearFP8. */
+    int span(RadBuilder* b, int64_t lo, int64_t hi) const {
+        RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
+        if (mx || m2x) {
+            RAD_ARCH_TRY(rad_weight_shard_span(b, s, lo, hi));
+            return rad_weight_shard_span(b, ref, lo, hi);
+        }
+        if (lo % RAD_FP8_BLOCK || hi % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: a row span [%lld, %lld) is not whole %d-row scale blocks\n",
+                    (long long)lo, (long long)hi, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
+    }
     /* `gemm_nt_q` over this weight, `fp8a8`, `mxfp4a8` or `m2xfp4` as it was declared, ranged
      * M 1..hi. `split_n`, when set, is the stored width a row slice takes its K split from
      * (docs/OPS.md). */

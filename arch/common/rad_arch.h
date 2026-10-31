@@ -1515,7 +1515,12 @@ inline const char* drafter_layer_prefix(const RadModelMeta* meta) {
         return "draft.transformer_layer_config.";
     return "draft.";
 }
-inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, const char* what) {
+/* `kv_repl_ok`: the drafter block reads its k and v at Geom::kv_off (rad_block_dflash2.h does), so
+ * fewer KV heads than ranks are replicated as geom_from replicates the target's: world a multiple
+ * of the head count, one KV head a rank, `kv_off` its first row in the unsharded k/v projection.
+ * Otherwise such a world is refused, as before. */
+inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, const char* what,
+                        bool kv_repl_ok = false) {
     dg = target;
     const char* pre = drafter_layer_prefix(meta);
     char key[160];
@@ -1540,7 +1545,15 @@ inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, 
     }
     RAD_ARCH_TRY(yarn_from(dg, meta, pre, dg.head_dim));
     RAD_ARCH_TRY(divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head));
-    RAD_ARCH_TRY(divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads", &dg.n_head_kv));
+    /* The target's kv_off is the target's; the drafter's is set here or zero. */
+    dg.kv_off = 0;
+    if (kv_repl_ok && dg.world > dg.n_head_kv_all && dg.world % dg.n_head_kv_all == 0) {
+        dg.n_head_kv = 1;   /* world / n_head_kv_all ranks share each KV head */
+        dg.kv_off    = (dg.rank / (dg.world / dg.n_head_kv_all)) * dg.head_dim;
+    } else {
+        RAD_ARCH_TRY(divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads",
+                                    &dg.n_head_kv));
+    }
     RAD_ARCH_TRY(divide_or_fail(dg.n_ff_all,      dg.world, "draft intermediate_size",   &dg.n_ff));
     const long long dvocab = rad_meta_geti(meta, k("vocab_size"), dg.n_vocab_all);
     if (dvocab != dg.n_vocab_all) {
