@@ -529,6 +529,10 @@ struct GateQuantFP8 {
      * not resolve: `silu_mul` into the bf16 plane (`op`), then `had_quant_act_fp8` over it into the
      * codes (`op_q`). */
     rad_op op_q = 0;
+    /* act "relu2" (Nemotron-H's ungated experts): `gate_up` is one part, n wide, and `op` is
+     * act_mul's relu over it twice, relu(x)^2 into the bf16 plane, which `op_q` quantises (rotated
+     * for a rotated weight). No fused form yet: the plane is written either way. */
+    bool   ungated = false;
 
     /* Set before declare: the product in bf16 alone, as for bf16 linears, for a consumer that
      * quantises its input itself (an int8 linear's op_q). */
@@ -558,6 +562,28 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
     clipped = limit > 0;
     clamped_fused = false;
     if (!std::isfinite(limit) || limit < 0) return RAD_E_INVAL;
+    ungated = std::strcmp(act_name, "relu2") == 0;
+    if (ungated) {
+        if (!gate_up || !a.x || n <= 0 || clipped || (!bf16 && (!a.cq() || !a.cs())) ||
+            (rot && a.q8_fed))
+            return RAD_E_INVAL;
+        const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
+        want_x = true;
+        op = rw(b, RAD_OP(b, "act_mul",
+                   RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("act", "relu"),
+                              RAD_STR("dtype", g.dtype)),
+                   RAD_NOWEIGHTS),
+               { gate_up }, { a.x });
+        if (!op) return RAD_E_INVAL;
+        if (bf16) return RAD_OK;
+        const char* qn = rot ? "had_quant_act_fp8" : a.q8_fed ? "quant_act_i8g" : "quant_act_fp8";
+        op_q = rw(b, RAD_OP(b, qn,
+                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 { a.x }, { a.cq(), a.cs() });
+        return op_q ? RAD_OK : RAD_E_INVAL;
+    }
     if (clipped) {
         /* No rotated int8 form: its quantiser would be quant_act_i8g, unrotated; and no clamp
          * with `silu_only`. */
@@ -652,6 +678,15 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
 inline void GateQuantFP8::step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0,
                                int64_t rows) const {
     if (rows <= 0) rows = T - r0;
+    if (ungated) {
+        RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, n), brow_slice(gate_up, r0, rows, n),
+                    brow_slice(a.x, r0, rows, n));
+        if (op_q)
+            RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, n),
+                        brow_slice(a.cq(), r0, rows, n),
+                        brow_slice(a.cs(), r0, rows, n / RAD_FP8_BLOCK));
+        return;
+    }
     if (clamped_fused) {
         RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, 2 * n),
                     brow_slice(a.cq(), r0, rows, n),
