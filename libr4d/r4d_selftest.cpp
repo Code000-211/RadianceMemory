@@ -1356,13 +1356,15 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
  * max_seqs (--max-model-len 8192, --max-num-seqs 4). Holds while every segment of the split law is
  * one tile at both launches: up to 2048 keys at one sequence, where the decode targets 256
  * segments and an eight-row verify 128 (r4d_decode_splits). */
-static void attn_verify_bits_case(const Plugin& pl, const char* name, int64_t gqa,
-                                  const char* kv_dtype, int64_t q_len, int64_t ctx) {
-    if (!sel(name)) return;
+static bool attn_verify_bits_case(const Plugin& pl, const char* name, int64_t gqa,
+                                  const char* kv_dtype, int64_t q_len, int64_t ctx,
+                                  bool quiet = false) {
+    if (!sel(name)) return true;
     const RadKernelInfo* r = find(pl, name);
     std::string tag = fmt("%s verify %lld rows = %lld decodes at %lld keys", name,
                           (long long)q_len, (long long)q_len, (long long)ctx);
-    if (!r) { ok(tag.c_str(), false, "row absent"); return; }
+    if (!r) { ok(tag.c_str(), false, "row absent"); return false; }
+    const size_t mark = g_allocs.size();   /* a sweep launches thousands of these: free as we go */
     const int64_t head_dim = 128, bs = 16, q_heads = gqa, max_ctx = 8192;
     const int64_t max_blocks = max_ctx / bs, blocks = (ctx + bs - 1) / bs;
     const int kv_is_fp8 = std::strcmp(kv_dtype, "bf16") != 0;
@@ -1426,8 +1428,34 @@ static void attn_verify_bits_case(const Plugin& pl, const char* name, int64_t gq
     int64_t eq = 0;
     for (int64_t j = 0; j < q_len; ++j)
         eq += !std::memcmp(&ver[(size_t)(j * row)], &one[(size_t)(j * row)], (size_t)row * 2);
-    ok(tag.c_str(), rc == RAD_OK && eq == q_len,
-       fmt("rc=%d, rows bit-equal %lld/%lld", rc, (long long)eq, (long long)q_len));
+    const bool good = rc == RAD_OK && eq == q_len;
+    while (g_allocs.size() > mark) { hipFree(g_allocs.back()); g_allocs.pop_back(); }
+    if (!quiet || !good)
+        ok(tag.c_str(), good, fmt("rc=%d, rows bit-equal %lld/%lld", rc, (long long)eq, (long long)q_len));
+    return good;
+}
+
+/* The same check for the verify widths a drafter of 1..7 proposes, over every context from 40 to
+ * 300 keys, then the page edges up to 2048: one line a width, a failure line a context. 2048 keys
+ * is where it ends: a verify of more than 32 (query, head) rows has one split target (128
+ * segments) and a plain decode another (256), so past 128 tiles the two cut the keys differently
+ * by design (r4d_decode_splits). */
+static void attn_verify_sweep(const Plugin& pl, const char* name, int64_t gqa, const char* kv_dtype) {
+    if (!sel(name)) return;
+    std::vector<int64_t> ctxs;
+    for (int64_t c = 40; c <= 300; ++c) ctxs.push_back(c);
+    for (int64_t c = 301; c <= 2048; ++c)
+        if (c % 16 <= 2 || c % 16 >= 14 || c >= 2040) ctxs.push_back(c);
+    for (int64_t q : { 2, 3, 4, 5, 8 }) {
+        int64_t bad = 0, n = 0;
+        for (int64_t c : ctxs) {
+            if (c < q) continue;
+            ++n;
+            bad += !attn_verify_bits_case(pl, name, gqa, kv_dtype, q, c, true);
+        }
+        ok(fmt("%s verify sweep, %lld rows, %lld contexts 40..2048", name, (long long)q,
+               (long long)n).c_str(), bad == 0, fmt("%lld contexts differ", (long long)bad));
+    }
 }
 
 /* A head-256 prefill geometry the KV split serves: queries per KV head, KV heads (a rank's), page
@@ -31161,6 +31189,9 @@ static void device_phase(const Plugin& pl) {
         attn_verify_bits_case(pl, "attn_decode_h128_gqa16_fp8kv",  16, "fp8_e4m3", 8, keys);
         attn_verify_bits_case(pl, "attn_decode_h128_gqa8_bf16kv",   8, "bf16",     8, keys);
     }
+    attn_verify_sweep(pl, "attn_decode_h128_gqa16_bf16kv", 16, "bf16");
+    attn_verify_sweep(pl, "attn_decode_h128_gqa16_fp8kv",  16, "fp8_e4m3");
+    attn_verify_sweep(pl, "attn_decode_h128_gqa8_bf16kv",   8, "bf16");
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
     /* And over the fp8_v4 and k6_v4 caches (Flash-Next's --kv-cache-dtype fp8_v4 / k6_v4). */
