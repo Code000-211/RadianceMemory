@@ -148,6 +148,8 @@ the cards the engine runs on.
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
 | `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |
 | `gemma4-31b-heretic-ara-w4a8.yaml` | `gemma4-31b-heretic-ara-w4a8.rad` | The same for Gemma 4 31B heretic-ara (refusals removed) |
+| `gemma4-12b-bf16.yaml` | `gemma4-12b-bf16.rad` | Gemma 4 12B in bf16, its assistant head as the MTP drafter, pictures and audio through the 12B's embedders, on two cards |
+| `gemma4-12b-i8g.yaml` | `gemma4-12b-i8g.rad` | The same with the trunk at int8 (i8a8), on one card |
 | `nemotron-3.5-bolt-e4b-bf16.yaml` | `nemotron-3.5-bolt-e4b-bf16.rad` | NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B) in bf16 with NVIDIA's DFlash drafter, the vision tower in pinned host memory, on one card |
 | `nemotron-3.5-bolt-e4b-i8g.yaml` | `nemotron-3.5-bolt-e4b-i8g.rad` | The same with the trunk at int8 (i8a8) |
 | `nemotron-3.5-bolt-e4b-a4.yaml` | `nemotron-3.5-bolt-e4b-a4.rad` | The same with the feed-forward at four bits (GPTQ), attention and layers 19-23 at i8a8 |
