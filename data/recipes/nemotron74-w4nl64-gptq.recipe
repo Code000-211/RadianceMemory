@@ -1,0 +1,44 @@
+# nemotron74-w4nl64-gptq.recipe -- Nemotron-3.5-Bolt-74B-A9B (nemotron_h_omni) from its bf16
+# checkpoint: the routed experts as rotated u4 codes into the w4nl codebook with one E4M3 scale a
+# (row, 64 of K) under a fixed f32 of 2^-13 (libr4d's w4nl64a8h), the codes chosen by GPTQ against
+# $CALIB and three sweeps of coordinate descent, as qwen4exp-w4nl64-i8-hc8m.recipe does; the block
+# linears block fp8, as nemotron74-fp8.recipe; the rest as the checkpoint holds it.
+#
+#   CALIB=DIR rad-convert <checkpoint> --recipe data/recipes/nemotron74-w4nl64-gptq.recipe \
+#       -o nemotron74-w4nl64.rad
+#
+# DIR holds each routed layer's pooled up Gram (K = the 1024-wide latent) and each expert's own down
+# Gram, recorded on nemotron74-fp8.rad (RADIANCE_CALIB_LAYERS splits the per-expert Hessians, 169
+# GiB for all 40 layers, over several runs). Without $CALIB the experts are rounded to nearest.
+
+blk.*.ffn_*_exps.*.weight            gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+
+blk.*.ssm_in_z.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_in_xbc.weight              rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_qkv.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_latent_in.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_latent_out.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_up_shexp.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The LiLiCorr drafter, when merged (`--draft-model <nemotron-3.5-bolt lilicorr>`): ModelOpt NVFP4
+# for fc, the backbone's MLPs and six of the correlator's linears, bf16 elsewhere (rad-convert
+# reads the NVFP4 under the drafter's prefix). The backbone's seven linears block fp8, as
+# rad_block_dflash2.h's DenseFP8 reads them (Gemma's DFlash2 recipe); NVFP4 to E4M3 with a scale a
+# 128 x 128 block loses less than the NVFP4 grid already did. The correlator's NVFP4 linears are
+# decoded to bf16 for its plain GEMMs; its other weights stay as shipped.
+dflash.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.lili.token_proj.weight        cast dtype=bf16
+dflash.lili.pass_proj.weight         cast dtype=bf16
+dflash.lili.context_proj.weight      cast dtype=bf16
+dflash.lili.blk.*.attn_out.weight    cast dtype=bf16
+dflash.lili.blk.*.mlp_up.weight      cast dtype=bf16
+dflash.lili.blk.*.mlp_down.weight    cast dtype=bf16
