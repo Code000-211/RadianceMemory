@@ -85,6 +85,7 @@ int         avx_par_force(int threads);
     X(mla_attn)                                                                                   \
     X(mla_attn_paged)                                                                             \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
+    X(lili_cand)            X(lili_attn)            X(lili_factor)          X(lili_walk)          \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
     X(scatter_rows)         X(ngram_ids)                                                          \
@@ -108,7 +109,7 @@ int         avx_par_force(int threads);
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
     X(lora_shrink)          X(lora_expand)          X(lora_expand_mm)                             \
     /* ---- attention */                                                                          \
-    X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
+    X(attn_paged)           X(attn_paged_sink)      X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
     X(sam_attn)             \

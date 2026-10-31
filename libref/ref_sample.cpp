@@ -674,9 +674,9 @@ int ref_sample_argmax(const RadArgs* a, RadStream) {
  * floats (exact below 2^24). Read before any sampling stage, as OpenAI's and llama-server's
  * logprobs report. Rows without the flag are not written. Under a split vocabulary ids are global
  * (+ `vocab_off`) and the host merges ranks; an unfilled slot is id -1, logit -infinity. The sum is
- * in double. */
+ * in double. Without `params` every row is written (a drafter's candidate logprobs). */
 int ref_sample_logprobs(const RadArgs* a, RadStream) {
-    if (!have(a, 3)) return RAD_E_INVAL;
+    if (a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1], *st = &a->t[2];
     const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
     const int64_t k = p_int(a, "k", 0);
@@ -686,11 +686,11 @@ int ref_sample_logprobs(const RadArgs* a, RadStream) {
     const int64_t w = 2 + 2 * k;
     if (M <= 0 || numel(st) < M * w) return RAD_E_SHAPE;
     Rows R;
-    RAD_REF_TRY(param_rows(pr, M, &R));
+    if (pr->data) RAD_REF_TRY(param_rows(pr, M, &R));
 
     REF_PAR_FOR(M * n_vocab * (k + 2))
     for (int64_t m = 0; m < M; ++m) {
-        if (!(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
+        if (pr->data && !(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
         const int64_t lb = rowoff(lg, m, n_vocab), ls = laststride(lg);
         const int64_t sb = rowoff(st, m, w), ss = laststride(st);
         float mx = -INFINITY;

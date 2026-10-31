@@ -685,9 +685,9 @@ AVX_KERNEL(sample_argmax) {
  * pass the test after the first few thousand columns.
  *
  * The sum is f32 in four accumulators. Its terms are in (0, 1] and a logprob carries only its
- * relative error, so f32 suffices (libref uses double). */
+ * relative error, so f32 suffices (libref uses double). Without `params` every row is written. */
 AVX_KERNEL(sample_logprobs) {
-    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    if (a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1], *st = &a->t[2];
     const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
     const int64_t k = p_int(a, "k", 0);
@@ -697,11 +697,11 @@ AVX_KERNEL(sample_logprobs) {
     const int64_t w = 2 + 2 * k;
     if (M <= 0 || numel(st) < M * w) return RAD_E_SHAPE;
     Rows R;
-    AVX_TRY(rows_of_params(pr, M, &R));
+    if (pr->data) AVX_TRY(rows_of_params(pr, M, &R));
 
     AVX_PARALLEL_FOR_IF(M * n_vocab >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
-        if (!(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
+        if (pr->data && !(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
         float* buf = scratch_f32((size_t)n_vocab + 2 * (size_t)k);
         const float* v = in_row(lg, rowoff(lg, m, n_vocab), n_vocab, buf);
         float* tv = buf + n_vocab;                 /* the set's values, descending */

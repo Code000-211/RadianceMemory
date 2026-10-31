@@ -162,6 +162,22 @@ static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT
 /* A learned position table resampled to each row's grid and added in (a vision tower's). */
 static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+/* LiLiCorr's correlator (ref_lili.cpp). */
+static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
+                                          P_INT("n"), P_STR("dtype"), P_F64O("eps"),
+                                          P_INTO("row_k") };
+static const RadOperandSpec oLiliCand[] = { OPD("stats"), OPD("pas"), WGT("ln_w"), WGT("ln_b"),
+                                            WGT("up_w"), WGT("up_b"), WGT("slot"), WGT("rank"),
+                                            OUT("cand"), OUT("feat"), OUT("base") };
+static const RadParamSpec pLiliAttn[] = { P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n_head"),
+                                          P_INT("head_dim"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oLiliAttn[] = { OPD("qkv"), WGT("rel"), WGT("same"), OUT("out") };
+static const RadParamSpec pLiliFactor[] = { P_INT("M"), P_INT("L"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLiliFactor[] = { OPD("h"), OPD("a"), OUT("y") };
+static const RadParamSpec pLiliWalk[] = { P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n"),
+                                          P_STR("dtype"), P_F64O("eps"), P_F64O("scale") };
+static const RadOperandSpec oLiliWalk[] = { OPD("edges"), OPD("aout"), OPD("cand"), OUT("tokens"),
+                                            OUT_O("scores") };
 
 static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
@@ -398,6 +414,13 @@ static const RadOperandSpec oAttnPaged[] = {
 static const RadOperandSpec oAttnPagedTree[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
+};
+
+/* attn_paged with a learned sink logit a query head (gpt-oss, LiLiCorr's drafter). A name of its
+ * own, so no attn_paged kernel that does not know the operand can be chosen for it. */
+static const RadOperandSpec oAttnPagedSink[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), WGT("sinks"), OUT("out")
 };
 /* Effective on kv_store, where `block_size` is RAD_REQUIRED: admits every value and refuses only a
  * query that omits it. On attn_paged the key is RAD_DERIVED and the constraint is skipped
@@ -803,7 +826,7 @@ static const RadOperandSpec oArgmax[]    = { OPD("logits"), OPD("params"), OUT("
  * sample_topk. */
 static const RadParamSpec pLogprobs[]    = { P_INT("M"), P_INT("n_vocab"), P_INT("k"),
                                              P_INTO("vocab_off") };
-static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD("params"), OUT("stats") };
+static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD_O("params"), OUT("stats") };
 static const RadOperandSpec oNarrow[]    = { INOUT("cand_idx"), INOUT("cand_val"), OPD("params") };
 static const RadOperandSpec oPick[]      = { OPD("cand_idx"), OPD("cand_val"), OPD("params"),
                                              OUT("token") };
@@ -1178,6 +1201,26 @@ static const RadOpSchema kSchemas[] = {
   "antialias=True) resamples it to the row's grid -- SigLIP2's position embedding: per axis a "
   "triangle filter on half-pixel centres, widened by the scale when shrinking, its in-table taps "
   "normalised. Separable, f32, rounded once before the add; coordinates clamp into their grid." },
+{ "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
+  "LiLiCorr's candidates. `stats` [M, world * (2 + 2k)] f32 is each rank's sample_logprobs row, "
+  "row-interleaved; the ranks merge to the log-normaliser and the k largest pairs by value, ties to "
+  "the lower id. cand [M, k] i32 = those ids. For candidate j, lp_j = logit_j - lse: feat row m*k+j "
+  "= silu(up_w . layernorm([lp_j, exp lp_j, lp_j - lp_0, j/(k-1), j == 0]; ln_w, ln_b, eps) + "
+  "up_b); base row m*k+j = pas[m] + slot[m % steps] + rank[j]. f32, rounded once to the outputs." },
+{ "lili_attn", ARR(pLiliAttn), ARR(oLiliAttn),
+  "Attention over each sequence's lattice of L = steps * k rows (row i at slot i / k): qkv [M, 3 * "
+  "n_head * head_dim] as q | k | v; score(i, j) = q_i . k_j * scale + rel[h][s_i - s_j + steps] + "
+  "(s_i == s_j ? same[h] : 0), softmax over the lattice's rows, out [M, n_head * head_dim]. No "
+  "mask." },
+{ "lili_factor", ARR(pLiliFactor), ARR(oLiliFactor),
+  "y [M, 3n] = [h_i | a_s | h_i * a_s] with s = i / L: each lattice row beside its sequence's anchor "
+  "and their product, the factor projection's input." },
+{ "lili_walk", ARR(pLiliWalk), ARR(oLiliWalk),
+  "LiLiCorr's walk. edges [M * steps * k, 2n] each candidate's outgoing | incoming vector, aout "
+  "[M, n] the anchor's; each normalised as v / max(|v|, eps). start[j] = scale * aout . in[0][j], "
+  "pair[s][i][j] = scale * out[s][i] . in[s+1][j]; greedy p_0 = argmax start, p_s = argmax "
+  "pair[s-1][p_{s-1}], first index on ties; tokens [M, steps] i32 = cand[m * steps + s][p_s]. "
+  "`scores` [M, steps, k, k], when passed: row 0 start for every i, row s pair[s - 1]." },
 { "add", ARR(pAdd), ARR(oBinary),
   "y = a + b. An operand carrying exactly n elements against a taller output broadcasts along "
   "rows; nothing else broadcasts. With `div`, y = rd(rd(a + b) / div), rd y's dtype: the last "
@@ -1489,6 +1532,10 @@ static const RadOpSchema kSchemas[] = {
   "causal row, else the row's parent's index within its sequence's rows (-1 for the block's "
   "first row). Inside the block such a row sees itself and its ancestors only, and its window is "
   "measured from the block's first position plus its depth." },
+{ "attn_paged_sink", ARR(pAttnPaged), ARR(oAttnPagedSink),
+  "attn_paged with `sinks` [n_head] f32, one logit a query head in the scaled-score domain: it "
+  "joins the softmax's maximum and denominator, contributes no value, and so only shrinks the "
+  "keys' weights (out = sum_j p_j v_j with p_j = exp(s_j) / (sum_k exp(s_k) + exp(sink)))." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "Dense varlen attention over cu_seqlens segments (rows cu/cu_div). Nothing paged. `window` is "
   "attn_paged's rule over a segment's positions: causal, i - j < window; non-causal, |i - j| < "
@@ -2290,6 +2337,14 @@ SIMPLE("ref_grid_embed", "grid_embed", "elem",
 SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        ref_grid_embed_aa),
+SIMPLE("ref_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features",
+       DT_FLOAT, ref_lili_cand),
+SIMPLE("ref_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",
+       DT_FLOAT, ref_lili_attn),
+SIMPLE("ref_lili_factor", "lili_factor", "draft", "LiLiCorr factor input [h | a | h * a]",
+       DT_FLOAT, ref_lili_factor),
+SIMPLE("ref_lili_walk", "lili_walk", "draft", "LiLiCorr edge scores and greedy walk", DT_FLOAT,
+       ref_lili_walk),
 SIMPLE("ref_add", "add", "elem", "elementwise sum", DT_FLOAT, ref_add),
 SIMPLE("ref_mul", "mul", "elem", "elementwise product", DT_FLOAT, ref_mul),
 SIMPLE("ref_mla_attn", "mla_attn", "attn", "absorbed latent MQA attention", DT_FLOAT,
@@ -2476,6 +2531,11 @@ ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged_tree, nullptr),
+ROW("ref_attn_paged_sink", "attn_paged_sink", "attn",
+    "paged causal / sliding-window attention with a sink logit a head, any query length",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; f32 sinks",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    nullptr, nullptr, ref_attn_paged_sink, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",

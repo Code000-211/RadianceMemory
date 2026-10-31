@@ -196,6 +196,8 @@ set(R4D_UNITS
   "r4d_rowtopk_bf16|"
   # The vocab-sharded draft head's cross-rank top-1, one id a row.
   "r4d_pair_argmax_f32|"
+  # LiLiCorr's correlator: candidates, lattice attention, factor input, walk.
+  "r4d_lili|"
   # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"

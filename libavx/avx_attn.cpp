@@ -101,8 +101,23 @@ static inline void axpy(float* acc, const float* v, float w, int64_t n) {
  * q-block) unit widens the context once into panels and runs its rows from them. Per-row math
  * (ascending dots, the same rescale points) is the decode form's; the loads differ. q-blocks of 64
  * keep enough units for the thread pool. Ragged (cus) inputs always take the decode form. */
-static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream stream) {
-    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
+/* A sink (attn_paged_sink): one more logit in a row's softmax, with no value. Folded in after the
+ * keys: the maximum moves to it if it is larger, and the sum takes its weight. */
+static inline void sink_fold(float sk, float* acc, int64_t head_dim, float* m, float* l) {
+    if (*m == -INFINITY) return;          /* no visible key: the row stays zero */
+    if (sk > *m) {
+        const float r = sc_exp(*m - sk);
+        for (int64_t d = 0; d < head_dim; ++d) acc[d] *= r;
+        *l = *l * r + 1.0f;
+        *m = sk;
+    } else {
+        *l += sc_exp(sk - *m);
+    }
+}
+
+static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream stream,
+                              const RadTensor* sinks, int oi) {
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[oi];
     const RadTensor* kdes = rad_arg_in(a, 4);
     const RadTensor* vdes = rad_arg_in(a, 5);
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
@@ -225,6 +240,7 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
                     if (++ntile == AVX_KV_TILE) flush();
                 }
                 flush();
+                if (sinks) sink_fold(ldt(sinks, h), acc, head_dim, &m, &l);
                 if (m == -INFINITY) {
                     for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
                     continue;
@@ -246,6 +262,7 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
     return RAD_OK;
 }
 
+/* attn_paged, and attn_paged_sink with `sinks` (one logit a query head): out at operand `oi`. */
 /* attn_paged_tree's ninth operand, `spec_parent` (rad_drafter_tree), is read here too, as libref
  * reads it: -2 an ordinary causal row; else the row's parent's index within its sequence's rows
  * (-1 for the block's first). Inside the block such a row sees itself and its ancestors only, and
@@ -253,14 +270,17 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
 /* `shared_anchor_window` (attn_paged_anchor_window): every row of a sequence measures its window,
  * and a causal row its last visible key, from the sequence's first query position instead of its
  * own, as libref does (ref_attn.cpp, ref_attn_paged_impl). */
-static int attn_paged_impl(const RadArgs* a, RadStream stream, bool shared_anchor_window) {
-    if (a->n_t < 8) return RAD_E_INVAL;
-    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
+static int attn_paged_rows(const RadArgs* a, RadStream stream, const RadTensor* sinks, int oi,
+                           bool shared_anchor_window = false) {
+    if (a->n_t < oi + 1) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[oi];
     const RadTensor* kdes = rad_arg_in(a, 4);
     const RadTensor* vdes = rad_arg_in(a, 5);
     const RadTensor* cus  = rad_arg_in(a, 6);
-    const RadTensor* tpar = a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    /* The tree operand sits where attn_paged_sink keeps its output; a sinked call has none. */
+    const RadTensor* tpar = !sinks && a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
     if (!q->data || !kv->data || !bt->data || !su->data || !o->data) return RAD_E_INVAL;
+    if (sinks && !sinks->data) return RAD_E_INVAL;
 
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa = p_int(a, "gqa", 1);
@@ -277,6 +297,7 @@ static int attn_paged_impl(const RadArgs* a, RadStream stream, bool shared_ancho
     if (kv_heads <= 0) return RAD_E_SHAPE;
     const int64_t q_heads = gqa * kv_heads;
     if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    if (sinks && numel(sinks) != q_heads) return RAD_E_SHAPE;
     const int64_t n_seq = numel(su);
     const int64_t rows = numel(q) / (q_heads * head_dim);
     if (n_seq <= 0 || rows <= 0) return RAD_E_SHAPE;
@@ -303,7 +324,8 @@ static int attn_paged_impl(const RadArgs* a, RadStream stream, bool shared_ancho
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     /* Uniform long queries take the panel form; ragged (cus) inputs stay here. */
-    if (!cus && q_len >= 32 && !tpar && !shared_anchor_window) return attn_paged_prefill(a, stream);
+    if (!cus && q_len >= 32 && !tpar && !shared_anchor_window)
+        return attn_paged_prefill(a, stream, sinks, oi);
     /* Work units are (token, kv-head) groups: the gqa query rows of a group share every key and
      * value row, so each is widened once for gqa dots/axpys. Per-row arithmetic is unchanged. */
     const int64_t total = rows * kv_heads;
@@ -446,6 +468,7 @@ static int attn_paged_impl(const RadArgs* a, RadStream stream, bool shared_ancho
             const int64_t h = kh * gqa + g;
             const int64_t ob = tok * o_rs + h * o_hs;
             float* ac = accs + g * head_dim;
+            if (sinks) sink_fold(ldt(sinks, h), ac, head_dim, &mm[g], &ll[g]);
             if (mm[g] == -INFINITY) {
                 for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
                 continue;
@@ -464,6 +487,11 @@ static int attn_paged_impl(const RadArgs* a, RadStream stream, bool shared_ancho
         }
     }
     return RAD_OK;
+}
+
+AVX_KERNEL(attn_paged_sink) {
+    if (a->n_t < 9 || !a->t[7].data) return RAD_E_INVAL;
+    return attn_paged_rows(a, stream, &a->t[7], 8);
 }
 
 /* ------------------------------------------------------------------ attn_dense, bf16 blocks */
@@ -752,13 +780,13 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
 }
 #endif
 
-AVX_KERNEL(attn_paged) { return attn_paged_impl(a, stream, false); }
+AVX_KERNEL(attn_paged) { return attn_paged_rows(a, stream, nullptr, 7, false); }
 
 /* attn_paged with one window anchor a sequence (DSpark's drafter); no tree operand. */
 AVX_KERNEL(attn_paged_anchor_window) {
     if (!a || a->n_t < 8) return RAD_E_INVAL;
     if (a->n_t > 8 && rad_arg_in(a, 8)) return RAD_E_UNSUPPORTED;
-    return attn_paged_impl(a, stream, true);
+    return attn_paged_rows(a, stream, nullptr, 7, true);
 }
 
 /* attn_paged with its tree operand present, which attn_paged reads (see there). Refused without

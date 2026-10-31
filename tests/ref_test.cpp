@@ -1079,6 +1079,7 @@ TEST(op_vocabulary) {
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
+        "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
         /* libr4d's row-form names, served by the base op's row. */
         "rmsnorm_rows", "rope_rows", "gemm_nt_q_short", "gemm_nt_q_gated_wide",
@@ -1149,6 +1150,8 @@ TEST(op_vocabulary) {
         /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
         "sub_i32",
         "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
+        /* LiLiCorr's candidate correlator (Nemotron-3.5-Bolt's drafter). */
+        "lili_cand", "lili_attn", "lili_factor", "lili_walk",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -1157,16 +1160,18 @@ TEST(op_vocabulary) {
     CHECK_EQ(api().kernel_count(), (int)(sizeof(kOps) / sizeof(kOps[0])));
 
     /* The structural constraint on the paged block, and only that; everything else must match
-     * anything. attn_paged_tree is attn_paged's row with the tree operand, the same constraint. */
+     * anything. attn_paged_tree, attn_paged_anchor_window and attn_paged_sink take attn_paged's. */
     CHECK_EQ(kern("attn_paged")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged")->constraints[0].key, "block_size") == 0);
     CHECK_EQ(kern("attn_paged_tree")->n_constraints, 1);
+    CHECK_EQ(kern("attn_paged_sink")->n_constraints, 1);
+    CHECK(std::strcmp(kern("attn_paged_sink")->constraints[0].key, "block_size") == 0);
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
     CHECK_EQ(kern("gemm_nt")->n_constraints, 0);
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 4);
+    CHECK_EQ(constrained, 5);
 }
 
 /* ================================================================== the numerics
@@ -3194,6 +3199,47 @@ TEST(op_attn_paged) {
     CHECK_OK(run("attn_paged", b));
     CHECK_NEAR(out2.at(4), 0.0f, 1e-6);
     CHECK_NEAR(out2.at(5), 1.0f, 1e-6);
+}
+
+TEST(op_attn_paged_sink) {
+    /* op_attn_paged's cache and queries, non-causal, with a sink logit a head: token 0 now sees both
+     * keys too, and each sink adds exp(sink) to the denominator only. Head 0, token 0, q = [1,0]:
+     * scores 1/sqrt(2) and 0, so weights 1, exp(-1/sqrt(2)) and exp(sink0 - 1/sqrt(2)). */
+    const float sc = 1.0f / 1.41421356f;
+    T q(RAD_F32, {2, 2, 2});
+    q.f({ 1, 0,   0, 1,
+          0, 1,   1, 0 });
+    T kv(RAD_F32, {1, 1, 2, 4});
+    kv.f({ 1, 0, 1, 0,
+           0, 1, 0, 1 });
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({2});
+    T sk(RAD_F32, {2});    sk.f({ 0.5f, 3.0f });     /* head 1's sink lies above every score */
+    T out(RAD_F32, {2, 2, 2});
+    A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(sk).t(out)
+          .i("q_len", 2).i("head_dim", 2).i("gqa", 2).i("block_size", 2)
+          .i("causal", 0).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged_sink", a));
+    const float w = std::exp(-sc);
+    const float d0 = 1.0f + w + std::exp(0.5f - sc);          /* head 0, either token */
+    CHECK_NEAR(out.at(0), 1.0f / d0, 1e-6); CHECK_NEAR(out.at(1), w / d0, 1e-6);
+    CHECK_NEAR(out.at(4), w / d0, 1e-6);    CHECK_NEAR(out.at(5), 1.0f / d0, 1e-6);
+    const float d1 = 1.0f + w + std::exp(3.0f - sc);          /* head 1 */
+    CHECK_NEAR(out.at(2), w / d1, 1e-6);    CHECK_NEAR(out.at(3), 1.0f / d1, 1e-6);
+    CHECK_NEAR(out.at(6), 1.0f / d1, 1e-6); CHECK_NEAR(out.at(7), w / d1, 1e-6);
+
+    /* A sink far below every score changes nothing: attn_paged's values, causal. */
+    T sk2(RAD_F32, {2}); sk2.f({ -1e30f, -1e30f });
+    T o1(RAD_F32, {2, 2, 2}), o2(RAD_F32, {2, 2, 2});
+    A b; b.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(o1)
+          .i("q_len", 2).i("head_dim", 2).i("gqa", 2).i("block_size", 2)
+          .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", b));
+    A c; c.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(sk2).t(o2)
+          .i("q_len", 2).i("head_dim", 2).i("gqa", 2).i("block_size", 2)
+          .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged_sink", c));
+    for (int i = 0; i < 8; ++i) CHECK_NEAR(o2.at(i), o1.at(i), 1e-7);
 }
 
 TEST(op_attn_paged_ragged) {
@@ -10010,6 +10056,13 @@ std::vector<Geo> geometries() {
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("lili_cand", "M", 3, a.i("M", R).i("k", 4).i("world", 1).i("steps", 3).i("n", 8)
+                                .s("dtype", "f32")),
+        G("lili_attn", "M", 8, a.i("M", R).i("steps", 2).i("k", 2).i("n_head", 2).i("head_dim", 4)
+                                .s("dtype", "f32")),
+        G("lili_factor", "M", 8, a.i("M", R).i("L", 4).i("n", 8).s("dtype", "f32")),
+        G("lili_walk", "M", 2, a.i("M", R).i("steps", 3).i("k", 2).i("n", 8).s("dtype", "f32")
+                                .d("eps", 1e-4).d("scale", 8.0)),
         G("layernorm", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("add", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("mul", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
@@ -10099,6 +10152,10 @@ std::vector<Geo> geometries() {
            .i("window", 4).s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
         G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                          .i("block_size", 4).i("causal", 1).i("window", 0)
+                                         .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
+                                         .i("ctx", 9)),
+        G("attn_paged_sink", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                         .i("block_size", 4).i("causal", 0).i("window", 0)
                                          .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
                                          .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
@@ -10371,7 +10428,9 @@ bool undrawable(const char* op) {
     // Complete raster grids need the hand-built cases in nemotron35_test, not random indices.
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
            !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
-           !std::strcmp(op, "pixtral_merge");
+           !std::strcmp(op, "pixtral_merge") ||
+           /* sample_logprobs rows (sorted pairs, positive sums): avx_check_hand.cpp builds them */
+           !std::strcmp(op, "lili_cand");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

@@ -950,6 +950,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
 | `attn_paged_anchor_window` | same parameters as `attn_paged` | same operands as `attn_paged` → `out` |
+| `attn_paged_sink` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`?, `sinks`w → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
@@ -967,6 +968,12 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 | `qkv_norm_rope_kv_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` `v_norm`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w, `slot_mapping`, `kv_cache`:inout |
+
+**`attn_paged_sink`** is `attn_paged` with a learned logit a query head beside the keys: `sinks`
+`[n_head]` f32, in the scaled-score domain, joins each row's softmax maximum and denominator and
+carries no value, so `out = Σ_j p_j v_j` with `p_j = exp(s_j) / (Σ_k exp(s_k) + exp(sink))`. A row
+with no visible key stays zero. It has its own name so that no `attn_paged` kernel which does not
+know the operand can be chosen for it (LiLiCorr's drafter, and gpt-oss's sinks have the same form).
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
 verify, thousands in a prefill chunk, and libr4d has a different kernel for each band.
@@ -2849,7 +2856,7 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_pick` | `M`(range) `n_cand` | `cand_idx`, `cand_val`, `params` → `token` |
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
-| `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
+| `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params`? → `stats` |
 | `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
 | `dflash_couple_propose` | `M`(range) `steps` `top_k` `rank` `n_vocab` `anchor_stride` `max_rounds` `q_temp`:f64/opt | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w, `seq_ids`, `draw`, `tokens`:inout → `state`:inout |
@@ -2907,7 +2914,8 @@ llama.cpp's: 0 turns the stage off for the row, and a negative value takes the w
 
 `sample_logprobs` serves an OpenAI `logprobs` field or llama-server's `n_probs`. It runs on the raw
 logits, before any stage has touched them, and only for a row whose flags carry `RAD_SP_LOGPROBS`;
-other rows are not written. `stats` is `[M, 2 + 2k]` f32: the row's maximum, the sum of
+other rows are not written. Without `params` every row is written (a drafter's candidate logprobs,
+`lili_cand`). `stats` is `[M, 2 + 2k]` f32: the row's maximum, the sum of
 `exp(l - max)` over it, and its `k` largest as (id, logit) pairs, descending, ties to the lower id,
 the id written as a float (exact below 2^24) and global under a split vocabulary (`vocab_off`
 added). A slot past the vocabulary is id -1, logit -infinity. `k` is geometry, the one width every
@@ -3449,6 +3457,42 @@ the draft logits, decoded greedily, with the predecessor read after the previous
 inside one workgroup. Written literally it is `steps` full-vocabulary `[rank, n_vocab]` matrix
 products; through this operand it is a codebook gather. The only approximation is the top-K
 candidate set, which can cost acceptance and nothing else.
+
+### LiLiCorr
+
+| op | params | operands |
+|---|---|---|
+| `lili_cand` | `M`(range) `k` `world` `steps` `n` `dtype` `eps`:f64/opt `row_k`/opt | `stats`, `pas`, `ln_w`w, `ln_b`w, `up_w`w, `up_b`w, `slot`w, `rank`w → `cand`, `feat`, `base` |
+| `lili_attn` | `M`(range) `steps` `k` `n_head` `head_dim` `dtype` `scale`:f64/opt | `qkv`, `rel`w, `same`w → `out` |
+| `lili_factor` | `M`(range) `L` `n` `dtype` | `h`, `a` → `y` |
+| `lili_walk` | `M`(range) `steps` `k` `n` `dtype` `eps`:f64/opt `scale`:f64/opt | `edges`, `aout`, `cand` → `tokens`, `scores`? |
+
+LiLiCorr (Nemotron-3.5-Bolt's drafter) is a DFlash2 backbone whose head is a candidate correlator:
+each draft position keeps the target head's top-k, and a small transformer over all positions'
+candidates scores the edges between consecutive positions. A sequence's lattice is `steps` positions
+of `k` candidates, row `s * k + j`, the sequences one after another.
+
+**`lili_cand`** reads `stats` `[M, world * (2 + 2 row_k)]` f32, each rank's `sample_logprobs` row
+row-interleaved (`row_k` >= `k` pairs, by default `k`: a caller widens a rank's row to whole 16-byte
+words for the all-gather, 9 pairs where it keeps 8), and merges them as one row would be read: the log-normaliser from the maxima and
+the rescaled sums, the `k` largest pairs by value, ties to the lower id. `cand` `[M, k]` i32 holds
+those ids. With `lp_j = logit_j - lse`, row `m * k + j` of `feat` is
+`silu(up_w · layernorm([lp_j, exp lp_j, lp_j - lp_0, j/(k-1), j == 0]; ln_w, ln_b, eps) + up_b)`
+and of `base` `pas[m] + slot[m % steps] + rank[j]`: the lattice row's additive part, to which the
+token and feature projections are added by their GEMMs' residual operand.
+
+**`lili_attn`** is attention within each lattice, every row seeing every row: `qkv` is
+`[M, 3 * n_head * head_dim]` as q | k | v, and the score is
+`q_i · k_j * scale + rel[h][s_i - s_j + steps] + (s_i == s_j ? same[h] : 0)` with `s_i = i / k`.
+
+**`lili_factor`** writes `[h_i | a_s | h_i * a_s]`, `s = i / L`: a lattice row beside its sequence's
+anchor and their product, the input of the factor projection `W [x, a, x * a] + b`.
+
+**`lili_walk`** normalises each candidate's outgoing and incoming vector (`edges`, `[out | in]`) and
+the anchor's outgoing one (`aout`) as `v / max(|v|, eps)`, scores `start[j] = scale * aout · in[0][j]`
+and `pair[s][i][j] = scale * out[s][i] · in[s + 1][j]`, and walks greedily from the start, the first
+index winning a tie: `tokens[m][s] = cand[m * steps + s][p_s]`. `scores` `[M, steps, k, k]` is the
+score tensor vLLM builds (row 0 the start for every `i`), for checking.
 
 ### `mtp_enter`
 

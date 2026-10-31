@@ -134,6 +134,22 @@ static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+/* LiLiCorr's correlator (avx_lili.cpp; libref/ref_lili.cpp has the contracts). */
+static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
+                                          P_INT("n"), P_STR("dtype"), P_F64O("eps"),
+                                          P_INTO("row_k") };
+static const RadOperandSpec oLiliCand[] = { OPD("stats"), OPD("pas"), WGT("ln_w"), WGT("ln_b"),
+                                            WGT("up_w"), WGT("up_b"), WGT("slot"), WGT("rank"),
+                                            OUT("cand"), OUT("feat"), OUT("base") };
+static const RadParamSpec pLiliAttn[] = { P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n_head"),
+                                          P_INT("head_dim"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oLiliAttn[] = { OPD("qkv"), WGT("rel"), WGT("same"), OUT("out") };
+static const RadParamSpec pLiliFactor[] = { P_INT("M"), P_INT("L"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLiliFactor[] = { OPD("h"), OPD("a"), OUT("y") };
+static const RadParamSpec pLiliWalk[] = { P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n"),
+                                          P_STR("dtype"), P_F64O("eps"), P_F64O("scale") };
+static const RadOperandSpec oLiliWalk[] = { OPD("edges"), OPD("aout"), OPD("cand"), OUT("tokens"),
+                                            OUT_O("scores") };
 
 static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
@@ -312,6 +328,12 @@ static const RadOperandSpec oAttnPaged[] = {
 static const RadOperandSpec oAttnPagedTree[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
+};
+
+/* attn_paged with a learned sink logit a query head; a name of its own (libref's file comment). */
+static const RadOperandSpec oAttnPagedSink[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), WGT("sinks"), OUT("out")
 };
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
@@ -899,7 +921,7 @@ static const RadOperandSpec oTopk[]      = { OPD("logits"), OPD("params"),
 static const RadOperandSpec oArgmax[]    = { OPD("logits"), OPD("params"), OUT("token") };
 static const RadParamSpec pLogprobs[]    = { P_INT("M"), P_INT("n_vocab"), P_INT("k"),
                                              P_INTO("vocab_off") };
-static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD("params"), OUT("stats") };
+static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD_O("params"), OUT("stats") };
 static const RadOperandSpec oNarrow[]    = { INOUT("cand_idx"), INOUT("cand_val"), OPD("params") };
 static const RadOperandSpec oPick[]      = { OPD("cand_idx"), OPD("cand_val"), OPD("params"),
                                              OUT("token") };
@@ -973,6 +995,16 @@ static const RadOpSchema kSchemas[] = {
   "x += a side x side position table resampled bilinearly to the row's grid." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
+{ "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
+  "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
+  "layernorm, the up projection and silu, and the lattice rows' additive part." },
+{ "lili_attn", ARR(pLiliAttn), ARR(oLiliAttn),
+  "attention over each sequence's candidate lattice with a learned bias on slot distance and the "
+  "same slot." },
+{ "lili_factor", ARR(pLiliFactor), ARR(oLiliFactor),
+  "[h | a | h * a] a lattice row, a its sequence's anchor." },
+{ "lili_walk", ARR(pLiliWalk), ARR(oLiliWalk),
+  "LiLiCorr's normalised edge scores and their greedy walk." },
 { "add", ARR(pAdd), ARR(oBinary),
   "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows. With "
   "`div`, y = rd(rd(a + b) / div), bit for bit libref's." },
@@ -1124,6 +1156,9 @@ static const RadOpSchema kSchemas[] = {
   "else the row's parent's index within its sequence's rows (-1 for the block's first). Inside the "
   "block such a row sees itself and its ancestors only; its window is measured from the block's "
   "first position plus its depth." },
+{ "attn_paged_sink", ARR(pAttnPaged), ARR(oAttnPagedSink),
+  "attn_paged with `sinks` [n_head] f32, one logit a query head beside the keys in the softmax's "
+  "maximum and denominator, with no value." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
   "(`window_right`)." },
@@ -1631,6 +1666,14 @@ SIMPLE("avx_grid_embed", "grid_embed", "elem",
 SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        L(grid_embed_aa)),
+SIMPLE("avx_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features", DT_FLOAT,
+       L(lili_cand)),
+SIMPLE("avx_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",
+       DT_FLOAT, L(lili_attn)),
+SIMPLE("avx_lili_factor", "lili_factor", "draft", "LiLiCorr factor input [h | a | h * a]",
+       DT_FLOAT, L(lili_factor)),
+SIMPLE("avx_lili_walk", "lili_walk", "draft", "LiLiCorr edge scores and greedy walk", DT_FLOAT,
+       L(lili_walk)),
 SIMPLE("avx_add", "add", "elem", "elementwise sum", DT_FLOAT, L(add)),
 SIMPLE("avx_mul", "mul", "elem", "elementwise product, broadcasting b", DT_FLOAT, L(mul)),
 SIMPLE("avx_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, L(act_mul)),
@@ -1793,6 +1836,10 @@ ROW("avx_attn_paged_tree", "attn_paged_tree", "attn",
     "paged causal / sliding-window attention with a tree verify block (spec_parent)",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_tree)),
+ROW("avx_attn_paged_sink", "attn_paged_sink", "attn",
+    "paged causal / sliding-window attention with a sink logit a head, any query length",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; f32 sinks",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_sink)),
 SIMPLE("avx_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        L(attn_dense)),
 SIMPLE("avx_attn_cross", "attn_cross", "attn",

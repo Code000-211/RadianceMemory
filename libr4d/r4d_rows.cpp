@@ -137,6 +137,19 @@ static const RadOperandSpec oAttnPagedTree[] = {
     { "spec_parent", RAD_OPD_IN,  0 },
 };
 
+/* attn_paged with a sink logit a query head, its own name so no kernel ignorant of it is chosen. */
+static const RadOperandSpec oAttnPagedSink[] = {
+    { "q",           RAD_OPD_IN,     0 },
+    { "kv_cache",    RAD_OPD_IN,     0 },
+    { "block_table", RAD_OPD_IN,     0 },
+    { "seqused",     RAD_OPD_IN,     0 },
+    { "k_descale",   RAD_OPD_IN,     1 },
+    { "v_descale",   RAD_OPD_IN,     1 },
+    { "cu_seqlens",  RAD_OPD_IN,     1 },
+    { "sinks",       RAD_OPD_WEIGHT, 0 },   /* [n_head] f32 */
+    { "out",         RAD_OPD_OUT,    0 },
+};
+
 /* attn_paged with gate_quant_fp8 folded into its merge: attn_paged's parameters plus the two of
  * gate_quant_fp8's that are not implied (its `n` is `head_dim`, its rows attn_paged's (token,
  * head) pairs), then attn_paged's operands, the gate, the codes and the scales. `out` holds the
@@ -2477,7 +2490,7 @@ static const RadParamSpec pLogprobs[] = {
 };
 static const RadOperandSpec oLogprobs[] = {
     { "logits", RAD_OPD_IN,  0 },
-    { "params", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  1 },   /* absent: every row */
     { "stats",  RAD_OPD_OUT, 0 },
 };
 static const RadOperandSpec oNarrow[] = {
@@ -2513,6 +2526,38 @@ static const RadOperandSpec oPairArgmax[] = {
     { "pairs", RAD_OPD_IN,  0 },
     { "idx",   RAD_OPD_OUT, 0 },
     { "val",   RAD_OPD_OUT, 1 },
+};
+/* LiLiCorr's correlator (r4d_lili.hip; libref/ref_lili.cpp has the contracts). */
+static const RadParamSpec pLiliCand[] = {
+    P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"), P_INT("n"), P_STR("dtype"),
+    P_F64O("eps"), P_INTO("row_k"),
+};
+static const RadOperandSpec oLiliCand[] = {
+    { "stats", RAD_OPD_IN, 0 },     { "pas", RAD_OPD_IN, 0 },
+    { "ln_w", RAD_OPD_WEIGHT, 0 },  { "ln_b", RAD_OPD_WEIGHT, 0 },
+    { "up_w", RAD_OPD_WEIGHT, 0 },  { "up_b", RAD_OPD_WEIGHT, 0 },
+    { "slot", RAD_OPD_WEIGHT, 0 },  { "rank", RAD_OPD_WEIGHT, 0 },
+    { "cand", RAD_OPD_OUT, 0 },     { "feat", RAD_OPD_OUT, 0 },     { "base", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLiliAttn[] = {
+    P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n_head"), P_INT("head_dim"), P_STR("dtype"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oLiliAttn[] = {
+    { "qkv", RAD_OPD_IN, 0 }, { "rel", RAD_OPD_WEIGHT, 0 }, { "same", RAD_OPD_WEIGHT, 0 },
+    { "out", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLiliFactor[] = { P_INT("M"), P_INT("L"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLiliFactor[] = {
+    { "h", RAD_OPD_IN, 0 }, { "a", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLiliWalk[] = {
+    P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n"), P_STR("dtype"), P_F64O("eps"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oLiliWalk[] = {
+    { "edges", RAD_OPD_IN, 0 }, { "aout", RAD_OPD_IN, 0 }, { "cand", RAD_OPD_IN, 0 },
+    { "tokens", RAD_OPD_OUT, 0 }, { "scores", RAD_OPD_OUT, 1 },
 };
 static const RadParamSpec pNormJoin[] = {
     P_INT("M"),
@@ -3345,6 +3390,9 @@ static const RadOpSchema kSchemas[] = {
      * attn_paged kernels read q dense and refuse a slice (RAD_E_STRIDE). Under this name the op
      * resolves to a kernel that takes the slice or to nothing, and in the latter case the
      * architecture lifts q into a dense block for attn_paged. */
+    SCHEMA("attn_paged_sink", pAttnPaged, oAttnPagedSink,
+           "attn_paged with `sinks` [n_head] f32: one logit a query head in the scaled-score "
+           "domain, in the softmax's maximum and denominator, with no value."),
     SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
@@ -3819,6 +3867,16 @@ static const RadOpSchema kSchemas[] = {
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
            "and the gated residual's write follows the reduction. Both wires at two ranks, the "
            "exact one at four."),
+    SCHEMA("lili_cand", pLiliCand, oLiliCand,
+           "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
+           "layernorm, the up projection and silu, and the lattice rows' additive part."),
+    SCHEMA("lili_attn", pLiliAttn, oLiliAttn,
+           "attention over each sequence's candidate lattice with a learned bias on slot distance "
+           "and the same slot."),
+    SCHEMA("lili_factor", pLiliFactor, oLiliFactor,
+           "[h | a | h * a] a lattice row, a its sequence's anchor."),
+    SCHEMA("lili_walk", pLiliWalk, oLiliWalk,
+           "LiLiCorr's normalised edge scores and their greedy walk."),
     SCHEMA("pair_argmax", pPairArgmax, oPairArgmax,
            "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in "
            "the first f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties "
@@ -4304,6 +4362,8 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
 R4D_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) R4D_WIN_C(cWinH128G1Fp8, 128, 1, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH128G8Bf16, 128, 8, "bf16", 0) R4D_WIN_C(cWinH128G8Fp8, 128, 8, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH128G16Bf16, 128, 16, "bf16", 0) R4D_WIN_C(cWinH128G16Fp8, 128, 16, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) R4D_WIN_C(cWinH256G1Fp8, 256, 1, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G2Bf16, 256, 2, "bf16", 0) R4D_WIN_C(cWinH256G2Fp8, 256, 2, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G4Bf16, 256, 4, "bf16", 1) R4D_WIN_C(cWinH256G4Fp8, 256, 4, "fp8_e4m3", 1)
@@ -4786,6 +4846,14 @@ static const RadConstraint cNormJoinRoute[] = {
 static const RadConstraint cPairArgmax[] = {
     C_GE("n", 1), C_IN("dtype", "f32 fp32"),
 };
+static const RadConstraint cLiliCand[] = {
+    C_GE("k", 2), C_LE("k", 64), C_GE("world", 1), C_LE("world", 16), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLiliAttn[] = {
+    C_GE("head_dim", 1), C_LE("head_dim", 128), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLiliFactor[] = { C_IN("dtype", "bf16") };
+static const RadConstraint cLiliWalk[] = { C_GE("k", 1), C_LE("k", 64), C_IN("dtype", "bf16") };
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
@@ -7371,6 +7439,24 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 R4D_WIN_PAIR(512, 16)
 #undef R4D_WIN_PAIR
 #undef R4D_WIN_ROW
+/* attn_paged_sink: the windowed kernels with the sink folded in (LiLiCorr's drafter, h128 at gqa 16
+ * to TP 2, gqa 8 at TP 4). */
+#define R4D_WINSINK_ROW(HD, G, KVN, KVS, C, KVDOC)                                                \
+{ "attn_window_sink_h" #HD "_gqa" #G "_" #KVN, "attn_paged_sink", "attn",                         \
+  "paged attention with a sink logit a head, any window, causal or not; split-KV with a merge",   \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query, " KVDOC " kv cache, f32 sinks, bf16 out, f32 partials",                             \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_sink_h##HD##_gqa##G##_##KVS,                              \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr,                                                                                \
+  r4d_shape_attn_paged_sink },
+R4D_WINSINK_ROW(128, 8, bf16kv, bf16, cWinH128G8Bf16, "bf16")
+R4D_WINSINK_ROW(128, 8, fp8kv, fp8, cWinH128G8Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_WINSINK_ROW(128, 16, bf16kv, bf16, cWinH128G16Bf16, "bf16")
+R4D_WINSINK_ROW(128, 16, fp8kv, fp8, cWinH128G16Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+#undef R4D_WINSINK_ROW
 
 /* DSpark's shared-anchor mask is intentionally a distinct op/kernel family, not an accepted
  * `window` variation of attn_paged's per-query visibility. Its base/upper key bounds are tied to
@@ -9886,6 +9972,41 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 /* pair_argmax, the sandwich-norm joins and expert_scale. The joins and expert_scale have no
  * opd_shape: libref has no row for them, and tests/r4d_emu holds their source to the replaced chain
  * bit for bit on the host. pair_argmax is described as libref describes it. */
+/* LiLiCorr's correlator: a few microseconds of a draft step each (r4d_lili.hip). */
+{ "lili_cand_bf16", "lili_cand", "draft",
+  "LiLiCorr candidates: the ranks' logprob rows merged, five rank features through layernorm, "
+  "the up projection and silu, and the lattice rows' additive part",
+  "k <= 64, world <= 16; one workgroup a draft position",
+  "f32 stats, layernorm and up projection; bf16 activations, slot and rank tables; i32 cand",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliCand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_cand, nullptr, nullptr, nullptr,
+  r4d_shape_lili_cand },
+{ "lili_attn_bf16", "lili_attn", "draft",
+  "LiLiCorr lattice attention with learned slot biases, no mask",
+  "steps * k <= 64, head_dim <= 128; one workgroup a (sequence, head)",
+  "bf16 qkv and out, f32 biases",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliAttn), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_attn, nullptr, nullptr, nullptr,
+  r4d_shape_lili_attn },
+{ "lili_factor_bf16", "lili_factor", "draft",
+  "LiLiCorr factor input [h | a | h * a]",
+  "any M and n; one workgroup a row",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliFactor), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_factor, nullptr, nullptr, nullptr,
+  r4d_shape_lili_factor },
+{ "lili_walk_bf16", "lili_walk", "draft",
+  "LiLiCorr normalised edge scores and their greedy walk",
+  "k <= 64, steps * k * k <= 512; one workgroup a sequence",
+  "bf16 edges and anchor, i32 cand and tokens, f32 scores",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliWalk), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_walk, nullptr, nullptr, nullptr,
+  r4d_shape_lili_walk },
+
 { "pair_argmax_f32", "pair_argmax", "select",
   "the top-1 of a row of (id, value) pairs, ties to the lower id, negative ids skipped",
   "any M and n; one wave a row; the outputs one element a row at their own pitch",

@@ -28,6 +28,10 @@
  *   a block-table entry < 0 is a missing block: its keys are not visible
  *   no visible key at all -> a zero row
  *   k_descale / v_descale per (sequence, kv head), absent = 1
+ *   attn_paged_sink: `sinks` [query heads] f32, one logit a head in the scaled-score domain, in
+ *     the softmax's maximum and denominator and with no value (LiLiCorr's drafter). Folded in where
+ *     a row is normalised: the unsplit kernel's store and the merge. The WMMA kernel takes none,
+ *     so a sink launch stays scalar.
  *
  * Paged layout: kv_cache[n_blocks, kv_heads, 16, 2*head_dim], K then V per slot, so one block of
  * one KV head is a contiguous run of 16 * 2 * head_dim elements; a key tile is one or two runs,
@@ -194,6 +198,7 @@ struct AttnArgs {
     const float*         vdes;
     uint16_t*            out;    long long o_rs, o_hs;
     float*               part;                             /* split-KV partials, or null */
+    const float*         sinks;                            /* [query heads] or null */
     int*                 tinfo;                            /* [tile] = (first row, positions) */
     float qscale;                                          /* softmax scale * log2(e) */
     int   max_blocks, n_seq, q_len, tps, kv_heads, causal, window, n_split;
@@ -484,6 +489,21 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
         if (!val[i]) continue;
         const int r = wave * RW + i, p = r / GQA, g = r - p * GQA;
         if (A.n_split == 1) {
+            /* A sink joins the row's max and sum with no value (log2 domain, as m and l). */
+            if (A.sinks && m[i] != -__builtin_inff()) {
+                const float s2 = A.sinks[kh * GQA + g] * 1.4426950408889634f;
+                if (s2 > m[i]) {
+                    const float corr = ex2(m[i] - s2);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) o[i][c][e] *= corr;
+                    l[i] = l[i] * corr + 1.0f;
+                    m[i] = s2;
+                } else {
+                    l[i] += ex2(s2 - m[i]);
+                }
+            }
             const float inv = l[i] > 0.0f ? vds / l[i] : 0.0f;
             uint16_t* op = A.out + (long long)(tok0 + p) * A.o_rs + (long long)(kh * GQA + g) * A.o_hs;
 #pragma unroll
@@ -922,8 +942,11 @@ __device__ __forceinline__ void merge_body(AttnArgs A) {
             for (int c = 0; c < NC; ++c) *(uint2*)(op + c * 128 + lane * 4) = make_uint2(0u, 0u);
             continue;
         }
-        const float w0 = ex2(m0 - mt), w1 = ex2(m1 - mt);    /* an empty split: ex2(-inf) = 0 */
-        const float lt = wave_sum(__builtin_fmaf(l0, w0, l1 * w1));
+        /* A sink joins the max and the sum with no value (log2 domain). */
+        const float s2 = A.sinks ? A.sinks[kh * GQA + g] * 1.4426950408889634f : ninf;
+        const float ms = __builtin_fmaxf(mt, s2);
+        const float w0 = ex2(m0 - ms), w1 = ex2(m1 - ms);    /* an empty split: ex2(-inf) = 0 */
+        const float lt = wave_sum(__builtin_fmaf(l0, w0, l1 * w1)) + (A.sinks ? ex2(s2 - ms) : 0.0f);
         const float inv = lt > 0.0f ? 1.0f / lt : 0.0f;
         float acc[NC][4];
 #pragma unroll
@@ -1051,9 +1074,11 @@ __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
 }
 
 template <int HD, int GQA, bool KV8, bool TREE = false, bool SHARED = false, bool FWD = false>
-static int launch_attn(const RadArgs* a, RadStream stream) {
+static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
-    if (!a || a->n_t < (TREE ? 9 : 8)) return RAD_E_INVAL;
+    if (!a || a->n_t < (TREE || sink ? 9 : 8)) return RAD_E_INVAL;
+    /* attn_paged_sink keeps its output where the tree operand would be: never both. */
+    if (TREE && sink) return RAD_E_INVAL;
     /* attn_paged_qrow_tree's ninth operand: one int32 a query row (docs/OPS.md). Causal only. */
     const RadTensor* tp = TREE ? rad_arg_in(a, 8) : nullptr;
     if (TREE && (!tp || !tp->data)) return RAD_E_INVAL;
@@ -1066,8 +1091,9 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     const RadTensor* kd = rad_arg_in(a, 4);
     const RadTensor* vd = rad_arg_in(a, 5);
     const RadTensor* cu = rad_arg_in(a, 6);
-    const RadTensor* o  = rad_arg_in(a, 7);
-    if (!q || !kv || !bt || !su || !o) return RAD_E_INVAL;
+    const RadTensor* sk = sink ? rad_arg_in(a, 7) : nullptr;
+    const RadTensor* o  = rad_arg_in(a, sink ? 8 : 7);
+    if (!q || !kv || !bt || !su || !o || (sink && !sk)) return RAD_E_INVAL;
 
     if (rad_args_geti_or(a, "head_dim", HD) != HD || rad_args_geti_or(a, "gqa", GQA) != GQA ||
         rad_args_geti_or(a, "block_size", 16) != 16)
@@ -1083,6 +1109,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     if (kv->dtype != (uint32_t)(KV8 ? RAD_F8E4M3 : RAD_BF16)) return RAD_E_DTYPE;
     if (bt->dtype != RAD_I32 || su->dtype != RAD_I32 || (cu && cu->dtype != RAD_I32)) return RAD_E_DTYPE;
     if ((kd && kd->dtype != RAD_F32) || (vd && vd->dtype != RAD_F32)) return RAD_E_DTYPE;
+    if (sk && sk->dtype != RAD_F32) return RAD_E_DTYPE;
 
     /* the cache: [n_blocks, kv_heads, 16, 2 * head_dim], slots dense */
     if (kv->rank != 4 || kv->shape[2] != 16 || kv->shape[3] != 2 * HD) return RAD_E_SHAPE;
@@ -1090,6 +1117,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     const int64_t kvh = kv->shape[1];
     if (kvh <= 0 || kvh > 65535) return RAD_E_SHAPE;
     const int64_t qh = kvh * GQA;
+    if (sk && rad_tensor_numel(sk) != qh) return RAD_E_SHAPE;
 
     int64_t rows = 0, q_rs = 0, q_hs = 0, orows = 0, o_rs = 0, o_hs = 0;
     if (!head_view(q, qh, HD, &rows, &q_rs, &q_hs) || !head_view(o, qh, HD, &orows, &o_rs, &o_hs))
@@ -1154,7 +1182,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
                             rows >= n_seq * (kWmmaMinQ / 2);
         const bool aligned = rad_ptr_aligned(q->data, 16) && rad_ptr_aligned(o->data, 16) &&
                              (q_rs | q_hs | o_rs | o_hs) % 8 == 0;
-        if (shaped && aligned) {
+        if (shaped && aligned && !sk) {
             constexpr int BQW = WGeo<HD>::R / GQA;
             int64_t ntw = 0, tpsw = 0;
             if (!cu) {
@@ -1220,6 +1248,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.vdes = vd ? (const float*)vd->data : nullptr;
     A.out = (uint16_t*)o->data;               A.o_rs = o_rs;  A.o_hs = o_hs;
     A.part = ns > 1 ? (float*)a->scratch : nullptr;
+    A.sinks = sk ? (const float*)sk->data : nullptr;
     A.tinfo = ns > 1 ? (int*)((char*)a->scratch + part_bytes<HD>()) : nullptr;
     const double scale = rad_args_getf_or(a, "scale", 1.0 / __builtin_sqrt((double)HD));
     A.qscale = (float)(scale * 1.4426950408889634);
@@ -1310,6 +1339,19 @@ R4D_WIN_ANCHOR_DEF(128, 1)
 R4D_WIN_ANCHOR_DEF(256, 1) R4D_WIN_ANCHOR_DEF(256, 2) R4D_WIN_ANCHOR_DEF(256, 4) R4D_WIN_ANCHOR_DEF(256, 8)
 R4D_WIN_ANCHOR_DEF(512, 1) R4D_WIN_ANCHOR_DEF(512, 2) R4D_WIN_ANCHOR_DEF(512, 4) R4D_WIN_ANCHOR_DEF(512, 8)
 #undef R4D_WIN_ANCHOR_DEF
+
+/* attn_paged_sink: LiLiCorr's drafter, 32 query heads over 2 KV heads at head_dim 128 (16 over 1
+ * at TP 2: gqa 16 either way; 8 over its replicated head at TP 4: gqa 8), non-causal over its
+ * block, a 1024-token window. */
+#define R4D_WINSINK_DEF(HD, G)                                                                    \
+    int r4d_rad_attn_window_sink_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {           \
+        return r4d_win::launch_attn<HD, G, false>(a, s, true);                                    \
+    }                                                                                              \
+    int r4d_rad_attn_window_sink_h##HD##_gqa##G##_fp8(const RadArgs* a, RadStream s) {            \
+        return r4d_win::launch_attn<HD, G, true>(a, s, true);                                     \
+    }
+R4D_WINSINK_DEF(128, 8) R4D_WINSINK_DEF(128, 16)
+#undef R4D_WINSINK_DEF
 
 /* Called at declare with no tensors. Partials are capped at kPartBudget (tile, head, split)
  * triples for any batch, so the size is a constant. */

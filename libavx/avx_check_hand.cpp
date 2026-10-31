@@ -544,6 +544,37 @@ void shape_cases(std::vector<Hand>& hs) {
           .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
         hs.push_back(std::move(ga));
 
+        /* LiLiCorr's candidates over two ranks' sample_logprobs rows: a merge that interleaves the
+         * ranks, an equal value on both (the lower id first), a rank with an unfilled slot. Rows
+         * of (max, sum, 4 (id, logit) pairs descending) a rank, k = 4, steps 3, n = 24. */
+        {
+            constexpr int64_t K = 4, W = 2, M = 3, NW = 24;
+            static const float kSt[M][W][2 + 2 * K] = {
+                { { 2.0f, 7.5f, 10, 2.0f, 11, 1.5f, 40, 0.25f, 41, -1.0f },
+                  { 1.5f, 9.0f, 70, 1.5f, 77, 1.0f, 72, 0.5f, 73, 0.25f } },
+                { { 0.5f, 3.0f, 5, 0.5f, 3, 0.25f, 9, 0.0f, 2, -3.0f },
+                  { 0.5f, 2.0f, 4, 0.5f, 8, 0.4f, -1, -INFINITY, -1, -INFINITY } },
+                { { -1.0f, 12.0f, 100, -1.0f, 101, -1.25f, 102, -2.0f, 103, -2.5f },
+                  { 3.0f, 1.5f, 200, 3.0f, 201, -4.0f, 202, -5.0f, 203, -6.0f } },
+            };
+            Hand lc("two ranks merged, a tie and an unfilled slot", "lili_cand", 2e-5);
+            lc.dense(RAD_F32, { M, W * (2 + 2 * K) },
+                     [](int64_t i) { return (&kSt[0][0][0])[i]; })
+              .dense(RAD_F32, { M, NW }, hfill(71))
+              .dense(RAD_F32, { 5 }, hfill(72))
+              .dense(RAD_F32, { 5 }, hfill(73))
+              .dense(RAD_F32, { NW, 5 }, hfill(74))
+              .dense(RAD_F32, { NW }, hfill(75))
+              .dense(RAD_F32, { 3, NW }, hfill(76))
+              .dense(RAD_F32, { K, NW }, hfill(77))
+              .dense(RAD_I32, { M, K }, [](int64_t) { return 0.0f; }, true)
+              .dense(RAD_F32, { M * K, NW }, [](int64_t) { return 0.0f; }, true)
+              .dense(RAD_F32, { M * K, NW }, [](int64_t) { return 0.0f; }, true)
+              .pi("M", M).pi("k", K).pi("world", W).pi("steps", 3).pi("n", NW).ps("dtype", "f32")
+              .pf("eps", 1e-5);
+            hs.push_back(std::move(lc));
+        }
+
         Hand n("M = 64 over 5 rows, verifies of 3 and 2", "ngram_ids", 0.0);
         n.idx({ 11, 12, 13, 21, 22 })
          .dense(RAD_I32, { 2, 2 + 2 }, [](int64_t i) { return (float)(100 + i); }, true)

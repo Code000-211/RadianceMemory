@@ -1062,6 +1062,20 @@ extern "C" int r4d_shape_attn_paged(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* attn_paged_sink -- attn_paged's operands with `sinks` [n_head] f32 before `out`. */
+extern "C" int r4d_shape_attn_paged_sink(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    if (operand < 7) return r4d_shape_attn_paged(p, n_p, operand, out);
+    if (operand == 8) return r4d_shape_attn_paged(p, n_p, 7, out);
+    const int64_t nh = pi(p, n_p, "n_head");
+    if (nh <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_F32, nh),
+    };
+    R4D_PICK(l);
+}
+
 /* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales,
  * flat as gate_quant_fp8 describes them: one row per (token, head) pair, `head_dim` columns. */
 extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int operand,
@@ -1753,6 +1767,49 @@ extern "C" int r4d_shape_pair_argmax(const RadParam* p, int n_p, int operand, Ra
         opd((uint32_t)RAD_F32, M, n, 2),
         opd((uint32_t)RAD_I32, M),
         opd((uint32_t)RAD_F32, M),
+    };
+    R4D_PICK(l);
+}
+
+/* LiLiCorr's ops, described as libref describes them; lili_cand declines (its stats rows are no
+ * draw; avx_check_hand.cpp and tests/r4d_emu build them). */
+extern "C" int r4d_shape_lili_cand(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;
+}
+extern "C" int r4d_shape_lili_attn(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), S = pi(p, n_p, "steps"), k = pi(p, n_p, "k");
+    const int64_t nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");
+    if (M <= 0 || S <= 0 || k <= 0 || nh <= 0 || hd <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = (M + S * k - 1) / (S * k) * (S * k);
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, rows, 3 * nh * hd),
+        opd((uint32_t)RAD_F32, nh, 2 * S + 1),
+        opd((uint32_t)RAD_F32, nh),
+        opd((uint32_t)RAD_BF16, rows, nh * hd),
+    };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_lili_factor(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), L = pi(p, n_p, "L"), n = pi(p, n_p, "n");
+    if (M <= 0 || L <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = (M + L - 1) / L * L;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, rows, n),
+        opd((uint32_t)RAD_BF16, rows / L, n),
+        opd((uint32_t)RAD_BF16, rows, 3 * n),
+    };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_lili_walk(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), S = pi(p, n_p, "steps"), k = pi(p, n_p, "k");
+    const int64_t n = pi(p, n_p, "n");
+    if (M <= 0 || S <= 0 || k <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M * S * k, 2 * n),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd_idx(M * S, k, 1000),
+        opd((uint32_t)RAD_I32, M, S),
+        opd((uint32_t)RAD_F32, M, S, k, k),
     };
     R4D_PICK(l);
 }

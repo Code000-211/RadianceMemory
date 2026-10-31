@@ -60,6 +60,7 @@ set(AVX_KERNEL_SRC
   avx_ltx.cpp
   avx_vsa.cpp
   avx_audio.cpp
+  avx_lili.cpp
 )
 
 # The flag sets, written out because each states which instructions the object may contain.

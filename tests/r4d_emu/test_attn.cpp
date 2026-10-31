@@ -1,6 +1,7 @@
 /* Drives libr4d's windowed attn_paged entry points (r4d_attn_paged_window.hip) through the SIMT
  * emulator and checks every output element against a port of libref's ref_attn_paged (same mask
- * predicates, f64 accumulation). */
+ * predicates, f64 accumulation). The attn_paged_sink entries too: a sink logit a query head joins
+ * the reference's maximum and sum. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -38,6 +39,7 @@ struct Case {
     int qpitch_extra = 0;                /* q as a column slice of a wider buffer */
     int expect_wmma = -1;                /* 1: must take the WMMA kernel, 0: must not, -1: either */
     bool ahead = false;                  /* non-causal, the window bounds the keys behind only */
+    bool sink = false;                   /* attn_paged_sink: a sink logit a query head */
 };
 
 using Fn = int (*)(const RadArgs*, RadStream);
@@ -52,6 +54,13 @@ static Fn pick(int hd, int gqa, bool fp8, bool ahead) {
     P(128, 1) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
     P(512, 16)
 #undef P
+    return nullptr;
+}
+static Fn pick_sink(int hd, int gqa, bool fp8) {
+    if (hd == 128 && gqa == 8)
+        return fp8 ? r4d_rad_attn_window_sink_h128_gqa8_fp8 : r4d_rad_attn_window_sink_h128_gqa8_bf16;
+    if (hd == 128 && gqa == 16)
+        return fp8 ? r4d_rad_attn_window_sink_h128_gqa16_fp8 : r4d_rad_attn_window_sink_h128_gqa16_bf16;
     return nullptr;
 }
 
@@ -101,7 +110,11 @@ static int run(const Case& c) {
     std::vector<char> scratch(c.scratch + 64);
     char* sp = scratch.data() + ((16 - ((uintptr_t)scratch.data() & 15)) & 15);
 
-    RadTensor t[8];
+    /* Sinks spread around the scores' scale, a few far above them (the sink takes the maximum) and
+     * one far below (it vanishes). */
+    std::vector<float> sinks(qh);
+    for (int h = 0; h < qh; ++h) sinks[h] = h % 5 == 3 ? 6.f + nrm() : h % 7 == 6 ? -40.f : 1.5f * nrm();
+    RadTensor t[9];
     t[0] = tens(qb.data(), RAD_BF16, {rows, qh * HD}); t[0].stride[0] = qcols;
     t[1] = tens(c.fp8 ? (void*)kv8.data() : (void*)kvb.data(), c.fp8 ? RAD_F8E4M3 : RAD_BF16, {nblocks, kvh, 16, slot});
     t[2] = tens(bt.data(), RAD_I32, {n_seq, maxb});
@@ -110,6 +123,7 @@ static int run(const Case& c) {
     t[5] = c.descale ? tens(vd.data(), RAD_F32, {n_seq, kvh}) : RadTensor{};
     t[6] = c.ragged ? tens(cu.data(), RAD_I32, {n_seq + 1}) : RadTensor{};
     t[7] = tens(out.data(), RAD_BF16, {rows, qh, HD});
+    if (c.sink) { t[8] = t[7]; t[7] = tens(sinks.data(), RAD_F32, {qh}); }
     int qmax = 0; for (int q : c.qlen) qmax = std::max(qmax, q);
     std::vector<RadParam> p;
     auto pi = [&](const char* k, long long v) { RadParam x{}; x.key = k; x.kind = RAD_P_INT; x.ival = v; p.push_back(x); };
@@ -121,9 +135,10 @@ static int run(const Case& c) {
     const double scale = 1.0 / std::sqrt((double)HD) * 1.3;   /* not the default: the param must be read */
     pf("scale", scale); pi("n_head", qh); pi("max_seqs", n_seq);
     if (c.max_ctx) pi("max_ctx", c.max_ctx);
-    RadArgs a{}; a.t = t; a.n_t = 8; a.p = p.data(); a.n_p = (int)p.size();
+    RadArgs a{}; a.t = t; a.n_t = c.sink ? 9 : 8; a.p = p.data(); a.n_p = (int)p.size();
     a.scratch = c.scratch ? sp : nullptr; a.scratch_bytes = c.scratch;
-    Fn fn = pick(HD, c.gqa, c.fp8, c.ahead);
+    Fn fn = c.sink ? pick_sink(HD, c.gqa, c.fp8) : pick(HD, c.gqa, c.fp8, c.ahead);
+    if (!fn) { std::printf("%-44s no entry point for this geometry\n", c.name.c_str()); return 1; }
     const int g0 = emu_grids;
     const int rc = fn(&a, nullptr);
     const int launches = emu_grids - g0;
@@ -146,13 +161,16 @@ static int run(const Case& c) {
             sc[j] = dot * scale; mx = std::max(mx, sc[j]);
         }
         std::vector<double> acc(HD, 0.0); double sum = 0;
-        if (mx > -INFINITY)
+        const bool any = mx > -INFINITY;
+        if (c.sink && any) mx = std::max(mx, (double)sinks[h]);
+        if (any)
             for (int j = 0; j < c.ctx[s]; ++j) {
                 if (sc[j] == -INFINITY) continue;
                 const double w = std::exp(sc[j] - mx); sum += w;
                 const int64_t kb = (((int64_t)bt[s * maxb + j / 16] * kvh + kh) * 16 + j % 16) * slot;
                 for (int d = 0; d < HD; ++d) acc[d] += w * kvf[kb + HD + d] * vd[s * kvh + kh];
             }
+        if (c.sink && any) sum += std::exp((double)sinks[h] - mx);
         for (int d = 0; d < HD; ++d) {
             const double ref = sum > 0 ? acc[d] / sum : 0.0;
             const float got = rad_bf16_to_f32(out[((size_t)tok * qh + h) * HD + d]);
@@ -244,6 +262,28 @@ int main(int argc, char** argv) {
         {"h256 gqa4 ahead w20 split", 256, 4, 1, false, false, false, false, 20, {5}, {300}, -1, 4096, s256, 0, 0, true},
         {"wmma h256 gqa2 ahead w20 picture 100 of 100", 256, 2, 2, false, false, false, false, 20, {100}, {100}, -1, 0, 0, 0, 1, true},
         {"wmma h256 gqa2 ahead w20 picture 90 of 300 fp8", 256, 2, 2, true, false, false, true, 20, {90}, {300}, -1, 0, 0, 0, 1, true},
+        /* LiLiCorr's drafter (attn_paged_sink): 32 query heads over 2 KV heads at h128 (16 over 1 at
+         * TP 2), a block of 8 non-causal rows past the context, a 1024-token window; one sequence
+         * and a batch, unsplit and split, a bf16 and an fp8 cache */
+        {"sink h128 gqa16 kvh2 block8 w1024", 128, 16, 2, false, false, false, false, 1024, {8}, {1500},
+         -1, 0, 0, 0, -1, false, true},
+        {"sink h128 gqa16 kvh1 block8 x3 split", 128, 16, 1, false, false, true, false, 1024, {8, 8, 8},
+         {900, 40, 2100}, -1, 262144, s128, 0, -1, false, true},
+        {"sink h128 gqa16 kvh2 fp8+descale split", 128, 16, 2, true, false, false, true, 1024, {8}, {1300},
+         -1, 262144, s128, 0, -1, false, true},
+        {"sink h128 gqa16 prefill-shaped stays scalar", 128, 16, 1, false, false, false, false, 1024, {96},
+         {400}, -1, 0, 0, 0, 0, false, true},
+        {"sink h128 gqa16 missing-block", 128, 16, 1, false, false, false, false, 1024, {8}, {70}, 1,
+         0, 0, 0, -1, false, true},
+        /* and at TP 4, 8 query heads over the rank's replicated KV head */
+        {"sink h128 gqa8 kvh1 block8 w1024", 128, 8, 1, false, false, false, false, 1024, {8}, {1500},
+         -1, 0, 0, 0, -1, false, true},
+        {"sink h128 gqa8 kvh1 block8 x3 split", 128, 8, 1, false, false, true, false, 1024, {8, 8, 8},
+         {900, 40, 2100}, -1, 262144, s128, 0, -1, false, true},
+        {"sink h128 gqa8 kvh1 fp8+descale split", 128, 8, 1, true, false, false, true, 1024, {8}, {1300},
+         -1, 262144, s128, 0, -1, false, true},
+        {"sink h128 gqa8 prefill-shaped stays scalar", 128, 8, 1, false, false, false, false, 1024, {96},
+         {400}, -1, 0, 0, 0, 0, false, true},
         /* and what must stay scalar: a verify batch, many sequences, a few rows each */
         {"scalar: 8 x verify16, ragged", 512, 4, 1, false, true, true, false, 0, {16, 16, 16, 16, 16, 16, 16, 16},
          {40, 50, 60, 70, 80, 90, 100, 110}, -1, 262144, s512, 0, 0},

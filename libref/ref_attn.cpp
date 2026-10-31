@@ -75,20 +75,24 @@ struct KvDyn  {
 }  /* namespace */
 
 /* ------------------------------------------------------------------ attn_paged */
+/* attn_paged, and attn_paged_sink with `sinks` (one logit a query head, beside the keys in the
+ * softmax's denominator and nowhere else): out at operand `oi`. */
 /* attn_paged_tree's ninth operand, `spec_parent` (RadBatch::spec_parent, rad_drafter_tree), is
  * read here too: a row whose entry is -2 is an ordinary causal row; any other row is a node of its
  * sequence's verify block, whose entry is its parent's row within the sequence's rows (-1 for the
  * root, the block's first row). Inside the block such a row sees itself and its ancestors only,
  * and its window is measured from the block's first position plus its depth -- the position its
  * token has if its path is committed -- rather than from its row. */
-static int ref_attn_paged_impl(const RadArgs* a, RadStream, bool shared_anchor_window) {
-    if (a->n_t < 8) return RAD_E_INVAL;
-    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
+static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, bool shared_anchor_window) {
+    if (a->n_t < oi + 1) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[oi];
     const RadTensor* kdes = t_in(a, 4);
     const RadTensor* vdes = t_in(a, 5);
     const RadTensor* cus  = t_in(a, 6);
-    const RadTensor* tpar = a->n_t > 8 ? t_in(a, 8) : nullptr;
+    /* The tree operand sits where attn_paged_sink keeps its output; a sinked call has none. */
+    const RadTensor* tpar = !sinks && a->n_t > 8 ? t_in(a, 8) : nullptr;
     if (!q->data || !kv->data || !bt->data || !su->data || !o->data) return RAD_E_INVAL;
+    if (sinks && !sinks->data) return RAD_E_INVAL;
 
     const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa        = p_int(a, "gqa", 1);
@@ -107,6 +111,7 @@ static int ref_attn_paged_impl(const RadArgs* a, RadStream, bool shared_anchor_w
     /* gqa and the cache's head count fix the query head count; a rank-3 query that disagrees would
      * stride through the wrong rows. */
     if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    if (sinks && numel(sinks) != q_heads) return RAD_E_SHAPE;
     const int64_t n_seq   = numel(su);
     const int64_t rows    = numel(q) / (q_heads * head_dim);
     if (n_seq <= 0 || rows <= 0) return RAD_E_SHAPE;
@@ -255,6 +260,11 @@ static int ref_attn_paged_impl(const RadArgs* a, RadStream, bool shared_anchor_w
                     return;
                 }
 
+                /* A sink is one more logit in the softmax with no value: the maximum takes it,
+                 * the sum adds it last, and the output stays the keys' weighted values. */
+                const float sk = sinks ? ldt(sinks, h) : -INFINITY;
+                if (sinks && sk > mx) mx = sk;
+
                 /* Pass two: exponentiate and accumulate in ascending key order. */
                 float acc[REF_HD_MAX];
                 for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
@@ -268,6 +278,7 @@ static int ref_attn_paged_impl(const RadArgs* a, RadStream, bool shared_anchor_w
                     for (int64_t d = 0; d < head_dim; ++d)
                         acc[d] += w * (kl(kv->data, vb + d * kvv.sd) * vds);
                 }
+                if (sinks) sum += ref_exp(sk - mx);
                 const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
                 for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
             };
@@ -282,14 +293,17 @@ static int ref_attn_paged_impl(const RadArgs* a, RadStream, bool shared_anchor_w
     return RAD_OK;
 }
 
-int ref_attn_paged(const RadArgs* a, RadStream s) {
-    return ref_attn_paged_impl(a, s, false);
-}
+int ref_attn_paged(const RadArgs* a, RadStream) { return attn_paged_impl(a, nullptr, 7, false); }
 
-int ref_attn_paged_anchor_window(const RadArgs* a, RadStream s) {
+int ref_attn_paged_anchor_window(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 8) return RAD_E_INVAL;
     if (a->n_t > 8 && t_in(a, 8)) return RAD_E_UNSUPPORTED;
-    return ref_attn_paged_impl(a, s, true);
+    return attn_paged_impl(a, nullptr, 7, true);
+}
+
+int ref_attn_paged_sink(const RadArgs* a, RadStream) {
+    if (a->n_t < 9 || !a->t[7].data) return RAD_E_INVAL;
+    return attn_paged_impl(a, &a->t[7], 8, false);
 }
 
 /* attn_paged with its tree operand present: ref_attn_paged reads it (see there). Refused without

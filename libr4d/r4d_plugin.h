@@ -169,6 +169,11 @@ int64_t r4d_rad_attn_qrow_h128_gqa8_scratch(const RadArgs*);
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
 int     r4d_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h128_gqa1_fp8 (const RadArgs*, RadStream);
+/* The same kernels under attn_paged_sink (a sink logit a query head). */
+int     r4d_rad_attn_window_sink_h128_gqa8_bf16 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_sink_h128_gqa8_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_sink_h128_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_sink_h128_gqa16_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream);
@@ -223,6 +228,11 @@ int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
  * draft head's merge (r4d_pair_argmax_f32.hip). */
 int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);
+/* LiLiCorr's correlator (r4d_lili.hip). */
+int     r4d_rad_lili_cand  (const RadArgs*, RadStream);
+int     r4d_rad_lili_attn  (const RadArgs*, RadStream);
+int     r4d_rad_lili_factor(const RadArgs*, RadStream);
+int     r4d_rad_lili_walk  (const RadArgs*, RadStream);
 /* Gemma 4's two sandwich-norm joins, each one kernel for a chain of rmsnorm / add / mul_weight
  * launches (r4d_norm_join_bf16.hip), and expert_scale, the embed_lookup + mul pair that scales
  * each routing weight by its expert's scale (r4d_expert_scale_bf16.hip). */
@@ -977,6 +987,7 @@ int r4d_shape_sample_pick      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_chain     (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_attn_paged        (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_attn_paged_sink   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged_gate_quant(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam*, int, int operand, RadOpdDesc*);
@@ -1013,6 +1024,10 @@ int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk_merge (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_pair_argmax    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_cand      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_attn      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_factor    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_walk      (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_quant_act_i8       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_had_quant_act_i8   (const RadParam*, int, int operand, RadOpdDesc*);

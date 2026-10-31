@@ -488,6 +488,50 @@ int ref_grid_embed_aa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return o.finish("grid_embed_aa", operand, out);
 }
 
+/* LiLiCorr's ops. lili_cand declines: its stats rows (sample_logprobs' sorted pairs and positive
+ * sums) are no draw; avx_check_hand.cpp builds them. The others draw freely. */
+int ref_lili_cand_shape(const RadParam*, int, int, RadOpdDesc*) { return RAD_E_UNSUPPORTED; }
+
+int ref_lili_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), S = gi(p, n_p, "steps", 0), k = gi(p, n_p, "k", 0);
+    const int64_t nh = gi(p, n_p, "n_head", 0), hd = gi(p, n_p, "head_dim", 0);
+    if (M <= 0 || S <= 0 || k <= 0 || nh <= 0 || hd <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = (M + S * k - 1) / (S * k) * (S * k);   /* whole lattices */
+    Opd o;
+    o.t(D, { rows, 3 * nh * hd });                 /* qkv */
+    o.t((uint32_t)RAD_F32, { nh, 2 * S + 1 });     /* rel */
+    o.t((uint32_t)RAD_F32, { nh });                /* same */
+    o.t(D, { rows, nh * hd });                     /* out */
+    return o.finish("lili_attn", operand, out);
+}
+
+int ref_lili_factor_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "L", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || L <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = (M + L - 1) / L * L;
+    Opd o;
+    o.t(D, { rows, n });                           /* h */
+    o.t(D, { rows / L, n });                       /* a */
+    o.t(D, { rows, 3 * n });                       /* y */
+    return o.finish("lili_factor", operand, out);
+}
+
+int ref_lili_walk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), S = gi(p, n_p, "steps", 0), k = gi(p, n_p, "k", 0);
+    const int64_t n = gi(p, n_p, "n", 0);
+    if (M <= 0 || S <= 0 || k <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M * S * k, 2 * n });                  /* edges */
+    o.t(D, { M, n });                              /* aout */
+    o.t_idx({ M * S, k }, 1000, -1, 0);            /* cand: ids, copied */
+    o.t((uint32_t)RAD_I32, { M, S });              /* tokens */
+    o.t((uint32_t)RAD_F32, { M, S, k, k });        /* scores */
+    return o.finish("lili_walk", operand, out);
+}
+
 int ref_layernorm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -1465,6 +1509,24 @@ int ref_attn_paged_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     for (int i = 0; i < 8; ++i) o.skip();
     o.t_idx({ M }, 0, -2, 0);                        /* spec_parent */
     return o.finish("attn_paged_tree", operand, out);
+}
+
+/* attn_paged's operands with the sinks before `out`: a learned logit a query head. */
+int ref_attn_paged_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int nbase = 8;
+    if (operand < 7) return ref_attn_paged_shape(p, n_p, operand, out);
+    if (operand == 8) return ref_attn_paged_shape(p, n_p, nbase - 1, out);
+    if (operand != 7 || !out) return RAD_E_SHAPE;
+    const int64_t gqa = gi(p, n_p, "gqa", 1);
+    const int64_t nh  = gi(p, n_p, "n_head", gqa);
+    if (nh <= 0) return RAD_E_UNSUPPORTED;
+    std::memset(out, 0, sizeof *out);
+    out->fill = (uint32_t)RAD_FILL_NORMAL;
+    out->idx_const = -1;
+    out->dtype = (uint32_t)RAD_F32;
+    out->rank = 1;
+    out->shape[0] = nh;
+    return RAD_OK;
 }
 
 int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

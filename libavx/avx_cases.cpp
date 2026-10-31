@@ -390,6 +390,16 @@ std::vector<Case> build_cases() {
                                      HI("block_size", 16), HI("causal", 1), HI("window", 8),
                                      HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
                                      HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* The sink form: a block of 8 non-causal rows (LiLiCorr's query pass), a decode row and the
+     * prefill panel form, with and without a window. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 8, 64 })
+            for (int window : { 0, 16 })
+                add("attn_paged_sink", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
+                                         HI("block_size", 16), HI("causal", qlen == 8 ? 0 : 1),
+                                         HI("window", window), HS("q_dtype", dt),
+                                         HS("kv_dtype", dt), HF("scale", 0.125),
+                                         HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
     for (const char* dt : { "f32", "bf16" })
         for (int causal : { 0, 1 })
             add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 2),
@@ -660,6 +670,16 @@ std::vector<Case> build_cases() {
          * avx_check's hand-built case. */
         add("grid_embed_aa", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
         add("grid_embed_aa", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
+    }
+
+    /* LiLiCorr's lattice ops, at its geometry (7 positions of 8 candidates, 8 heads) narrowed in
+     * width; lili_cand's rows are no draw and are avx_check_hand.cpp's. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("lili_attn", { HI("M", 112), HI("steps", 7), HI("k", 8), HI("n_head", 8),
+                           HI("head_dim", 16), HS("dtype", dt) });
+        add("lili_factor", { HI("M", 112), HI("L", 56), HI("n", 48), HS("dtype", dt) });
+        add("lili_walk", { HI("M", 3), HI("steps", 7), HI("k", 8), HI("n", 40), HS("dtype", dt),
+                           HF("eps", 1e-4), HF("scale", 8.0) });
     }
 
     /* MoE. Both `a_order` spellings, since the two grouped GEMMs of a routed block use
