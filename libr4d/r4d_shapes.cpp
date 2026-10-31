@@ -421,6 +421,26 @@ extern "C" int r4d_shape_kda_update(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_ssd_update(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const char* form = rad_param_gets(p, n_p, "state_form", "");
+    if (!std::strcmp(form, "anchor")) return RAD_E_UNSUPPORTED;
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), P = pi(p, n_p, "head_dim");
+    const int64_t N = pi(p, n_p, "d_state"), G = pi(p, n_p, "groups");
+    if (G < 1 || H % G) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const char* mode = rad_param_gets(p, n_p, "mode", "");
+    const int64_t history = !std::strcmp(mode, "verify") ? M : 1;
+    const RadOpdDesc l[] = {
+        opd(D, M, H, P), opd(D, M, G, N), opd(D, M, G, N), opd(D, M, H),
+        opd((uint32_t)RAD_F32, H), opd((uint32_t)RAD_F32, H), opd((uint32_t)RAD_F32, H),
+        opd((uint32_t)RAD_F32, history + 1, H, P, N),
+        opd_idx(1, history, history + 1, -1, RAD_OPD_F_IDX_UNIQUE),
+        opd_idx(2, 0, M, -1, RAD_OPD_F_IDX_CU),
+        opd_idx(1, 0, 0, 1), opd_idx(1, 0, 0, 1), opd(D, M, H, P),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_mhc_pre(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const uint32_t D = dt_act(p, n_p, "dtype");

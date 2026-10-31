@@ -631,6 +631,17 @@ static const RadOperandSpec oKdaUpdate[] = {
     {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
     {"o", RAD_OPD_OUT, 0},
 };
+static const RadParamSpec pSsdUpdate[] = {
+    P_INT("M"), P_INT("heads"), P_INT("head_dim"), P_INT("d_state"), P_INT("groups"),
+    P_STR("mode"), P_STR("dtype"), P_STRO("state_form"),
+};
+static const RadOperandSpec oSsdUpdate[] = {
+    {"x", RAD_OPD_IN, 0}, {"B", RAD_OPD_IN, 0}, {"C", RAD_OPD_IN, 0},
+    {"dt", RAD_OPD_IN, 0}, {"A_log", RAD_OPD_WEIGHT, 0}, {"dt_bias", RAD_OPD_WEIGHT, 0},
+    {"D", RAD_OPD_WEIGHT, 0}, {"state", RAD_OPD_INOUT, 0}, {"state_idx", RAD_OPD_IN, 0},
+    {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
+    {"o", RAD_OPD_OUT, 0},
+};
 static const RadOperandSpec oHcWrite[] = {
     { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
 };
@@ -2322,6 +2333,19 @@ static const RadOperandSpec oPleConv[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
 };
+/* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
+static const RadOperandSpec oPleConvBias[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "resid",        RAD_OPD_IN,     1 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "b",            RAD_OPD_WEIGHT, 0 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
 /* ple_conv's operands without `resid`, its parameters without `dilation`. */
 static const RadParamSpec pCausalConv[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
@@ -3310,6 +3334,11 @@ static const RadOpSchema kSchemas[] = {
            "Absent, every token commits: the read is at offset zero and the last "
            "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
            "`resid` absent drops the add and leaves the plain convolution."),
+    SCHEMA("ple_conv_bias", pPleConv, oPleConvBias,
+           "ple_conv with `b`, a per-channel bias added inside the silu: y[t] = resid[t] + "
+           "silu(b[c] + sum_j w[c][j] * x[t - (width-1-j)*dilation]). At dilation one with no "
+           "`resid` it is Mamba-2's conv1d. The window, `has_init`, `cache_idx` and "
+           "`num_accepted` are ple_conv's."),
     SCHEMA("causal_conv1d", pCausalConv, oCausalConv,
            "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
            "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
@@ -3491,6 +3520,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
            "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
            "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
+    SCHEMA("ssd_update", pSsdUpdate, oSsdUpdate,
+           "Mamba-2 selective state update: dt' = softplus(dt + dt_bias) (no clamp), state decays by "
+           "exp(-exp(A_log) dt') and gains dt' x B^T; o = state C + D x. verify stores candidate "
+           "states; prefill commits the final state. Absolute cu offsets, accepted-prefix read slot, "
+           "optional cold initialization, per_candidate only."),
     SCHEMA("hc_read", pHcRead, oHcRead,
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
@@ -4931,6 +4965,13 @@ static const RadConstraint cKdaUpdate[] = {
     C_EQ("head_k", 128),   C_EQ("head_v", 128), C_IN("mode", "prefill verify"),
     C_IN("dtype", "bf16"),
 };
+/* Mamba-2 at a 128-wide state (four registers a lane) and heads in rows of 16 (four waves of four
+ * rows): Nemotron-H's 64. */
+static const RadConstraint cSsdUpdate[] = {
+    C_GE("M", 1),           C_GE("heads", 1),     C_LE("heads", 65535),
+    C_EQ("d_state", 128),   C_GE("head_dim", 16), C_LE("head_dim", 256),
+    C_DIV("head_dim", 16),  C_IN("mode", "prefill verify"), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cMhcPre[] = {
     C_GE("M", 1),          C_LE("M", 65535),      C_GE("n", 1),
     C_LE("n", 16384),      C_GE("hc", 2),         C_LE("hc", 8),
@@ -6049,6 +6090,14 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cPleConv), NOTUNE,
   nullptr, nullptr, r4d_rad_ple_conv },
+
+{ "ple_conv_bias_bf16", "ple_conv_bias", "norm",
+  "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d); one thread a channel",
+  "width up to 5 and dilation up to 4 -- (width-1)*dilation is a register window",
+  "bf16 activations, weights, bias and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPleConv), NOTUNE,
+  nullptr, nullptr, r4d_rad_ple_conv_bias },
 
 { "causal_conv1d_bf16", "causal_conv1d", "conv",
   "depthwise causal conv with no activation (ple_conv's kernel); one thread a channel",
@@ -8072,6 +8121,12 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cKdaUpdate), NOTUNE,
   nullptr, nullptr, r4d_rad_kda_update, nullptr, nullptr, nullptr,
   r4d_shape_kda_update },
+{ "ssd_update_n128_bf16", "ssd_update", "gdn", "Mamba-2 recurrence and candidate states",
+  "heads 1..65535, d_state 128, head_dim a multiple of 16 up to 256, prefill and verify",
+  "bf16 activations, f32 A_log, dt_bias, D and state",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cSsdUpdate), NOTUNE,
+  nullptr, nullptr, r4d_rad_ssd_update, nullptr, nullptr, nullptr,
+  r4d_shape_ssd_update },
 { "mhc_pre_bf16", "mhc_pre", "norm", "manifold residual gates and Sinkhorn mixing",
   "M 1..65535, n 1..16384, hc 2..8, iterations 1..256", "bf16 activation, f32 weights and coefficients",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPre), NOTUNE,

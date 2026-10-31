@@ -630,6 +630,46 @@ void shape_cases(std::vector<Hand>& hs) {
                     .ps("state_form", "anchor");
                 hs.push_back(std::move(h));
             }
+    /* Nemotron-H's Mamba-2 under the same two-copy state: a scratch holding three records of
+     * 1 + head_dim + d_state floats (decay, u, B) behind the count. */
+    for (const char* mode : { "prefill", "verify" })
+        for (int accepted : { 1, 2, 3 })
+            for (int cold : { 0, 1 }) {
+                constexpr int64_t P = 16, N = 32, R = 1 + P + N;
+                Hand h("SSD anchor accepted-prefix replay", "ssd_update", 0.01);
+                h.dense(RAD_BF16, { 2, 1, P }, hfill(221, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, N }, hfill(222, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, N }, hfill(223, 0.25f))
+                    .dense(RAD_BF16, { 2, 1 }, hfill(224, 0.25f))
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return 0.0f; })
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return -1.0f; })
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return 0.5f; })
+                    .dense(
+                        RAD_F32, { 2, 1, P, N },
+                        [](int64_t i) {
+                            if (i < P * N) return 0.125f;
+                            i -= P * N;
+                            if (!i) return 3.0f;
+                            if (i > 3 * R) return 0.0f;
+                            const int64_t at = (i - 1) % R;
+                            return at == 0 ? 0.75f : at <= P ? 0.01f : 0.125f;
+                        },
+                        true)
+                    .dense(RAD_I32, { 1, 6 }, [](int64_t i) { return i < 3 ? 0.0f : 1.0f; })
+                    .idx({ 0, 2 })
+                    .idx({ accepted })
+                    .idx({ cold ? 0 : 1 })
+                    .dense(RAD_BF16, { 2, 1, P }, hfill(225), true)
+                    .pi("M", 2)
+                    .pi("heads", 1)
+                    .pi("head_dim", P)
+                    .pi("d_state", N)
+                    .pi("groups", 1)
+                    .ps("mode", mode)
+                    .ps("dtype", "bf16")
+                    .ps("state_form", "anchor");
+                hs.push_back(std::move(h));
+            }
     for (const char* mode : { "absorb", "expand" }) {
         const bool absorb = !std::strcmp(mode, "absorb");
         const int64_t in = absorb ? 17 : 31, out = absorb ? 31 : 17;

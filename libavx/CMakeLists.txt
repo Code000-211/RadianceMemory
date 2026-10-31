@@ -52,6 +52,7 @@ set(AVX_KERNEL_SRC
   avx_qsa.cpp
   avx_moe.cpp
   avx_gdn.cpp
+  avx_ssd.cpp
   avx_sample.cpp
   avx_misc.cpp
   avx_gen.cpp

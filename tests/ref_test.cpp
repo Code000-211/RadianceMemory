@@ -411,6 +411,152 @@ TEST(kda_prefill_commits_final_state_and_uses_absolute_cu_offsets) {
     CHECK_EQ(out.at(2), 0.0f);
 }
 
+/* dt = 0 with no bias gives softplus(0) = ln 2, so A_log 0 and ln 2 decay by exactly 1/2 and 1/4. */
+TEST(ssd_prefill_decays_per_head_and_adds_the_skip) {
+    const float l2 = std::log(2.0f);
+    T x(RAD_F32, {2, 2, 1}); x.f({1, 2, 3, 4});
+    T B(RAD_F32, {2, 1, 2}); B.f({1, 0, 0, 1});
+    T C(RAD_F32, {2, 1, 2}); C.f({1, 1, 1, 0});
+    T dt(RAD_F32, {2, 2}), dtb(RAD_F32, {2});
+    T alog(RAD_F32, {2}); alog.f({0, l2});
+    T D(RAD_F32, {2}); D.f({1, 0});
+    T state(RAD_F32, {1, 2, 1, 2}); state.f({9, 9, 9, 9});
+    T idx(RAD_I32, {1, 1}); idx.n({0});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T init(RAD_I32, {1}); init.n({0});
+    T out(RAD_F32, {2, 2, 1});
+    A a; a.t(x).t(B).t(C).t(dt).t(alog).t(dtb).t(D).t(state).t(idx).t(cu).tnull().t(init).t(out)
+        .i("M", 2).i("heads", 2).i("head_dim", 1).i("d_state", 2).i("groups", 1)
+        .s("mode", "prefill").s("dtype", "f32");
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    /* has_init 0 ignores the 9s; head 0 carries D = 1, head 1 none. */
+    CHECK_NEAR(out.at(0), l2 + 1, 3e-6);
+    CHECK_NEAR(out.at(1), 2 * l2, 3e-6);
+    CHECK_NEAR(out.at(2), l2 / 2 + 3, 3e-6);
+    CHECK_NEAR(out.at(3), l2 / 2, 3e-6);
+    CHECK_NEAR(state.at(0), l2 / 2, 3e-6);
+    CHECK_NEAR(state.at(1), 3 * l2, 3e-6);
+    CHECK_NEAR(state.at(2), l2 / 2, 3e-6);
+    CHECK_NEAR(state.at(3), 4 * l2, 3e-6);
+    /* Above softplus's threshold of 20 dt passes through: e^{-25} is zero to f32 at this scale. */
+    dt.f({25, 0, 0, 0});
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 25 + 1, 3e-5);
+    a.ps[4].ival = 3;
+    CHECK_EQ(run("ssd_update", a), RAD_E_SHAPE);
+}
+
+TEST(ssd_candidate_states_restore_the_accepted_prefix) {
+    const float l2 = std::log(2.0f);
+    T x(RAD_F32, {2, 1, 1}); x.f({2, 2});
+    T B(RAD_F32, {2, 1, 1}); B.f({1, 1});
+    T C(RAD_F32, {2, 1, 1}); C.f({1, 1});
+    T dt(RAD_F32, {2, 1}), alog(RAD_F32, {1}), dtb(RAD_F32, {1}), D(RAD_F32, {1});
+    T state(RAD_F32, {3, 1, 1, 1}); state.f({4, 0, 123});
+    T idx(RAD_I32, {1, 2}); idx.n({0, 1});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T accepted(RAD_I32, {1}); accepted.n({1});
+    T out(RAD_F32, {2, 1, 1});
+    A a; a.t(x).t(B).t(C).t(dt).t(alog).t(dtb).t(D).t(state).t(idx).t(cu).t(accepted).tnull().t(out)
+        .i("M", 2).i("heads", 1).i("head_dim", 1).i("d_state", 1).i("groups", 1)
+        .s("mode", "verify").s("dtype", "f32");
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 2 + 2 * l2, 3e-6);
+    CHECK_NEAR(out.at(1), 1 + 3 * l2, 3e-6);
+    CHECK_NEAR(state.at(0), 2 + 2 * l2, 3e-6);
+    CHECK_NEAR(state.at(1), 1 + 3 * l2, 3e-6);
+    CHECK_EQ(state.at(2), 123.0f);
+    /* The next step keeps only candidate 0 and reads its slot. */
+    cu.n({0, 1});
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1 + 3 * l2, 3e-6);
+    /* Keeping both instead starts from slot 1. */
+    state.f({4, 1 + 3 * l2, 123});
+    accepted.n({2});
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 0.5f * (1 + 3 * l2) + 2 * l2, 3e-6);
+    accepted.n({3});
+    CHECK_EQ(run("ssd_update", a), RAD_E_SHAPE);
+}
+
+/* The anchor form against the per-candidate one over two verify windows: the same outputs, and the
+ * committed state after a window is the candidate state its accepted prefix left, bit for bit. */
+TEST(ssd_anchor_replays_only_the_accepted_prefix_of_the_previous_window) {
+    constexpr int H = 2, P = 8, N = 16, W = 3;
+    for (int accepted : { 1, 2, 3 }) {
+        T x(RAD_F32, { W, H, P }), B(RAD_F32, { W, 1, N }), C(RAD_F32, { W, 1, N });
+        T dt(RAD_F32, { W, H }), al(RAD_F32, { H }), dtb(RAD_F32, { H }), D(RAD_F32, { H });
+        T anchor(RAD_F32, { 2, H, P, N }), candidate(RAD_F32, { W, H, P, N });
+        T ai(RAD_I32, { 1, 6 }), ci(RAD_I32, { 1, W }), cu(RAD_I32, { 2 }), na(RAD_I32, { 1 }),
+            init(RAD_I32, { 1 });
+        T ao(RAD_F32, { W, H, P }), co(RAD_F32, { W, H, P });
+        std::vector<float> v(W * H * P);
+        for (size_t j = 0; j < v.size(); ++j) v[j] = (float)((int)(j % 13) - 6) * 0.125f;
+        x.f(v);
+        std::vector<float> bc(W * N);
+        for (size_t j = 0; j < bc.size(); ++j) bc[j] = (float)((int)(j % 7) - 3) * 0.25f;
+        B.f(bc);
+        for (size_t j = 0; j < bc.size(); ++j) bc[j] = (float)((int)(j % 5) - 2) * 0.5f;
+        C.f(bc);
+        dt.f({ 0.5f, -1, 0, 1, -0.5f, 2 });
+        al.f({ 0, -0.5f });
+        dtb.f({ 0.25f, -0.25f });
+        D.f({ 1, 0.5f });
+        anchor.f(std::vector<float>(2 * H * P * N, 0));
+        candidate.f(std::vector<float>(W * H * P * N, 0));
+        ai.n({ 0, 0, 0, 1, 1, 1 });
+        ci.n({ 0, 1, 2 });
+        cu.n({ 0, W });
+        na.n({ 1 });
+        init.n({ 1 });
+        auto args = [&](T& state, T& idx, T& out, bool anc) {
+            A a;
+            a.t(x).t(B).t(C).t(dt).t(al).t(dtb).t(D).t(state).t(idx).t(cu).t(na).t(init).t(out)
+                .i("M", W).i("heads", H).i("head_dim", P).i("d_state", N).i("groups", 1)
+                .s("mode", "verify").s("dtype", "f32");
+            if (anc) a.s("state_form", "anchor");
+            return a;
+        };
+        A a = args(anchor, ai, ao, true), c = args(candidate, ci, co, false);
+        REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+        REQUIRE_EQ(run("ssd_update", c), RAD_OK);
+        for (int j = 0; j < W * H * P; ++j) CHECK_EQ(ao.at(j), co.at(j));
+        /* Nothing is committed before the next step says how much was accepted. */
+        for (int j = 0; j < H * P * N; ++j) CHECK_EQ(anchor.at(j), 0);
+        std::vector<float> committed(H * P * N);
+        for (int j = 0; j < H * P * N; ++j)
+            committed[j] = candidate.at((accepted - 1) * H * P * N + j);
+        na.n({ accepted });
+        REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+        REQUIRE_EQ(run("ssd_update", c), RAD_OK);
+        for (int j = 0; j < W * H * P; ++j) CHECK_EQ(ao.at(j), co.at(j));
+        for (int j = 0; j < H * P * N; ++j) CHECK_EQ(anchor.at(j), committed[j]);
+        const auto saved = anchor.mem;
+        na.n({ 4 });
+        CHECK_EQ(run("ssd_update", a), RAD_E_SHAPE);
+        CHECK(anchor.mem == saved);
+    }
+}
+
+/* Head h reads group h / (heads / groups): heads 0 and 1 share group 0, not heads 0 and 2. */
+TEST(ssd_heads_read_their_group_in_blocks) {
+    const float l2 = std::log(2.0f);
+    T x(RAD_F32, {1, 4, 1}); x.f({1, 1, 1, 1});
+    T B(RAD_F32, {1, 2, 2}); B.f({1, 0, 0, 1});
+    T C(RAD_F32, {1, 2, 2}); C.f({1, 0, 0, 2});
+    T dt(RAD_F32, {1, 4}), alog(RAD_F32, {4}), dtb(RAD_F32, {4}), D(RAD_F32, {4});
+    T state(RAD_F32, {1, 4, 1, 2});
+    T idx(RAD_I32, {1, 1}); idx.n({0});
+    T cu(RAD_I32, {2}); cu.n({0, 1});
+    T out(RAD_F32, {1, 4, 1});
+    A a; a.t(x).t(B).t(C).t(dt).t(alog).t(dtb).t(D).t(state).t(idx).t(cu).tnull().tnull().t(out)
+        .i("M", 1).i("heads", 4).i("head_dim", 1).i("d_state", 2).i("groups", 2)
+        .s("mode", "prefill").s("dtype", "f32");
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    const float want[] = {l2, l2, 2 * l2, 2 * l2};
+    for (int h = 0; h < 4; ++h) CHECK_NEAR(out.at(h), want[h], 3e-6);
+}
+
 TEST(mla_attention_reads_one_latent_and_masks_the_last_selected_page) {
     T q(RAD_F32, { 1, 1, 2 }), kv(RAD_F32, { 2, 1, 2, 2 }), bt(RAD_I32, { 1, 2 });
     T len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, 2 });
@@ -1049,7 +1195,7 @@ TEST(op_vocabulary) {
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
-        "kda_update",
+        "kda_update", "ssd_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
         "seg_mean_bf16_sum",
@@ -1059,6 +1205,8 @@ TEST(op_vocabulary) {
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
         "fill",
         "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
+        /* Mamba-2's conv1d (Nemotron-3.5-Bolt): ple_conv with a bias inside the silu. */
+        "ple_conv_bias",
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
@@ -1726,6 +1874,34 @@ TEST(op_ple_gate) {
  * accumulate to 100a + 10b + c and any misread tap changes a digit. silu is applied after, so
  * the expectation is silu of that number.
  */
+/* Mamba-2's conv1d: ple_conv_bias at dilation one and with no residual. The bias
+ * must sit inside the activation, so silu(b + conv) and not b + silu(conv). */
+TEST(op_ple_conv_bias_is_inside_the_silu) {
+    auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
+    T x(RAD_F32, {3, 2}); x.f({ 1, 10, 2, 20, 3, 30 });
+    T w(RAD_F32, {2, 2}); w.f({ 1, 1, 0.5f, -1 });
+    T cs(RAD_F32, {1, 2, 1}); cs.f({ 4, 8 });
+    T cu(RAD_I32, {2}); cu.n({ 0, 3 });
+    T ci(RAD_I32, {1}); ci.n({ 0 });
+    T hi(RAD_I32, {1}); hi.n({ 1 });
+    T y(RAD_F32, {3, 2});
+    T b(RAD_F32, {2}); b.f({ -2, 3 });
+    A a; a.t(x).t(w).t(cs).t(cu).tnull().t(ci).t(hi).tnull().t(b).t(y)
+         .i("M", 3).i("n", 2).i("width", 2).i("dilation", 1).s("dtype", "f32");
+    CHECK_OK(run("ple_conv_bias", a));
+    /* channel 0: taps (prev, cur) * (1, 1) - 2; channel 1: (prev, cur) * (0.5, -1) + 3 */
+    CHECK_NEAR(y.at(0), silu(4 + 1 - 2.0f), 1e-5);
+    CHECK_NEAR(y.at(1), silu(0.5f * 8 - 10 + 3.0f), 1e-5);
+    CHECK_NEAR(y.at(2), silu(1 + 2 - 2.0f), 1e-5);
+    CHECK_NEAR(y.at(5), silu(0.5f * 20 - 30 + 3.0f), 1e-5);
+    /* the window keeps the inputs, not the biased sums */
+    CHECK_EQ(cs.at(0), 3.0f);
+    CHECK_EQ(cs.at(1), 30.0f);
+    T bad(RAD_F32, {3});
+    a.ts[8] = bad.t;
+    CHECK_EQ(run("ple_conv_bias", a), RAD_E_SHAPE);
+}
+
 TEST(op_ple_conv) {
     auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
     const int n = 1, wid = 3, dil = 2, hist = (wid - 1) * dil;   /* 4 */
@@ -10098,6 +10274,8 @@ std::vector<Geo> geometries() {
         G("scatter_rows", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("ple_gate", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("ple_conv", "M", 6, a.i("M", R).i("n", 8).i("width", 3).i("dilation", 2).s("dtype", "f32")),
+        G("ple_conv_bias", "M", 6, a.i("M", R).i("n", 8).i("width", 4).i("dilation", 1)
+                                    .s("dtype", "f32")),
         G("causal_conv1d", "M", 6, a.i("M", R).i("n", 8).i("width", 4).s("dtype", "f32")),
         G("ngram_ids", "M", 4, a.i("M", R).i("heads", 2).i("ngram", 3).i("eos", 1)),
         G("cast", "M", 3, a.i("M", R).i("n", 8).s("from", "f32").s("to", "bf16")),
@@ -10296,6 +10474,8 @@ std::vector<Geo> geometries() {
         G("kda_update", "M", 3, a.i("M", R).i("heads", 2).i("head_k", 8).i("head_v", 8)
                                 .d("lower_bound", -5.0).d("scale", 0.35).d("l2_eps", 1e-6)
                                 .s("mode", "prefill").s("dtype", "f32")),
+        G("ssd_update", "M", 3, a.i("M", R).i("heads", 4).i("head_dim", 4).i("d_state", 8)
+                                .i("groups", 2).s("mode", "prefill").s("dtype", "f32")),
         G("mla_attn", "M", 3, a.i("M", R).i("latent_dim", 8).i("heads", 2).i("blocks", 2)
                               .i("block_size", 4).d("scale", 0.125).s("dtype", "f32")),
         G("mla_project", "M", 3, a.i("M", R).i("heads", 2).i("head_dim", 4).i("latent_dim", 6)

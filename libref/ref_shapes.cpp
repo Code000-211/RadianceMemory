@@ -358,6 +358,27 @@ int ref_kda_update_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("kda_update", operand, out);
 }
 
+int ref_ssd_update_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const char* form = gs(p, n_p, "state_form");
+    if (form && !std::strcmp(form, "anchor")) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0);
+    const int64_t P = gi(p, n_p, "head_dim", 0), N = gi(p, n_p, "d_state", 0);
+    const int64_t G = gi(p, n_p, "groups", 0);
+    if (M < 1 || H < 1 || P < 1 || N < 1 || G < 1 || H % G) return RAD_E_UNSUPPORTED;
+    const char* mode = gs(p, n_p, "mode");
+    const int64_t history = mode && !std::strcmp(mode, "verify") ? M : 1;
+    Opd o;
+    o.t(D, {M, H, P}); o.t(D, {M, G, N}); o.t(D, {M, G, N}); o.t(D, {M, H});
+    o.t((uint32_t)RAD_F32, {H}); o.t((uint32_t)RAD_F32, {H}); o.t((uint32_t)RAD_F32, {H});
+    o.t((uint32_t)RAD_F32, {history + 1, H, P, N});
+    o.t_idx({1, history}, history + 1, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);
+    o.t_idx({2}, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t_idx({1}, 0, 1, 0); o.t_idx({1}, 0, 1, 0);
+    o.t(D, {M, H, P});
+    return o.finish("ssd_update", operand, out);
+}
+
 int ref_mhc_pre_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
@@ -1053,6 +1074,27 @@ int ref_ple_conv_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
     o.t(D, { M, n });                                /* y */
     return o.finish("ple_conv", operand, out);
+}
+
+/* ple_conv's description with `b` before `y`. */
+int ref_ple_conv_bias_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D  = act_dt(p, n_p);
+    const int64_t M   = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t wid = gi(p, n_p, "width", 0), dil = gi(p, n_p, "dilation", 1);
+    if (M <= 0 || n <= 0 || wid <= 0 || dil <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = 1, hist = (wid - 1) * dil, depth = hist - 1 + M;
+    Opd o;
+    o.t(D, { M, n });                                /* x */
+    o.t(D, { n, wid });                              /* w */
+    o.t(D, { S, n, depth });                         /* conv_state, INOUT */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);           /* cu */
+    o.t(D, { M, n });                                /* resid */
+    o.t_idx({ S }, S, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);           /* cache_idx */
+    o.t_idx({ S }, 0, 1, 0);                         /* has_init: warm */
+    o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
+    o.t(D, { n });                                   /* b */
+    o.t(D, { M, n });                                /* y */
+    return o.finish("ple_conv_bias", operand, out);
 }
 
 /* ple_conv's description without `resid` and at dilation one. */

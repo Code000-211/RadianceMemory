@@ -118,6 +118,8 @@ set(R4D_UNITS
   "r4d_dsa|"
   "r4d_mla|"
   "r4d_kda|"
+  # Mamba-2's selective state update (Nemotron-H), the KDA kernel's register layout.
+  "r4d_ssd|"
   "r4d_moe_mxfp4|"
   "r4d_fp8_f32scale|"
   "r4d_ngram_ids|"

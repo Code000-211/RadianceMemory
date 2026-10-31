@@ -87,6 +87,11 @@ static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("he
 static const RadOperandSpec oKdaUpdate[] = { OPD("q"), OPD("k"), OPD("v"), OPD("a"), OPD("b"),
     WGT("A_log"), WGT("dt_bias"), INOUT("state"), OPD("state_idx"), OPD("cu"),
     OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
+static const RadParamSpec pSsdUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
+    P_INT("d_state"), P_INT("groups"), P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
+static const RadOperandSpec oSsdUpdate[] = { OPD("x"), OPD("B"), OPD("C"), OPD("dt"),
+    WGT("A_log"), WGT("dt_bias"), WGT("D"), INOUT("state"), OPD("state_idx"), OPD("cu"),
+    OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
 
 static const RadParamSpec pNgramIds[]   = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
                                             P_INT("eos") };
@@ -106,6 +111,11 @@ static const RadParamSpec pPleConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                            OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
                                            OPD_O("num_accepted"), OUT("y") };
+/* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
+static const RadOperandSpec oPleConvBias[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                               OPD_O("resid"), OPD_O("cache_idx"),
+                                               OPD_O("has_init"), OPD_O("num_accepted"), WGT("b"),
+                                               OUT("y") };
 static const RadParamSpec pCausalConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"),
                                               P_STR("dtype") };
 static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
@@ -977,6 +987,7 @@ static const RadOpSchema kSchemas[] = {
 { "mhc_post", ARR(pHcWrite), ARR(oMhcPost), "Source-to-destination manifold residual update." },
 { "mhc_contract", ARR(pHcWrite), ARR(oMhcContract), "Mean over manifold residual streams." },
 { "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate), "Bounded per-channel KDA with candidate-state rollback." },
+{ "ssd_update", ARR(pSsdUpdate), ARR(oSsdUpdate), "Mamba-2 scalar-decay state update with candidate-state rollback, per_candidate or anchor." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
   "block-scaled fp8 form of x and its Hadamard-rotated twin. See docs/OPS.md for the three facts "
@@ -1077,6 +1088,8 @@ static const RadOpSchema kSchemas[] = {
   "PLE gate: three grouped norms, a dot, a signed sqrt." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
   "PLE's dilated depthwise conv, silu and residual add." },
+{ "ple_conv_bias", ARR(pPleConv), ARR(oPleConvBias),
+  "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)." },
 { "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
   "depthwise causal conv with ple_conv's window, no activation and no residual (LFM2)." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds), "hashed n-gram row ids for PLE." },
@@ -1646,6 +1659,7 @@ SIMPLE("avx_mhc_pre_finish", "mhc_pre_finish", "norm", "manifold gates from proj
 SIMPLE("avx_mhc_post", "mhc_post", "norm", "manifold residual update", DT_FLOAT, L(mhc_post)),
 SIMPLE("avx_mhc_contract", "mhc_contract", "norm", "mean of residual streams", DT_FLOAT, L(mhc_contract)),
 SIMPLE("avx_kda_update", "kda_update", "gdn", "bounded KDA and candidate-state rollback", DT_FLOAT, L(kda_update)),
+SIMPLE("avx_ssd_update", "ssd_update", "gdn", "Mamba-2 recurrence and candidate-state rollback", DT_FLOAT, L(ssd_update)),
 ROWL("avx_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",
      DT_FLOAT ", or mixing matrices of E4M3 / int8 codes with a scale plane, joined", L(hc_read),
@@ -1747,6 +1761,9 @@ SIMPLE("avx_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot
        DT_FLOAT, L(ple_gate)),
 SIMPLE("avx_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, L(ple_conv)),
+SIMPLE("avx_ple_conv_bias", "ple_conv_bias", "norm",
+       "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)", DT_FLOAT,
+       L(ple_conv_bias)),
 SIMPLE("avx_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
        DT_FLOAT, L(causal_conv1d)),
 SIMPLE("avx_cast", "cast", "elem", "dtype conversion", DT_ANY, L(cast)),

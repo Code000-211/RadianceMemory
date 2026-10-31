@@ -2357,6 +2357,7 @@ wrong.
 | op | params | operands |
 |---|---|---|
 | `kda_update` | `M`(range) `heads` `head_k` `head_v` `lower_bound`:f64 `scale`:f64 `l2_eps`:f64 `mode` `dtype` `state_form`/opt | `q`, `k`, `v`, `a`, `b`, `A_log`w, `dt_bias`w, `state`:inout, `state_idx`, `cu`, `num_accepted`?, `has_init`? → `o` |
+| `ssd_update` | `M`(range) `heads` `head_dim` `d_state` `groups` `mode` `dtype` `state_form`/opt | `x`, `B`, `C`, `dt`, `A_log`w, `dt_bias`w, `D`w, `state`:inout, `state_idx`, `cu`, `num_accepted`?, `has_init`? → `o` |
 | `gdn_conv_prep` | `M`(range) `head_k` `head_v` `chunk`/der `conv_width` `l2_eps`:f64/opt `softplus_thr`:f64/opt | `x`, `w`w, `b`w?, `A_log`w, `dt_bias`w, `conv_state`:inout, `cu`, `a`?, `b_gate`?, `cache_idx`?, `has_init`? → `q`,`k`,`v`,`g`,`beta` |
 | `gdn_conv_update` | `q_len`(range) `head_k` `head_v` `conv_width` `max_query_len`/opt | `x`, `w`w, `b`w?, `conv_state`:inout, `state_idx`, `num_accepted`, `cu` → `q`,`k`,`v` |
 | `gdn_kkt_solve` | `M`(range) `head_k` `chunk`/der | `k`, `beta`, `g`, `cu` → `A` |
@@ -2398,6 +2399,26 @@ sequence's tokens in order (held to libref by `r4d_selftest` and `tests/r4d_emu/
 Under `anchor`, `verify` replays the accepted prefix in a separate dispatch before the window, so
 no value row overwrites factors another is still reading. A sequence whose window or slots are
 out of bounds is skipped on the device, not refused.
+
+**`ssd_update` is Mamba-2's selective state update** (the SSD recurrence, token by token). Per token
+and head `h`, with `g = h / (heads / groups)` the head's B/C group:
+
+    dt' = softplus(dt[h] + dt_bias[h])        A = -exp(A_log[h])
+    S   = e^{dt' A} S + dt' x[h] B[g]^T        o[h] = S C[g] + D[h] x[h]
+
+It is a delta-net head without the delta: one scalar decay per head and token, no beta and no l2
+norm on B or C, and the skip term `D`, so the gdn ops cannot run it. dt is not clamped: the
+checkpoints carry `time_step_limit = (0, inf)`, which mamba_ssm's kernels and vLLM pass, while
+transformers' CPU fallback clamps at `time_step_min`, which on a real prompt binds for about one
+(token, head) pair in eight. softplus is the identity above 20, as in torch and mamba_ssm.
+`state` is f32 `[slots, heads, head_dim, d_state]`; `x` and `o` may be `[M, heads, head_dim]` or
+flat, `B` and `C` `[M, groups, d_state]` or flat, `dt` one value per (token, head). Heads read their
+group in blocks (heads `0 .. heads/groups - 1` read group 0), the mamba_ssm convention, not
+round-robin. `o` excludes the model's gated norm. The rollback contract is `kda_update`'s, in both
+forms. Under `anchor` the scratch holds, per head, the replay count and one record per window token:
+the decay `e^{dt' A}`, `u = dt' x` (`head_dim`) and `B` (`d_state`), as many as the
+`[head_dim, d_state]` block holds and at most 32 (a 64 x 128 head holds 42). The replay applies a
+record with the window's own update, so the committed state is the per-candidate one bit for bit.
 
 **Speculative rollback is part of the schema** (`spec.md` §10). The recurrent state and the conv
 window have already absorbed rejected tokens, so the state cache is a rolling window of
@@ -2592,6 +2613,7 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+| `ple_conv_bias` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`?, `b`w → `y` |
 | `causal_conv1d` | `M`(range) `n` `width` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
 
 `logits_gemm` is separate from `gemm_nt` because `lm_head` is its own access class
@@ -2822,6 +2844,15 @@ prefill's question and `num_accepted` decode's.
 
 The residual add is folded in because the reference is `gv + silu(conv(gvn))` and both tensors are
 `[M, hc*n]`. `resid` absent leaves the plain convolution.
+
+### `ple_conv_bias`
+
+    y[t] = resid[t] + silu( b[c] + sum_j w[c][j] * x[t - (width-1-j)*dilation] )
+
+`ple_conv` with `b`, a per-channel bias inside the activation, before `y`. At dilation one with no
+`resid` it is Mamba-2's `conv1d` over its `[x | B | C]` channels, so the Mamba block keeps the
+window and rollback contract above. It is an op of its own, as `attn_paged_sink` is beside
+`attn_paged`, so the architectures that issue `ple_conv` keep their operand list.
 
 ### `causal_conv1d`
 

@@ -112,6 +112,10 @@ static const RadParamSpec pPleConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                           OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
                                           OPD_O("num_accepted"), OUT("y") };
+/* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
+static const RadOperandSpec oPleConvBias[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                              OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
+                                              OPD_O("num_accepted"), WGT("b"), OUT("y") };
 static const RadParamSpec pCausalConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
                                             P_STR("dtype") };
 static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
@@ -145,6 +149,12 @@ static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("he
     P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
 static const RadOperandSpec oKdaUpdate[] = { OPD("q"), OPD("k"), OPD("v"), OPD("a"), OPD("b"),
     WGT("A_log"), WGT("dt_bias"), INOUT("state"), OPD("state_idx"), OPD("cu"),
+    OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
+/* Mamba-2's selective state update: kda_update's rollback contract with a scalar decay per head. */
+static const RadParamSpec pSsdUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
+    P_INT("d_state"), P_INT("groups"), P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
+static const RadOperandSpec oSsdUpdate[] = { OPD("x"), OPD("B"), OPD("C"), OPD("dt"),
+    WGT("A_log"), WGT("dt_bias"), WGT("D"), INOUT("state"), OPD("state_idx"), OPD("cu"),
     OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
 /* The MTP head's entry for a wide residual stream. `ngroup` is hc for a grouped norm over the
  * sub-streams, 1 for a flat one over the whole row (see ref_hc.cpp). */
@@ -1164,6 +1174,15 @@ static const RadOpSchema kSchemas[] = {
   "verify reads state_idx[seq,num_accepted-1] and writes each candidate state_idx[seq,t]; "
   "prefill reads/writes column zero, committing only the final state. cu offsets are absolute; "
   "has_init=0 starts from zero and a negative initial slot emits zero output. No output norm." },
+{ "ssd_update", ARR(pSsdUpdate), ARR(oSsdUpdate),
+  "Mamba-2 selective state update: dt'=softplus(dt+dt_bias) (identity above 20, no clamp), "
+  "S*=exp(-exp(A_log)*dt'); S+=dt'*x*B^T; o=S*C+D*x, B and C shared by heads/groups heads. "
+  "State is f32 [slot,heads,head_dim,d_state]. verify reads state_idx[seq,num_accepted-1] and "
+  "writes each candidate state_idx[seq,t]; prefill reads/writes column zero, committing only the "
+  "final state. cu offsets are absolute; has_init=0 starts from zero and a negative initial slot "
+  "emits zero output. state_form anchor: one committed state (column 0) and a scratch slot "
+  "(column width/2) of per-token records (decay, dt' x, B) replayed up to num_accepted. No output "
+  "norm." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual. N = grouped_rmsnorm(h) -- one rsqrt per `n`-wide stream, "
   "one gain of hc*n over all of them, `w + wadd`; g = sigmoid(mix_up @ silu(mix_down @ N / hc)); "
@@ -1351,6 +1370,10 @@ static const RadOpSchema kSchemas[] = {
   "(width-1)*dilation - 1 slots plus one a token. Absent, every token commits: the read is at "
   "offset zero and the last (width-1)*dilation inputs land at offset zero, which is the prefill "
   "chunk. `resid` absent drops the add and leaves the plain convolution." },
+{ "ple_conv_bias", ARR(pPleConv), ARR(oPleConvBias),
+  "ple_conv with `b`, a per-channel bias added inside the silu: y[t] = resid[t] + silu(b[c] + "
+  "sum_j w[c][j] * x[t - (width-1-j)*dilation]). At dilation one with no `resid` it is Mamba-2's "
+  "conv1d. The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's." },
 { "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
   "y[t] = sum_j w[c][j] * x[t - (width-1-j)], a DEPTHWISE CAUSAL convolution with no activation "
   "and no residual (LFM2's short convolution, whose gates the caller applies). The state, "
@@ -2317,6 +2340,8 @@ SIMPLE("ref_mhc_contract", "mhc_contract", "norm", "mean of manifold residual st
        ref_mhc_contract),
 SIMPLE("ref_kda_update", "kda_update", "gdn", "bounded per-channel delta recurrence and candidate rollback", DT_FLOAT,
        ref_kda_update),
+SIMPLE("ref_ssd_update", "ssd_update", "gdn", "Mamba-2 scalar-decay recurrence and candidate rollback", DT_FLOAT,
+       ref_ssd_update),
 ROWL("ref_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",
      DT_FLOAT ", or mixing matrices of E4M3 / int8 codes with a scale plane, joined",
@@ -2423,6 +2448,9 @@ SIMPLE("ref_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot
        DT_FLOAT, ref_ple_gate),
 SIMPLE("ref_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, ref_ple_conv),
+SIMPLE("ref_ple_conv_bias", "ple_conv_bias", "norm",
+       "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)", DT_FLOAT,
+       ref_ple_conv_bias),
 SIMPLE("ref_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
        DT_FLOAT, ref_causal_conv1d),
 SIMPLE("ref_gather_rows", "gather_rows", "elem", "y[i,:] = x[idx[i],:]", DT_ANY, ref_gather_rows),

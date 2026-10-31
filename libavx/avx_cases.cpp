@@ -179,6 +179,10 @@ std::vector<Case> build_cases() {
             add("kda_update", { HI("M", 3), HI("heads", 2), HI("head_k", 32), HI("head_v", 32),
                                 HF("lower_bound", -5), HF("scale", 0.1767766952966369),
                                 HF("l2_eps", 1e-6), HS("mode", mode), HS("dtype", dt) });
+        /* Nemotron-H's per-rank shape at four ranks is 32 heads x 64 over 2 groups of 128. */
+        for (const char* mode : { "prefill", "verify" })
+            add("ssd_update", { HI("M", 3), HI("heads", 4), HI("head_dim", 16), HI("d_state", 32),
+                                HI("groups", 2), HS("mode", mode), HS("dtype", dt) });
         add("hc_write",  { HI("M", 5), HI("n", 128), HI("hc", 4), HS("dtype", dt) });
         add("hc_project",{ HI("M", 5), HI("n", 128), HI("hc", 4), HF("scale", 1.0),
                            HS("dtype", dt) });

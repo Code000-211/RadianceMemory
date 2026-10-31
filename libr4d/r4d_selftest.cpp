@@ -18949,6 +18949,172 @@ static void kda_check(const Plugin& pl, const char* mode, bool cold, int accepte
     dlclose(ref);
 }
 
+/* ssd_update against libref, as kda_check: two sequences over pitched planes, in prefill or verify,
+ * warm or cold, read at an accepted prefix; output, every written state slot and the red zones. */
+static void ssd_check(const Plugin& pl, const char* mode, bool cold, int accepted_count,
+                      bool anchor = false) {
+    const char* name = "ssd_update_n128_bf16";
+    const auto* row = find(pl, name);
+    if (!row || !g_plugin) {
+        ok(name, false, "row or plugin path absent");
+        return;
+    }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) {
+        ok(name, false, "reference plugin unavailable");
+        return;
+    }
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "ssd_update")) {
+                oracle = at(i);
+                break;
+            }
+    if (!oracle) {
+        ok(name, false, "reference operation unavailable");
+        dlclose(ref);
+        return;
+    }
+    /* Two heads a group, so B and C are shared and the group index is exercised. */
+    const int H = 4, G = 2, T0 = 6, P = 64, N = 128;
+    const std::vector<std::vector<int64_t>> shapes = {
+        { T0, H, P }, { T0, G, N }, { T0, G, N },   { T0, H },  { H },
+        { H },        { H },        { 8, H, P, N }, { 2, anchor ? 6 : 3 }, { 3 },
+        { 2 },        { 2 },        { T0, H, P },
+    };
+    std::vector<std::vector<uint8_t>> bytes(13), visible(13);
+    std::vector<RadTensor> host, device;
+    std::vector<void*> allocations;
+    auto offset = [](const RadTensor& t, int64_t logical) {
+        int64_t physical = 0;
+        for (int d = (int)t.rank - 1; d >= 0; --d) {
+            physical += (logical % t.shape[d]) * t.stride[d];
+            logical /= t.shape[d];
+        }
+        return physical;
+    };
+    for (int i = 0; i < 13; ++i) {
+        /* A_log, dt_bias and D (4..6) are f32, as the plugin declares them, and so is the state. */
+        const uint32_t dt = i >= 8 && i <= 11  ? (uint32_t)RAD_I32
+                            : i >= 4 && i <= 7 ? (uint32_t)RAD_F32
+                                               : (uint32_t)RAD_BF16;
+        auto ht = T(nullptr, dt, shapes[(size_t)i]);
+        if (ht.rank >= 2) {
+            int64_t pitch = ht.shape[ht.rank - 1] + 4;
+            for (int d = (int)ht.rank - 2; d >= 0; --d) {
+                ht.stride[d] = pitch;
+                pitch = ht.shape[d] * pitch + 8;
+            }
+        }
+        const size_t size = (size_t)(ht.shape[0] * ht.stride[0]) * esz(dt) + 256;
+        bytes[(size_t)i].assign(size, 0xa5);
+        visible[(size_t)i].assign(size, 0);
+        ht.data = bytes[(size_t)i].data() + 128;
+        int64_t count0 = 1;
+        for (uint32_t d = 0; d < ht.rank; ++d) count0 *= ht.shape[d];
+        for (int64_t j = 0; j < count0; ++j) {
+            const int64_t off0 = offset(ht, j);
+            const float value =
+                (float)((int)(st_mix32((uint32_t)(i * 173 + j)) % 2001) - 1000) / 2000;
+            if (dt == RAD_F32)
+                ((float*)ht.data)[off0] = value;
+            else if (dt == RAD_BF16)
+                ((uint16_t*)ht.data)[off0] = h_to_bf16(value);
+            else
+                ((int*)ht.data)[off0] = 0;
+            for (size_t b0 = 0; b0 < esz(dt); ++b0)
+                visible[(size_t)i][128 + (size_t)off0 * esz(dt) + b0] = 1;
+        }
+        host.push_back(ht);
+    }
+    auto integers = [&](int i, std::initializer_list<int> values) {
+        int64_t j = 0;
+        for (int v : values) ((int*)host[(size_t)i].data)[offset(host[(size_t)i], j++)] = v;
+    };
+    if (anchor) {
+        /* Committed 2 and 5, scratch 0 and 6, each scratch's counts zero: nothing to replay. */
+        integers(8, { 2, 2, 2, 0, 0, 0, 5, 5, 5, 6, 6, 6 });
+        integers(9, { 0, 3, 6 });
+        for (int slot : { 0, 6 })
+            for (int h = 0; h < H; ++h)
+                ((float*)host[7].data)[slot * host[7].stride[0] + h * host[7].stride[1]] = 0;
+    } else {
+        integers(8, { 2, 0, 3, 5, 6, 7 });
+        integers(9, { 1, 3, 6 });
+    }
+    integers(10, { accepted_count, 1 });
+    integers(11, { cold ? 0 : 1, 1 });
+    for (int i = 0; i < 13; ++i) {
+        void* d = dalloc(bytes[(size_t)i].size());
+        if (!d) {
+            ok(name, false, "allocation failed");
+            dlclose(ref);
+            return;
+        }
+        allocations.push_back(d);
+        st_memcpy(d, bytes[(size_t)i].data(), bytes[(size_t)i].size(), hipMemcpyHostToDevice);
+        auto dt = host[(size_t)i];
+        dt.data = (char*)d + 128;
+        device.push_back(dt);
+    }
+    std::vector<RadParam> ps = {
+        PI("M", T0 + 7),     PI("heads", H),    PI("head_dim", P), PI("d_state", N),
+        PI("groups", G),     PS("mode", mode),  PS("dtype", "bf16"),
+        PS("state_form", anchor ? "anchor" : "per_candidate")
+    };
+    RadArgs args{};
+    args.t = host.data();
+    args.n_t = 13;
+    args.p = ps.data();
+    args.n_p = (int)ps.size();
+    args.world_size = 1;
+    const int rc = oracle->launch(&args, nullptr);
+    ok("SSD host oracle", rc == RAD_OK);
+    if (rc == RAD_OK) run_case(row, device, ps);
+    if (rc == RAD_OK && anchor && !std::strcmp(mode, "verify")) {
+        // A second window must replay only the accepted prefix of the first window.
+        integers(11, { 1, 1 });
+        st_memcpy(allocations[11], bytes[11].data(), bytes[11].size(), hipMemcpyHostToDevice);
+        args.t = host.data();
+        ok("SSD anchor second-window host replay", oracle->launch(&args, nullptr) == RAD_OK);
+        run_case(row, device, ps);
+    }
+    bool matches = rc == RAD_OK, guards = true;
+    for (int i : { 7, 12 })
+        if (rc == RAD_OK) {
+            std::vector<uint8_t> got(bytes[(size_t)i].size());
+            st_memcpy(got.data(), allocations[(size_t)i], got.size(), hipMemcpyDeviceToHost);
+            for (size_t j = 0; j < got.size(); ++j)
+                if (!visible[(size_t)i][j]) guards = guards && got[j] == 0xa5;
+            const auto& ht = host[(size_t)i];
+            int64_t count0 = 1;
+            for (uint32_t d = 0; d < ht.rank; ++d) count0 *= ht.shape[d];
+            for (int64_t j = 0; j < count0; ++j) {
+                const auto off0 = offset(ht, j);
+                const float expected = ht.dtype == RAD_F32
+                                           ? ((const float*)ht.data)[off0]
+                                           : h_bf16(((const uint16_t*)ht.data)[off0]);
+                const float actual = ht.dtype == RAD_F32
+                                         ? ((const float*)(got.data() + 128))[off0]
+                                         : h_bf16(((const uint16_t*)(got.data() + 128))[off0]);
+                const float tol =
+                    ht.dtype == RAD_F32 ? 2e-5f : 0.008f + 0.008f * std::fabs(expected);
+                matches = matches && std::isfinite(actual) && std::fabs(actual - expected) <= tol;
+            }
+        }
+    ok(fmt("SSD %s %s cold=%d accepted=%d: output, state, untouched slots",
+           anchor ? "anchor" : "candidate", mode, cold, accepted_count)
+           .c_str(),
+       matches);
+    ok("SSD pitched rows and state red zones", guards);
+    dlclose(ref);
+}
+
 /* One launch, then a 200 ms warm-up and `iters` timed launches (st_time_us: --cold gives the
  * median of flushed launches). -1 when the row refuses the arguments. */
 static double form_us(const RadKernelInfo* r, RadArgs* a, int iters) {
@@ -33194,6 +33360,14 @@ static void device_phase(const Plugin& pl) {
         mla_check(pl, 33, 8, 17, "mla_attn_matrix_bf16", MlaFill::ragged, nullptr, 1);
         mla_check(pl, 7, 8, 513, "mla_attn_matrix_bf16", MlaFill::prefill, nullptr, 1);
     }
+    if (sel("ssd_update_n128_bf16"))
+        for (const char* mode : { "prefill", "verify" })
+            for (int accepted : { 1, 2, 3 }) {
+                ssd_check(pl, mode, false, accepted);
+                ssd_check(pl, mode, true, accepted);
+                ssd_check(pl, mode, false, accepted, true);
+                ssd_check(pl, mode, true, accepted, true);
+            }
     if (sel("kda_update_k128_v128_bf16")) {
         for (const char* mode : { "prefill", "verify" })
             for (int accepted : { 1, 2, 3 }) {
