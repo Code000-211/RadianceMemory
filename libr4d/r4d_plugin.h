@@ -211,6 +211,13 @@ int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs*, RadStream);
 R4D_WIN_TREE_DECL(256, 1) R4D_WIN_TREE_DECL(256, 2) R4D_WIN_TREE_DECL(256, 4) R4D_WIN_TREE_DECL(256, 8)
 R4D_WIN_TREE_DECL(512, 1) R4D_WIN_TREE_DECL(512, 2) R4D_WIN_TREE_DECL(512, 4) R4D_WIN_TREE_DECL(512, 8)
 #undef R4D_WIN_TREE_DECL
+/* attn_paged_ahead and attn_paged_qrow_ahead (docs/OPS.md): the windowed kernels with a non-causal
+ * window that bounds the keys behind only. */
+#define R4D_WIN_AHEAD_DECL(HD, G)                                                                 \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_bf16(const RadArgs*, RadStream);               \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_fp8 (const RadArgs*, RadStream);
+R4D_WIN_AHEAD_DECL(256, 1) R4D_WIN_AHEAD_DECL(256, 2) R4D_WIN_AHEAD_DECL(256, 4) R4D_WIN_AHEAD_DECL(256, 8)
+#undef R4D_WIN_AHEAD_DECL
 /* dflash_tree (r4d_dflash_tree_bf16.hip): dflash_select's lattice grown best-first into a tree. */
 int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded

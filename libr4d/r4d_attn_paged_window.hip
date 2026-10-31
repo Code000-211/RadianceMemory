@@ -24,6 +24,7 @@
  *   pos     = seqused[s] - q_len(s) + i                  (seqused INCLUDES this step's queries)
  *   causal  key j visible when j <= pos;  non-causal when j < seqused[s]
  *   window  causal: pos - j < window;  non-causal: |pos - j| < window;  0 = none
+ *   ahead   non-causal, window > 0: only pos - j < window, the keys after pos unbounded (FWD, below)
  *   a block-table entry < 0 is a missing block: its keys are not visible
  *   no visible key at all -> a zero row
  *   k_descale / v_descale per (sequence, kv head), absent = 1
@@ -197,6 +198,8 @@ struct AttnArgs {
     float qscale;                                          /* softmax scale * log2(e) */
     int   max_blocks, n_seq, q_len, tps, kv_heads, causal, window, n_split;
     int   shared_window;                                    /* all query rows use sequence anchor */
+    /* 1: a non-causal window bounds the keys behind only (launch_attn's FWD) */
+    int   ahead;
     /* A tree verify (attn_paged_qrow_tree): RadBatch::spec_parent, one a query row; read only by
      * the TREE instances. */
     const int*           tpar;
@@ -310,7 +313,7 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
 
     /* ---- the tile's key range, and this split's share of it */
     int hi = causal ? (A.shared_window ? tbase + 1 : plast + 1) : ctx;
-    if (!causal && window > 0 && !A.shared_window) hi = imin(hi, plast + window);
+    if (!causal && window > 0 && !A.shared_window && !A.ahead) hi = imin(hi, plast + window);
     hi = imin(imin(hi, ctx), A.max_blocks * 16);
     /* A tree row's window is measured from the block's first position plus its depth, which can
      * be below its own position; an anchor-window launch also uses the first row for every query. */
@@ -445,7 +448,7 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
             if (A.shared_window)
                 vis = vis && (wpq - kk < window);
             else if (window > 0)
-                vis = vis && (wpq - kk < window) && (causal || kk - wpq < window);
+                vis = vis && (wpq - kk < window) && (causal || A.ahead || kk - wpq < window);
             const float sv = vis ? sc[0] : -__builtin_inff();
             const float mn = __builtin_fmaxf(m[i], wave_max(sv));
             if (mn == -__builtin_inff()) return;     /* nothing visible yet: uniform */
@@ -639,7 +642,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
     const int plast = qbase + npos - 1;
     const int causal = A.causal, window = A.window;
     int hi = causal ? plast + 1 : ctx;
-    if (!causal && window > 0) hi = imin(hi, plast + window);
+    if (!causal && window > 0 && !A.ahead) hi = imin(hi, plast + window);
     hi = imin(imin(hi, ctx), A.max_blocks * 16);
     const int lo = window > 0 ? imax(0, qbase - window + 1) : 0;
     const int lo_a = lo & ~15;
@@ -830,7 +833,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 const int kk = k0 + 8 * h + e;
                 bool vis = rval && tok && kk >= lo && kk < hi;
                 if (causal) vis = vis && kk <= pos;
-                if (window > 0) vis = vis && (pos - kk < window) && (causal || kk - pos < window);
+                if (window > 0) vis = vis && (pos - kk < window) && (causal || A.ahead || kk - pos < window);
                 sv[e] = vis ? tot[e] * sscale : -__builtin_inff();
                 mx = __builtin_fmaxf(mx, sv[e]);
             }
@@ -1047,7 +1050,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
     r4d_chain_done();
 }
 
-template <int HD, int GQA, bool KV8, bool TREE = false, bool SHARED = false>
+template <int HD, int GQA, bool KV8, bool TREE = false, bool SHARED = false, bool FWD = false>
 static int launch_attn(const RadArgs* a, RadStream stream) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
     if (!a || a->n_t < (TREE ? 9 : 8)) return RAD_E_INVAL;
@@ -1072,6 +1075,9 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     const long long causal = rad_args_geti_or(a, "causal", 1);
     const long long window = rad_args_geti_or(a, "window", 0);
     if ((causal != 0 && causal != 1) || window < 0 || window > (1ll << 30)) return RAD_E_SHAPE;
+    /* The open-ended window is a non-causal one: a causal row has nothing ahead, and without a
+     * window there is nothing to bound. */
+    if (FWD && (causal != 0 || window == 0)) return RAD_E_SHAPE;
 
     if (q->dtype != RAD_BF16 || o->dtype != RAD_BF16) return RAD_E_DTYPE;
     if (kv->dtype != (uint32_t)(KV8 ? RAD_F8E4M3 : RAD_BF16)) return RAD_E_DTYPE;
@@ -1180,6 +1186,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
             W.causal = (int)causal;
             W.window = (int)window;
             W.shared_window = SHARED;
+            W.ahead = FWD ? 1 : 0;
             W.n_split = 1;
             R4D_KLAUNCH(R4D_KNAME(attn_wmma_kernel<HD, GQA, KV8>), dim3((unsigned)ntw, (unsigned)kvh, 1u),
                        dim3(kWThreads), (hipStream_t)stream, W);
@@ -1224,6 +1231,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.causal = (int)causal;
     A.window = (int)window;
     A.shared_window = SHARED;
+    A.ahead = FWD ? 1 : 0;
     A.n_split = (int)ns;
     A.tpar = TREE ? (const int*)tp->data : nullptr;
 
@@ -1264,6 +1272,18 @@ R4D_WIN_DEF(128, 1)
 R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
 R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8) R4D_WIN_DEF(512, 16)
 #undef R4D_WIN_DEF
+
+/* attn_paged_ahead and attn_paged_qrow_ahead: a non-causal window that bounds the keys behind only
+ * (FWD), the sliding layers' mask over a picture's rows (docs/OPS.md). */
+#define R4D_WIN_AHEAD_DEF(HD, G)                                                                  \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {          \
+        return r4d_win::launch_attn<HD, G, false, false, false, true>(a, s);                              \
+    }                                                                                              \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_fp8(const RadArgs* a, RadStream s) {           \
+        return r4d_win::launch_attn<HD, G, true, false, false, true>(a, s);                               \
+    }
+R4D_WIN_AHEAD_DEF(256, 1) R4D_WIN_AHEAD_DEF(256, 2) R4D_WIN_AHEAD_DEF(256, 4) R4D_WIN_AHEAD_DEF(256, 8)
+#undef R4D_WIN_AHEAD_DEF
 
 /* attn_paged_qrow_tree: the scalar kernel with a tree verify's mask (TREE). */
 #define R4D_WIN_TREE_DEF(HD, G)                                                                   \

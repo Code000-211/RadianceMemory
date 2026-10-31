@@ -3284,6 +3284,12 @@ static const RadOpSchema kSchemas[] = {
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
            "where it lies rather than lifted into a dense block first."),
+    SCHEMA("attn_paged_ahead", pAttnPaged, oAttnPaged,
+           "attn_paged, non-causal, with `window` (> 0) bounding the keys behind a row only: key j is "
+           "visible when pos - j < window, every later key of the sequence is. A sliding layer's mask "
+           "over a picture's rows read both ways."),
+    SCHEMA("attn_paged_qrow_ahead", pAttnPaged, oAttnPaged,
+           "attn_paged_ahead with q read at its own row pitch, as attn_paged_qrow."),
     SCHEMA("attn_paged_qrow_tree", pAttnPaged, oAttnPagedTree,
            "attn_paged_qrow over a tree verify (rad_drafter_tree): spec_parent is -2 for an "
            "ordinary causal row, else the row's parent's index within its sequence's rows (-1 for "
@@ -4243,6 +4249,17 @@ R4D_WIN_C(cAnchorH512G4Bf16, 512, 4, "bf16", 1) R4D_WIN_C(cAnchorH512G4Fp8, 512,
 R4D_WIN_C(cAnchorH512G8Bf16, 512, 8, "bf16", 1) R4D_WIN_C(cAnchorH512G8Fp8, 512, 8, "fp8_e4m3", 1)
 R4D_WIN_C(cWinH512G16Bf16, 512, 16, "bf16", 0) R4D_WIN_C(cWinH512G16Fp8, 512, 16, "fp8_e4m3", 0)
 #undef R4D_WIN_C
+/* The open-ended window (attn_paged_ahead): non-causal, a window of at least one. */
+#define R4D_WIN_AHEAD_C(NAME, HD, G, KV)                                                          \
+    static const RadConstraint NAME[] = {                                                          \
+        C_EQ("head_dim", HD), C_EQ("gqa", G), C_EQ("block_size", 16), C_EQ("causal", 0),           \
+        C_GE("window", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                          \
+    };
+R4D_WIN_AHEAD_C(cWinAheadH256G1Bf16, 256, 1, "bf16") R4D_WIN_AHEAD_C(cWinAheadH256G1Fp8, 256, 1, "fp8_e4m3")
+R4D_WIN_AHEAD_C(cWinAheadH256G2Bf16, 256, 2, "bf16") R4D_WIN_AHEAD_C(cWinAheadH256G2Fp8, 256, 2, "fp8_e4m3")
+R4D_WIN_AHEAD_C(cWinAheadH256G4Bf16, 256, 4, "bf16") R4D_WIN_AHEAD_C(cWinAheadH256G4Fp8, 256, 4, "fp8_e4m3")
+R4D_WIN_AHEAD_C(cWinAheadH256G8Bf16, 256, 8, "bf16") R4D_WIN_AHEAD_C(cWinAheadH256G8Fp8, 256, 8, "fp8_e4m3")
+#undef R4D_WIN_AHEAD_C
 /* Twelve queries per KV head, head_dim 256 (r4d_attn_paged_h256_gqa12.hip): Qwen3.8-Flash-Next's
  * QSA layers, 24 query heads over 2. `q_len <= 5` is the same `q_len * gqa <= 64` bound, tighter
  * than the legal speculation depths: a depth-7 verify (q_len 8) takes the prefill kernel, which
@@ -7257,6 +7274,34 @@ R4D_ANCHOR_PAIR(256, 1) R4D_ANCHOR_PAIR(256, 2) R4D_ANCHOR_PAIR(256, 4) R4D_ANCH
 R4D_ANCHOR_PAIR(512, 1) R4D_ANCHOR_PAIR(512, 2) R4D_ANCHOR_PAIR(512, 4) R4D_ANCHOR_PAIR(512, 8)
 #undef R4D_ANCHOR_PAIR
 #undef R4D_ANCHOR_ROW
+/* ...and the same kernels under attn_paged_ahead and attn_paged_qrow_ahead, where the window
+ * bounds the keys behind only. */
+#define R4D_WIN_AHEAD_ROW(HD, G, KVN, KVS, C, KVDOC)                                              \
+{ "attn_ahead_h" #HD "_gqa" #G "_" #KVN, "attn_paged_ahead", "attn",                              \
+  "paged attention, non-causal, a window over the keys behind only",                             \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query, " KVDOC " kv cache, bf16 out, f32 partials",                                        \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_ahead_h##HD##_gqa##G##_##KVS,                             \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr, nullptr },                                                                     \
+{ "attn_qrow_ahead_h" #HD "_gqa" #G "_" #KVN, "attn_paged_qrow_ahead", "attn",                    \
+  "paged attention reading q at its own row pitch, non-causal, a window over the keys behind only", \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query (any row pitch), " KVDOC " kv cache, bf16 out, f32 partials",                        \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_ahead_h##HD##_gqa##G##_##KVS,                             \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr, nullptr },
+#define R4D_WIN_AHEAD_PAIR(HD, GQ)                                                                 \
+    R4D_WIN_AHEAD_ROW(HD, GQ, bf16kv, bf16, cWinAheadH##HD##G##GQ##Bf16, "bf16")                   \
+    R4D_WIN_AHEAD_ROW(HD, GQ, fp8kv, fp8, cWinAheadH##HD##G##GQ##Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_WIN_AHEAD_PAIR(256, 1) R4D_WIN_AHEAD_PAIR(256, 2) R4D_WIN_AHEAD_PAIR(256, 4)
+R4D_WIN_AHEAD_PAIR(256, 8)
+#undef R4D_WIN_AHEAD_PAIR
+#undef R4D_WIN_AHEAD_ROW
 
 /* ...and under attn_paged_qrow_tree, the scalar kernel with a tree verify's mask (the launch
  * refuses a non-causal one and never takes the WMMA kernel). */

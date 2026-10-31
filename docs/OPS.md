@@ -507,6 +507,20 @@ depth, the position its token takes once its path is committed. Causal layers on
 `attn_paged_tree`; libr4d `attn_paged_qrow_tree` at h256/gqa2 on the split-KV decode kernel and at
 every geometry of the windowed kernels, to 64 rows a block.
 
+| op | params | operands |
+|---|---|---|
+| `attn_paged_ahead` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
+| `attn_paged_qrow_ahead` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
+
+`attn_paged_ahead` is `attn_paged` at `causal` 0 with a window that bounds the keys behind a row
+only: key `j` is visible to row `i` when `i - j < window` and `j < seqused`, so every key after the
+row is. `attn_paged` reads a non-causal window two-sided (`|i - j| < window`). Gemma 4's sliding
+layers read a picture's rows this way (transformers' mask is the window AND (causal OR the same
+picture)), and the two differ only for a picture longer than the window. `window` is at least 1.
+`attn_paged_qrow_ahead` is the same with `q` at its own row pitch, as `attn_paged_qrow`. libr4d
+serves both at h256, 1 to 8 queries per kv head, on the windowed kernels; no other library
+declares them, so a plugin asking for them learns whether a card serves the geometry.
+
 Of the ops above, libref serves only `attn_paged_tree`, which is not a fusion but `attn_paged`'s
 tree form. It has no row for any of the fusions, deliberately. An architecture asks for a fusion and declares
 the chain where it does not resolve (`rad_op_resolved`); a reference row would make it resolve
