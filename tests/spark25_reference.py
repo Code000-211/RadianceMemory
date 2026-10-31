@@ -52,9 +52,8 @@ def write_tokenizer(path):
         vocab[s] = 256 + i
         added.append(dict(id=256 + i, content=s, single_word=False, lstrip=False,
                           rstrip=False, normalized=False, special=True))
-    # A 1024-token vocabulary leaves every rank a nonempty shard even at a ragged TP=3.
-    # The vocabulary shard is rounded up to a 128-row block, so a small vocab leaves a rank with
-    # nothing at some widths. 3584 rows give every world from 1 to 8 a nonempty shard.
+    # Vocabulary shards are rounded to 128-row blocks; 3584 rows give worlds 1 to 8 a nonempty
+    # shard, including ragged worlds such as TP=3.
     for i in range(259, 3584):
         s = f"<extra_{i}>"
         vocab[s] = i
@@ -66,6 +65,52 @@ def write_tokenizer(path):
                model=dict(type="BPE", dropout=None, unk_token=None, byte_fallback=False,
                           vocab=vocab, merges=[]))
     (path / "tokenizer.json").write_text(json.dumps(tok, ensure_ascii=False))
+
+
+# The last prompt crosses the 32-token prefill chunk boundary; the third leaves the local window.
+PROMPTS = ("a", "hello", "longer prompt", "the quick brown fox jumps over the lazy dog twice")
+
+
+def serve(build, rad, port, env, log, tp=1):
+    """Start Radiance on the host kernels over `rad` and wait for /health. The caller stops it."""
+    proc = subprocess.Popen(
+        [str(build / "bin/radiance"), "--model", str(rad), "--host", "127.0.0.1", "--port",
+         str(port), "--kernels", "libref", "--debug-accept-reference-kernels", "--max-model-len",
+         "64", "--max-num-batched-tokens", "32", "--max-num-seqs", "1", "--tp", str(tp)],
+        env=env, stdout=log, stderr=subprocess.STDOUT)
+    url = f"http://127.0.0.1:{port}"
+    for _ in range(300):
+        if proc.poll() is not None:
+            proc.wait()
+            raise RuntimeError("Radiance exited before listening")
+        try:
+            urllib.request.urlopen(url + "/health", timeout=1).close()
+            return proc, url
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.1)
+    stop(proc)
+    raise RuntimeError("Radiance did not start")
+
+
+def stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def generate(url, prompt, steps=5, logprobs=10):
+    """Greedy decode of `steps` tokens with the top candidates at each step."""
+    data = json.dumps(dict(prompt=prompt, max_tokens=steps, temperature=0, logprobs=logprobs,
+                           ignore_eos=True)).encode()
+    req = urllib.request.Request(url + "/v1/completions", data,
+                                 {"Content-Type": "application/json"})
+    rows = json.load(urllib.request.urlopen(req, timeout=30))["choices"][0]["logprobs"]["content"]
+    if len(rows) != steps:
+        raise AssertionError(f"{prompt!r}: expected {steps} decode rows, got {len(rows)}")
+    return rows
 
 
 def main():
@@ -140,35 +185,12 @@ def main():
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         with (root / "server.log").open("w+") as log:
-            proc = subprocess.Popen([build / "bin/radiance", "--model", rad, "--host", "127.0.0.1",
-                "--port", str(port), "--kernels", "libref", "--debug-accept-reference-kernels",
-                "--max-model-len", "64", "--max-num-batched-tokens", "32", "--max-num-seqs", "1",
-                "--tp", str(args.tp)],
-                env=env, stdout=log, stderr=subprocess.STDOUT)
+            proc = None
             try:
-                url = f"http://127.0.0.1:{port}"
-                for _ in range(200):
-                    if proc.poll() is not None:
-                        raise RuntimeError("Radiance exited before listening")
-                    try:
-                        urllib.request.urlopen(url + "/health", timeout=1).close()
-                        break
-                    except (OSError, urllib.error.URLError):
-                        time.sleep(0.1)
-                else:
-                    raise RuntimeError("Radiance did not start")
-                # The longer prompts exceed the local window, and the last also crosses the
-                # 32-token prefill chunk boundary. Compare cached decode to the same HF continuation.
-                for prompt in ("a", "hello", "longer prompt", "the quick brown fox jumps over the lazy dog twice"):
-                    request = dict(prompt=prompt, max_tokens=5, temperature=0, logprobs=10,
-                                   ignore_eos=True)
-                    data = json.dumps(request).encode()
-                    req = urllib.request.Request(url + "/v1/completions", data,
-                                                 {"Content-Type": "application/json"})
-                    result = json.load(urllib.request.urlopen(req, timeout=30))
-                    rows = result["choices"][0]["logprobs"]["content"]
-                    if len(rows) != 5:
-                        raise AssertionError(f"{prompt!r}: expected 5 decode rows, got {len(rows)}")
+                proc, url = serve(build, rad, port, env, log, tp=args.tp)
+                # Compare cached decode with the same HF continuation.
+                for prompt in PROMPTS:
+                    rows = generate(url, prompt)
                     ids = list(prompt.encode())
                     max_error = 0.0
                     matches = 0
@@ -197,12 +219,8 @@ def main():
                 print(log.read(), file=sys.stderr)
                 raise
             finally:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                if proc is not None:
+                    stop(proc)
 
 
 if __name__ == "__main__":

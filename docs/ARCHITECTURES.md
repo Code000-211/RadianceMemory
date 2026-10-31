@@ -112,11 +112,35 @@ otherwise it fails with `RAD_E_UNSUPPORTED` rather than running rank-local parti
 serves these collectives at 2, 3, 4 and 8 ranks; other widths resolve only on a library with a
 general `all_reduce` (libref), so a card deployment is limited to those worlds.
 
-The initial implementation serves BF16 with tied embeddings, headwise sigmoid gates and the
-checkpoint's own rotary parameters. It does not implement DSpark, quantisation recipes, other gate
-activations or rotary-scaling overrides. The tokenizer and its template come from the checkpoint;
-the architecture declares the `<think>`/`</think>` reasoning markers and the
-`<tool_call>name<arg_key>...` tool-call format.
+Both plugins reject multi-rank declarations if a required exact collective cannot be resolved;
+otherwise a missing reduction would silently leave rank-local projections in the residual.
+
+The tokenizer and its template come from the checkpoint; the architecture declares the
+`<think>`/`</think>` reasoning markers and the `<tool_call>name<arg_key>...` tool-call format.
+DSpark, other gate activations and rotary-scaling overrides are not implemented.
+
+## Rotated int8 (IQ8R)
+
+`arch/spark25_w8a8` serves a trunk whose linears use the fwht128-rotated int8 grid: per-128 int8
+activation codes feed `i8a8h` GEMMs, while the embedding and small per-head gate remain BF16 and
+normalisation gains remain FP32. Exact GELU runs before the down projection's separate Hadamard quantiser. The output head
+may be BF16 or a separately quantised int8 table. The descriptor is `w8a8_fwht128`; the container
+must set `quantization_config.quant_method=w8a8` and `quantization_config.fmt=fwht128`.
+Column-sharded inputs and their offsets must be whole 128-column scale groups. A rank with an
+unaligned span is refused, not served with misaligned scales.
+
+`data/recipes/spark-x26-4b-iq8r.recipe` fits the six trunk projection types against BF16
+calibration Grams, and quantises the output head with RTN. The BF16 plugin records them with
+`RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS`, and `RADIANCE_SPARK_CALIB_LAYERS=lo:hi`; calibration
+requires TP=1 to retain off-diagonal cross-rank terms. Drive a representative corpus through
+prefill with `--no-prefix-cache` and no speculative decoding. Each slice writes six RADGRAM2 files
+per layer. Calibration completeness is not a measure of quality: compare the resulting container
+against BF16 on disjoint data, including the tail of the per-position KL distribution.
+
+`tests/spark25_iq8r.py` compares a deterministic quantised fixture with the Transformers reference,
+including top-10 probabilities across cached decoding. `--tp 2` checks two fake host ranks, and
+`--wide-tp --tp N` exercises group-aligned attention and FFN shards for N from 1 to 8. As with the
+BF16 fixture, run it under a GPU-denying device cgroup on a shared machine.
 
 For a CPU differential against the reference implementation's `configuration_spark.py` and
 `modeling_spark.py`, with Python's torch, transformers and safetensors installed:

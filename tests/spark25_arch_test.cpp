@@ -3,6 +3,7 @@
 #include "arch_fakes.h"
 #include "rad_plugin.h"
 #include "../arch/spark25_bf16/spark25_bf16.cpp"
+#include "../arch/spark25_w8a8/spark25_w8a8.cpp"
 
 using namespace rad_fake;
 
@@ -150,6 +151,81 @@ TEST(tensor_parallel_covers_heads_and_ffn_without_changing_gqa) {
         CHECK(std::all_of(ffn_owners.begin(), ffn_owners.end(), [](int n) { return n == 1; }));
         CHECK(std::all_of(vocab_owners.begin(), vocab_owners.end(), [](int n) { return n == 1; }));
     }
+}
+
+static void spark_iq8r_encodings(RadBuilder& b, bool rotated = true) {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    if (rotated) rad_enc_copy_str(e.transform, "fwht128");
+    for (const char* name : {"attn_q.weight", "attn_k.weight", "attn_v.weight",
+                             "attn_output.weight", "ffn_gate_up.weight", "ffn_down.weight"})
+        b.encs.emplace_back(name, e);
+    b.encs.emplace_back("output.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128));
+}
+
+TEST(iq8r_graph_uses_rotated_codes_and_is_liveness_safe) {
+    for (int world = 1; world <= 8; ++world) {
+        for (int rank = 0; rank < world; ++rank) {
+            MetaKV k = spark_meta();
+            k.m.quant = "w8a8_fwht128";
+            k.set("quantization_config.quant_method", "w8a8")
+             .set("quantization_config.fmt", "fwht128");
+            RadBuilder b;
+            spark_iq8r_encodings(b);
+            RadBuildCtx ctx = build_ctx();
+            ctx.world_size = world;
+            ctx.rank = rank;
+            REQUIRE_EQ(spark25_w8a8::declare(&b, k.meta(), &ctx), RAD_OK);
+            int quantized = 0;
+            for (const auto& op : b.ops) if (op.op == "gemm_nt_q") {
+                CHECK_EQ(pstr(&op, "dtype"), std::string("i8a8h"));
+                ++quantized;
+            }
+            CHECK_EQ(quantized, 24);  /* six linears x four layers */
+            CHECK_EQ(count_op(b, "all_reduce"), world == 1 ? 0 : 9);
+            for (int n : {1, 8}) {
+                RadBatch batch = decode_batch();
+                batch.n_tok = batch.max_q_len = n;
+                RadCtx c{.b = &b, .batch = &batch, .rank = rank, .world = world};
+                spark25_w8a8::step(&c, &batch);
+                CHECK_LINT(b, &c);
+                CHECK(c.step_fail.empty());
+            }
+        }
+    }
+}
+
+TEST(iq8r_rejects_unrotated_weights_and_missing_collectives) {
+    MetaKV k = spark_meta();
+    k.m.quant = "w8a8_fwht128";
+    k.set("quantization_config.quant_method", "w8a8")
+     .set("quantization_config.fmt", "fwht128");
+    RadBuildCtx ctx = build_ctx();
+    RadBuilder unrotated;
+    spark_iq8r_encodings(unrotated, false);
+    CHECK_EQ(stderr_of_rc([&] { return spark25_w8a8::declare(&unrotated, k.meta(), &ctx); }),
+             RAD_E_DTYPE);
+    RadBuilder missing;
+    spark_iq8r_encodings(missing);
+    missing.refuse.insert("all_reduce");
+    ctx.world_size = 2;
+    CHECK_EQ(stderr_of_rc([&] { return spark25_w8a8::declare(&missing, k.meta(), &ctx); }),
+             RAD_E_UNSUPPORTED);
+}
+
+TEST(tp_rejects_missing_all_reduce_instead_of_skipping_it) {
+    MetaKV k = spark_meta();
+    RadBuilder b;
+    b.refuse.insert("all_reduce");
+    RadBuildCtx ctx = build_ctx();
+    ctx.world_size = 2;
+    CHECK_EQ(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }),
+             RAD_E_UNSUPPORTED);
+
+    /* No collective is required for single-device inference. */
+    RadBuilder single;
+    single.refuse.insert("all_reduce");
+    ctx.world_size = 1;
+    CHECK_EQ(spark25_bf16::declare(&single, k.meta(), &ctx), RAD_OK);
 }
 
 TEST(tp_projection_rounds_to_bf16_before_the_fp32_residual_add) {

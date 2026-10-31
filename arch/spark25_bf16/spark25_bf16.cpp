@@ -11,6 +11,7 @@
  * and writes bf16 for the linear projections.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_fp8.h>
 #include "chat.h"
 #include "spark25_prefill_pass_key.h"
 
@@ -29,6 +30,7 @@ struct Layer {
     rad_op anorm = 0, qp = 0, kp = 0, vp = 0, gp = 0, rq = 0, rk = 0, store = 0, attn = 0;
     rad_op sigmoid = 0, gate_heads = 0, op = 0, widen_attn = 0, reduce_attn = 0, add_attn = 0;
     rad_op fnorm = 0, gup = 0, act = 0, dp = 0, widen_ffn = 0, reduce_ffn = 0, add_ffn = 0;
+    CalibTap tap_in{}, tap_o{}, tap_gu{}, tap_down{};
 };
 
 struct Model {
@@ -40,6 +42,9 @@ struct Model {
     rad_weight tok = 0, norm = 0, head = 0;
     rad_op embed = 0, widen = 0, reduce_embed = 0, final_norm = 0, gather = 0, logits_op = 0;
     std::vector<Layer> layers;
+    bool tap_live = false;
+    long long calib_rows = 0;
+    int64_t calib_lo = 0, calib_hi = 0;
 };
 static Model models[MAX_RANKS];
 
@@ -163,6 +168,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     std::vector<bool> local;
     RAD_ARCH_TRY(schedule(meta, g.n_layer, local));
+    if (calib_dir()) {
+        if (g.world != 1) {
+            fprintf(stderr, "radiance: spark25 calibration requires one rank so column-split "
+                            "Grams retain their cross terms\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_ARCH_TRY(calib_layers("spark25", "RADIANCE_SPARK_CALIB_LAYERS", g.n_layer,
+                                  &m.calib_lo, &m.calib_hi));
+        m.tap_live = true;
+    }
     const int64_t window = rad_meta_geti(meta, "sliding_window", 0);
     if (window <= 0) {
         fprintf(stderr, "radiance: spark25: a positive sliding_window is required\n");
@@ -366,6 +381,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         a.widen_ffn = widen(m.delta);
         a.add_ffn = add();
+        if (m.tap_live && l >= m.calib_lo && l < m.calib_hi) {
+            RAD_ARCH_TRY(a.tap_in.declare(b, nm, T, nm.f("blk.%d.attn_in", l), m.h, E));
+            RAD_ARCH_TRY(a.tap_o.declare(b, nm, T, nm.f("blk.%d.attn_o", l), m.attn, Q));
+            RAD_ARCH_TRY(a.tap_gu.declare(b, nm, T, nm.f("blk.%d.ffn_in", l), m.h, E));
+            RAD_ARCH_TRY(a.tap_down.declare(b, nm, T, nm.f("blk.%d.ffn_down_in", l), m.ff, F));
+        }
     }
     m.final_norm = norm(m.norm, m.x, m.h);
     m.gather = rw(b, RAD_OP(b, "gather_rows", RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
@@ -382,7 +403,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = models[rad_rank(c)];
+    Model& m = models[rad_rank(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
@@ -400,6 +421,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE(c, a.kp, brows(m.h, T), RAD_W(a.k), brows(m.k, T));
         RAD_ISSUE(c, a.vp, brows(m.h, T), RAD_W(a.v), brows(m.v, T));
         RAD_ISSUE(c, a.gp, brows(m.h, T), RAD_W(a.gate), brows(m.gate, T));
+        a.tap_in.step(c, m.h, T, m.tap_live);
         RAD_ISSUE(c, a.rq, brows(m.q, T), pos);
         RAD_ISSUE(c, a.rk, brows(m.k, T), pos);
         RAD_ISSUE(c, a.store, brows(m.k, T), brows(m.v, T), praw(slot, RAD_I32, T),
@@ -412,13 +434,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const RadOperand heads = RAD_P_T2(rad_buf_ptr(c, m.attn), RAD_BF16, T * g.n_head, g.head_dim);
         const RadOperand gates = RAD_P_T2(rad_buf_ptr(c, m.gate), RAD_BF16, T * g.n_head, 1);
         RAD_ISSUE_N(c, a.gate_heads, T * g.n_head, heads, gates, RAD_NONE, heads);
+        a.tap_o.step(c, m.attn, T, m.tap_live);
         RAD_ISSUE(c, a.op, brows(m.attn, T), RAD_W(a.o), brows(m.h, T));
         if (a.reduce_attn) RAD_ISSUE_N(c, a.reduce_attn, T * g.n_embd, brows(m.h, T), RAD_NONE);
         RAD_ISSUE(c, a.widen_attn, brows(m.h, T), brows(m.delta, T));
         RAD_ISSUE(c, a.add_attn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
         RAD_ISSUE(c, a.fnorm, brows(m.x, T), RAD_W(a.fn), brows(m.h, T));
         RAD_ISSUE(c, a.gup, brows(m.h, T), RAD_W(a.gu), brows(m.gu, T));
+        a.tap_gu.step(c, m.h, T, m.tap_live);
         RAD_ISSUE(c, a.act, bcol(m.gu, 0, g.n_ff, T), bcol(m.gu, g.n_ff, g.n_ff, T), brows(m.ff, T));
+        a.tap_down.step(c, m.ff, T, m.tap_live);
         RAD_ISSUE(c, a.dp, brows(m.ff, T), RAD_W(a.down), brows(m.h, T));
         if (a.reduce_ffn) RAD_ISSUE_N(c, a.reduce_ffn, T * g.n_embd, brows(m.h, T), RAD_NONE);
         RAD_ISSUE(c, a.widen_ffn, brows(m.h, T), brows(m.delta, T));
@@ -430,6 +455,31 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.hout, batch->n_out));
         RAD_ISSUE_N(c, m.logits_op, batch->n_out, brows(m.hout, batch->n_out), RAD_W(m.head),
                     brows(m.logits, batch->n_out));
+    }
+    if (m.tap_live) {
+        m.calib_rows += T;
+        if (m.calib_rows >= calib_target()) {
+            bool ok = true;
+            for (int64_t l = m.calib_lo; l < m.calib_hi; ++l) {
+                const Layer& a = m.layers[(size_t)l];
+                char stem[96];
+                for (const char* proj : {"attn_q", "attn_k", "attn_v"}) {
+                    std::snprintf(stem, sizeof stem, "blk.%lld.%s", (long long)l, proj);
+                    ok = calib_write(c, a.tap_in.h, a.tap_in.K, m.calib_rows, stem, 0) && ok;
+                }
+                std::snprintf(stem, sizeof stem, "blk.%lld.attn_output", (long long)l);
+                ok = calib_write(c, a.tap_o.h, a.tap_o.K, m.calib_rows, stem, 0) && ok;
+                std::snprintf(stem, sizeof stem, "blk.%lld.ffn_gate_up", (long long)l);
+                ok = calib_write(c, a.tap_gu.h, a.tap_gu.K, m.calib_rows, stem, 0) && ok;
+                std::snprintf(stem, sizeof stem, "blk.%lld.ffn_down", (long long)l);
+                ok = calib_write(c, a.tap_down.h, a.tap_down.K, m.calib_rows, stem, 0) && ok;
+            }
+            m.tap_live = false;
+            std::fprintf(stderr, "radiance: spark25 rank %d wrote calibration Grams for layers "
+                                 "%lld:%lld after %lld tokens to %s%s\n", rad_rank(c),
+                         (long long)m.calib_lo, (long long)m.calib_hi, m.calib_rows, calib_dir(),
+                         ok ? "" : ", with errors");
+        }
     }
 }
 
