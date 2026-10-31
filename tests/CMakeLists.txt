@@ -10,12 +10,12 @@
 #   fast     every test with none of slow, gpu, oot and perf, set at the end of this file: the
 #            inner loop (`ctest --preset fast`, or `ctest -L fast`)
 #
-# arch_test and glm5next_test do not link rad_core: they supply their own recording fake of the
-# declare-phase C ABI (arch_fakes.h), so plugins are tested without depending on core/build/'s
-# builder. With the archive linked, a new ABI call missing from the fake would pull in
-# rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a single
-# undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test)
+# arch_test, glm5next_test, nemotron35_test, spark25_arch_test and nemotronh_test do not link rad_core: they supply
+# their own recording fake of the declare-phase C ABI (arch_fakes.h), so plugins are tested without
+# depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
+# would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
+# single undefined reference.
+set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -386,10 +386,10 @@ if(TARGET abi_layout_test)
     COMPILE_OPTIONS "-std=c11;-pedantic-errors;-Wall;-Wextra")
 endif()
 
-# arch_test reads libref's vocabulary from $RADIANCE_HOME/kernels to check that each architecture
-# declares on it, and glm5next_test the loaded libraries' op schemas, so libref is built before
-# them.
-foreach(t arch_test glm5next_test)
+# arch_test and nemotronh_test read libref's vocabulary from $RADIANCE_HOME/kernels to check that
+# each architecture declares on it, and glm5next_test the loaded libraries' op schemas, so libref is
+# built before them.
+foreach(t arch_test glm5next_test nemotronh_test)
   if(TARGET libref AND TARGET ${t})
     add_dependencies(${t} libref)
   endif()
