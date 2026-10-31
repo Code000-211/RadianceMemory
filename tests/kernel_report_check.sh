@@ -15,7 +15,7 @@ command -v python3 >/dev/null 2>&1 || { echo "  SKIP python3 not present"; exit 
 python3 - "$REPORT" <<'PY'
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
-pat = re.compile(r"`lib\w+`: (\d+) row\(s\) not reached:")
+pat = re.compile(r"`\w+`: (\d+) row\(s\) not reached:")
 heads = [(i, m.group(1)) for i, l in enumerate(lines) if (m := pat.match(l))]
 bad = 0
 for j, (a, claimed) in enumerate(heads):
