@@ -154,6 +154,8 @@ the cards the engine runs on.
 | `nemotron-3.5-bolt-e4b-bf16.yaml` | `nemotron-3.5-bolt-e4b-bf16.rad` | NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B) in bf16 with NVIDIA's DFlash drafter, the vision tower in pinned host memory, on one card |
 | `nemotron-3.5-bolt-e4b-i8g.yaml` | `nemotron-3.5-bolt-e4b-i8g.rad` | The same with the trunk at int8 (i8a8) |
 | `nemotron-3.5-bolt-e4b-a4.yaml` | `nemotron-3.5-bolt-e4b-a4.rad` | The same with the feed-forward at four bits (GPTQ), attention and layers 19-23 at i8a8 |
+| `nemotron-3.5-bolt-74b-w4a8.yaml` | `nemotron-3.5-bolt-74b-w4a8.rad` | NVIDIA-Nemotron-3.5-Bolt-74B-A9B with four-bit experts and a block-FP8 trunk, NVIDIA's LiLiCorr drafter, vision, on two cards |
+| `nemotron-3.5-bolt-74b-fp8.yaml` | `nemotron-3.5-bolt-74b-fp8.rad` | NVIDIA-Nemotron-3.5-Bolt-74B-A9B in block FP8 with NVIDIA's LiLiCorr drafter, vision, on four cards |
 | `translategemma-27b.yaml` | `translategemma-27b-mxfp4-gptq.rad` | TranslateGemma 27B MXFP4 with its chat template (`gemma3.jinja`) |
 | `glm53-flash.yaml` | `glm53-flash-mxfp4.rad` | GLM-5.3-Flash, MXFP4 experts and block-FP8 attention, on eight cards |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
