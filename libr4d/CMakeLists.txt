@@ -68,6 +68,8 @@ set(R4D_UNITS
   # Two queries per KV head at head_dim 128 only (Qwen3-1.7B's 16 over 8, Qwen3-ASR's decoder):
   # the gqa8 body with the ratio set.
   "r4d_attn_paged_h128_gqa2|"
+  # Sixteen queries per KV head at head_dim 128 (Nemotron-H's 32 over 2 at one or two ranks).
+  "r4d_attn_paged_h128_gqa16|"
   "r4d_attn_vit_h72_bf16|"
   # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.

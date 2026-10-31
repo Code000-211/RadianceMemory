@@ -30860,6 +30860,16 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_decode_h128_gqa2_fp8kv",   128, 2,  1, "fp8_e4m3", 0, 256);
     attn_numeric_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2,  1, "bf16",     0, 256);
     attn_numeric_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2, 24, "bf16",     0, 256);
+    /* Nemotron-H's 32 query heads over 2 at one rank. */
+    attn_case(pl, "attn_prefill_h128_gqa16_fp8kv",  128, 16, 32, "fp8_e4m3", 1);
+    attn_case(pl, "attn_prefill_h128_gqa16_bf16kv", 128, 16, 32, "bf16",     1);
+    attn_case(pl, "attn_decode_h128_gqa16_fp8kv",   128, 16,  1, "fp8_e4m3", 0);
+    attn_case(pl, "attn_decode_h128_gqa16_bf16kv",  128, 16,  1, "bf16",     0);
+    attn_numeric_case(pl, "attn_prefill_h128_gqa16_fp8kv",  128, 16, 64, "fp8_e4m3", 0, 256);
+    attn_numeric_case(pl, "attn_prefill_h128_gqa16_bf16kv", 128, 16, 64, "bf16",     0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa16_fp8kv",   128, 16,  1, "fp8_e4m3", 0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa16_bf16kv",  128, 16,  1, "bf16",     0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa16_bf16kv",  128, 16,  4, "bf16",     0, 256);
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
     /* And over the fp8_v4 and k6_v4 caches (Flash-Next's --kv-cache-dtype fp8_v4 / k6_v4). */

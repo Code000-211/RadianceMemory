@@ -4521,6 +4521,23 @@ static const RadConstraint cAttnDecodeH128G2Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 2), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
+/* Sixteen queries per KV head at head_dim 128 (Nemotron-H's 32 over 2): q_len <= 4 at decode. */
+static const RadConstraint cAttnPrefillH128G16Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnPrefillH128G16Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+static const RadConstraint cAttnDecodeH128G16Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 4), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH128G16Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 4), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
 /* Key rename: libr4d writes C_IN("q_dtype","bf16") and C_IN("kv_dtype","bf16"); docs/OPS.md's
  * `attn_dense` has one `dtype`. The predicate is unchanged.
  *
@@ -7756,6 +7773,44 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
   ROW(cAttnDecodeH128G2Bf16), ROW(tAttnSplit), nullptr,
   nullptr, nullptr, r4d_rad_attn_decode_h128_gqa2_bf16, r4d_rad_attn_decode_h128_gqa2_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h128_gqa16_fp8kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 128, 16 queries per kv head, paged block 16, varlen",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH128G16Fp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h128_gqa16_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h128_gqa16_bf16kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 128, 16 queries per kv head, paged block 16, varlen",
+  "bf16 query, bf16 kv cache, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH128G16Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h128_gqa16_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h128_gqa16_fp8kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify)",
+  "head_dim 128, 16 queries per kv head, paged block 16, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH128G16Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h128_gqa16_fp8, r4d_rad_attn_decode_h128_gqa16_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h128_gqa16_bf16kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify)",
+  "head_dim 128, 16 queries per kv head, paged block 16, q_len*gqa <= 64, no window",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH128G16Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h128_gqa16_bf16, r4d_rad_attn_decode_h128_gqa16_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged },
 

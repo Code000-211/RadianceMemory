@@ -385,6 +385,13 @@ int     r4d_rad_attn_prefill_h128_gqa2_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa2_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa2_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h128_gqa2_scratch(const RadArgs*);
+/* Sixteen queries per KV head at head_dim 128 (Nemotron-H): the gqa8 body at gqa 16
+ * (r4d_attn_paged_h128_gqa16.hip). */
+int     r4d_rad_attn_prefill_h128_gqa16_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h128_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa16_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa16_bf16 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h128_gqa16_scratch(const RadArgs*);
 /* Twelve queries per KV head, head_dim 256 only: Qwen3.8-Flash-Next's QSA layers. Same body,
  * another instantiation (r4d_attn_paged_h256_gqa12.hip). */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8 (const RadArgs*, RadStream);
