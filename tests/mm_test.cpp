@@ -24,6 +24,7 @@
 #include "gemma4_golden.h"
 #include "gemma4u_golden.h"
 #include "glm5_golden.h"
+#include "radio_golden.h"
 #include "imaging_golden.h"
 #include "lfm2_golden.h"
 #include "mm/resample.h"
@@ -584,6 +585,62 @@ std::vector<uint16_t> raster(const Item& it, int32_t s) {
 }
 
 }  /* namespace */
+
+namespace {
+VisionConfig radio_cfg() {
+    VisionConfig c;
+    c.family = Family::Radio;
+    c.patch = kRadioPatch;
+    c.merge = kRadioMerge;
+    c.temporal = 1;
+    c.radio_min_patches = kRadioMinP;
+    c.radio_max_patches = kRadioMaxP;
+    c.radio_max_len = kRadioMaxLen;
+    c.radio_video_patches = kRadioVideoP;
+    c.radio_tubelet = 2;
+    c.radio_prefix = 10;
+    return c;
+}
+}  /* namespace */
+
+/* NVIDIA's tile rule, Python's round-half-even included (a side that is an odd multiple of 16
+ * takes one patch more than an even one), for pictures and video frames. */
+TEST(radio_sizes_are_the_references) {
+    const VisionConfig c = radio_cfg();
+    for (const GoldRadioSize& g : kGoldRadioSize) {
+        int32_t pw = 0, ph = 0, vw = 0, vh = 0;
+        radio_size(g.w, g.h, c, &pw, &ph);
+        radio_video_size(g.w, g.h, c, &vw, &vh);
+        if (pw != g.pw || ph != g.ph || vw != g.vw || vh != g.vh)
+            std::fprintf(stderr, "    %lld x %lld: tile %d x %d, frame %d x %d; reference %d x %d, "
+                         "%d x %d\n", (long long)g.w, (long long)g.h, pw, ph, vw, vh, g.pw, g.ph,
+                         g.vw, g.vh);
+        CHECK_EQ(pw, g.pw);
+        CHECK_EQ(ph, g.ph);
+        CHECK_EQ(vw, g.vw);
+        CHECK_EQ(vh, g.vh);
+    }
+}
+
+/* torch's antialiased bicubic on float pixels, shrinking and growing, overshoot kept. */
+TEST(radio_resize_is_torchs_antialiased_bicubic_on_floats) {
+    Frame f;
+    f.w = 7;
+    f.h = 5;
+    f.rgb.resize(7 * 5 * 3);
+    for (int y = 0; y < 5; ++y)
+        for (int x = 0; x < 7; ++x)
+            for (int c = 0; c < 3; ++c)
+                f.rgb[((size_t)y * 7 + x) * 3 + c] = (uint8_t)((37 * x + 11 * y + 53 * c) % 256);
+    struct Case { int w, h; const float* want; };
+    const Case cases[] = { { 4, 3, kGoldRadioAa43 }, { 9, 6, kGoldRadioAa96 } };
+    for (const Case& k : cases) {
+        std::vector<float> out;
+        resize_bicubic_aa_f32(f, k.w, k.h, &out);
+        REQUIRE_EQ(out.size(), (size_t)(k.w * k.h * 3));
+        for (size_t i = 0; i < out.size(); ++i) CHECK_NEAR(out[i], k.want[i], 2e-3);
+    }
+}
 
 TEST(gemma4_sizes_are_the_references) {
     for (const GoldGemma4Size& g : kGoldGemma4Size) {

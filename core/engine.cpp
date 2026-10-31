@@ -3046,6 +3046,18 @@ int Engine::run_server() {
                 return RAD_E_INVAL;
             }
             if (cfg_.image_tokens) vc.max_image_tokens = *cfg_.image_tokens;
+        } else if (vc.family == mm::Family::Radio) {
+            /* NVIDIA's processor sizes a picture and a video frame by patch budgets
+             * (min_num_patches..max_num_patches, video_target_num_patches), not pixel bands. */
+            if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.image_tokens ||
+                cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_max_frame_tokens) {
+                RAD_ERR("media: this model's processor sizes images and video frames by its patch "
+                        "budgets (min_num_patches, max_num_patches, video_target_num_patches), so "
+                        "--image-min/max-pixels, --image-tokens, --video-min/max-pixels and "
+                        "--video-max-frame-tokens do nothing on it");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.video_min_frames) vc.min_frames = *cfg_.video_min_frames;
         } else {
             if (cfg_.image_tokens) {
                 RAD_ERR("media: --image-tokens is a token budget, and this model's processor "
@@ -3146,6 +3158,16 @@ int Engine::run_server() {
                      ranks_[0]->program.encoder_name.c_str(), mm_proc->config().image_soft_tokens,
                      mm_proc->config().video_soft_tokens, mm_proc->config().fps,
                      mm_proc->config().max_frames, (long long)encd.max_patches);
+        else if (mm_proc->config().family == mm::Family::Radio)
+            RAD_INFO("media: %s%s through '%s'; an image becomes one tile of %d..%d patches "
+                     "(a quarter as many tokens), a video frame about %d patches, %d frames a "
+                     "tubelet at %.3g frames a second, at most %d frames, no pruning; %lld "
+                     "patches a pass", o.allow_image ? "images" : "",
+                     o.allow_video ? " and video" : "", ranks_[0]->program.encoder_name.c_str(),
+                     mm_proc->config().radio_min_patches, mm_proc->config().radio_max_patches,
+                     mm_proc->config().radio_video_patches, mm_proc->config().radio_tubelet,
+                     mm_proc->config().fps, mm_proc->config().max_frames,
+                     (long long)encd.max_patches);
         else
             RAD_INFO("media: %s%s through '%s'; an image resizes to at most %lld pixels (%lld "
                      "patches a pass), a video to %lld pixels over all its frames",

@@ -31,7 +31,16 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
     while (s + 1 < n_seg && patch_at(s + 1) <= first) ++s;
     for (int64_t k = 0; k < count; ++k) {
         while (s + 1 < n_seg && patch_at(s + 1) <= first + k) ++s;
-        const int64_t within = first + k - patch_at(s);
+        int64_t within = first + k - patch_at(s);
+        if (within < seg_prefix) {
+            /* A row the tower fills itself: row -1, the column naming which. */
+            planes[k]             = -1;
+            planes[count + k]     = (int32_t)within;
+            planes[2 * count + k] = seg_h(s);
+            planes[3 * count + k] = seg_w(s);
+            continue;
+        }
+        within -= seg_prefix;
         const int64_t bw = seg_w(s) / merge;
         int64_t row, col;
         if (patch_raster) {
