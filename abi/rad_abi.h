@@ -19,7 +19,7 @@ extern "C" {
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
  * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 35u
+#define RAD_ABI_VERSION 36u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

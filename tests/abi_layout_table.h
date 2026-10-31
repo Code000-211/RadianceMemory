@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 35 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 36 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -35,7 +35,7 @@
 { "RadArgs", "world_size", 60, 4 },
 { "RadArgs", "kv_used_max_h", 64, 4 },
 { "RadArgs", "wgp_count", 68, 4 },
-{ "RadBatch", "", 0, 432 },
+{ "RadBatch", "", 0, 480 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -95,6 +95,12 @@
 { "RadBatch", "sgen_b", 408, 8 },
 { "RadBatch", "kv_used_max_h", 416, 8 },
 { "RadBatch", "positions_h", 424, 8 },
+{ "RadBatch", "n_bidi", 432, 8 },
+{ "RadBatch", "bidi_row", 440, 8 },
+{ "RadBatch", "bidi_n", 448, 8 },
+{ "RadBatch", "bidi_seq", 456, 8 },
+{ "RadBatch", "bidi_used", 464, 8 },
+{ "RadBatch", "anchor_rows", 472, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },

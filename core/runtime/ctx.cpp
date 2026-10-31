@@ -968,7 +968,7 @@ int Ctx::lane_join(int from, int to) {
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 472,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 480,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1011,6 +1011,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     ptr(b->token_ids);  ptr(b->positions);  ptr(b->cu_seqlens);    ptr(b->seq_ids);
     ptr(b->out_ids);    ptr(b->q_lens);     ptr(b->ctx_lens);      ptr(b->num_accepted);
     ptr(b->spec_parent); ptr(b->checkpoint_tok); ptr(b->checkpoint_slot); ptr(b->draft_out_ids);
+    /* A block drafter's query pass reads it (null on every other pass). */
+    ptr(b->anchor_rows);
     /* Null on a step with no adapter row, which then issues no adapter op (Ctx::issue_lora): the
      * two are different passes. The slots themselves are read on the card. */
     ptr(b->lora_slot);

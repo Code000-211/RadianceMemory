@@ -123,6 +123,7 @@ void BatchBuilder::carve(Set& s, char* h) {
     /* The advance's per-sequence runtime-window data (advance.h); 0 when there is none. */
     pair(&s.h_rpos,   &s.d_rpos,   S);
     pair(&s.h_tlen,   &s.d_tlen,   S);
+    pair(&s.h_arow,   &s.d_arow,   S);
     s.h_grp = ::rad::carve<AdvGroup>(h, oh, (int64_t)s.groups.size());
     s.d_grp = ::rad::carve<AdvGroup>(d, od, (int64_t)s.groups.size());
     for (size_t gi = 0; gi < s.groups.size(); ++gi) {
@@ -1107,6 +1108,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         s.h_q[i]   = e.n_tokens;
         s.h_ctx[i] = e.ctx_len;
         s.h_acc[i] = e.n_accepted;
+        s.h_arow[i] = -1;
         if (e.is_prefill) { if (e.n_tokens > max_q_pf) max_q_pf = e.n_tokens; }
         else               { if (e.n_tokens > max_q_dec) max_q_dec = e.n_tokens; }
     }
@@ -1264,6 +1266,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.num_accepted = cfg_.n_spec > 0 ? on_rank(base, b0, s.d_acc) : nullptr;
         /* Staged above on a tree step: each row's parent row, -2 for an ordinary causal one. */
         B.spec_parent = plan.spec_is_tree ? on_rank(base, b0, s.d_parent) : nullptr;
+        /* Pass 1 is a block drafter's query pass (a serial head has no pass 1). */
+        B.anchor_rows = plan.draft_pass == 1 ? on_rank(base, b0, s.d_arow) : nullptr;
         B.rope_pos = mm_on_ ? on_rank(base, b0, s.d_rope) : nullptr;
         B.rope_mixed = rope_mixed;
         B.n_mm_rows = n_mm;
@@ -1348,6 +1352,7 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.ctx_off  = off(s.d_ctx);
     a.acc_off  = off(s.d_acc);
     a.out_off  = off(s.d_out);
+    a.arow_off = off(s.d_arow);
     a.sid_off  = off(s.d_sid);
     a.cu_off   = off(s.d_cu);
     a.q_off    = off(s.d_q);

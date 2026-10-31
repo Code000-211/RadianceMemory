@@ -356,6 +356,13 @@ typedef struct RadBatch {
     const int32_t* bidi_n;             /* host */
     const int32_t* bidi_seq;           /* host */
     const int32_t* bidi_used;          /* device */
+    /* ---- appended in ABI 36 (a block drafter's anchor row) */
+    /* A block drafter's query pass (draft_pass 1): [n_seq] device, for each drafting sequence the
+     * row of its last committed position in the context pass just run, whose rows are the verify
+     * step's in order. -1 for a row the card did not position. A drafter that conditions on the
+     * context state at the anchor (LiLiCorr) gathers it there; the query rows themselves sit past
+     * that position. Null on every other pass. */
+    const int32_t* anchor_rows;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

@@ -48,7 +48,11 @@ struct StepSlot {
      * drafter's context rows by it. 0 after a chain verify, which needs neither. */
     int32_t npath;
     int32_t path[RAD_SCHED_MAX_SPEC];
-    int32_t pad[2];
+    /* The last verify step's row of its last committed position, in that step's own row order,
+     * which a block drafter's context pass mirrors. ADV_BLOCK hands it to the query pass
+     * (RadBatch::anchor_rows): LiLiCorr's correlator reads the context state there. */
+    int32_t hrow;
+    int32_t pad[1];
 };
 
 enum AdvMode : int32_t {
@@ -115,6 +119,7 @@ struct AdvanceArgs {
     int32_t n_groups = 0;
     char*   slab = nullptr;   /* this rank's device slab */
     int64_t tok_off = 0, pos_off = 0, ctx_off = 0, acc_off = 0, out_off = 0;
+    int64_t arow_off = -1;    /* [n_seq] ADV_BLOCK: each row's StepSlot::hrow; -1 when not carved */
     int64_t sid_off = 0, cu_off = 0, q_off = 0;
     /* [4][row_pitch] int32: device-row flag; the verify step's token row of the row's first
      * verified position; its first sampled row, or -1 for a row that sampled nothing; and one

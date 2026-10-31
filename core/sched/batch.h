@@ -220,6 +220,9 @@ private:
          * runtime window (advance.h). Per sequence because each prompt has its own floor. */
         int32_t  *h_rpos = nullptr, *d_rpos = nullptr;
         int32_t  *h_tlen = nullptr, *d_tlen = nullptr;
+        /* [max_seqs] a block drafter's query pass: each row's last committed row in the context
+         * pass just run (RadBatch::anchor_rows), written on the card by ADV_BLOCK. */
+        int32_t  *h_arow = nullptr, *d_arow = nullptr;
 
         char*      h_derived = nullptr;   /* derivation staging, byte-addressed */
         /* [3][n_tok] rotary positions and [n_tok] encoder-row targets (RadBatch::rope_pos,
