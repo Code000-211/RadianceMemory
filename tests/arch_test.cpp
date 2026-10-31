@@ -8012,7 +8012,11 @@ TEST(gemma4_31b_dflash2_fc_splits_by_rows_without_changing_a_bit) {
             }
             if (o.op == "all_gather" && pint(&o, "row") == cs.share) {
                 ++fc_gathers;
-                CHECK_EQ(pint(&o, "numel"), (long long)(2048 * E));   /* the trunk's instance */
+                /* The trunk's instance, and a range: a sizing declare may not change it. */
+                const RecParam* ne = param(&o, "numel");
+                REQUIRE(ne != nullptr);
+                CHECK_EQ(ne->kind, (int)RAD_P_RANGE);
+                CHECK_EQ(ne->ihi, (long long)(2048 * E));
                 CHECK_EQ(pint(&o, "world_size"), (long long)cs.world);
             }
         }

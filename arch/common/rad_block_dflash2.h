@@ -555,12 +555,15 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     if (fc_rows) {
         /* The split (SHARDING above): this rank's block-aligned rows into `cpart`, its window of
          * them gathered into `c`. The GEMM takes its K split from the whole width. The gather
-         * rides the trunk's all-reduce instance (the same numel bound, so the same instance). */
+         * rides the trunk's all-reduce instance (the same numel bound, so the same instance).
+         * The message is a range, as the all-reduce's: a fixed numel follows max_tok, and the
+         * arena's sizing declare (RadBuildCtx::shape_probe) refuses a fixed parameter that
+         * changes with the step size. */
         op_cfc = w_fc.gemm(b, crows, fc_rows, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.cpart},
                            g.n_embd);
         op_cgath = rw(b, RAD_OP(b, "all_gather",
                          RAD_PARAMS(RAD_INT("world_size", g.world),
-                                    RAD_INT("numel", crows * g.n_embd),
+                                    RAD_RANGE("numel", g.n_embd, crows * g.n_embd),
                                     RAD_STR("dtype", g.dtype), RAD_INT("row", fc_share)),
                          RAD_NOWEIGHTS),
                      {w.cpart}, {w.c});
@@ -1090,7 +1093,8 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
     if (fc_rows) {
         RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
                     brows(w.cpart, T), RAD_NONE, w_fc.bref());
-        RAD_ISSUE_N(c, op_cgath, T, bcol(w.cpart, fc_off, fc_share, T), brows(w.c, T));
+        RAD_ISSUE_N(c, op_cgath, T * g.n_embd, bcol(w.cpart, fc_off, fc_share, T),
+                    brows(w.c, T));
     } else {
         RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
                     brows(w.c, T), RAD_NONE, w_fc.bref());
