@@ -17,6 +17,7 @@
 #include "rad_yarn.h"
 #include "rad_abi_layout.h"
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +122,36 @@ inline void dbg_resid(RadCtx* c, int layer, const char* site, int64_t n_embd,
 inline const char* calib_dir() {
     static const char* d = std::getenv("RADIANCE_CALIB_DIR");
     return d && *d ? d : nullptr;
+}
+
+/* Whether layer `layer` taps (RADIANCE_CALIB_LAYERS: comma-separated layers and "lo-hi" ranges;
+ * unset, every layer). A model whose per-expert Hessians do not fit the host at once (Nemotron-3.5
+ * Bolt's are 169 GiB) calibrates in several runs over disjoint ranges; each run writes only its
+ * layers' files, so the runs share one directory. */
+inline bool calib_layer_on(int layer) {
+    static const std::vector<std::pair<int, int>> ranges = [] {
+        std::vector<std::pair<int, int>> r;
+        const char* s = std::getenv("RADIANCE_CALIB_LAYERS");
+        while (s && *s) {
+            char* e = nullptr;
+            const long lo = std::strtol(s, &e, 10);
+            if (e == s) break;
+            long hi = lo;
+            if (*e == '-') {
+                const char* h = e + 1;
+                hi = std::strtol(h, &e, 10);
+                if (e == h) break;
+            }
+            r.emplace_back((int)lo, (int)hi);
+            s = *e == ',' ? e + 1 : e;
+            if (*s && *s != ',' && !std::isdigit((unsigned char)*s)) break;
+        }
+        return r;
+    }();
+    if (!std::getenv("RADIANCE_CALIB_LAYERS")) return true;
+    for (const auto& r : ranges)
+        if (layer >= r.first && layer <= r.second) return true;
+    return false;
 }
 
 /* Token count at which the tap dumps and switches itself off (RADIANCE_CALIB_TOKENS, default

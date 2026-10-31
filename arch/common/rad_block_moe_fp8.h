@@ -1833,6 +1833,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                             (!calib_dne_failed &&
                              calib_dne.write(gram_dn_stem, c.expert_base, gram_domain,
                                              rad_rank(c_)));
+            /* Written: the host sums are done with (a layer's can be gigabytes). */
+            calib_dne.acc = {};
+            calib_dne.rows = {};
             calib_done = true;
             if (layer == 0)
                 std::fprintf(stderr, "radiance: calibration wrote layer Hessians after %lld "
