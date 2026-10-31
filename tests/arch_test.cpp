@@ -10777,9 +10777,17 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
     const char* mv[] = { "gemma4_unified_vision", "3840", "1120", "48", "vision" };
     keys.insert(keys.end(), std::begin(mk), std::end(mk));
     vals.insert(vals.end(), std::begin(mv), std::end(mv));
-    static const int32_t row[] = { 40 }, rows[] = { 10 }, seq[] = { 1 }, used[] = { 30 };
+    static const int32_t row[] = { 40 }, seq[] = { 1 }, used[] = { 30 };
     const int64_t L_sliding = 10;                    /* layers 5 and 11 are global */
+    /* A run of 10 rows within the window, and one longer than a window of 8, whose rows read the
+     * keys behind them only through the window (attn_paged_ahead). */
+    const int32_t run = 10;
+    static const int32_t rows[] = { run };
+    for (const int win : { 1024, 8 })
     for (int mode = 0; mode < 3; ++mode) {          /* 0 on, 1 no key, 2 RADIANCE_MEDIA_BIDI=0 */
+        std::vector<const char*> wvals = vals;
+        for (size_t k = 0; k < keys.size(); ++k)
+            if (!std::strcmp(keys[k], "sliding_window")) wvals[k] = win == 8 ? "8" : "1024";
         for (bool fused : { false, true }) {
             for (int world : { 1, 2 }) {
                 for (int rank = 0; rank < world; ++rank) {
@@ -10791,7 +10799,7 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
                     }
                     RadModelMeta meta = gemma4_12b_meta();
                     meta.n_kv = (int)keys.size() - (mode == 1 ? 1 : 0);
-                    meta.kv_key = keys.data(); meta.kv_val = vals.data();
+                    meta.kv_key = keys.data(); meta.kv_val = wvals.data();
                     RadBuildCtx ctx = build_ctx(rank, world);
                     ctx.max_enc_patches = 1120;
                     if (mode == 2) setenv("RADIANCE_MEDIA_BIDI", "0", 1);
@@ -10804,10 +10812,18 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
                     for (const auto& o : b.ops)
                         if ((o.op == "attn_paged" || o.op == "attn_paged_qrow") && pint(&o, "causal") == 0) {
                             ++nc;
-                            CHECK_EQ(pint(&o, "window"), 1024);
+                            CHECK_EQ(pint(&o, "window"), win);
                             CHECK_EQ(pint(&o, "head_dim"), 256);
                         }
                     CHECK_EQ(nc, on ? (int)L_sliding : 0);
+                    int na = 0;
+                    for (const auto& o : b.ops)
+                        if (o.op == "attn_paged_ahead" || o.op == "attn_paged_qrow_ahead") {
+                            ++na;
+                            CHECK_EQ(pint(&o, "causal"), 0);
+                            CHECK_EQ(pint(&o, "window"), win);
+                        }
+                    CHECK_EQ(na, on ? (int)L_sliding : 0);
 
                     RadBatch batch = prefill_batch();
                     batch.n_bidi = 1;
@@ -10821,11 +10837,15 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
                     rad_op last_attn = 0;
                     for (const auto& i : c.issues) {
                         const RecOp* o = b.op_of(i.op);
-                        if (!o || (o->op != "attn_paged" && o->op != "attn_paged_qrow")) continue;
+                        if (!o || (o->op != "attn_paged" && o->op != "attn_paged_qrow" &&
+                                   o->op != "attn_paged_ahead" && o->op != "attn_paged_qrow_ahead"))
+                            continue;
                         if (pint(o, "causal") == 1) { last_attn = i.op; continue; }
                         ++again;
                         CHECK(last_attn != 0);                       /* behind the causal pass */
-                        CHECK_EQ(i.n, 10);
+                        const bool ahead = o->op.size() > 6 && o->op.compare(o->op.size() - 6, 6, "_ahead") == 0;
+                        CHECK_EQ(ahead, run > win);
+                        CHECK_EQ(i.n, run);
                         REQUIRE(i.opd.size() == 8);
                         CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_KV);
                         CHECK(i.opd[3].raw == used);
@@ -10834,7 +10854,7 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
                         CHECK(i.opd[6].kind == RAD_OPK_NONE);
                         const int64_t qd = (16 / world) * (pint(o, "head_dim"));
                         CHECK_EQ(i.opd[7].offset, 40 * qd);          /* its rows of the output */
-                        CHECK_EQ(i.opd[7].rows, 10);
+                        CHECK_EQ(i.opd[7].rows, run);
                         last_attn = 0;
                     }
                     CHECK_EQ(again, on ? (int)L_sliding : 0);

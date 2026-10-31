@@ -462,6 +462,9 @@ struct Gemma4Attn {
      * kernel serves it. */
     bool   want_bidi = false;
     rad_op op_bidi = 0, op_bidi_row = 0;
+    /* The same where the window bounds the keys behind a row only: a run longer than the window
+     * (op_ahead_row where q is read in the row); 0 where no kernel serves it. */
+    rad_op op_ahead = 0, op_ahead_row = 0;
     bool   bidi_ok() const { return op_bidi || op_bidi_row; }
     /* the feed-forward's gate_up read into the cache beside this block's all-reduce, or 0 (see
      * "Prefetch beside the reductions") */
@@ -743,8 +746,13 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
         }
     }
     if (want_bidi) {
-        if (op_attn_row) op_bidi_row = attn("attn_paged_qrow", {w.qkv}, 0, 0);
-        else             op_bidi     = attn("attn_paged", {w.q}, 0, 0);
+        if (op_attn_row) {
+            op_bidi_row  = attn("attn_paged_qrow", {w.qkv}, 0, 0);
+            op_ahead_row = attn("attn_paged_qrow_ahead", {w.qkv}, 0, 0);
+        } else {
+            op_bidi  = attn("attn_paged", {w.q}, 0, 0);
+            op_ahead = attn("attn_paged_ahead", {w.q}, 0, 0);
+        }
     }
 
     /* The tree form over the decode rows: a verify block of 1 + n_spec rows a sequence, so the
@@ -872,18 +880,23 @@ int Gemma4Attn::declare_shared(RadBuilder* b, Names& nm, const char* pre) {
                                 RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
                   {w.q}, {w.attn});
-    if (want_bidi)
-        op_bidi = rw(b, RAD_OP(b, "attn_paged",
-                         RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
-                                    RAD_INT("head_dim", cls.head_dim),
-                                    RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 0),
-                                    RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
-                                    RAD_INT("block_size", RAD_KV_BLOCK),
-                                    RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
-                                    RAD_F64("scale", 1.0),
-                                    RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
-                         RAD_NOWEIGHTS),
-                      {w.q}, {w.attn});
+    if (want_bidi) {
+        auto bidi = [&](const char* op) {
+            return rw(b, RAD_OP(b, op,
+                          RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
+                                     RAD_INT("head_dim", cls.head_dim),
+                                     RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 0),
+                                     RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
+                                     RAD_INT("block_size", RAD_KV_BLOCK),
+                                     RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                     RAD_F64("scale", 1.0),
+                                     RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                          RAD_NOWEIGHTS),
+                       {w.q}, {w.attn});
+        };
+        op_bidi  = bidi("attn_paged");
+        op_ahead = bidi("attn_paged_ahead");
+    }
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                    RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -1076,10 +1089,11 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
 
 /* A run's rows (RadBatch::n_bidi) see every key of their run, later ones included: attention over
  * their sequence's cache up to the run's end without the causal bound, written over what the
- * causal pass left in their rows, on a sliding layer. Its window stays, two-sided: (causal or the
- * run) and the window, which holds every key of a run up to the window's length. The keys are all
- * in the cache: the step stored its own, and a run's earlier rows are this step's or a prefix
- * hit's. */
+ * causal pass left in their rows, on a sliding layer. Its window stays: (causal or the run) and
+ * the window, as transformers' mask has it. The window bounds the keys behind a row; within it a
+ * run's far end is in reach of every row up to the window's length, and a longer run is read with
+ * attn_paged_ahead, whose window bounds the keys behind only. The keys are all in the cache: the
+ * step stored its own, and a run's earlier rows are this step's or a prefix hit's. */
 void Gemma4Attn::attend_bidi(RadCtx* c, const RadBatch* batch, bool q_dense) const {
     if (batch->n_bidi <= 0 || !bidi_ok()) return;
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
@@ -1092,15 +1106,20 @@ void Gemma4Attn::attend_bidi(RadCtx* c, const RadBatch* batch, bool q_dense) con
         const RadOperand tb = praw2(table ? table + s * pitch : nullptr, RAD_I32, 1, pitch);
         const RadOperand used = praw(batch->bidi_used + i, RAD_I32, 1);
         const RadOperand out = brow_slice(w.attn, r0, n, qd);
+        /* A run longer than the window has rows that miss its far end under a two-sided window;
+         * transformers' mask bounds only the keys behind. */
+        const bool ahead = n > cls.window;
+        const rad_op bidi_row = ahead && op_ahead_row ? op_ahead_row : op_bidi_row;
+        const rad_op bidi     = ahead && op_ahead ? op_ahead : op_bidi;
         if (op_bidi_row) {
-            RAD_ISSUE_N(c, op_bidi_row, n, bcol_at(w.qkv, r0, qkvd, 0, qd, n),
+            RAD_ISSUE_N(c, bidi_row, n, bcol_at(w.qkv, r0, qkvd, 0, qd, n),
                         kv_cache(kv, kv_layer), tb, used, RAD_NONE, RAD_NONE, RAD_NONE, out);
             continue;
         }
         if (!q_dense)
             RAD_ISSUE_N(c, op_lift_q, n, bcol_at(w.qkv, r0, qkvd, 0, qd, n),
                         brow_slice(w.q, r0, n, qd));
-        RAD_ISSUE_N(c, op_bidi, n, brow_slice(w.q, r0, n, qd), kv_cache(kv, kv_layer), tb, used,
+        RAD_ISSUE_N(c, bidi, n, brow_slice(w.q, r0, n, qd), kv_cache(kv, kv_layer), tb, used,
                     RAD_NONE, RAD_NONE, RAD_NONE, out);
     }
 }

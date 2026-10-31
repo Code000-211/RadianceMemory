@@ -1563,10 +1563,10 @@ tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces the
   overlays every layer, which differs little on most pictures. The scheduler ends no prefill chunk
   inside such a run (`Scheduler::bidi_fit`), the trunk pass names its runs (`RadBatch::n_bidi`), and
   each sliding layer attends a run's rows a second time with `attn_paged` at `causal` 0 over the
-  cache up to the run's end, written over their causal result. The window stays two-sided there:
-  a run longer than the window (1120 soft tokens against 1024) sees its later keys only up to a
-  window ahead, as vLLM bounds them, where transformers' mask bounds only the keys behind. Read
-  causally, the 12B answers pictures differently and often wrongly (on DocVQA, "The image does not
+  cache up to the run's end, written over their causal result. The window stays, as in
+  transformers' mask (the window AND (causal OR the same picture)): it bounds the keys behind a row.
+  A run longer than the window (1120 soft tokens against 1024) is read with `attn_paged_ahead`, whose
+  window bounds the keys behind only, so its first rows see the run's far end. Read causally, the 12B answers pictures differently and often wrongly (on DocVQA, "The image does not
   provide information" for an answer it reads off the page). `RADIANCE_MEDIA_BIDI=0` keeps every
   layer causal.
 
