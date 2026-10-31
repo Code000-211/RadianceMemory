@@ -200,7 +200,10 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
                 return refuse(fmt("columns [%lld, %lld) of the %s '%s' plane do not fall on whole "
                                   "bytes", (long long)pq.col0, (long long)(pq.col0 + pq.cols),
                                   rad_dtype_name(p.dtype), p.role));
-            if (!s.rects.empty() && pq.cols != s.cols)
+            /* A vector's stacked parts lie end to end as one row, so they may differ in width (a
+             * Mamba convolution's bias is [x | B | C]); a matrix's parts stack as rows. */
+            const bool vec = rank == 1 && pq.rows == 1;
+            if (!vec && !s.rects.empty() && pq.cols != s.cols)
                 return refuse("the share's parts differ in width");
             PlaneShare::Rect r;
             r.row0  = pq.row0;
@@ -208,11 +211,16 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
             r.byte0 = pq.col0 * bits / 8;
             r.bytes = rad_enc_row_bytes(p.dtype, pq.cols);
             s.rects.push_back(r);
-            s.rows += pq.rows;
-            s.cols = pq.cols;
+            if (vec) {
+                s.rows = 1;
+                s.cols += pq.cols;
+            } else {
+                s.rows += pq.rows;
+                s.cols = pq.cols;
+            }
         }
-        /* A vector's stacked parts come out as one piece a part, each a row of the share; laid
-         * end to end they are the declared vector, so only the element count has to agree. */
+        /* Laid end to end, a vector's parts are the declared vector, so only the element count
+         * has to agree. */
         const bool fits = rank == 1 ? s.rows * s.cols == w.sel_rows[k] * w.sel_cols[k]
                                     : s.rows == w.sel_rows[k] && s.cols == w.sel_cols[k];
         if (!fits)
