@@ -55,8 +55,9 @@ void MetaOwn::finish() {
  * since the plugin only sees RadModelMeta, whose typed fields size everything at declare.
  *
  * A text-only model puts its dimensions at the top level; a multimodal one nests them under
- * `text_config` beside `vision_config`. Every key is flattened into the free-form list by dotted
- * path, and typed fields are read from `text_config.X`, falling back to `X`, so a plugin finds
+ * `text_config` beside `vision_config` (NVIDIA's omni wrappers: `llm_config`). Every key is
+ * flattened into the free-form list by dotted path, and typed fields are read from
+ * `text_config.X`, then `llm_config.X`, falling back to `X`, so a plugin finds
  * `vision_config.depth` under that name either way.
  */
 /* An array's scalars appended to `s` space-separated, nested arrays flattened row-major (a
@@ -96,10 +97,20 @@ static void flatten_json(const nlohmann::json& j, const std::string& prefix, Met
         else if (v.is_string())       out->kv(key, v.get<std::string>());
         else if (v.is_array()) {
             /* An array of scalars becomes a space-separated string (mrope_section "11 11 10",
-             * layer_types "linear_attention full_attention ..."), nested arrays row-major.
-             * Arrays of objects are skipped. */
+             * layer_types "linear_attention full_attention ..."), nested arrays row-major. An
+             * array of objects is flattened element by element under its index (Nemotron-H
+             * Puzzle's per-layer `block_configs.1.n_routed_experts`); other mixed arrays are
+             * skipped. */
             std::string s;
-            if (join_scalars(v, &s)) out->kv(key, s);
+            if (join_scalars(v, &s)) {
+                out->kv(key, s);
+            } else {
+                bool objects = !v.empty();
+                for (const auto& e : v) objects = objects && e.is_object();
+                if (objects)
+                    for (size_t i = 0; i < v.size(); ++i)
+                        flatten_json(v[i], key + "." + std::to_string(i), out);
+            }
         }
     }
 }
@@ -197,31 +208,38 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
 
     flatten_json(j, "", out);
 
-    /* Alias text_config.X to a bare X where no bare X exists, so plugins read the same free-form
-     * keys (e.g. `partial_rotary_factor`) with or without a vision tower. A bare key wins where
-     * both exist. */
+    /* Alias text_config.X (or llm_config.X) to a bare X where no bare X exists, so plugins read
+     * the same free-form keys (e.g. `partial_rotary_factor`) with or without a vision tower. A
+     * bare key wins where both exist. */
     {
         const size_t n = out->keys.size();
-        for (size_t i = 0; i < n; ++i) {
-            const std::string& k = out->keys[i];
-            if (k.rfind("text_config.", 0) != 0) continue;
-            const std::string bare = k.substr(12);
-            bool have = false;
-            for (size_t j2 = 0; j2 < n; ++j2) if (out->keys[j2] == bare) { have = true; break; }
-            if (!have) out->kv(bare, out->vals[i]);
+        for (const char* pre : { "text_config.", "llm_config." }) {
+            const size_t len = std::strlen(pre);
+            for (size_t i = 0; i < n; ++i) {
+                const std::string& k = out->keys[i];
+                if (k.rfind(pre, 0) != 0) continue;
+                const std::string bare = k.substr(len);
+                bool have = false;
+                for (size_t j2 = 0; j2 < out->keys.size(); ++j2)
+                    if (out->keys[j2] == bare) { have = true; break; }
+                if (!have) out->kv(bare, out->vals[i]);
+            }
         }
     }
 
     auto gs = [&](const char* k) -> const char* { return out->get(k); };
-    /* text_config first, then the top level. */
-    auto gi = [&](const char* k, int64_t dflt) -> int64_t {
+    /* text_config first, then llm_config, then the top level. */
+    auto nested = [&](const char* k) -> const char* {
         const char* v = gs((std::string("text_config.") + k).c_str());
-        if (!v) v = gs(k);
+        if (!v) v = gs((std::string("llm_config.") + k).c_str());
+        return v ? v : gs(k);
+    };
+    auto gi = [&](const char* k, int64_t dflt) -> int64_t {
+        const char* v = nested(k);
         return v ? strtoll(v, nullptr, 10) : dflt;
     };
     auto gf = [&](const char* k, double dflt) -> double {
-        const char* v = gs((std::string("text_config.") + k).c_str());
-        if (!v) v = gs(k);
+        const char* v = nested(k);
         return v ? strtod(v, nullptr) : dflt;
     };
 
@@ -236,6 +254,8 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
         /* Gemma 4 12B (`gemma4_unified`): its text model is Gemma 4's, served by the gemma4
          * plugins; `model_type` tells them apart. */
         if (out->arch == "gemma4unified") out->arch = "gemma4";
+        /* Nemotron-H Omni wraps a Nemotron-H Puzzle text model (`llm_config`) the same way. */
+        if (out->arch == "nemotronhomni") out->arch = "nemotronh";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
@@ -244,6 +264,15 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
      * moe_top_k. They are the last fallbacks in each chain, so a config carrying both spellings
      * reads the HuggingFace one. */
     m.n_layers    = gi("num_hidden_layers", gi("n_layer", 0));
+    /* Nemotron-H Puzzle states no count: HF derives it from the per-layer list. */
+    if (m.n_layers == 0)
+        if (const char* types = nested("layers_block_type"))
+            for (const char* p = types; *p;) {
+                while (*p == ' ') ++p;
+                if (!*p) break;
+                ++m.n_layers;
+                while (*p && *p != ' ') ++p;
+            }
     m.n_embd      = gi("hidden_size", gi("n_embd", 0));
     m.n_head      = gi("num_attention_heads", gi("n_head", 0));
     m.n_head_kv   = gi("num_key_value_heads", m.n_head);
@@ -1406,16 +1435,17 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         if (why) *why = std::move(m);
         return rc;
     };
+    const Import im = imports_at(name);   /* a drafter's own form under its prefix */
     /* CtFp8 has no imported form: its FP8 weights read stock (ckpt_resolve). */
-    if (import_ == Import::None || import_ == Import::CtFp8) return RAD_E_NOTFOUND;
+    if (im == Import::None || im == Import::CtFp8) return RAD_E_NOTFOUND;
     if (auto hit = imported_.find(name); hit != imported_.end()) {
         *codes = hit->second.first;
         *scale = hit->second.second;
         return RAD_OK;
     }
 
-    if (import_ == Import::ParoI5 || import_ == Import::ParoI4) {
-        const bool i5 = import_ == Import::ParoI5;
+    if (im == Import::ParoI5 || im == Import::ParoI4) {
+        const bool i5 = im == Import::ParoI5;
         /* Paro int5: `X.weight` is X.qweight/.qweight_hi (codes), X.scales (f16 [G, N]) and
          * X.qzeros/.qzeros_hi (zero points). The view describes the logical [N, K] u5 matrix;
          * ckpt_plane_rows re-lays the planes row by row. */
@@ -1455,13 +1485,13 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return RAD_OK;
     }
 
-    if (import_ == Import::QuarkMx || import_ == Import::ParoMx || import_ == Import::ParoM2) {
+    if (im == Import::QuarkMx || im == Import::ParoMx || im == Import::ParoM2) {
         /* Quark's MXFP4 is `fp4_e2m1*e8m0[1x32]` as stored: two codes per byte (element 2j in the
          * low nibble), one biased exponent per 32 of K. The view only renames dtypes and the
          * logical width. Excluded layers are plain tensors. ParoQuant's M2XFP4 grid carries one
          * more plane (`weight_meta`, [N, K/32] u8) that is handed to the weight through
          * import_meta: its bytes are the encoding's third plane as they ship. */
-        const bool m2 = import_ == Import::ParoM2;
+        const bool m2 = im == Import::ParoM2;
         const SrcTensor* w = find(name);
         const SrcTensor* e = w ? find(name + "_scale") : nullptr;
         if (!w || !e || w->rad_dtype != RAD_U8) return RAD_E_NOTFOUND;
@@ -1488,7 +1518,7 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return RAD_OK;
     }
 
-    if (import_ == Import::CtInt4) {
+    if (im == Import::CtInt4) {
         /* CT-INT4: `X.weight` ships as X.weight_packed (i32 [N, K/8], eight codes per word from the
          * low bits, each the signed code plus 8) and X.weight_scale ([N, K/group]), and when
          * asymmetric X.weight_zero_point (see SrcTensor::ct_zero). compressed-tensors dequantises
@@ -1559,7 +1589,7 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return RAD_OK;
     }
 
-    if (import_ == Import::ModelOpt) {
+    if (im == Import::ModelOpt) {
         /* ModelOpt's NVFP4: `X.weight` U8 [N, K/2] (two e2m1 codes a byte, the even k in the low
          * nibble), `X.weight_scale` e4m3 [N, K/16] and `X.weight_scale_2` f32, one per tensor.
          * ModelOpt dequantises
@@ -1615,7 +1645,7 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return RAD_OK;
     }
 
-    if (import_ == Import::Nvfp4) {
+    if (im == Import::Nvfp4) {
         /* NVFP4 (compressed-tensors' nvfp4-pack-quantized): `X.weight_packed` U8 [N, K/2], two
          * e2m1 codes per byte with the even k in the low nibble; `X.weight_scale` e4m3 [N, K/16];
          * `X.weight_global_scale` f32, one per tensor. The global scale is a divisor: the value is
@@ -1793,6 +1823,36 @@ int Checkpoint::add_draft(const std::string& dir, const std::string& prefix) {
     std::unordered_map<std::string, std::string> owner;
     RAD_TRY(shard_list(dir, dir + "/model.safetensors.index.json", false, &shards, &owner));
     for (const auto& sh : shards) RAD_TRY(add_shard(sh, prefix, owner.empty() ? nullptr : &owner));
+    /* The drafter's own quantisation. One is read: ModelOpt's NVFP4 in groups of 16 (LiLiCorr
+     * ships `modelopt_fp4` / `W4A16_NVFP4`: NVFP4 weights, bf16 activations, which a recipe rule
+     * decodes like the target's NVFP4). Its names take that form (imports_at); anything else
+     * quantised is refused by name rather than read as plain tensors. */
+    const std::string dq = prefix + "quantization_config.";
+    auto qd = [&](const char* k) {
+        const char* v = meta_.get(dq + k);
+        return v ? std::string(v) : std::string();
+    };
+    const std::string qm = qd("quant_method");
+    if (!qm.empty()) {
+        const std::string qa = qd("quant_algo"), gs = qd("group_size");
+        const bool modelopt = qm == "modelopt" || qm == "modelopt_fp4";
+        if (!modelopt || (qa != "NVFP4" && qa != "W4A16_NVFP4") || (!gs.empty() && gs != "16")) {
+            RAD_ERR("drafter %s: quantization_config %s / %s (group %s) is not one this reads; "
+                    "ModelOpt's NVFP4 in groups of 16 is", dir.c_str(), qm.c_str(), qa.c_str(),
+                    gs.empty() ? "unstated" : gs.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        if (import_ != Import::None && import_ != Import::ModelOpt) {
+            RAD_ERR("drafter %s: an NVFP4 drafter beside a target imported in another form is not "
+                    "read", dir.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        draft_import_ = Import::ModelOpt;
+        draft_prefix_ = prefix;
+        /* As the target's: the tool's config is provenance, not a served format. */
+        for (std::string& k : meta_.keys)
+            if (k.rfind(dq, 0) == 0) k = prefix + "imported_" + k.substr(prefix.size());
+    }
     meta_.finish();
     return RAD_OK;
 }
@@ -2712,8 +2772,9 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                        "rad-convert imports with its scales rounded to bf16 -- serve the "
                        "container it writes";
         }
-    } else if (dt == RAD_FP4E2M1 && scaled && (ck.imports() == Checkpoint::Import::Nvfp4 ||
-                                               ck.imports() == Checkpoint::Import::ModelOpt)) {
+    } else if (dt == RAD_FP4E2M1 && scaled &&
+               (ck.imports_at(p0.name) == Checkpoint::Import::Nvfp4 ||
+                ck.imports_at(p0.name) == Checkpoint::Import::ModelOpt)) {
         /* NVFP4 as import_piece reads it: e2m1 codes beside the f32 scale the e4m3 one and the
          * second level make, one per 16 of K, each piece with its own second level. Not trivial
          * (the scale is derived), so the loader refuses it and rad-convert decodes it for a
