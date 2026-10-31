@@ -1348,6 +1348,88 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
        fmt("corrupted ref must fail: max_err=%.5g bad=%d", nmax, nbadc));
 }
 
+/* A speculative verify against the decodes it replaces: `q_len` query rows of one sequence whose
+ * context after the step is `ctx`, launched together, must give bit for bit the `q_len` single-row
+ * launches at the same positions (context ctx - q_len + 1 + j for row j), or greedy text with a
+ * drafter differs from the text without one. One KV head a rank, as Nemotron-H's trunk at two
+ * (gqa 16) and four (gqa 8) ranks, ragged as the engine issues it, with the engine's max_ctx and
+ * max_seqs (--max-model-len 8192, --max-num-seqs 4). Holds while every segment of the split law is
+ * one tile at both launches: up to 2048 keys at one sequence, where the decode targets 256
+ * segments and an eight-row verify 128 (r4d_decode_splits). */
+static void attn_verify_bits_case(const Plugin& pl, const char* name, int64_t gqa,
+                                  const char* kv_dtype, int64_t q_len, int64_t ctx) {
+    if (!sel(name)) return;
+    const RadKernelInfo* r = find(pl, name);
+    std::string tag = fmt("%s verify %lld rows = %lld decodes at %lld keys", name,
+                          (long long)q_len, (long long)q_len, (long long)ctx);
+    if (!r) { ok(tag.c_str(), false, "row absent"); return; }
+    const int64_t head_dim = 128, bs = 16, q_heads = gqa, max_ctx = 8192;
+    const int64_t max_blocks = max_ctx / bs, blocks = (ctx + bs - 1) / bs;
+    const int kv_is_fp8 = std::strcmp(kv_dtype, "bf16") != 0;
+    const uint32_t kvdt = kv_is_fp8 ? RAD_F8E4M3 : RAD_BF16;
+    const int ew = kv_is_fp8 ? 1 : 2;
+    const int64_t nelem = blocks * bs * 2 * head_dim;
+    std::vector<uint8_t> kv((size_t)nelem * ew);
+    for (int64_t e = 0; e < nelem; ++e) {
+        if (kv_is_fp8) { kv[(size_t)e] = st_rand_e4m3((uint32_t)e); continue; }
+        const uint16_t h = st_rand_bf16((uint32_t)e);
+        kv[(size_t)e * 2] = (uint8_t)h; kv[(size_t)e * 2 + 1] = (uint8_t)(h >> 8);
+    }
+    /* the pages in reverse, so a row reading a neighbour's page shows */
+    std::vector<int32_t> bt((size_t)max_blocks, -1);
+    for (int64_t b = 0; b < blocks; ++b) bt[(size_t)b] = (int32_t)(blocks - 1 - b);
+    const int64_t row = q_heads * head_dim;
+    std::vector<uint16_t> qh((size_t)(q_len * row));
+    for (size_t i = 0; i < qh.size(); ++i) qh[i] = st_rand_bf16((uint32_t)(i * 7 + 3));
+    void* d_kv = dalloc(kv.size());
+    st_memcpy(d_kv, kv.data(), kv.size(), hipMemcpyHostToDevice);
+    void* d_q = dalloc(qh.size() * 2);
+    st_memcpy(d_q, qh.data(), qh.size() * 2, hipMemcpyHostToDevice);
+    void* d_out = dalloc(qh.size() * 2);
+    /* rows [j0, j0 + n) at context `used`; returns the launch's code */
+    auto launch = [&](int64_t j0, int64_t n, int64_t used) {
+        std::vector<RadTensor> ts = {
+            T((char*)d_q + j0 * row * 2, RAD_BF16, { n, q_heads, head_dim }),
+            T(d_kv, kvdt, { blocks, 1, bs, 2 * head_dim }),
+            TI32({ 1, max_blocks }, bt),
+            TI32({ 1 }, { (int32_t)used }),
+            TF32({ 1, 1 }, 1.0f),
+            TF32({ 1, 1 }, 1.0f),
+            TI32({ 2 }, { 0, (int32_t)n }),
+            T((char*)d_out + j0 * row * 2, RAD_BF16, { n, q_heads, head_dim }),
+        };
+        if (!kv_is_fp8) { absent(ts[4]); absent(ts[5]); }
+        std::vector<RadParam> ps = {
+            PI("q_len", q_len), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
+            PI("causal", 1), PI("window", 0), PI("n_head", q_heads), PI("max_seqs", 4),
+            PI("max_ctx", max_ctx), PS("q_dtype", "bf16"), PS("kv_dtype", kv_dtype),
+        };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need < 0) return (int)need;
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = r->launch(&a, (RadStream) nullptr);
+        const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+        return he != hipSuccess ? -1000 - (int)he : rc;
+    };
+    int rc = launch(0, q_len, ctx);
+    std::vector<uint16_t> ver(qh.size()), one(qh.size());
+    st_memcpy(ver.data(), d_out, ver.size() * 2, hipMemcpyDeviceToHost);
+    for (int64_t j = 0; j < q_len && rc == RAD_OK; ++j) rc = launch(j, 1, ctx - q_len + 1 + j);
+    st_memcpy(one.data(), d_out, one.size() * 2, hipMemcpyDeviceToHost);
+    int64_t eq = 0;
+    for (int64_t j = 0; j < q_len; ++j)
+        eq += !std::memcmp(&ver[(size_t)(j * row)], &one[(size_t)(j * row)], (size_t)row * 2);
+    ok(tag.c_str(), rc == RAD_OK && eq == q_len,
+       fmt("rc=%d, rows bit-equal %lld/%lld", rc, (long long)eq, (long long)q_len));
+}
+
 /* A head-256 prefill geometry the KV split serves: queries per KV head, KV heads (a rank's), page
  * size, and the unit's test hooks' prefix (`<hook>_splits`, the law; `<hook>_last_splits`, the
  * count the unit's last launch used). The workgroup holds 384 / gqa query positions. */
@@ -31070,6 +31152,15 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_decode_h128_gqa16_fp8kv",   128, 16,  1, "fp8_e4m3", 0, 256);
     attn_numeric_case(pl, "attn_decode_h128_gqa16_bf16kv",  128, 16,  1, "bf16",     0, 256);
     attn_numeric_case(pl, "attn_decode_h128_gqa16_bf16kv",  128, 16,  4, "bf16",     0, 256);
+    /* LiLiCorr's verify: 7 drafts and the anchor, eight waves. */
+    attn_numeric_case(pl, "attn_decode_h128_gqa16_fp8kv",   128, 16,  8, "fp8_e4m3", 0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa16_bf16kv",  128, 16,  8, "bf16",     0, 256);
+    /* ... and gives, row for row, the decodes it replaces; gqa 8 is the trunk at four ranks */
+    for (int64_t keys : { 120, 700, 2048 }) {
+        attn_verify_bits_case(pl, "attn_decode_h128_gqa16_bf16kv", 16, "bf16",     8, keys);
+        attn_verify_bits_case(pl, "attn_decode_h128_gqa16_fp8kv",  16, "fp8_e4m3", 8, keys);
+        attn_verify_bits_case(pl, "attn_decode_h128_gqa8_bf16kv",   8, "bf16",     8, keys);
+    }
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
     /* And over the fp8_v4 and k6_v4 caches (Flash-Next's --kv-cache-dtype fp8_v4 / k6_v4). */

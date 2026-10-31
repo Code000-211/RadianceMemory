@@ -2130,7 +2130,12 @@ Traps:
 scratch of per-token records: decay, `dt' x`, B), at most 31 drafts a step. NVIDIA's LiLiCorr block
 drafter proposes 7: 32 query heads over 2 KV heads of 128, which four ranks replicate as the trunk's
 attention does (`drafter_geom`'s `kv_repl_ok`: each rank reads its head's k and v rows at `kv_off`,
-and `attn_paged_sink` runs at gqa 8 instead of 16).
+and `attn_paged_sink` runs at gqa 8 instead of 16). A verify's 8 query rows run the trunk's
+attention in the split-KV decode kernel a plain decode runs, at gqa 16 (one and two ranks) in eight
+waves as at gqa 8 (four) in four, so each row is the single-row decode at its position bit for bit
+while each of the split law's segments holds one 16-key tile (a context up to 2048 tokens: 256
+segments at a decode, 128 at a verify). Past that the partition differs and a near-tie can flip
+greedy text, as `ident.sh` allows ([TOOLS](TOOLS.md)).
 
 **Vision.** `arch/nemotronh/radio.h` serves the C-RADIO (v4-H) tower and its `mlp1` projector when
 the container holds them (`vision_config.model_type` `radio`): pictures, and video in tubelets of
