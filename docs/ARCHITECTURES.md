@@ -123,24 +123,37 @@ DSpark, other gate activations and rotary-scaling overrides are not implemented.
 
 `arch/spark25_w8a8` serves a trunk whose linears use the fwht128-rotated int8 grid: per-128 int8
 activation codes feed `i8a8h` GEMMs, while the embedding and small per-head gate remain BF16 and
-normalisation gains remain FP32. Exact GELU runs before the down projection's separate Hadamard quantiser. The output head
-may be BF16 or a separately quantised int8 table. The descriptor is `w8a8_fwht128`; the container
-must set `quantization_config.quant_method=w8a8` and `quantization_config.fmt=fwht128`.
-Column-sharded inputs and their offsets must be whole 128-column scale groups. A rank with an
-unaligned span is refused, not served with misaligned scales.
+normalisation gains remain FP32. Exact GELU runs before the down projection's separate Hadamard
+quantiser. The output head may be BF16 or a separately quantised int8 table. The descriptor is
+`w8a8_fwht128`; the container must set `quantization_config.quant_method=w8a8` and
+`quantization_config.fmt=fwht128`.
 
-`data/recipes/spark-x26-4b-iq8r.recipe` fits the six trunk projection types against BF16
-calibration Grams, and quantises the output head with RTN. The BF16 plugin records them with
-`RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS`, and `RADIANCE_SPARK_CALIB_LAYERS=lo:hi`; calibration
-requires TP=1 to retain off-diagonal cross-rank terms. Drive a representative corpus through
-prefill with `--no-prefix-cache` and no speculative decoding. Each slice writes six RADGRAM2 files
-per layer. Calibration completeness is not a measure of quality: compare the resulting container
-against BF16 on disjoint data, including the tail of the per-position KL distribution.
+The full recipe, `data/recipes/spark-x26-4b-iq8r.recipe`, is an explicit speed/size tradeoff, not a
+quality-preferred default. `data/recipes/spark-x26-4b-iq8r-keep12.recipe` leaves layers 0–11 in
+BF16 and is the tested quality-preferred allocation (6.09 GB / 5.67 GiB). The full IQ8R container
+is 4.52 GiB; BF16 is 8.29 GiB. The measured comparison used top-128-plus-tail KL, with the full
+variant's maximum 11.883 and keep12's maximum 0.247 over 31,391 held-out positions. These are
+coarsened distribution-parity measurements, not full-vocabulary KL or task-benchmark scores. The
+source revision and replay commands, tail details, hashes, calibration/evaluation provenance, and
+limits are in [`SPARK25-IQ8R.md`](SPARK25-IQ8R.md). The cited numbers require the shared prefill
+softmax fix #362 (`7480da3d46b0475d9d77966e31284cc19072759`); they are not evidence for standalone
+#363 without that prerequisite.
 
-`tests/spark25_iq8r.py` compares a deterministic quantised fixture with the Transformers reference,
-including top-10 probabilities across cached decoding. `--tp 2` checks two fake host ranks, and
-`--wide-tp --tp N` exercises group-aligned attention and FFN shards for N from 1 to 8. As with the
-BF16 fixture, run it under a GPU-denying device cgroup on a shared machine.
+The BF16 plugin records the calibration Grams with `RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS`,
+and `RADIANCE_SPARK_CALIB_LAYERS=lo:hi`; use TP=1 to retain off-diagonal cross-rank terms. Drive
+a representative corpus through prefill with prefix caching and speculation disabled. Each layer
+slice writes six RADGRAM2 files. The published calibration manifest and dataset revision are
+recorded in [`SPARK25-IQ8R.md`](SPARK25-IQ8R.md); calibration completeness is not a measure of
+quality.
+
+A column-sharded input must have a 128-column-aligned offset and width. When possible, FFN sharding
+partitions whole 128-channel groups with a ragged remainder-first split. Spark's 10,240-channel FFN
+has 80 groups, so TP=3 gets 27/27/26 groups and is aligned; TP=3 is not inherently refused. The
+architecture rejects a particular computed span only if it is not group-aligned. Actual serving
+also requires the selected kernels and collectives to support the world size. `tests/spark25_iq8r.py`
+compares a deterministic quantised fixture with the Transformers reference, including top-10
+probabilities across cached decoding; `--wide-tp --tp N` checks aligned attention/FFN shards for
+N=1..8. Use a GPU-denying device cgroup for this CPU fixture on shared machines.
 
 For a CPU differential against the reference implementation's `configuration_spark.py` and
 `modeling_spark.py`, with Python's torch, transformers and safetensors installed:

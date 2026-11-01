@@ -1,5 +1,7 @@
-# spark-x26-4b-iq8r.recipe -- Spark X2.6 4B (Spark2_5ForCausalLM) on IQ8R's rotated int8 grid.
-# Every trunk linear rotated by fwht128 and fitted by GPTQ against the container's own calibration
+# Full, opt-in speed/size variant for Spark X2.6 4B (Spark2_5ForCausalLM) on IQ8R's rotated int8 grid.
+# For the tested quality-preferred allocation retaining layers 0..11 in BF16, use
+# spark-x26-4b-iq8r-keep12.recipe instead. Neither allocation guarantees task quality for every use.
+# Every trunk linear rotated by fwht128 and fitted by GPTQ against calibration
 # Hessians (RADGRAM2), an int8 code with a bf16 scale per [1 x 128] (docs/IQR.md). Served by
 # arch/spark25_w8a8 at gemm_nt_q dtype i8a8h behind had_quant_act_i8g.
 #

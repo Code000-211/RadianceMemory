@@ -313,6 +313,11 @@ if(TARGET spechub)
   add_dependencies(sample_test spechub)
 endif()
 
+if(TARGET spark25_recipe_test)
+  target_compile_definitions(spark25_recipe_test PRIVATE
+    RAD_SPARK25_RECIPE_DIR="${CMAKE_SOURCE_DIR}/data/recipes")
+endif()
+
 # ================================================================== whole models on the CPU
 #
 # engine_e2e_test runs the radiance binary on tiny synthetic checkpoints (tests/tiny_model.h) on

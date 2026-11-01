@@ -212,6 +212,21 @@ TEST(iq8r_rejects_unrotated_weights_and_missing_collectives) {
              RAD_E_UNSUPPORTED);
 }
 
+TEST(iq8r_refuses_containers_with_a_different_format) {
+    for (const auto& [method, fmt] : {std::pair{"w8a8", "fwht64"},
+                                      std::pair{"fp8", "fwht128"}}) {
+        MetaKV k = spark_meta();
+        k.m.quant = "w8a8_fwht128";
+        k.set("quantization_config.quant_method", method)
+         .set("quantization_config.fmt", fmt);
+        RadBuilder b;
+        spark_iq8r_encodings(b);
+        RadBuildCtx ctx = build_ctx();
+        CHECK_EQ(stderr_of_rc([&] { return spark25_w8a8::declare(&b, k.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+}
+
 TEST(tp_rejects_missing_all_reduce_instead_of_skipping_it) {
     MetaKV k = spark_meta();
     RadBuilder b;
