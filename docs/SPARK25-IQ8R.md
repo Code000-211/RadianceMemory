@@ -65,8 +65,13 @@ The recorded matched-reference artifacts are local and were not copied into this
 - Keep12 report and per-row file: `rowfix-keep12-kld.json` and
   `rowfix-keep12-kld.json.rows` (report SHA-256
   `d6b577c1e6f7fc5c40814744bea22079998562229eaa2b2a892274544a149dbf`).
-- Reference KLD metadata records 31,391 positions and corpus FNV-1a `17d9069a2711c745`; candidate
-  `.rows` files contain one row per scored position (KL, candidate NLL, reference NLL, top-1 match).
+- `rowfix-keep12-kld.json` records `ref_form: "top-128 + tail"`, reference `rowfix-bf16-ref128`,
+  `all.positions: 31391`, mean KL `0.0006770557376511436`, maximum KL `0.2471124678850174`, and
+  99.1112% top-1 agreement. These are coarsened top-128-plus-tail KL values, not exact
+  full-vocabulary KL. `rowfix-diverse-kld.json` uses the same `rowfix-bf16-ref128` reference and
+  31,391 positions. The reference metadata records corpus FNV-1a `17d9069a2711c745`; the companion
+  `.json.rows` files contain the per-position score rows (KL, candidate NLL, reference NLL, top-1
+  match).
 
 The measured rowfix comparison used Radiance source commit `54f2602367eb96ca08674095f7e32506fd7d752b`
 (the build tree points to `/mnt/gostar_data/radiance-worktrees/spark-x2-6`), `libr4d@0.5.0`, TP=1,
