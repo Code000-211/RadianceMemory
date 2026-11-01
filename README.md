@@ -193,11 +193,11 @@ sequenceDiagram
         SCH->>KV: residency_demote_landed()<br/>→ pool blocks back to the free list
     end
     SCH->>KV: residency_demote(seq, sink, tail, ≤ 64 blocks)
-    KV-->>SCH: moves (block → slot); entries now read cold
+    KV-->>SCH: moves (block → slot), entries now read cold
     SCH->>TX: issue_moves(to_host)
     TX->>CS: wait for everything compute was given
     TX->>TX: gather_rows → copy to store slots
-    Note over SCH: the next build uploads the changed table entries;<br/>a step issued earlier still reads the old pool ids,<br/>which stay valid until the copy has landed
+    Note over SCH: the next build uploads the changed table entries.<br/>A step issued earlier still reads the old pool ids,<br/>which stay valid until the copy has landed
 ```
 
 The rules that keep this safe without any host wait:
