@@ -9,9 +9,15 @@
  * Tensor parallelism splits attention by whole KV groups, replicating KV heads when ranks
  * outnumber them. As in the HF reference, residuals accumulate in f32; rmsnorm reads that stream
  * and writes bf16 for the linear projections.
+ *
+ * A container built with `--draft-model` also carries a DSpark drafter, which reads the residual
+ * stream after the trunk layers its config names and denoises a block of masked positions in one
+ * pass. The trunk's part of that is the taps and the drafter pass dispatch (see
+ * arch/rad_block_dspark_bf16.h for the drafter itself).
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
+#include <arch/rad_block_dspark_bf16.h>
 #include "chat.h"
 #include "spark25_prefill_pass_key.h"
 
@@ -45,8 +51,38 @@ struct Model {
     bool tap_live = false;
     long long calib_rows = 0;
     int64_t calib_lo = 0, calib_hi = 0;
+    /* The drafter, declared only when the container carries one and this serve speculates. Its own
+     * KV group holds the context it derived from the trunk's taps. */
+    DsparkBF16     ds{};
+    DsparkBF16::Wire dsw{};
+    DsparkTaps     taps{};
+    rad_kvgroup    kv_draft = 0;
+    bool           have_ds = false;
 };
 static Model models[MAX_RANKS];
+
+/* Whether the container carries a drafter at all (`--draft-model` merged one under `draft.`), and
+ * whether this file implements it. A drafter this plugin cannot run is refused at declare rather
+ * than left unused: the container would serve at the speed of a model with no drafter, and the
+ * user would have no way to find out that the flag they passed did nothing. */
+static int drafter_kind(const RadModelMeta* meta, bool* present) {
+    *present = false;
+    const char* da = rad_meta_gets(meta, "draft.architectures", "");
+    if (!da || !*da) {
+        /* A drafter's config.json flattened, or a GGUF import, either of which names it. */
+        if (rad_meta_geti(meta, "draft.num_hidden_layers", 0) <= 0) return RAD_OK;
+        da = rad_meta_gets(meta, "draft.model_type", "");
+    }
+    if (std::strstr(da, "DSpark") || std::strcmp(da, "dspark") == 0) {
+        *present = true;
+        return RAD_OK;
+    }
+    *present = true;
+    fprintf(stderr, "radiance: spark25: this container carries a '%s' drafter. Spark's drafts are "
+                    "DSpark, with a rank-N Markov head over the target's own table; this "
+                    "architecture implements that and nothing else\n", da);
+    return RAD_E_UNSUPPORTED;
+}
 
 /* The HF config names every layer. Do not infer a periodic schedule: it changes the mask and
  * rotary of a layer and would silently produce a different model. */
@@ -233,6 +269,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         !m.hout || !m.logits) return RAD_E_INVAL;
     RAD_ARCH_TRY(rad_declare_logits(b, m.logits));
 
+    /* ---- the drafter's taps, when the container carries a drafter and this serve speculates.
+     * Declared before the layer loop because the stream outlives it: the drafter's context pass
+     * runs after the trunk's, on the residual streams the trunk saved here. */
+    bool drafter = false;
+    RAD_ARCH_TRY(drafter_kind(meta, &drafter));
+    if (drafter && ctx->max_spec > 0) {
+        m.taps.read(meta, g.n_layer);
+        if (m.taps.n <= 0) {
+            fprintf(stderr, "radiance: spark25: the drafter names no trunk layer to read, or names "
+                            "only layers past this target's last (`draft.target_layer_ids`)\n");
+            return RAD_E_FORMAT;
+        }
+        RAD_ARCH_TRY(m.taps.declare(b, nm, g, g.max_tok, m.x));
+    }
+
     auto weight = [&](const char* name, const char* src, uint32_t dt,
                       std::initializer_list<int64_t> shape, RadWeightGroup group,
                       int access = RAD_ACCESS_PER_TOKEN, int shard = RAD_SHARD_NONE) {
@@ -394,6 +445,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.logits_op = rw(b, RAD_OP(b, "logits_gemm", RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
         RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
         RAD_WEIGHTS(m.head)), {m.hout}, {m.logits});
+    char ids[128] = "";
+    /* The drafter is declared last, after the head. The buffer planner takes lifetimes in
+     * declaration order, and a drafter's passes run after the whole trunk's, so declaring it in the
+     * middle would let a trunk temporary be planned onto bytes the drafter is still reading. */
+    if (m.taps.n > 0) {
+        RAD_ARCH_TRY(declare_dspark(&m.ds, &m.dsw, &m.kv_draft, b, nm, meta, ctx, g, m.taps,
+                                    (int)g.n_layer, m.tok, nm.ckpt("model.embedding.weight")));
+        m.have_ds = true;
+        for (int t = 0, off = 0; t < m.taps.n && off < (int)sizeof(ids) - 8; ++t)
+            off += std::snprintf(ids + off, sizeof ids - off, "%s%d", t ? ", " : "",
+                                 m.taps.layer[t]);
+        rad_note(b, "the drafter reads the residual stream after layer(s) %s", ids);
+    }
+
     rad_note(b, "spark25 rank %d/%d: %lld layers, %lld query / %lld KV heads x %lld, "
                 "FFN %lld, vocab [%lld, %lld), local window %lld", g.rank, g.world,
              (long long)g.n_layer, (long long)g.n_head, (long long)g.n_head_kv,
@@ -405,6 +470,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = models[rad_rank(c)];
     const Geom& g = m.g;
+    /* A drafter pass; the sign gives the kind. Positive is the query pass, which denoises the whole
+     * block and proposes from it; negative is the context pass, which turns the tokens the trunk
+     * just committed into the drafter's own K and V. Zero is a trunk step. */
+    if (batch->draft_pass != 0) {
+        if (!m.have_ds) {
+            rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
+                             "container carries no `draft.` block, or declare ran at max_spec 0");
+            return;
+        }
+        if (batch->draft_pass > 0) m.ds.step(c, batch);
+        else                       m.ds.context(c, batch);
+        return;
+    }
     const int64_t T = batch->n_tok;
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     RAD_ISSUE(c, m.embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tok), brows(m.h, T));
@@ -448,6 +526,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (a.reduce_ffn) RAD_ISSUE_N(c, a.reduce_ffn, T * g.n_embd, brows(m.h, T), RAD_NONE);
         RAD_ISSUE(c, a.widen_ffn, brows(m.h, T), brows(m.delta, T));
         RAD_ISSUE(c, a.add_ffn, brows(m.x, T), brows(m.delta, T), brows(m.x, T));
+        /* The tap after this layer, on prefill and decode alike: the drafter conditions on every
+         * committed token's residual stream, not only on prefill's. */
+        m.taps.step(c, m.x, T, (int64_t)i, g.n_embd);
     }
     RAD_ISSUE(c, m.final_norm, brows(m.x, T), RAD_W(m.norm), brows(m.h, T));
     if (batch->n_out > 0) {
@@ -509,9 +590,31 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_m
 }
 #endif
 
+/* The speculation depth this container supports: zero without a drafter, or the block length a
+ * DSpark drafter was trained at. `draft_depth_fixed` because a block-diffusion drafter denoises
+ * exactly that many mask positions, and `declare` refuses to run it at any other depth. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    out->draft_depth = 0;
+    out->draft_depth_fixed = 0;
+    bool present = false;
+    if (drafter_kind(meta, &present) != RAD_OK) return RAD_E_UNSUPPORTED;
+    if (!present) return RAD_OK;
+    const long long bs = rad_meta_geti(meta, "draft.block_size", 0);
+    if (bs < 2) {
+        fprintf(stderr, "radiance: spark25: the container carries a drafter with no "
+                        "draft.block_size\n");
+        return RAD_E_FORMAT;
+    }
+    out->draft_depth = (int)bs;
+    out->draft_depth_fixed = 1;
+    return RAD_OK;
+}
+
 static const RadChatFormat* chat_format(const RadModelMeta*) { return spark_chat_format(); }
 }
 #ifndef RAD_ARCH_NO_EXPORTS
+RAD_ARCH_PROBE(spark25_bf16)
 RAD_ARCH_PLUGIN(spark25_bf16, "spark25", "", "0.1.0", "Spark X2.6 BF16")
 RAD_ARCH_CHAT_FORMAT(spark25_bf16)
 #ifdef SPARK25_HAVE_PREFILL_SPLIT

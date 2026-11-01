@@ -415,6 +415,358 @@ TEST(spark_prefill_keys_match_live_r4d_split_grid) {
 #endif
 }
 
+/* A DSpark drafter merged under `draft.`, as `--draft-model` writes it: five sliding layers over a
+ * trunk, a seven-token block, a rank-256 Markov head, and the tap list the published Spark drafts
+ * carry (translated into the layers whose output is tapped). */
+static MetaKV with_dspark(MetaKV k) {
+    k.set("draft.architectures", "DSparkDraftModel")
+     .set("draft.model_type", "dspark")
+     .set("draft.num_hidden_layers", "5")
+     .set("draft.hidden_size", "2560")
+     .set("draft.intermediate_size", "10240")
+     .set("draft.num_attention_heads", "16")
+     .set("draft.num_key_value_heads", "4")
+     .set("draft.head_dim", "256")
+     .set("draft.rms_norm_eps", "1e-06")
+     .set("draft.rope_theta", "10000")
+     .set("draft.vocab_size", "131072")
+     .set("draft.partial_rotary_factor", "1")
+     .set("draft.hidden_act", "gelu")
+     .set("draft.is_causal", "0")
+     .set("draft.use_sliding_window", "1")
+     .set("draft.sliding_window", "512")
+     .set("draft.block_size", "7")
+     .set("draft.sample_from_anchor", "1")
+     .set("draft.mask_token_id", "2")
+     .set("draft.target_layer_ids", "1 3")
+     .set("draft.gguf_target_layers", "2 4")
+     .set("draft.tie_word_embeddings", "1")
+     .set("draft.headwise_attn_output_gate", "1")
+     .set("draft.gate_attn_act_mode", "sigmoid")
+     .set("draft.fc_norm", "1")
+     .set("draft.markov_rank", "256")
+     .set("draft.markov_head_type", "vanilla")
+     .set("draft.has_confidence_head", "1");
+    return k;
+}
+
+static RadBuildCtx spec_ctx(int max_spec) {
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = max_spec;
+    return ctx;
+}
+
+TEST(a_dspark_drafter_is_declared_over_the_trunk) {
+    MetaKV k = with_dspark(spark_meta());
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(7);
+    REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+
+    /* What the core drives: a block drafter, seven rows and seven drafts, staged against the
+     * window the plugin gated its own attention with. */
+    CHECK_EQ(b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+    CHECK_EQ(b.drafter.depth, 7);
+    CHECK_EQ(b.drafter.block, 7);                       /* every row predicts, the anchor included */
+    CHECK_EQ(b.drafter.mask_token, 2);
+    CHECK_EQ(b.drafter.window, 513);                    /* 512-key history plus anchor */
+    CHECK(b.drafter.proposal != 0);
+    CHECK_EQ(b.drafter.proposal_pitch, (int64_t)7);
+    CHECK_EQ(b.drafter_name, std::string("dspark"));
+
+    /* Its own exact anchor-aligned KV window, and its layers bound past the trunk's four. */
+    REQUIRE_EQ(b.kv_groups.size(), (size_t)2);
+    const RecKV& draft_kv = b.kv_groups[1];
+    CHECK_EQ(draft_kv.d.kind, (int)RAD_KV_WINDOW);
+    CHECK_EQ(draft_kv.d.window, (int64_t)513);
+    CHECK_EQ(draft_kv.d.n_head_kv, (int64_t)4);
+    CHECK_EQ(draft_kv.d.head_dim, (int64_t)256);
+    for (int l = 0; l < 5; ++l) {
+        auto it = std::find_if(b.binds.begin(), b.binds.end(),
+                               [&](const std::pair<int, rad_kvgroup>& p) { return p.first == 4 + l; });
+        REQUIRE(it != b.binds.end());
+        CHECK_EQ(it->second, (rad_kvgroup)2);   /* the drafter's group, not the trunk's */
+    }
+
+    /* The taps: two column slices of one f32 stream, copied out of the trunk as it passes. */
+    const RecBuf* src = find_b(b, "draft_src");
+    REQUIRE(src);
+    CHECK_EQ(src->d.dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(src->d.rank, 2u);
+    CHECK_EQ(src->d.shape[1], (int64_t)2 * 2560);
+    CHECK_EQ(count_op(b, "cast") >= 1, true);
+
+    /* The drafter's weights, at the names the container carries -- including the gate under the
+     * `g_proj` spelling the target uses, and the Markov pair as vocabulary-wide codebooks. */
+    const RecWeight* fc = find_w(b, "dspark.fc.weight");
+    REQUIRE(fc);
+    CHECK_EQ(fc->d.dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(fc->d.rank, 2u);
+    CHECK_EQ(fc->d.shape[0], (int64_t)2560);
+    CHECK_EQ(fc->d.shape[1], (int64_t)2 * 2560);
+    const RecMap* fc_map = find_map(b, "dspark.fc.weight");
+    REQUIRE(fc_map);
+    CHECK_EQ(fc_map->src[0], std::string("draft.fc.weight"));
+    REQUIRE(find_w(b, "dspark.fc_norm.0.weight") != nullptr);
+    REQUIRE(find_w(b, "dspark.fc_norm.1.weight") != nullptr);
+    const RecWeight* gate = find_w(b, "dspark.blk.0.attn_gate");
+    REQUIRE(gate);
+    CHECK_EQ(gate->d.shape[0], (int64_t)16);            /* one gate a head */
+    CHECK_EQ(gate->d.shape[1], (int64_t)2560);
+    const RecMap* gate_map = find_map(b, "dspark.blk.0.attn_gate");
+    REQUIRE(gate_map);
+    CHECK_EQ(gate_map->src[0], std::string("draft.layers.0.self_attn.g_proj.weight"));
+    /* Every drafter name, norms included, is the container's name under `draft.` -- a missing
+     * separator here reads a tensor that is not there. */
+    for (const auto& prm : {std::pair{"dspark.blk.0.attn_norm.weight",
+                                      "draft.layers.0.input_layernorm.weight"},
+                            {"dspark.blk.0.ffn_norm.weight",
+                             "draft.layers.0.post_attention_layernorm.weight"},
+                            {"dspark.blk.4.ffn_norm.weight",
+                             "draft.layers.4.post_attention_layernorm.weight"}}) {
+        const RecMap* m = find_map(b, prm.first);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->src[0], std::string(prm.second));
+    }
+    const RecWeight* gu = find_w(b, "dspark.blk.0.ffn_gate_up");
+    REQUIRE(gu);
+    CHECK_EQ(gu->d.n_row_parts, 2);                     /* [gate | up], one weight */
+    const RecWeight* mk1 = find_w(b, "dspark.markov_w1");
+    REQUIRE(mk1);
+    CHECK_EQ(mk1->d.access, RAD_ACCESS_VOCAB);
+    CHECK_EQ(mk1->d.shard, RAD_SHARD_NONE);
+    CHECK_EQ(mk1->d.shape[0], (int64_t)131072);
+    CHECK_EQ(mk1->d.shape[1], (int64_t)256);
+    const RecWeight* head = find_w(b, "dspark.head.weight");
+    REQUIRE(head);
+    CHECK_EQ(head->d.dtype, (uint32_t)RAD_BF16);
+    const RecMap* head_map = find_map(b, "dspark.head.weight");
+    REQUIRE(head_map);
+    CHECK_EQ(head_map->src[0], std::string("model.embedding.weight"));   /* the target's tied table */
+
+    /* Its layers: non-causal attention over the exact shared anchor window, exact-erf gelu, one
+     * sigmoid gate a head, and a rotary over the whole head. */
+    CHECK_EQ(count_op(b, "attn_paged"), 4);
+    CHECK_EQ(count_op(b, "attn_paged_anchor_window"), 1);
+    const RecOp* d_attn = find_op(b, "attn_paged_anchor_window", 0);
+    REQUIRE(d_attn != nullptr);
+    CHECK_EQ(pint(d_attn, "causal"), 0);
+    CHECK_EQ(pint(d_attn, "window"), 513);
+    CHECK_EQ(pint(d_attn, "gqa"), 4);
+    /* The M range tops out at the block, not at a token count. */
+    const RecParam* ql = nullptr;
+    for (const auto& prm : d_attn->p) if (prm.key == "q_len") ql = &prm;
+    REQUIRE(ql != nullptr);
+    CHECK_EQ(ql->ival, 1);
+    CHECK_EQ(ql->ihi, 7);
+    CHECK_EQ(pstr(d_attn, "q_dtype"), std::string("bf16"));
+    for (const auto& o : b.ops) {
+        if (o.op != "act_mul") continue;
+        CHECK_EQ(pstr(&o, "act"), std::string("gelu"));  /* exact erf, as the trunk's */
+    }
+    CHECK_EQ(count_op(b, "rope") >= 4 * 2 + 1, true);
+    const RecOp* markov = find_op(b, "dflash_markov_greedy", 0);
+    REQUIRE(markov);
+    CHECK_EQ(pint(markov, "steps"), 7);
+    CHECK_EQ(pint(markov, "rank"), 256);
+    CHECK_EQ(pint(markov, "anchor_stride"), 7);         /* token_ids is `block` a sequence */
+    CHECK_EQ(pint(markov, "n_vocab"), (int64_t)131072);
+    CHECK_EQ(pstr(markov, "dtype"), std::string("bf16"));
+    CHECK_EQ(find_op(b, "dflash_select", 0), nullptr);
+    CHECK_EQ(find_op(b, "row_topk", 0), nullptr);
+    const RecBuf* best_scores = nullptr;
+    const RecBuf* best_tokens = nullptr;
+    for (const auto& bf : b.bufs) {
+        if (bf.name == "ds_markov_score") best_scores = &bf;
+        if (bf.name == "ds_markov_token") best_tokens = &bf;
+    }
+    REQUIRE(best_scores && best_tokens);
+    CHECK_EQ(best_scores->d.shape[0], (int64_t)8);
+    CHECK_EQ(best_scores->d.shape[1], (int64_t)(131072 + 63) / 64);
+    const RecBuf* dlog = nullptr;
+    for (const auto& bf : b.bufs) if (bf.name == "ds_dlog") dlog = &bf;
+    REQUIRE(dlog != nullptr);
+    CHECK_EQ(dlog->d.dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(count_op(b, "logits_gemm"), 1);            /* the trunk's head; the draft's is a GEMM */
+    CHECK(count_op(b, "gemm_nt") > 0);
+
+    /* The drafter is declared after the trunk, and the graph resolves: no op the plugin declared is
+     * left unused, and every weight it reads came from a name map. */
+    for (const auto& o : b.ops) if (o.resolved) CHECK(o.uses_declared);
+    for (const auto& w : b.weights) if (!w.d.source) CHECK(find_map(b, w.name) != nullptr);
+    const std::string notes = [&] {
+        std::string n;
+        for (const auto& s : b.notes) n += s + "\n";
+        return n;
+    }();
+    CHECK(notes.find("DSpark drafter") != std::string::npos);
+    CHECK(notes.find("after layer(s) 1, 3") != std::string::npos);
+}
+
+TEST(the_drafter_passes_run_and_the_draft_is_proposed_from_the_block) {
+    MetaKV k = with_dspark(spark_meta());
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(7);
+    REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+
+    /* One engine step, as the scheduler drives it: a verify pass over the accepted block, the
+     * drafter's context pass over what the trunk just committed, then its query pass over the
+     * staged block (the anchor and six masks). */
+    const auto ver = kit(b, std::vector<int>(4, 8), {});
+    const auto ctx_pass = context_pass(b, *ver);
+    const auto qry = query_pass(b, 4, 7, 7);            /* seven rows, seven drafts */
+    const auto v = run_passes(b, spark25_bf16::step, { ver.get(), ctx_pass.get(), qry.get() });
+    CHECK_PASSES(b, v);
+
+    /* The query pass is the drafter alone: five attention layers, the head, and the walk that
+     * writes the proposal buffer -- and no trunk layer at all. */
+    RadCtx& q = *v[2];
+    int attn = 0, gemm = 0;
+    bool selected = false, proposed = false;
+    for (const auto& i : q.issues) {
+        const RecOp* o = b.op_of(i.op);
+        REQUIRE(o != nullptr);
+        if (o->op == "attn_paged_anchor_window") ++attn;
+        if (o->op == "gemm_nt") ++gemm;
+        if (o->op == "dflash_markov_greedy") {
+            selected = true;
+            REQUIRE_EQ(i.opd.size(), (size_t)7);   /* logits, anchor, pred, succ, tiles, tokens */
+            proposed = true;
+        }
+    }
+    CHECK_EQ(attn, 5);
+    CHECK(gemm > 0);
+    CHECK(selected);
+    CHECK(proposed);
+
+    /* The context pass stores K and V for every committed token and proposes nothing. */
+    RadCtx& h = *v[1];
+    int stores = 0, selects = 0;
+    for (const auto& i : h.issues) {
+        const RecOp* o = b.op_of(i.op);
+        REQUIRE(o != nullptr);
+        if (o->op == "kv_store") ++stores;
+        if (o->op == "dflash_select") ++selects;
+    }
+    CHECK_EQ(stores, 5);
+    CHECK_EQ(selects, 0);
+
+    /* And the trunk's own step, with the drafter silent. */
+    const auto dec = kit(b, { 1, 1, 1, 1 }, {});
+    const auto d = run_passes(b, spark25_bf16::step, { dec.get() });
+    CHECK_PASSES(b, d);
+    for (const auto& i : d[0]->issues) {
+        const RecOp* o = b.op_of(i.op);
+        REQUIRE(o != nullptr);
+        CHECK(o->op != "dflash_select");
+    }
+}
+
+TEST(a_drafter_is_refused_when_the_pair_or_the_depth_is_wrong) {
+    /* A serve that asks for another depth: a block-diffusion drafter has no partial block. */
+    {
+        MetaKV k = with_dspark(spark_meta());
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(3);
+        CHECK_EQ(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+    /* The head is read replicated, so a vocab-sharded world cannot draft from it. */
+    {
+        MetaKV k = with_dspark(spark_meta());
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(7);
+        ctx.world_size = 2;
+        CHECK_EQ(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+    for (const auto& change : {std::pair{"draft.hidden_size", "4096"},         /* another target */
+                               std::pair{"draft.markov_rank", "0"},            /* no head to walk */
+                               std::pair{"draft.markov_rank", "24"},           /* not a strided rank */
+                               std::pair{"draft.sample_from_anchor", "0"},     /* a slot with no rows */
+                               std::pair{"draft.hidden_act", "gelu_tanh"},     /* not what it trained */
+                               std::pair{"draft.gate_attn_act_mode", "tanh"},
+                               std::pair{"draft.architectures", "DFlashDraftModel"},
+                               std::pair{"draft.sliding_window", "4"},         /* shorter than a block */
+                               std::pair{"draft.block_size", "0"}}) {
+        MetaKV k = with_dspark(spark_meta());
+        k.set(change.first, change.second);
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(7);
+        CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }) != RAD_OK);
+    }
+    /* A library that only has the older per-query window or candidate-pruned selector must refuse
+     * DSpark declaration, not silently substitute an operation with different semantics. */
+    for (const char* op : {"attn_paged_anchor_window", "dflash_markov_greedy"}) {
+        MetaKV k = with_dspark(spark_meta());
+        RadBuilder b;
+        b.refuse.insert(op);
+        RadBuildCtx ctx = spec_ctx(7);
+        CHECK(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }) != RAD_OK);
+    }
+    /* A drafter whose tap list names only layers past the target's last reads nothing, which is not
+     * a drafter. */
+    {
+        MetaKV k = with_dspark(spark_meta());
+        k.set("draft.target_layer_ids", "9 11");
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(7);
+        CHECK_EQ(stderr_of_rc([&] { return spark25_bf16::declare(&b, k.meta(), &ctx); }),
+                 RAD_E_FORMAT);
+    }
+    /* With no speculation asked for, the drafter is not declared and its weights stay out of the
+     * program -- but the container still serves. */
+    {
+        MetaKV k = with_dspark(spark_meta());
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(0);
+        REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+        CHECK_EQ(b.drafter.kind, (int)RAD_DRAFT_NONE);
+        CHECK(find_w(b, "dspark.fc.weight") == nullptr);
+    }
+    /* And the probe tells the engine what depth the container supports, before declare. */
+    RadArchProbe p{};
+    MetaKV k = with_dspark(spark_meta());
+    REQUIRE_EQ(spark25_bf16::probe(k.meta(), &p), RAD_OK);
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    RadArchProbe plain{};
+    MetaKV none = spark_meta();
+    REQUIRE_EQ(spark25_bf16::probe(none.meta(), &plain), RAD_OK);
+    CHECK_EQ(plain.draft_depth, 0);
+}
+
+/* The int8 trunk carries the same drafter: the drafter reads the trunk's residual stream, which is
+ * f32 whatever the linears are, so the wiring is the trunk's and the graph is the drafter's. */
+TEST(the_int8_trunk_carries_the_same_drafter) {
+    MetaKV k = with_dspark(spark_meta());
+    k.m.quant = "w8a8_fwht128";
+    k.set("quantization_config.quant_method", "w8a8")
+     .set("quantization_config.fmt", "fwht128");
+    RadBuilder b;
+    spark_iq8r_encodings(b);
+    RadBuildCtx ctx = spec_ctx(7);
+    REQUIRE_EQ(spark25_w8a8::declare(&b, k.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+    CHECK_EQ(b.drafter.depth, 7);
+    CHECK_EQ(b.drafter.window, 513);
+    CHECK(find_w(b, "dspark.fc.weight") != nullptr);
+    CHECK_EQ(count_op(b, "attn_paged_anchor_window"), 1);
+    CHECK_EQ(count_op(b, "dflash_markov_greedy"), 1);
+    CHECK_EQ(count_op(b, "dflash_select"), 0);
+    const auto ver = kit(b, std::vector<int>(4, 8), {});
+    const auto ctx_pass = context_pass(b, *ver);
+    const auto qry = query_pass(b, 4, 7, 7);
+    const auto v = run_passes(b, spark25_w8a8::step, { ver.get(), ctx_pass.get(), qry.get() });
+    CHECK_PASSES(b, v);
+    /* The trunk's quantised linears are untouched by the drafter's bf16 graph. */
+    CHECK(count_op(b, "gemm_nt_q") > 0);
+
+    RadArchProbe p{};
+    REQUIRE_EQ(spark25_w8a8::probe(k.meta(), &p), RAD_OK);
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+}
+
 TEST(refuses_unimplemented_variants) {
     RadBuildCtx ctx = build_ctx();
     for (const auto& change : {std::pair{"tie_word_embeddings", "0"},
