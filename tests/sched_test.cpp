@@ -1942,6 +1942,29 @@ TEST(a_preempted_prefill_ignores_a_kv_group_that_holds_no_blocks) {
     f.commit_plain();
 }
 
+/* A preempted request publishes what it computed, as a finished one does: its prompt stays in the
+ * cache, and the recompute adopts it instead of computing it again (a 96.6k-token prompt took about
+ * 25 s of a pair of cards). The blocks stay reclaimable: the cache gives them back under pressure. */
+TEST(a_preempted_request_publishes_its_prefix) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 60000;
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const size_t before = f.pc.published.size();
+    CHECK(f.sch.step() != nullptr);
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    bool found = false;
+    for (size_t i = before; i < f.pc.published.size(); ++i)
+        if (f.pc.published[i].seq == b && f.pc.published[i].n_tokens >= 128) found = true;
+    CHECK(found);
+    f.commit_plain();
+    (void)a;
+}
+
 /* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
 
  * preempting the lowest-priority running request before the step is planned, so it cannot queue

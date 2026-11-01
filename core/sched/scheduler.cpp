@@ -589,14 +589,11 @@ void Scheduler::trim_prefix_cache() {
     if (short_by > 0) (void)pc_->trim(short_by);
 }
 
-void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
-                              bool publish, int status, const char* why) {
-    ++step_finished_;
-    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
-     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
-     * and failed requests are published too; their prompts were computed, and a client that hangs
-     * up mid-answer is likely to ask for that prefix again. */
-    if (publish && cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
+/* What a request computed, into the prefix cache, while it still owns the blocks: at its close,
+ * and at a preemption, whose recompute then adopts its prompt instead of computing it again.
+ * True when published. */
+bool Scheduler::publish_prefix(SchedReq& s) {
+    if (cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
         s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
         /* R-SWA: a sequence with a runtime window is not published (KVManager::set_window). Its
          * table is a reference plus a ring rather than a prefix from position 0, and the window
@@ -618,8 +615,20 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
             trim_prefix_cache();
+            return rc >= 0;
         }
     }
+    return false;
+}
+
+void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
+                              bool publish, int status, const char* why) {
+    ++step_finished_;
+    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
+     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
+     * and failed requests are published too; their prompts were computed, and a client that hangs
+     * up mid-answer is likely to ask for that prefix again. */
+    if (publish) (void)publish_prefix(s);
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
     /* Prompt lookup's index is this text's alone. */
@@ -1262,13 +1271,16 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
 }
 
 /* ------------------------------------------------------------------ preemption */
-void Scheduler::preempt_back() {
+bool Scheduler::preempt_back() {
     int32_t slot = running_.back();
     SchedReq& s = *reqs_[(size_t)slot];
     Request& r = *s.req;
 
     /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
-     * is the tail of its token sequence, so it simply re-prefills prompt ++ output. */
+     * is the tail of its token sequence, so it simply re-prefills prompt ++ output. What it computed
+     * is published first: the recompute adopts it from the cache, and under pressure the cache gives
+     * the blocks back (the newest entries last). */
+    const bool published = publish_prefix(s);
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -1288,6 +1300,7 @@ void Scheduler::preempt_back() {
     running_.pop_back();
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
     ++m_.preemptions;
+    return published;
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -1603,6 +1616,9 @@ void Scheduler::undo_hit(SchedReq& s) {
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len();
+    /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
+     * no new block. */
+    const int64_t hit = (cfg_.prefix_cache && pc_) ? pc_->lookup(r, nullptr, nullptr).n_attn_tokens : 0;
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
@@ -1610,7 +1626,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
          * wanted the whole prompt from a pool of none and kept a preempted request out for good. */
         if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
-                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
         if (need < 0) need = 0;
         for (int32_t slot : running_) {
             const SchedReq& rs = *reqs_[(size_t)slot];
@@ -1743,7 +1759,7 @@ const RadBatch* Scheduler::step() {
                 running_.erase(std::find(running_.begin(), running_.end(), victim));
                 running_.push_back(victim);
             }
-            preempt_back();
+            if (preempt_back()) evict_rounds = 0;   /* its blocks stay in the cache: evict them first */
         }
     }
 
@@ -1964,7 +1980,9 @@ const RadBatch* Scheduler::step() {
             /* The back of the running set gives its blocks up. When that is this request, the
              * requests ahead of it hold the pool: it is preempted by recompute and waits for
              * them, rather than failed. */
-            preempt_back();
+            /* A victim that published keeps its blocks in the cache: eviction gets its rounds
+             * back, so they are reclaimed before anyone else is preempted. */
+            if (preempt_back()) evict_rounds = 0;
             preempted_here = true;
             if (last) { yielded = true; break; }
         }

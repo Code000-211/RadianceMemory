@@ -821,7 +821,8 @@ private:
     const Request* serial_req(const SerialSeq& m) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
-    void preempt_back();
+    bool preempt_back();                                      /* true: the victim published its prefix */
+    bool publish_prefix(SchedReq& s);
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets
