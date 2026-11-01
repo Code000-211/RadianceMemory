@@ -1,4 +1,4 @@
-# RadianceMemory — window residency for sparse-attention KV
+# [WIP]RadianceMemory — window residency for sparse-attention KV
 
 RadianceMemory keeps a long conversation's KV cache on the card **only where the model actually reads
 it**. Everything else sits in pinned host memory and comes back for the steps that need it. Those
