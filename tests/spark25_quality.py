@@ -13,8 +13,8 @@ Example (run inside an externally managed GPU scope when using libr4d):
     --candidate keep12=/models/spark-iq8r-keep12.rad
 """
 import argparse
-import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -22,29 +22,13 @@ import subprocess
 import sys
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def fnv1a64(path):
-    # Match core/kld.cpp: getline hashes each line without its terminating LF.
-    h = 1469598103934665603
-    with Path(path).open("rb") as f:
-        for line in f:
-            if line.endswith(b"\n"):
-                line = line[:-1]
-            for b in line:
-                h = ((h ^ b) * 1099511628211) & 0xffffffffffffffff
-    return f"{h:016x}"
+from spark25_validation import (fnv1a64, plugin_hashes, reference_provenance, sha256,
+                                validate_reference, validate_report)
 
 
 def parse_candidate(spec):
     name, sep, path = spec.partition("=")
-    if not sep or not name or not path:
+    if not sep or not name or not path or Path(name).name != name or name in (".", ".."):
         raise argparse.ArgumentTypeError("candidate must be NAME=/path/to/model.rad")
     return name, Path(path).resolve()
 
@@ -72,6 +56,9 @@ def main():
                    help="reuse an existing compatible top-128 reference instead of recording it")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+    if (args.tp < 1 or args.max_model_len < 1 or args.max_num_batched_tokens < 1 or
+            args.gpu_headroom_mib < 0):
+        p.error("TP/model/chunk limits must be positive and headroom nonnegative")
 
     radiance, home, reference = args.radiance.resolve(), args.home.resolve(), args.reference.resolve()
     corpus, out = args.corpus.resolve(), args.out.resolve()
@@ -96,15 +83,19 @@ def main():
                              str(ref_dir), "--kld-out", str(out / f"{name}-kld.json")]))
         return 0
 
+    plugins = plugin_hashes(home)
+    reference_inputs = {
+        "reference_model": str(reference), "reference_sha256": sha256(reference),
+        "corpus": str(corpus), "corpus_sha256": sha256(corpus),
+        "corpus_fnv1a64": fnv1a64(corpus), "radiance": str(radiance),
+        "radiance_sha256": sha256(radiance), "plugins": plugins, "arguments": common,
+    }
     out.mkdir(parents=True, exist_ok=True)
     ref_meta_path = ref_dir / "kld.json"
     if args.reuse_reference:
         if not ref_meta_path.is_file():
             p.error(f"--reuse-reference requested but {ref_meta_path} is missing")
         ref_meta = json.loads(ref_meta_path.read_text())
-        if (ref_meta.get("format") != "radiance-kld-top-1" or ref_meta.get("top") != 128 or
-                ref_meta.get("corpus_fnv1a64") != fnv1a64(corpus)):
-            p.error("existing reference is not the same top-128 reference for this corpus")
     else:
         if ref_dir.exists():
             p.error(f"reference directory already exists: {ref_dir}; choose another --out or use --reuse-reference")
@@ -113,10 +104,8 @@ def main():
         subprocess.run(record, env=env, check=True)
         ref_meta = json.loads(ref_meta_path.read_text())
 
-    if ref_meta.get("format") != "radiance-kld-top-1" or ref_meta.get("top") != 128:
-        p.error("reference is not radiance-kld-top-1 with top=128")
-    if ref_meta.get("corpus_fnv1a64") != fnv1a64(corpus):
-        p.error("KLD reference corpus hash does not match --corpus")
+    validate_reference(ref_meta, reference, corpus)
+    bound_reference = reference_provenance(ref_dir, reference_inputs, args.reuse_reference)
 
     run = {
         "reference_model": str(reference), "reference_sha256": sha256(reference),
@@ -130,8 +119,8 @@ def main():
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "gpu_headroom_mib": args.gpu_headroom_mib,
         "speculation": 0, "prefix_cache": False,
-        "reference_manifest": ref_meta,
-        "candidates": {},
+        "reference_manifest": ref_meta, "reference_provenance": bound_reference,
+        **plugins, "candidates": {},
     }
     if args.provenance:
         prov = args.provenance.resolve()
@@ -148,20 +137,18 @@ def main():
                                   stdout=subprocess.PIPE, text=True).stdout.strip()
         run["source"] = {"root": str(root), "revision": git("rev-parse", "HEAD"),
                          "status_porcelain": git("status", "--porcelain")}
-    kernel_dir = home / "kernels"
-    if kernel_dir.is_dir():
-        run["kernel_shared_objects"] = {str(f.relative_to(home)): sha256(f)
-                                        for f in sorted(kernel_dir.rglob("*.so"))}
 
     expected_rows = ref_meta.get("rows")
     for name, model in candidates:
         report = out / f"{name}-kld.json"
         command = [str(radiance), "--model", str(model), *common, "--kld-ref", str(ref_dir),
                    "--kld-out", str(report)]
+        candidate_sha256 = sha256(model)
         subprocess.run(command, env=os.environ.copy(), check=True)
         scored = json.loads(report.read_text())
-        if scored.get("ref_form") != "top-128 + tail" or scored.get("all", {}).get("positions") != expected_rows:
-            p.error(f"{name}: candidate report is not matched to the top-128 reference rows")
+        validate_report(scored, ref_dir, reference, corpus, model, expected_rows)
+        if sha256(model) != candidate_sha256:
+            p.error(f"{name}: candidate changed during scoring")
         values = scored["all"]["kld"]
         row_path = Path(str(report) + ".rows")
         raw = row_path.read_bytes()
@@ -169,8 +156,12 @@ def main():
             p.error(f"{name}: unexpected per-position rows size {len(raw)}")
         row_values = struct.unpack("<" + "f" * (expected_rows * 4), raw)
         kl = [row_values[i * 4] for i in range(expected_rows)]
-        run["candidates"][name] = {"model": str(model), "sha256": sha256(model),
-                                   "report": str(report), "rows": str(row_path),
+        # core/kld.cpp's A/S - log(S) can retain tiny signed roundoff near zero.
+        if not all(math.isfinite(value) for value in kl):
+            p.error(f"{name}: non-finite coarsened KL row")
+        run["candidates"][name] = {"model": str(model), "sha256": candidate_sha256,
+                                   "report": str(report), "report_sha256": sha256(report),
+                                   "rows": str(row_path), "rows_sha256": sha256(row_path),
                                    "metrics": scored["all"],
                                    "positions_over_1_nat": sum(x > 1.0 for x in kl)}
         print(f"{name}: {expected_rows} positions; ref_form={scored['ref_form']}; "
@@ -178,6 +169,10 @@ def main():
               f"p99.9={values['p99_9']:.6g}, max={values['max']:.6g}, "
               f">1 nat={run['candidates'][name]['positions_over_1_nat']}")
 
+    if (plugin_hashes(home) != plugins or sha256(radiance) != run["radiance_sha256"] or
+            sha256(reference) != run["reference_sha256"]):
+        p.error("runtime, reference model or plugin inventory changed during the run")
+    reference_provenance(ref_dir, reference_inputs, reuse=True)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     print(f"Run receipt: {out / 'run.json'}")
     print("Per-position rows are available as <name>-kld.json.rows; replay severe positions with "
@@ -186,4 +181,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"spark25_quality: {exc}", file=sys.stderr)
+        sys.exit(1)

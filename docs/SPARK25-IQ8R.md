@@ -102,10 +102,16 @@ required collectives. Calibration itself remains TP=1.
 
 ## Reproduce matched KLD and tail replays
 
-Use a private output directory; the reference is immutable once `kld.json` is written. The harness
-hashes the checkpoint, executable, corpus, evaluation manifest, loaded kernel shared objects, and
-optional source revision into `run.json`. It replays the same corpus against BF16 once and scores
-each candidate against that reference, with fixed chunking/cache/TP flags:
+Use a private output directory; the reference is immutable once recorded. The harness hashes the
+checkpoint, executable, corpus, evaluation manifest, and **kernel, architecture and optional quantizer
+shared-object inventories** into `run.json`. This includes the architecture graph plugin, not only
+`libr4d.so`; an optional source revision is context, not proof that a binary was built from it. The
+inventory must remain unchanged during the measurement. These probes accept one explicit home, not
+a colon-separated home search path. They replay the same corpus against BF16 once and score each
+candidate with fixed chunking/cache/TP flags. A reference `provenance.json` binds the BF16 model bytes,
+corpus, runtime/plugins, settings and recorded data files. `--reuse-reference` requires this binding
+to match; legacy unbound references must be recorded afresh, not relabelled with the supplied model.
+Reports and per-position score files are hashed into the run receipt as well:
 
 ```sh
 python3 tests/spark25_quality.py \\
@@ -118,16 +124,19 @@ python3 tests/spark25_quality.py \\
   --candidate "full=$FULL_IQ8R" --candidate "keep12=$KEEP12"
 ```
 
-Run that process inside the host's exclusive GPU/device scope for `libr4d`. For one of the candidate
-reports, start that same model as a server with TP=1, BF16 KV, `--max-model-len 4096`,
-`--max-num-seqs 1`, `--max-num-batched-tokens 128`, `--num-speculative-tokens 0`, and
-`--no-prefix-cache`. Then replay the highest-KL rows with their exact token prefixes from the BF16
-reference (the tool checks the server consumed every prefix token):
+Run that process inside the host's exclusive GPU/device scope for `libr4d`. To replay a candidate's
+highest-KL rows, run the following **inside the same kind of device scope**. The tool validates the
+report's reference/corpus/model identities, report/row hashes, reference binding, and current runtime,
+model and plugin hashes against `run.json`, then starts its own private candidate server with the
+scoring run's TP, BF16 KV, model/chunk limits, speculation0 and prefix-cache-off settings. It verifies
+the private served ID and the consumed prefix/completion/cache counts. Arbitrary external `--url`
+servers are not accepted: a served alias alone cannot prove which checkpoint was loaded.
 
 ```sh
 python3 tests/spark25_kld_tail.py \\
+  --run "$RUN/run.json" \\
   --reference "$RUN/bf16-top128-ref" --report "$RUN/full-kld.json" \\
-  --url http://127.0.0.1:5914 --model spark --out "$RUN/full-tail-replay.json"
+  --out "$RUN/full-tail-replay.json"
 ```
 
 The replay compares candidate top-20 log-probabilities with the stored reference top-20 for the
@@ -140,7 +149,10 @@ Run this separately for each model, one process/container at a time and under an
 scope. It reuses the same evaluation prompts, disables prefix caching and speculation, and stores
 per-request latency plus p50/p95/max and aggregate generated-token throughput at each concurrency.
 These are end-to-end request measurements (prefill plus decode and service overhead), not decode-only
-throughput or task scores:
+throughput or task scores. Every response must report positive integer prompt usage and exactly
+`--max-tokens` generated tokens with a `length` finish (EOS is ignored for this fixed-work smoke).
+Missing, zero or short counts fail the run rather than producing a successful throughput receipt.
+Runtime/model/plugin hashes are checked again before writing the receipt; use a fresh `--out`:
 
 ```sh
 python3 tests/spark25_qos.py \\

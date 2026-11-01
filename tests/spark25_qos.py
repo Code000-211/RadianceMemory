@@ -8,8 +8,8 @@ latency, and aggregate generated-token throughput; it does not claim task qualit
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -20,12 +20,7 @@ import urllib.error
 import urllib.request
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+from spark25_validation import plugin_hashes, sha256
 
 
 def quantile(values, q):
@@ -43,8 +38,8 @@ def prompts_from(path):
         if not line:
             continue
         row = json.loads(line)
-        if not isinstance(row.get("prompt"), str):
-            raise ValueError(f"{path}:{line_no}: expected a string prompt")
+        if not isinstance(row.get("prompt"), str) or not row["prompt"].strip():
+            raise ValueError(f"{path}:{line_no}: expected a nonempty string prompt")
         prompts.append({"source": row.get("source", ""), "prompt": row["prompt"]})
     if not prompts:
         raise ValueError(f"{path}: no prompts")
@@ -60,10 +55,21 @@ def request(url, model, prompt, max_tokens, timeout):
     with urllib.request.urlopen(req, timeout=timeout) as response:
         data = json.load(response)
     elapsed = time.perf_counter() - start
-    usage = data.get("usage", {})
-    return {"seconds": elapsed, "prompt_tokens": int(usage.get("prompt_tokens", 0)),
-            "completion_tokens": int(usage.get("completion_tokens", 0)),
-            "finish_reason": data["choices"][0].get("finish_reason")}
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        raise ValueError("response is missing usage")
+    prompt_tokens, completed = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if type(prompt_tokens) is not int or prompt_tokens <= 0:
+        raise ValueError("response must report a positive integer prompt_tokens count")
+    if type(completed) is not int or completed != max_tokens:
+        raise ValueError(f"response must report exactly {max_tokens} completion tokens, got {completed!r}")
+    choices = data.get("choices", [])
+    if len(choices) != 1 or choices[0].get("finish_reason") != "length":
+        raise ValueError("forced-length QoS response did not finish at its requested length")
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise ValueError("request duration is not a positive finite measurement")
+    return {"seconds": elapsed, "prompt_tokens": prompt_tokens,
+            "completion_tokens": completed, "finish_reason": "length"}
 
 
 def main():
@@ -92,12 +98,17 @@ def main():
     concurrencies = [int(x) for x in args.concurrency.split(",")]
     if not concurrencies or any(x < 1 for x in concurrencies):
         p.error("--concurrency must be comma-separated positive integers")
-    if args.requests < 1 or args.repeats < 1 or args.max_tokens < 1:
-        p.error("requests, repeats, and max-tokens must be positive")
+    if (args.requests < 1 or args.repeats < 1 or args.max_tokens < 1 or args.tp < 1 or
+            args.max_model_len < 1 or args.max_num_batched_tokens < 1 or args.gpu_headroom_mib < 0 or
+            not math.isfinite(args.timeout) or args.timeout <= 0):
+        p.error("counts/limits/timeout must be positive and finite; headroom must be nonnegative")
     for path in (radiance, model):
         if not path.is_file():
             p.error(f"not a file: {path}")
     out.mkdir(parents=True, exist_ok=True)
+    if (out / "qos.json").exists():
+        p.error("qos.json already exists; choose a fresh --out for this measurement")
+    plugins = plugin_hashes(home)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -119,11 +130,7 @@ def main():
                "max_num_batched_tokens": args.max_num_batched_tokens,
                "gpu_headroom_mib": args.gpu_headroom_mib,
                "requests_per_repeat": args.requests, "repeats": args.repeats,
-               "max_tokens": args.max_tokens, "command": command, "results": {}}
-    kernel_dir = home / "kernels"
-    if kernel_dir.is_dir():
-        receipt["kernel_shared_objects"] = {
-            str(f.relative_to(home)): sha256(f) for f in sorted(kernel_dir.rglob("*.so"))}
+               "max_tokens": args.max_tokens, "command": command, **plugins, "results": {}}
     if args.source_root:
         root = args.source_root.resolve()
         receipt["source"] = {
@@ -166,6 +173,10 @@ def main():
             wall = time.perf_counter() - started
             latencies = [x["seconds"] for x in samples]
             generated = sum(x["completion_tokens"] for x in samples)
+            if (len(samples) != args.requests * args.repeats or
+                    generated != args.requests * args.repeats * args.max_tokens or
+                    not math.isfinite(wall) or wall <= 0):
+                raise ValueError("QoS measurement did not complete the expected work")
             summary = {"requests": len(samples), "wall_seconds": wall,
                        "latency_seconds": {"p50": quantile(latencies, 0.50),
                                            "p95": quantile(latencies, 0.95),
@@ -185,6 +196,9 @@ def main():
             proc.kill()
             proc.wait()
         server_log.close()
+    if (plugin_hashes(home) != plugins or sha256(radiance) != receipt["radiance_sha256"] or
+            sha256(model) != receipt["model_sha256"]):
+        raise ValueError("runtime, model or plugin inventory changed during the measurement")
     report = out / "qos.json"
     report.write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"QoS receipt: {report}")

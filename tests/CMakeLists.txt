@@ -799,6 +799,9 @@ find_program(RAD_PYTHON3 NAMES python3)
 if(RAD_PYTHON3)
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME spark25_validation_test
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/spark25_validation_test.py)
+  set_tests_properties(spark25_validation_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree
