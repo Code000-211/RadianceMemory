@@ -72,8 +72,9 @@
  *     prev(0) = the anchor; prev(l) = the greedy token chosen at l - 1
  *
  * `dflash_markov_greedy` scans the full vocabulary at every position and greedily chooses the
- * largest biased score, exactly the pinned reference's serial Markov walk. It does not prune to the
- * base head's top K, use a joint-path heap, or apply the confidence head to logits.
+ * largest biased score, following the structure of the pinned reference's serial Markov walk.
+ * BF16 base logits, reduction order and tie behavior can differ from that reference. It does not
+ * prune to the base head's top K, use a joint-path heap, or apply confidence to logits.
  *
  * The confidence head (`conf_proj`, one sigmoid a position predicting acceptance) is imported and
  * ignored: it exists to let a serving loop cut the block short, this engine's depth is fixed at

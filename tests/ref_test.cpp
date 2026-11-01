@@ -9480,6 +9480,28 @@ TEST(dflash_markov_greedy_scans_full_vocab_and_keeps_sequences_independent) {
     CHECK_EQ(tile_scores.at(2), 0.0f);
 }
 
+/* Independent pitches in the two scratch arrays are part of the tensor contract. Guard cells
+ * distinguish correct row addressing from treating both outputs as tightly packed. */
+TEST(dflash_markov_greedy_padded_scratch_rows) {
+    constexpr int V=130, R=32, M=2, tiles=3;
+    T logits(RAD_BF16, {M, V}), anchor(RAD_I32, {M}); anchor.n({1, 2});
+    T pred(RAD_BF16, {V, R}), succ(RAD_BF16, {V, R});
+    st_dt(RAD_BF16, pred.t.data, R, 1); st_dt(RAD_BF16, pred.t.data, 2*R+1, 1);
+    st_dt(RAD_BF16, succ.t.data, 129*R, 4); st_dt(RAD_BF16, succ.t.data, 80*R+1, 8);
+    T scores(RAD_F32, {M, 5}); scores.f(std::vector<float>(10, -777));
+    T tokens(RAD_I32, {M, 7}); tokens.n(std::vector<int64_t>(14, -777));
+    scores.t.shape[1]=tiles; tokens.t.shape[1]=tiles;
+    T out(RAD_I32, {M, 1});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(scores).t(tokens).t(out)
+        .i("M", M).i("steps", 1).i("rank", R).i("n_vocab", V).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 129); CHECK_EQ(out.iat(1), 80);
+    CHECK_EQ(tokens.iat(2), 129); CHECK_EQ(tokens.iat(7+1), 80);
+    CHECK_EQ(scores.at(2), 4); CHECK_EQ(scores.at(5+1), 8);
+    for (int i : {3,4,8,9}) CHECK_EQ(scores.at(i), -777);
+    for (int i : {3,4,5,6,10,11,12,13}) CHECK_EQ(tokens.iat(i), -777);
+}
+
 /* A one-row, one-layer DSpark oracle assembled from libref's ordinary ops. The literals check the
  * architecture-specific chain rather than only each primitive: each tap has its own RMS gain,
  * the normalized taps feed fc/h_norm then context K/V projections, context and draft K/V land in

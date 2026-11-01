@@ -1,6 +1,6 @@
 // Full-vocabulary DSpark Markov greedy walk. Unlike dflash_select's candidate-lattice walk, this
-// operation applies the learned bigram bias to every draft-head logit and greedily selects the
-// largest biased score at each position, matching the pinned llama.cpp reference.
+// operation applies the learned bigram bias to every BF16 draft-head logit and greedily selects
+// the largest biased score. The pinned llama.cpp graph uses F32 base logits and may differ.
 #include <hip/hip_runtime.h>
 #include <climits>
 #include "r4d_gdn_args.h"
@@ -16,6 +16,13 @@ constexpr int kCandidatesPerTile = 64;
 constexpr int kCandidatesPerWarp = kCandidatesPerTile / kWarps;
 constexpr int kMaxRank = 512;
 
+// The device computes element offsets in signed long; reject a row span that would overflow.
+bool rows_fit(long long rows, long long pitch, long long width, int element_bytes) {
+  const long long limit = LLONG_MAX / element_bytes;
+  return rows > 0 && width > 0 && width <= limit && pitch >= width &&
+         (rows == 1 || pitch <= (limit - (width - 1)) / (rows - 1));
+}
+
 // One CTA scans 64 vocabulary rows, eight at a time (one warp per row). The rank reduction is
 // parallel across the warp and codebook loads remain contiguous. Each CTA writes its exact local
 // argmax; a second kernel reduces those tile winners before the next dependent position starts.
@@ -23,7 +30,8 @@ __global__ __launch_bounds__(kThreads) void markov_score_tiles(
     const r4d_u16* __restrict__ logits, long logits_pitch,
     const int* __restrict__ anchor, long anchor_stride,
     const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
-    float* __restrict__ tile_scores, int* __restrict__ tile_tokens,
+    float* __restrict__ tile_scores, long scores_pitch,
+    int* __restrict__ tile_tokens, long tokens_pitch,
     const int* __restrict__ out, long out_pitch,
     int step, int steps, int rank, int vocab, int n_tiles) {
   const int seq = blockIdx.y;
@@ -80,13 +88,14 @@ __global__ __launch_bounds__(kThreads) void markov_score_tiles(
         best_token = token;
       }
     }
-    tile_scores[(long)seq * n_tiles + tile] = best;
-    tile_tokens[(long)seq * n_tiles + tile] = best_token;
+    tile_scores[(long)seq * scores_pitch + tile] = best;
+    tile_tokens[(long)seq * tokens_pitch + tile] = best_token;
   }
 }
 
 __global__ __launch_bounds__(kThreads) void markov_reduce_tiles(
-    const float* __restrict__ tile_scores, const int* __restrict__ tile_tokens,
+    const float* __restrict__ tile_scores, long scores_pitch,
+    const int* __restrict__ tile_tokens, long tokens_pitch,
     int* __restrict__ out, long out_pitch, int step, int n_tiles) {
   const int seq = blockIdx.x;
   const int tid = threadIdx.x;
@@ -96,8 +105,8 @@ __global__ __launch_bounds__(kThreads) void markov_reduce_tiles(
   float best = -INFINITY;
   int best_token = INT_MAX;
   for (int tile = tid; tile < n_tiles; tile += kThreads) {
-    const float score = tile_scores[(long)seq * n_tiles + tile];
-    const int token = tile_tokens[(long)seq * n_tiles + tile];
+    const float score = tile_scores[(long)seq * scores_pitch + tile];
+    const int token = tile_tokens[(long)seq * tokens_pitch + tile];
     if (score > best || (score == best && token < best_token)) {
       best = score;
       best_token = token;
@@ -121,17 +130,18 @@ __global__ __launch_bounds__(kThreads) void markov_reduce_tiles(
 }
 
 int markov_emit(const r4d_u16* logits, long logits_pitch, const int* anchor, long anchor_stride,
-                const r4d_u16* pred, const r4d_u16* succ, float* tile_scores, int* tile_tokens,
-                int* out, long out_pitch, int sequences, int steps, int rank, int vocab,
+                const r4d_u16* pred, const r4d_u16* succ, float* tile_scores, long scores_pitch,
+                int* tile_tokens, long tokens_pitch, int* out, long out_pitch,
+                int sequences, int steps, int rank, int vocab,
                 int n_tiles, RadStream stream) {
   for (int step = 0; step < steps; ++step) {
     hipLaunchKernelGGL(markov_score_tiles, dim3(n_tiles, sequences), dim3(kThreads), 0,
                        (hipStream_t)stream, logits, logits_pitch, anchor, anchor_stride, pred,
-                       succ, tile_scores, tile_tokens, out, out_pitch, step, steps, rank, vocab,
-                       n_tiles);
+                       succ, tile_scores, scores_pitch, tile_tokens, tokens_pitch, out, out_pitch,
+                       step, steps, rank, vocab, n_tiles);
     hipLaunchKernelGGL(markov_reduce_tiles, dim3(sequences), dim3(kThreads), 0,
-                       (hipStream_t)stream, tile_scores, tile_tokens, out, out_pitch, step,
-                       n_tiles);
+                       (hipStream_t)stream, tile_scores, scores_pitch, tile_tokens, tokens_pitch,
+                       out, out_pitch, step, n_tiles);
   }
   return (int)hipGetLastError();
 }
@@ -155,8 +165,8 @@ extern "C" int r4d_rad_dflash_markov_greedy(const RadArgs* a, RadStream stream) 
   const long long rank = r4d_geti_or(a, "rank", 0);
   const long long vocab = r4d_geti_or(a, "n_vocab", 0);
   const long long anchor_stride = r4d_geti_or(a, "anchor_stride", 1);
-  if (steps <= 0 || rank < kWave || rank > kMaxRank || rank % kWave || vocab <= 0 ||
-      anchor_stride <= 0)
+  if (steps <= 0 || steps > INT_MAX || rank < kWave || rank > kMaxRank || rank % kWave ||
+      vocab <= 0 || vocab > INT_MAX - kCandidatesPerTile || anchor_stride <= 0)
     return R4D_NO(RAD_E_INVAL);
 
   if (out->dtype != RAD_I32 || out->rank != 2 || out->shape[1] < steps)
@@ -164,8 +174,12 @@ extern "C" int r4d_rad_dflash_markov_greedy(const RadArgs* a, RadStream stream) 
   const long long sequences = out->shape[0];
   const long long out_pitch = r4d_row_pitch(out);
   const long long logits_pitch = r4d_row_pitch(logits);
-  if (sequences <= 0 || out_pitch < steps || logits->dtype != RAD_BF16 || logits->rank != 2 ||
-      logits->shape[0] < sequences * steps || logits->shape[1] < vocab || logits_pitch < vocab)
+  // blockIdx.y is limited to 65535, and all kernel loop indices are int.
+  if (sequences <= 0 || sequences > 65535 || sequences > LLONG_MAX / steps ||
+      (sequences - 1) > (LLONG_MAX - 1) / anchor_stride ||
+      !rows_fit(sequences, out_pitch, steps, sizeof(int)) || logits->dtype != RAD_BF16 ||
+      logits->rank != 2 || logits->shape[0] < sequences * steps || logits->shape[1] < vocab ||
+      !rows_fit(sequences * steps, logits_pitch, vocab, sizeof(r4d_u16)))
     return R4D_NO(RAD_E_SHAPE);
 
   if (anchor->dtype != RAD_I32 || !r4d_contig(anchor) ||
@@ -179,13 +193,15 @@ extern "C" int r4d_rad_dflash_markov_greedy(const RadArgs* a, RadStream stream) 
   if (scores->dtype != RAD_F32 || tokens->dtype != RAD_I32 || scores->rank != 2 ||
       tokens->rank != 2 || scores->shape[0] < sequences || tokens->shape[0] < sequences ||
       scores->shape[1] < n_tiles || tokens->shape[1] < n_tiles ||
-      r4d_row_pitch(scores) < n_tiles || r4d_row_pitch(tokens) < n_tiles)
+      !rows_fit(sequences, r4d_row_pitch(scores), n_tiles, sizeof(float)) ||
+      !rows_fit(sequences, r4d_row_pitch(tokens), n_tiles, sizeof(int)))
     return R4D_NO(RAD_E_SHAPE);
 
   return R4D_RAW(markov_emit((const r4d_u16*)logits->data, (long)logits_pitch,
                              (const int*)anchor->data, (long)anchor_stride,
                              (const r4d_u16*)pred->data, (const r4d_u16*)succ->data,
-                             (float*)scores->data, (int*)tokens->data, (int*)out->data,
+                             (float*)scores->data, (long)r4d_row_pitch(scores),
+                             (int*)tokens->data, (long)r4d_row_pitch(tokens), (int*)out->data,
                              (long)out_pitch, (int)sequences, (int)steps, (int)rank,
                              (int)vocab, (int)n_tiles, stream));
 }
