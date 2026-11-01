@@ -824,6 +824,85 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------ dflash_markov_greedy */
+/* `logits`, `anchor`, `pred`w, `succ`w -> tile-local winners and `tokens`.
+ *
+ * The pinned DSpark reference adds the full-vocabulary bilinear bigram bias to each draft-head
+ * score, then takes a vocabulary-wide greedy argmax at every position. This is deliberately not
+ * `dflash_select`: no top-K candidate restriction is applied, and the result at one position is
+ * the predecessor for the next. Scratch is a 64-token tile decomposition used by the device row;
+ * the reference writes the same tile winners before selecting the global winner. */
+int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *anchor = &a->t[1], *pred = &a->t[2];
+    const RadTensor *succ = &a->t[3], *tile_scores = &a->t[4], *tile_tokens = &a->t[5];
+    const RadTensor *out = &a->t[6];
+    if (!logits->data || !anchor->data || !pred->data || !succ->data ||
+        !tile_scores->data || !tile_tokens->data || !out->data) return RAD_E_INVAL;
+    if (logits->dtype != RAD_BF16 || pred->dtype != RAD_BF16 || succ->dtype != RAD_BF16 ||
+        tile_scores->dtype != RAD_F32 || tile_tokens->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+
+    const int64_t steps = p_int(a, "steps", 0);
+    const int64_t R = p_int(a, "rank", 0);
+    const int64_t V = p_int(a, "n_vocab", 0);
+    const int64_t astr = p_int(a, "anchor_stride", 1);
+    const int64_t M = steps > 0 && V > 0
+                    ? band_rows(numel(logits) / (steps * V), p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr <= 0) return RAD_E_SHAPE;
+    if (numel(logits) < M * steps * V || numel(anchor) < (M - 1) * astr + 1 ||
+        numel(pred) < V * R || numel(succ) < V * R || numel(out) < M * steps)
+        return RAD_E_SHAPE;
+    const int64_t n_tiles = (V + 63) / 64;
+    if (numel(tile_scores) < M * n_tiles || numel(tile_tokens) < M * n_tiles)
+        return RAD_E_SHAPE;
+
+    const int64_t ls = laststride(logits), ps = laststride(pred), ss = laststride(succ);
+    const int64_t os = laststride(out), tss = laststride(tile_scores), tis = laststride(tile_tokens);
+    REF_PAR_FOR(M * steps * V * R)
+    for (int64_t m = 0; m < M; ++m) {
+        std::vector<float> previous((size_t)R);
+        int64_t pid = ld_int(anchor->dtype, anchor->data, offlin(anchor, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t row = m * steps + l;
+            const bool pid_ok = pid >= 0 && pid < V;
+            const int64_t pb = pid_ok ? rowoff(pred, pid, R) : 0;
+            for (int64_t r = 0; r < R; ++r)
+                previous[(size_t)r] = pid_ok ? ldt(pred, pb + r * ps) : 0.0f;
+
+            float global_best = -INFINITY;
+            int64_t global_token = 0;
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64;
+                const int64_t end = std::min<int64_t>(first + 64, V);
+                float best = -INFINITY;
+                int64_t best_token = first;
+                const int64_t lb = rowoff(logits, row, V);
+                for (int64_t token = first; token < end; ++token) {
+                    float score = ldt(logits, lb + token * ls);
+                    const int64_t sb = rowoff(succ, token, R);
+                    for (int64_t r = 0; r < R; ++r)
+                        score += previous[(size_t)r] * ldt(succ, sb + r * ss);
+                    if (score > best || (score == best && token < best_token)) {
+                        best = score;
+                        best_token = token;
+                    }
+                }
+                stt(tile_scores, rowoff(tile_scores, m, n_tiles) + tile * tss, best);
+                st_int(tile_tokens->dtype, tile_tokens->data,
+                       rowoff(tile_tokens, m, n_tiles) + tile * tis, best_token);
+                if (best > global_best || (best == global_best && best_token < global_token)) {
+                    global_best = best;
+                    global_token = best_token;
+                }
+            }
+            st_int(out->dtype, out->data, rowoff(out, m, steps) + l * os, global_token);
+            pid = global_token;
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------- dflash_tree */
 /* `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w -> `tokens`, `parents`
  *

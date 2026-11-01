@@ -1404,7 +1404,8 @@ int ref_lora_expand_mm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
  * The block count and context length are this description's choice; any cache large enough for
  * the indices will do. */
 
-int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+static int ref_attn_paged_shape_impl(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                                     const char* op_name) {
     /* `q_len` is the ranged parameter, a query length (one row at decode, thousands in a prefill
      * chunk; different kernels, docs/OPS.md). */
     const int64_t M   = gi(p, n_p, "q_len", 0);
@@ -1443,7 +1444,15 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
      * would have to agree with a tool's `M` rather than this description's. */
     o.skip();                                        /* cu_seqlens */
     o.t(Q,  { S * M, nh, hd });                      /* out */
-    return o.finish("attn_paged", operand, out);
+    return o.finish(op_name, operand, out);
+}
+
+int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_attn_paged_shape_impl(p, n_p, operand, out, "attn_paged");
+}
+
+int ref_attn_paged_anchor_window_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_attn_paged_shape_impl(p, n_p, operand, out, "attn_paged_anchor_window");
 }
 
 /* attn_paged's operands and its tree's parents, each row an ordinary causal one (-2): a drawn
@@ -2228,6 +2237,28 @@ int ref_dflash_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_BF16, { nv, R });                      /* succ */
     o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);  /* tokens */
     return o.finish("dflash_select", operand, out);
+}
+
+/* The full-vocabulary DSpark Markov walk. Its tile planes hold one exact local max per 64 ids. */
+int ref_dflash_markov_greedy_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t R = gi(p, n_p, "rank", 0);
+    const int64_t nv = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr = gi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || R <= 0 || nv <= 0 || astr <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    const int64_t tiles = (nv + 63) / 64;
+    Opd o;
+    o.t((uint32_t)RAD_BF16, { rows, nv });                          /* logits */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);        /* anchor */
+    o.t((uint32_t)RAD_BF16, { nv, R });                            /* pred */
+    o.t((uint32_t)RAD_BF16, { nv, R });                            /* succ */
+    o.t((uint32_t)RAD_F32, { M, tiles });                           /* tile_scores */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, tiles }, nv, -1, 0);        /* tile_tokens */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);        /* tokens */
+    return o.finish("dflash_markov_greedy", operand, out);
 }
 
 /* dflash_select's operands, then `nodes` tokens and parents a sequence. */

@@ -194,6 +194,7 @@ struct AttnArgs {
     int*                 tinfo;                            /* [tile] = (first row, positions) */
     float qscale;                                          /* softmax scale * log2(e) */
     int   max_blocks, n_seq, q_len, tps, kv_heads, causal, window, n_split;
+    int   shared_window;                                    /* all query rows use sequence anchor */
     /* A tree verify (attn_paged_qrow_tree): RadBatch::spec_parent, one a query row; read only by
      * the TREE instances. */
     const int*           tpar;
@@ -302,15 +303,16 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
     const int qbase = ctx - qlen + pfirst;           /* absolute position of the tile's first query */
     const int plast = qbase + npos - 1;
     const int causal = A.causal, window = A.window;
+    const int tbase = ctx - qlen;                    /* first query position, the block anchor */
+    const int window_base = A.shared_window ? tbase : ((TREE && A.tpar) ? tbase : qbase);
 
     /* ---- the tile's key range, and this split's share of it */
-    int hi = causal ? plast + 1 : ctx;
-    if (!causal && window > 0) hi = imin(hi, plast + window);
+    int hi = causal ? (A.shared_window ? tbase + 1 : plast + 1) : ctx;
+    if (!causal && window > 0 && !A.shared_window) hi = imin(hi, plast + window);
     hi = imin(imin(hi, ctx), A.max_blocks * 16);
     /* A tree row's window is measured from the block's first position plus its depth, which can
-     * be below its own position, so a tree launch starts every tile at the block's first. */
-    const int tbase = ctx - qlen;
-    const int lo = window > 0 ? imax(0, ((TREE && A.tpar) ? tbase : qbase) - window + 1) : 0;
+     * be below its own position; an anchor-window launch also uses the first row for every query. */
+    const int lo = window > 0 ? imax(0, window_base - window + 1) : 0;
     const int lo_a = lo & ~(BK - 1);
     const int nkt = hi > lo_a ? (hi - lo_a + BK - 1) / BK : 0;
     const int per = (nkt + A.n_split - 1) / A.n_split;
@@ -434,11 +436,14 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
                 reduce_scatter<8, BK>(sc, lane);
             }
             const int pq = pos[i];
-            bool vis = kok && (causal ? kk <= pq : true);
+            bool vis = kok && (causal ? kk <= (A.shared_window ? tbase : pq) : true);
             if constexpr (TREE)
                 if (tr[i] && vis && kk >= tbase) vis = ((tm[i] >> (kk - tbase)) & 1ull) != 0;
-            const int wpq = TREE ? wq[i] : pq;
-            if (window > 0) vis = vis && (wpq - kk < window) && (causal || kk - wpq < window);
+            const int wpq = A.shared_window ? tbase : (TREE ? wq[i] : pq);
+            if (A.shared_window)
+                vis = vis && (wpq - kk < window);
+            else if (window > 0)
+                vis = vis && (wpq - kk < window) && (causal || kk - wpq < window);
             const float sv = vis ? sc[0] : -__builtin_inff();
             const float mn = __builtin_fmaxf(m[i], wave_max(sv));
             if (mn == -__builtin_inff()) return;     /* nothing visible yet: uniform */
@@ -1040,7 +1045,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
     r4d_chain_done();
 }
 
-template <int HD, int GQA, bool KV8, bool TREE = false>
+template <int HD, int GQA, bool KV8, bool TREE = false, bool SHARED = false>
 static int launch_attn(const RadArgs* a, RadStream stream) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
     if (!a || a->n_t < (TREE ? 9 : 8)) return RAD_E_INVAL;
@@ -1137,7 +1142,8 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
             if (qmax_w <= 0 || qmax_w > rows) qmax_w = rows;
         }
         /* Never a tree: its verify blocks are decode-sized, and only the scalar kernel reads one. */
-        const bool shaped = !TREE && qmax_w >= kWmmaMinQ && rows >= n_seq * (kWmmaMinQ / 2);
+        const bool shaped = !TREE && !SHARED && qmax_w >= kWmmaMinQ &&
+                            rows >= n_seq * (kWmmaMinQ / 2);
         const bool aligned = rad_ptr_aligned(q->data, 16) && rad_ptr_aligned(o->data, 16) &&
                              (q_rs | q_hs | o_rs | o_hs) % 8 == 0;
         if (shaped && aligned) {
@@ -1171,6 +1177,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
             W.kv_heads = (int)kvh;
             W.causal = (int)causal;
             W.window = (int)window;
+            W.shared_window = SHARED;
             W.n_split = 1;
             R4D_KLAUNCH(R4D_KNAME(attn_wmma_kernel<HD, GQA, KV8>), dim3((unsigned)ntw, (unsigned)kvh, 1u),
                        dim3(kWThreads), (hipStream_t)stream, W);
@@ -1214,6 +1221,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.kv_heads = (int)kvh;
     A.causal = (int)causal;
     A.window = (int)window;
+    A.shared_window = SHARED;
     A.n_split = (int)ns;
     A.tpar = TREE ? (const int*)tp->data : nullptr;
 
@@ -1266,6 +1274,20 @@ R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8)
 R4D_WIN_TREE_DEF(256, 1) R4D_WIN_TREE_DEF(256, 2) R4D_WIN_TREE_DEF(256, 4) R4D_WIN_TREE_DEF(256, 8)
 R4D_WIN_TREE_DEF(512, 1) R4D_WIN_TREE_DEF(512, 2) R4D_WIN_TREE_DEF(512, 4) R4D_WIN_TREE_DEF(512, 8)
 #undef R4D_WIN_TREE_DEF
+
+/* Exact DSpark mask: every query row uses the first query position as the sliding-window anchor.
+ * This is a distinct op name so a library without this semantic cannot silently resolve it. */
+#define R4D_WIN_ANCHOR_DEF(HD, G)                                                                \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_bf16kv(const RadArgs* a, RadStream s) {      \
+        return r4d_win::launch_attn<HD, G, false, false, true>(a, s);                             \
+    }                                                                                             \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_fp8kv(const RadArgs* a, RadStream s) {       \
+        return r4d_win::launch_attn<HD, G, true, false, true>(a, s);                              \
+    }
+R4D_WIN_ANCHOR_DEF(128, 1)
+R4D_WIN_ANCHOR_DEF(256, 1) R4D_WIN_ANCHOR_DEF(256, 2) R4D_WIN_ANCHOR_DEF(256, 4) R4D_WIN_ANCHOR_DEF(256, 8)
+R4D_WIN_ANCHOR_DEF(512, 1) R4D_WIN_ANCHOR_DEF(512, 2) R4D_WIN_ANCHOR_DEF(512, 4) R4D_WIN_ANCHOR_DEF(512, 8)
+#undef R4D_WIN_ANCHOR_DEF
 
 /* Called at declare with no tensors. Partials are capped at kPartBudget (tile, head, split)
  * triples for any batch, so the size is a constant. */

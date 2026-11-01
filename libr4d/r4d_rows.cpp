@@ -713,6 +713,20 @@ static const RadOperandSpec oDflashSelect[] = {
     { "succ",   RAD_OPD_WEIGHT, 0 },
     { "tokens", RAD_OPD_OUT,    0 },
 };
+/* DSpark's exact, vocabulary-wide greedy Markov walk. Per-tile score/id planes are explicit
+ * outputs so the device implementation can parallelize each full-vocabulary step and reduce it
+ * before the next autoregressive step. */
+static const RadParamSpec pDflashMarkov[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "steps", RAD_P_INT, RAD_REQUIRED },
+    { "rank", RAD_P_INT, RAD_REQUIRED }, { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "anchor_stride", RAD_P_INT, RAD_OPTIONAL }, { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDflashMarkov[] = {
+    { "logits", RAD_OPD_IN, 0 }, { "anchor", RAD_OPD_IN, 0 },
+    { "pred", RAD_OPD_WEIGHT, 0 }, { "succ", RAD_OPD_WEIGHT, 0 },
+    { "tile_scores", RAD_OPD_OUT, 0 }, { "tile_tokens", RAD_OPD_OUT, 0 },
+    { "tokens", RAD_OPD_OUT, 0 },
+};
 /* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
 static const RadParamSpec pDflashTree[] = {
     { "M",       RAD_P_INT, RAD_REQUIRED },
@@ -3259,6 +3273,8 @@ static const RadOpSchema kSchemas[] = {
            "paged causal attention, varlen. The ranged parameter is q_len, not M: one query row "
            "at decode, up to 64/gqa at a speculative verify, thousands in a prefill chunk, and "
            "libr4d has a different kernel for each band."),
+    SCHEMA("attn_paged_anchor_window", pAttnPaged, oAttnPaged,
+           "paged attention whose query rows all use the sequence's first query as the sliding-window anchor."),
     /* attn_paged under its own name, for q read at its own row pitch. The windowed kernels
      * (r4d_attn_paged_window.hip) read q in place in a fused [q|k|v] projection; the other
      * attn_paged kernels read q dense and refuse a slice (RAD_E_STRIDE). Under this name the op
@@ -3379,6 +3395,10 @@ static const RadOpSchema kSchemas[] = {
            "positions, and the greedy walk that turns a block of independent top-k sets into one "
            "path. Only the K edges leaving the previous pick are scored, because the walk is "
            "serial and the other K-1 rows of the score matrix are never read."),
+    SCHEMA("dflash_markov_greedy", pDflashMarkov, oDflashMarkov,
+           "DSpark's exact greedy Markov walk: add the full-vocabulary bilinear bias to each "
+           "draft-head logit, choose the greatest token (ties to the lower id), then use it as the "
+           "next position's predecessor."),
     SCHEMA("dflash_tree", pDflashTree, oDflashTree,
            "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
            "a taken node's children are the valid candidates at the next position, each with log "
@@ -4209,6 +4229,16 @@ R4D_WIN_C(cWinH512G1Bf16, 512, 1, "bf16", 0) R4D_WIN_C(cWinH512G1Fp8, 512, 1, "f
 R4D_WIN_C(cWinH512G2Bf16, 512, 2, "bf16", 0) R4D_WIN_C(cWinH512G2Fp8, 512, 2, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH512G4Bf16, 512, 4, "bf16", 0) R4D_WIN_C(cWinH512G4Fp8, 512, 4, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH512G8Bf16, 512, 8, "bf16", 0) R4D_WIN_C(cWinH512G8Fp8, 512, 8, "fp8_e4m3", 0)
+/* DSpark uses the same geometry constraints, but requires a positive window. */
+R4D_WIN_C(cAnchorH128G1Bf16, 128, 1, "bf16", 1) R4D_WIN_C(cAnchorH128G1Fp8, 128, 1, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH256G1Bf16, 256, 1, "bf16", 1) R4D_WIN_C(cAnchorH256G1Fp8, 256, 1, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH256G2Bf16, 256, 2, "bf16", 1) R4D_WIN_C(cAnchorH256G2Fp8, 256, 2, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH256G4Bf16, 256, 4, "bf16", 1) R4D_WIN_C(cAnchorH256G4Fp8, 256, 4, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH256G8Bf16, 256, 8, "bf16", 1) R4D_WIN_C(cAnchorH256G8Fp8, 256, 8, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH512G1Bf16, 512, 1, "bf16", 1) R4D_WIN_C(cAnchorH512G1Fp8, 512, 1, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH512G2Bf16, 512, 2, "bf16", 1) R4D_WIN_C(cAnchorH512G2Fp8, 512, 2, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH512G4Bf16, 512, 4, "bf16", 1) R4D_WIN_C(cAnchorH512G4Fp8, 512, 4, "fp8_e4m3", 1)
+R4D_WIN_C(cAnchorH512G8Bf16, 512, 8, "bf16", 1) R4D_WIN_C(cAnchorH512G8Fp8, 512, 8, "fp8_e4m3", 1)
 #undef R4D_WIN_C
 /* Twelve queries per KV head, head_dim 256 (r4d_attn_paged_h256_gqa12.hip): Qwen3.8-Flash-Next's
  * QSA layers, 24 query heads over 2. `q_len <= 5` is the same `q_len * gqa <= 64` bound, tighter
@@ -4621,6 +4651,10 @@ static const RadConstraint cDflashConv[] = {
 static const RadConstraint cDflashSelect[] = {
     C_GE("steps", 1), C_GE("top_k", 1), C_LE("top_k", 32),
     C_DIV("rank", 32), C_LE("rank", 512), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cDflashMarkov[] = {
+    C_GE("steps", 1), C_DIV("rank", 32), C_LE("rank", 512),
+    C_GE("n_vocab", 1), C_IN("dtype", "bf16"),
 };
 /* dflash_tree's frontier (nodes x top_k children) and its node table live in LDS. */
 static const RadConstraint cDflashTree[] = {
@@ -7199,6 +7233,27 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 #undef R4D_WIN_PAIR
 #undef R4D_WIN_ROW
 
+/* DSpark's shared-anchor mask is intentionally a distinct op/kernel family, not an accepted
+ * `window` variation of attn_paged's per-query visibility. Its base/upper key bounds are tied to
+ * the sequence's first query row. */
+#define R4D_ANCHOR_ROW(HD, G, KVN, KVS, C, KVDOC)                                                 \
+{ "attn_anchor_window_h" #HD "_gqa" #G "_" #KVN, "attn_paged_anchor_window", "attn",          \
+  "paged attention with the first query row as the shared sliding-window anchor",                \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",           \
+  "bf16 query, " KVDOC " kv cache, bf16 out, f32 partials",                                      \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_WINDOW,                                                         \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_anchor_window_h##HD##_gqa##G##_##KVS,                            \
+  r4d_rad_attn_window_h##HD##_scratch, nullptr, nullptr, r4d_shape_attn_paged },
+#define R4D_ANCHOR_PAIR(HD, GQ)                                                                   \
+    R4D_ANCHOR_ROW(HD, GQ, bf16kv, bf16kv, cAnchorH##HD##G##GQ##Bf16, "bf16")                     \
+    R4D_ANCHOR_ROW(HD, GQ, fp8kv, fp8kv, cAnchorH##HD##G##GQ##Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_ANCHOR_PAIR(128, 1)
+R4D_ANCHOR_PAIR(256, 1) R4D_ANCHOR_PAIR(256, 2) R4D_ANCHOR_PAIR(256, 4) R4D_ANCHOR_PAIR(256, 8)
+R4D_ANCHOR_PAIR(512, 1) R4D_ANCHOR_PAIR(512, 2) R4D_ANCHOR_PAIR(512, 4) R4D_ANCHOR_PAIR(512, 8)
+#undef R4D_ANCHOR_PAIR
+#undef R4D_ANCHOR_ROW
+
 /* ...and under attn_paged_qrow_tree, the scalar kernel with a tree verify's mask (the launch
  * refuses a non-causal one and never takes the WMMA kernel). */
 #define R4D_WIN_TREE_ROW(HD, G, KVN, KVS, C, KVDOC)                                               \
@@ -9540,6 +9595,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cDflashConv), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_conv, nullptr, nullptr, nullptr,
   r4d_shape_dflash_conv },
+
+{ "dflash_markov_greedy_bf16", "dflash_markov_greedy", "dflash",
+  "Full-vocabulary DSpark Markov bias and serial greedy argmax; dependent positions each follow "
+  "a complete scan of the draft-head vocabulary",
+  "steps >= 1, rank a multiple of 32 and <= 512, 64 vocabulary ids per scratch tile",
+  "bf16 logits and codebooks, i32 anchor, f32/i32 tile winners, i32 tokens out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDflashMarkov), NOTUNE,
+  nullptr, nullptr, r4d_rad_dflash_markov_greedy, nullptr, nullptr, nullptr,
+  r4d_shape_dflash_markov },
 
 { "dflash_select_bf16", "dflash_select", "dflash",
   "DFlash2 candidate selector: the low-rank edge scores and the greedy walk over them, one "

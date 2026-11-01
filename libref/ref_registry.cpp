@@ -298,9 +298,15 @@ static const RadOperandSpec oGemmQGated[] = { OPD("a"), OPD("a_scale"), WGT("b")
 static const RadParamSpec pDflashSelect[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                               P_INT("rank"), P_INT("n_vocab"),
                                               P_INTO("anchor_stride"), P_STR("dtype") };
+static const RadParamSpec pDflashMarkov[] = { P_INT("M"), P_INT("steps"), P_INT("rank"),
+                                              P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                              P_STR("dtype") };
 static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
                                                 OUT("tokens") };
+static const RadOperandSpec oDflashMarkov[] = { OPD("logits"), OPD("anchor"), WGT("pred"),
+                                                WGT("succ"), OUT("tile_scores"),
+                                                OUT("tile_tokens"), OUT("tokens") };
 static const RadParamSpec pDflashTree[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                             P_INT("rank"), P_INT("n_vocab"),
                                             P_INTO("anchor_stride"), P_INT("nodes"),
@@ -1376,6 +1382,10 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
+{ "dflash_markov_greedy", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "The DSpark reference walk: score all vocabulary ids at each position as draft_logit[token] + "
+  "sum_r pred[previous_token][r] * succ[token][r], select the greatest score (lower id breaks "
+  "ties), then use that token as the next predecessor." },
 { "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
   "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
   "is the anchor, each selected node's children are the valid candidates at the next position "
@@ -1467,6 +1477,11 @@ static const RadOpSchema kSchemas[] = {
   "one kernel serves decode, speculative verify and prefill. seqused is the TOTAL key count "
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
+{ "attn_paged_anchor_window", ARR(pAttnPaged), ARR(oAttnPaged),
+  "Paged attention with one shared window anchor at the first query position in each sequence. "
+  "Every row uses anchor - key < window as its lower-bound predicate; causal attention also masks "
+  "keys after the anchor. This operation has a distinct name because ordinary attn_paged measures "
+  "visibility from each query row." },
 { "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
   "attn_paged over a tree verify (rad_drafter_tree): spec_parent[row] is -2 for an ordinary "
   "causal row, else the row's parent's index within its sequence's rows (-1 for the block's "
@@ -2381,6 +2396,10 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_dflash_markov_greedy", "dflash_markov_greedy", "draft",
+       "DSpark's full-vocabulary greedy Markov walk",
+       "bf16 logits and codebooks, f32/i32 tile winners, i32 tokens out",
+       ref_dflash_markov_greedy),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),
@@ -2441,6 +2460,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
+ROW("ref_attn_paged_anchor_window", "attn_paged_anchor_window", "attn",
+    "paged attention with an exact shared anchor-aligned sliding window",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    nullptr, nullptr, ref_attn_paged_anchor_window, nullptr),
 ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
     "paged causal / sliding-window attention with a tree verify block (spec_parent)",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",

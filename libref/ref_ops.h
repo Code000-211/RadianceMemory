@@ -132,6 +132,7 @@ int ref_rmsnorm_quant_fp8  (const RadArgs*, RadStream);
 int ref_gated_quant_fp8    (const RadArgs*, RadStream);
 int ref_gemm_nt_q_gated    (const RadArgs*, RadStream);
 int ref_dflash_select      (const RadArgs*, RadStream);
+int ref_dflash_markov_greedy(const RadArgs*, RadStream);
 int ref_dflash_tree        (const RadArgs*, RadStream);
 int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
@@ -153,6 +154,7 @@ int ref_logits_gemm        (const RadArgs*, RadStream);
 
 /* ---- attention */
 int ref_attn_paged         (const RadArgs*, RadStream);
+int ref_attn_paged_anchor_window(const RadArgs*, RadStream);
 int ref_attn_paged_tree    (const RadArgs*, RadStream);
 int ref_attn_dense         (const RadArgs*, RadStream);
 int ref_attn_cross         (const RadArgs*, RadStream);
@@ -412,6 +414,7 @@ REF_SHAPE_FN(ref_rmsnorm_quant_fp8);
 REF_SHAPE_FN(ref_gated_quant_fp8);
 REF_SHAPE_FN(ref_gemm_nt_q_gated);
 REF_SHAPE_FN(ref_dflash_select);
+REF_SHAPE_FN(ref_dflash_markov_greedy);
 REF_SHAPE_FN(ref_dflash_tree);
 REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
@@ -430,6 +433,7 @@ REF_SHAPE_FN(ref_embed_lookup_q);
 REF_SHAPE_FN(ref_logits_gemm);
 
 REF_SHAPE_FN(ref_attn_paged);
+REF_SHAPE_FN(ref_attn_paged_anchor_window);
 REF_SHAPE_FN(ref_attn_paged_tree);
 REF_SHAPE_FN(ref_attn_dense);
 REF_SHAPE_FN(ref_attn_cross);

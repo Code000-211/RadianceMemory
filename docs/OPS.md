@@ -935,6 +935,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | op | params | operands |
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
+| `attn_paged_anchor_window` | same parameters as `attn_paged` | same operands as `attn_paged` → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
@@ -955,6 +956,10 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
 verify, thousands in a prefill chunk, and libr4d has a different kernel for each band.
+`attn_paged_anchor_window` has the same layout but different visibility: the first query position
+in each sequence is the shared anchor for every query row, with the lower-bound predicate
+`anchor - key < window`; causal mode additionally masks keys after the anchor. It is a distinct op
+name so an older plugin cannot silently interpret this as per-query `attn_paged`.
 `block_size` is read off the resolved kernel, not chosen: declare the group, declare the op, then
 ask `rad_kv_block_size()` (`spec.md` §7.2).
 
@@ -3354,6 +3359,17 @@ bytes do not depend on the batch.
 
 A drafter is an ordinary graph over ordinary ops except at its two ends: what proposes the
 candidates, and what enters the head from the trunk.
+
+### DSpark
+
+| op | params | operands |
+|---|---|---|
+| `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
+
+`dflash_markov_greedy` is the exact DSpark reference walk, not DFlash2's candidate-lattice selector.
+For every position it adds `sum_r pred[previous,r] * succ[token,r]` to every vocabulary logit,
+chooses the greatest biased score (ties to the lower token id), and uses that id as the next
+predecessor. The explicit tile outputs are scratch for the device's vocabulary-wide reduction.
 
 ### DFlash2
 

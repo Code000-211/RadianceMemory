@@ -81,7 +81,7 @@ struct KvDyn  {
  * root, the block's first row). Inside the block such a row sees itself and its ancestors only,
  * and its window is measured from the block's first position plus its depth -- the position its
  * token has if its path is committed -- rather than from its row. */
-int ref_attn_paged(const RadArgs* a, RadStream) {
+static int ref_attn_paged_impl(const RadArgs* a, RadStream, bool shared_anchor_window) {
     if (a->n_t < 8) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
     const RadTensor* kdes = t_in(a, 4);
@@ -97,7 +97,8 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
     const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
     const int     causal     = (int)p_int(a, "causal", 1);
     const int64_t window     = p_int(a, "window", 0);
-    if (head_dim <= 0 || gqa <= 0 || block_size <= 0) return RAD_E_SHAPE;
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0 ||
+        (shared_anchor_window && window <= 0)) return RAD_E_SHAPE;
     if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
 
     const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
@@ -198,11 +199,16 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                 /* Key j's slot in the cache, or -1 when the mask hides it or its block is
                  * unmapped. */
                 auto key_at = [&](int64_t j) -> int64_t {
-                    if (causal && j > pos) return -1;
+                    const int64_t mask_pos = shared_anchor_window ? base : pos;
+                    if (causal && j > mask_pos) return -1;
                     if (tree && j >= base && !((tmask >> (j - base)) & 1)) return -1;
                     if (window > 0) {
-                        const int64_t d = wpos - j;
-                        if (causal ? (d >= window) : (d >= window || d <= -window)) return -1;
+                        const int64_t d = (shared_anchor_window ? base : wpos) - j;
+                        if (shared_anchor_window) {
+                            if (d >= window) return -1;
+                        } else if (causal ? (d >= window) : (d >= window || d <= -window)) {
+                            return -1;
+                        }
                     }
                     const int64_t blk =
                         ld_int(bt->dtype, bt->data, s * bt_rs + (j / block_size) * bt_cs);
@@ -274,6 +280,16 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+int ref_attn_paged(const RadArgs* a, RadStream s) {
+    return ref_attn_paged_impl(a, s, false);
+}
+
+int ref_attn_paged_anchor_window(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    if (a->n_t > 8 && t_in(a, 8)) return RAD_E_UNSUPPORTED;
+    return ref_attn_paged_impl(a, s, true);
 }
 
 /* attn_paged with its tree operand present: ref_attn_paged reads it (see there). Refused without
