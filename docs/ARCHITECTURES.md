@@ -20,7 +20,7 @@ plugin claims.
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
-| `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)) |
+| `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
@@ -117,7 +117,7 @@ otherwise a missing reduction would silently leave rank-local projections in the
 
 The tokenizer and its template come from the checkpoint; the architecture declares the
 `<think>`/`</think>` reasoning markers and the `<tool_call>name<arg_key>...` tool-call format.
-DSpark, other gate activations and rotary-scaling overrides are not implemented.
+Other gate activations and rotary-scaling overrides are not implemented.
 
 ## Rotated int8 (IQ8R)
 
@@ -154,6 +154,63 @@ also requires the selected kernels and collectives to support the world size. `t
 compares a deterministic quantised fixture with the Transformers reference, including top-10
 probabilities across cached decoding; `--wide-tp --tp N` checks aligned attention/FFN shards for
 N=1..8. Use a GPU-denying device cgroup for this CPU fixture on shared machines.
+
+## DSpark drafting
+
+Both Spark plugins declare a DSpark graph when the container already carries `draft.*` tensors
+(the presence of `draft.markov_w1.weight` is the switch). Building that container from XHToken's
+standalone GGUF is not in this change.
+
+The container's `draft.target_layer_ids` are the ids of the layers that *consume* each tap, so they
+are one above the taps `arch/spark25_bf16` and `arch/spark25_w8a8` copy out of the residual stream:
+3, 11, 19, 26 and 34 become the taps after layers 2, 10, 18, 25 and 33. The drafter's five
+`fc_norm` rows -- one gain per tap -- are the `fc_norm_t0` ... `fc_norm_t4` vectors the graph
+declares.
+
+`arch/common/rad_block_dspark_bf16.h` is the drafter's graph, declared by both Spark plugins after
+the trunk when the container carries `draft.markov_w1.weight`. It is its own block: the MiniCPM5
+DSpark block (`rad_block_dspark.h`) has Q/K norms, SiLU and an fp8 activation grid, and Spark's has
+none of those. Per pass it encodes the taps the trunk copied into `dflash_src` (each tap RMS-normed
+by its own `fc_norm_t<i>`, concatenated, projected by `fc`, normed by `output_norm_enc`), embeds the
+anchor token, runs the five bf16 sliding-window layers over the drafter's own KV group, then scores
+the vocabulary through the trunk's tied table. At each position, the rank-256 Markov head adds
+`sum_r w1[previous,r] * w2[token,r]` to the draft-head logit for **every** vocabulary token and
+greedily selects the greatest biased score (ties to the lower token id); that selected token is the
+next position's predecessor. This follows the pinned reference's serial greedy walk, not a top-K
+walk or joint-path heap. The head writes F32 logits before the walk, but numerical identity is not
+established: the reference CPU chooses the last equal maximum, its GPU reduction has backend-specific
+tie ordering, and this graph chooses the lower token id. Reduction order can also change near-tie
+results; real reference proposal parity remains unvalidated. A
+retained confidence projection is not used: it neither rescales logits nor changes proposals;
+adaptive depth is not implemented by this fixed-depth graph.
+
+Sliding attention uses a separate `attn_paged_anchor_window` operation because ordinary
+`attn_paged` measures its window from each query row. For a configured 512-token history, the
+reference uses `n_swa = 513`: every draft query shares the anchor's exact inclusive key range,
+`[anchor - 512, anchor]` for causal attention, or the anchor's lower cutoff and the staged context's
+upper end for non-causal attention. The same 513-token width is declared for attention, the drafter
+KV group and scheduler staging; cache recycling and rollback boundaries still require independent
+runtime validation. Both new operations have distinct names, so an older device library that
+does not implement these semantics refuses the graph rather than resolving a similar-looking op.
+
+The drafter is declared only at one rank: its `fc` is unsharded and its head scores the full
+vocabulary, so a `--tp` above 1 is refused at declaration rather than served half-sharded.
+
+The earlier DSpark throughput figures were measured with the approximate window and candidate-pruned
+walk; they are not a performance claim for the corrected graph. Run the reproducible runtime QoS
+harness below against the corrected BF16 path before publishing new acceptance, latency or
+throughput results. This branch's existing W8A8 caller shares the corrected BF16 drafter graph, but
+remains a separate release/measurement follow-up to restack after #363. Target verification does
+not establish that drafting preserves acceptance rate, latency, or generated text under every
+serving schedule.
+
+`scripts/dspark_qos_regression.py` is an unvalidated two-server QoS harness, not evidence that
+runtime gates pass. In particular, it treats missing metrics as zero, aggregate proposed versus
+accepted counts cannot prove a partial rejection, and a stop finish reason does not prove an
+explicit stop sequence was encountered. `--prefix-cache-mib 0` does not disable the VRAM prefix
+cache; use `--no-prefix-cache` for that. See `docs/DSPARK-370-DEVICE-FOLLOWUP.md` for the
+limitations and serial diagnostic receipts. Controlled KV rollback/eviction, acceptance quality,
+and QoS measurements remain open; CPU tests and matching sample text cannot establish them.
 
 For a CPU differential against the reference implementation's `configuration_spark.py` and
 `modeling_spark.py`, with Python's torch, transformers and safetensors installed:
