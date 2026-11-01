@@ -111,6 +111,10 @@ a colon-separated home search path. They replay the same corpus against BF16 onc
 candidate with fixed chunking/cache/TP flags. A reference `provenance.json` binds the BF16 model bytes,
 corpus, runtime/plugins, settings and recorded data files. `--reuse-reference` requires this binding
 to match; legacy unbound references must be recorded afresh, not relabelled with the supplied model.
+The harness snapshots inputs before recording, checks them immediately afterward before publishing
+provenance, and checks them again before publishing the run receipt. These checks detect persistent
+changes, not a concurrent change that is reverted between checks; keep inputs immutable throughout.
+A retry removes any previous `run.json` before measurement, so retain old receipts separately.
 Reports and per-position score files are hashed into the run receipt as well:
 
 ```sh

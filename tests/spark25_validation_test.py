@@ -97,6 +97,59 @@ class MeasurementTests(unittest.TestCase):
         execute = self.record_quality("--reuse-reference")
         self.assertEqual(execute.call_count, 1)  # score only, no new reference recording
 
+    def test_recording_input_mutations_do_not_publish_provenance_or_receipt(self):
+        paths = (self.reference, self.runtime, self.corpus, self.home / "architectures/fixture.so")
+        for index, path in enumerate(paths):
+            with self.subTest(path=path):
+                self.out = self.root / f"record-mutation-{index}"
+                original = path.read_bytes()
+
+                def mutate_during_record(command, **kwargs):
+                    self.fake_runtime(command, **kwargs)
+                    if "--kld-record" in command:
+                        path.write_bytes(original + b"changed")
+
+                try:
+                    with patch.object(sys, "argv", self.quality_args()), \
+                            patch.object(quality.subprocess, "run", side_effect=mutate_during_record) as execute:
+                        with self.assertRaisesRegex(ValueError, "reference inputs changed"):
+                            quality.main()
+                    self.assertEqual(execute.call_count, 1)
+                    self.assertFalse((self.out / "bf16-top128-ref/provenance.json").exists())
+                    self.assertFalse((self.out / "run.json").exists())
+                finally:
+                    path.write_bytes(original)
+
+    def test_scoring_input_mutations_prevent_success_receipt(self):
+        paths = (self.reference, self.runtime, self.corpus, self.home / "architectures/fixture.so")
+        for index, path in enumerate(paths):
+            with self.subTest(path=path):
+                self.out = self.root / f"score-mutation-{index}"
+                original = path.read_bytes()
+
+                def mutate_during_score(command, **kwargs):
+                    self.fake_runtime(command, **kwargs)
+                    if "--kld-ref" in command:
+                        path.write_bytes(original + b"changed")
+
+                try:
+                    with patch.object(sys, "argv", self.quality_args()), \
+                            patch.object(quality.subprocess, "run", side_effect=mutate_during_score), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(ValueError, "reference inputs changed"):
+                            quality.main()
+                    self.assertFalse((self.out / "run.json").exists())
+                finally:
+                    path.write_bytes(original)
+
+    def test_failed_retry_removes_previous_success_receipt(self):
+        self.record_quality()
+        self.reference.write_bytes(b"changed")
+        with patch.object(sys, "argv", self.quality_args("--reuse-reference")):
+            with self.assertRaises(ValueError):
+                quality.main()
+        self.assertFalse((self.out / "run.json").exists())
+
     def test_signed_kl_roundoff_is_preserved(self):
         self.score_kl = -1e-10
         self.record_quality()

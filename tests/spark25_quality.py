@@ -83,14 +83,26 @@ def main():
                              str(ref_dir), "--kld-out", str(out / f"{name}-kld.json")]))
         return 0
 
-    plugins = plugin_hashes(home)
-    reference_inputs = {
-        "reference_model": str(reference), "reference_sha256": sha256(reference),
-        "corpus": str(corpus), "corpus_sha256": sha256(corpus),
-        "corpus_fnv1a64": fnv1a64(corpus), "radiance": str(radiance),
-        "radiance_sha256": sha256(radiance), "plugins": plugins, "arguments": common,
-    }
     out.mkdir(parents=True, exist_ok=True)
+    # A failed retry must not leave a previous run's receipt looking like its result.
+    (out / "run.json").unlink(missing_ok=True)
+
+    def snapshot_inputs():
+        return {
+            "reference_model": str(reference), "reference_sha256": sha256(reference),
+            "corpus": str(corpus), "corpus_sha256": sha256(corpus),
+            "corpus_fnv1a64": fnv1a64(corpus), "radiance": str(radiance),
+            "radiance_sha256": sha256(radiance), "plugins": plugin_hashes(home),
+            "arguments": list(common),
+        }
+
+    reference_inputs = snapshot_inputs()
+    plugins = reference_inputs["plugins"]
+
+    def verify_inputs():
+        if snapshot_inputs() != reference_inputs:
+            raise ValueError("reference inputs changed during recording or scoring")
+
     ref_meta_path = ref_dir / "kld.json"
     if args.reuse_reference:
         if not ref_meta_path.is_file():
@@ -102,17 +114,21 @@ def main():
         ref_dir.mkdir(parents=True)
         env = os.environ.copy()
         subprocess.run(record, env=env, check=True)
+        # Check before trusting or binding any output from the recorder.
+        verify_inputs()
         ref_meta = json.loads(ref_meta_path.read_text())
 
     validate_reference(ref_meta, reference, corpus)
+    # Never publish a binding if the recorder may have observed different input bytes.
+    verify_inputs()
     bound_reference = reference_provenance(ref_dir, reference_inputs, args.reuse_reference)
 
     run = {
-        "reference_model": str(reference), "reference_sha256": sha256(reference),
+        "reference_model": str(reference), "reference_sha256": reference_inputs["reference_sha256"],
         "reference_dir": str(ref_dir), "reference_form": "top-128 + tail",
-        "corpus": str(corpus), "corpus_sha256": sha256(corpus),
-        "corpus_fnv1a64": fnv1a64(corpus), "evaluation_manifest": None,
-        "radiance": str(radiance), "radiance_sha256": sha256(radiance),
+        "corpus": str(corpus), "corpus_sha256": reference_inputs["corpus_sha256"],
+        "corpus_fnv1a64": reference_inputs["corpus_fnv1a64"], "evaluation_manifest": None,
+        "radiance": str(radiance), "radiance_sha256": reference_inputs["radiance_sha256"],
         "radiance_home": str(home), "kernel_selector": args.kernels,
         "tp": args.tp, "kv_cache_dtype": "bf16", "max_num_seqs": 1,
         "max_model_len": args.max_model_len,
@@ -169,9 +185,7 @@ def main():
               f"p99.9={values['p99_9']:.6g}, max={values['max']:.6g}, "
               f">1 nat={run['candidates'][name]['positions_over_1_nat']}")
 
-    if (plugin_hashes(home) != plugins or sha256(radiance) != run["radiance_sha256"] or
-            sha256(reference) != run["reference_sha256"]):
-        p.error("runtime, reference model or plugin inventory changed during the run")
+    verify_inputs()
     reference_provenance(ref_dir, reference_inputs, reuse=True)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     print(f"Run receipt: {out / 'run.json'}")
