@@ -1378,6 +1378,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         const RestoreResult rr = pc_->restore(r, whole_only);
         if (rr == RestoreResult::Declined) {
             s.restore_waited = true;
+            admit_next_step_ = true;
             RAD_DEBUG("admit %llu: the restore waits a step for %d deferred release(s)",
                       (unsigned long long)r.id, n_deferred_);
             return RAD_E_FULL;
@@ -2073,13 +2074,18 @@ const RadBatch* Scheduler::step() {
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
                     ? share_tok : 0;
             admit_full_ = 0;
+            admit_next_step_ = false;
             const int as = admit_one(s, budget, areserve);
             if (as == kAdmitWait) { ++at; continue; }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
-             * Fail it (spec §17) and ask the next request, instead of parking the step loop. */
-            if (as < 0 && running_.empty() && s.req && s.req->state == ReqState::Preempted &&
-                preempt_wait_overdue(s)) {
+             * Fail it (spec §17) and ask the next request, instead of parking the step loop. Not
+             * when this step admitted someone ahead of it (the budget or a card went to them) or
+             * the refusal is a restore waiting a step for deferred releases: both clear by the
+             * next step, and failing them lost two of ten preempted requests under KV pressure
+             * once their prompts were published at the preemption (1. 11. 2026). */
+            if (as < 0 && running_.empty() && plan_.e.empty() && !admit_next_step_ && s.req &&
+                s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
                 RAD_WARN("request %llu failed: overdue preempted prefill could not be admitted "
                          "with nothing running (%s)",
                          (unsigned long long)s.req->id, rad_strerror(as));

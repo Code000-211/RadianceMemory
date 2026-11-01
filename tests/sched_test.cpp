@@ -2025,6 +2025,58 @@ TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
     (void)b; (void)c;
 }
 
+/* The overdue path fails a preempted prefill only when waiting cannot help. A restore that waits a
+ * step for a deferred release is a wait: failing it on an idle engine lost two of ten preempted
+ * requests under KV pressure once their prompts were published at the preemption (1. 11. 2026). */
+TEST(an_overdue_preempted_prefill_whose_restore_waits_a_step_is_not_failed) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.n_spec = 7;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, /*max_tokens=*/64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    /* B's growth meets A's blocks: B is preempted while A runs. */
+    for (int i = 0; i < 8; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        if (f.sch.find(b)->state == ReqState::Preempted) break;
+    }
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+
+    /* A is cancelled while a drafter pass names its blocks: they come back only at the next
+     * commit, and nothing runs. */
+    Scheduler::BlockRow rows[4];
+    REQUIRE_EQ(f.sch.block_begin(/*block=*/8, /*depth=*/7, /*window=*/0, /*mask=*/99, rows, 4), 1);
+    REQUIRE(f.sch.block_context(1) != nullptr);
+    CHECK_OK(f.sch.cancel(a));
+    f.sch.block_end();
+    REQUIRE(f.sch.has_deferred());
+    REQUIRE_EQ(f.sch.metrics().running, 0);
+
+    /* B's restore waits a step for that release; B must still be there after it. The cache
+     * gives back what it holds when asked. */
+    f.pc.decline_whole = true;
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    if (!f.sch.step() && f.sch.has_deferred()) f.sch.release_deferred();
+    CHECK(f.sch.find(b)->state != ReqState::Failed);
+    /* As the engine does when a step plans nothing: it drains, then releases what was deferred. */
+    bool ran = false;
+    for (int i = 0; i < 4 && !ran; ++i) {
+        if (!f.sch.step()) {
+            if (f.sch.has_deferred()) f.sch.release_deferred();
+            continue;
+        }
+        ran = f.sch.find(b)->state == ReqState::Running;
+        f.commit_plain();
+    }
+    CHECK(ran);
+    CHECK(f.sch.find(b)->state != ReqState::Failed);
+}
+
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     Fixture f;
     f.build();

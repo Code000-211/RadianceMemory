@@ -525,6 +525,7 @@ private:
     int64_t       span_min_ = 0;
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
+    bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
