@@ -1068,7 +1068,7 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
-        "dflash_markov_greedy",
+        "dflash_markov_greedy", "dflash_markov_greedy_f32",
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
         "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
         "rmsnorm_had_quant_i8",
@@ -9480,6 +9480,27 @@ TEST(dflash_markov_greedy_scans_full_vocab_and_keeps_sequences_independent) {
     CHECK_EQ(tile_scores.at(2), 0.0f);
 }
 
+TEST(dflash_markov_f32_preserves_a_near_tie_and_refuses_bf16) {
+    T logits(RAD_F32, {1, 2}); logits.f({1.001f, 1.002f});
+    T anchor(RAD_I32, {1}); anchor.n({0});
+    T pred(RAD_BF16, {2, 32}), succ(RAD_BF16, {2, 32});
+    T score(RAD_F32, {1, 1}), token(RAD_I32, {1, 1}), out(RAD_I32, {1, 1});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(score).t(token).t(out)
+        .i("M", 1).i("steps", 1).i("rank", 32).i("n_vocab", 2).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy_f32", a));
+    CHECK_EQ(out.iat(0), 1);
+    T bad_anchor(RAD_F32, {1}); bad_anchor.f({0});
+    a.ts[1] = bad_anchor.t;
+    CHECK_EQ(run("dflash_markov_greedy_f32", a), RAD_E_SHAPE);
+    a.ts[1] = anchor.t;
+    CHECK(run("dflash_markov_greedy", a) != RAD_OK);
+    T bf_logits(RAD_BF16, {1, 2}); bf_logits.f({1.001f, 1.002f});
+    a.ts[0] = bf_logits.t;
+    CHECK(run("dflash_markov_greedy_f32", a) != RAD_OK);
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 0);
+}
+
 /* Independent pitches in the two scratch arrays are part of the tensor contract. Guard cells
  * distinguish correct row addressing from treating both outputs as tightly packed. */
 TEST(dflash_markov_greedy_padded_scratch_rows) {
@@ -10056,6 +10077,9 @@ std::vector<Geo> geometries() {
         G("dflash_markov_greedy", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
                                              .i("n_vocab", 130).i("anchor_stride", 1)
                                              .s("dtype", "bf16")),
+        G("dflash_markov_greedy_f32", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
+                                                 .i("n_vocab", 130).i("anchor_stride", 1)
+                                                 .s("dtype", "bf16")),
         G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                  .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),

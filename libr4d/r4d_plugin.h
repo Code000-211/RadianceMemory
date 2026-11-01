@@ -198,6 +198,7 @@ R4D_ATTN_ANCHOR_DECL(512, 1) R4D_ATTN_ANCHOR_DECL(512, 2) R4D_ATTN_ANCHOR_DECL(5
 R4D_ATTN_ANCHOR_DECL(512, 8)
 #undef R4D_ATTN_ANCHOR_DECL
 int     r4d_rad_dflash_markov_greedy(const RadArgs*, RadStream);
+int     r4d_rad_dflash_markov_greedy_f32(const RadArgs*, RadStream);
 /* attn_paged_qrow_tree (docs/OPS.md): the h256/gqa2 split-KV decode and the windowed kernels with a
  * tree verify's mask from operand 8, `spec_parent`. */
 int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8 (const RadArgs*, RadStream);
@@ -1012,6 +1013,7 @@ int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_markov  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov_f32(const RadParam*, int, int operand, RadOpdDesc*);
 
 /* -- declared fusions (r4d_fuse.cpp, pure host) --
  *

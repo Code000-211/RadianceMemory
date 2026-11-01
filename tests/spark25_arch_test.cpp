@@ -564,7 +564,7 @@ TEST(a_dspark_drafter_is_declared_over_the_trunk) {
         CHECK_EQ(pstr(&o, "act"), std::string("gelu"));  /* exact erf, as the trunk's */
     }
     CHECK_EQ(count_op(b, "rope") >= 4 * 2 + 1, true);
-    const RecOp* markov = find_op(b, "dflash_markov_greedy", 0);
+    const RecOp* markov = find_op(b, "dflash_markov_greedy_f32", 0);
     REQUIRE(markov);
     CHECK_EQ(pint(markov, "steps"), 7);
     CHECK_EQ(pint(markov, "rank"), 256);
@@ -585,8 +585,8 @@ TEST(a_dspark_drafter_is_declared_over_the_trunk) {
     const RecBuf* dlog = nullptr;
     for (const auto& bf : b.bufs) if (bf.name == "ds_dlog") dlog = &bf;
     REQUIRE(dlog != nullptr);
-    CHECK_EQ(dlog->d.dtype, (uint32_t)RAD_BF16);
-    CHECK_EQ(count_op(b, "logits_gemm"), 1);            /* the trunk's head; the draft's is a GEMM */
+    CHECK_EQ(dlog->d.dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(count_op(b, "logits_gemm"), 2);            /* trunk and draft F32 heads */
     CHECK(count_op(b, "gemm_nt") > 0);
 
     /* The drafter is declared after the trunk, and the graph resolves: no op the plugin declared is
@@ -621,18 +621,31 @@ TEST(the_drafter_passes_run_and_the_draft_is_proposed_from_the_block) {
      * writes the proposal buffer -- and no trunk layer at all. */
     RadCtx& q = *v[2];
     int attn = 0, gemm = 0;
-    bool selected = false, proposed = false;
+    bool selected = false, proposed = false, draft_head = false;
+    rad_buf head_logits = 0;
     for (const auto& i : q.issues) {
         const RecOp* o = b.op_of(i.op);
         REQUIRE(o != nullptr);
         if (o->op == "attn_paged_anchor_window") ++attn;
         if (o->op == "gemm_nt") ++gemm;
-        if (o->op == "dflash_markov_greedy") {
+        if (o->op == "logits_gemm") {
+            REQUIRE_EQ(i.opd.size(), (size_t)3);
+            REQUIRE_EQ(i.opd[2].kind, (uint8_t)RAD_OPK_BUF);
+            head_logits = i.opd[2].handle;
+            REQUIRE(head_logits > 0 && head_logits <= b.bufs.size());
+            CHECK_EQ(b.bufs[head_logits - 1].d.dtype, (uint32_t)RAD_F32);
+            draft_head = true;
+        }
+        if (o->op == "dflash_markov_greedy_f32") {
             selected = true;
             REQUIRE_EQ(i.opd.size(), (size_t)7);   /* logits, anchor, pred, succ, tiles, tokens */
-            proposed = true;
+            CHECK_EQ(i.opd[0].handle, head_logits);
+            CHECK_EQ(i.opd[6].kind, (uint8_t)RAD_OPK_BUF);
+            CHECK_EQ(i.opd[6].handle, b.drafter.proposal);
+            proposed = i.opd[6].handle == b.drafter.proposal;
         }
     }
+    CHECK(draft_head);
     CHECK_EQ(attn, 5);
     CHECK(gemm > 0);
     CHECK(selected);
@@ -640,25 +653,33 @@ TEST(the_drafter_passes_run_and_the_draft_is_proposed_from_the_block) {
 
     /* The context pass stores K and V for every committed token and proposes nothing. */
     RadCtx& h = *v[1];
-    int stores = 0, selects = 0;
+    int stores = 0;
     for (const auto& i : h.issues) {
         const RecOp* o = b.op_of(i.op);
         REQUIRE(o != nullptr);
         if (o->op == "kv_store") ++stores;
-        if (o->op == "dflash_select") ++selects;
     }
     CHECK_EQ(stores, 5);
-    CHECK_EQ(selects, 0);
+    auto drafter_silent = [&](const RadCtx& pass) {
+        for (const auto& i : pass.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op == "dflash_markov_greedy_f32" || o->op == "dflash_select")
+                return false;
+            for (const auto& operand : i.opd)
+                if (operand.kind == RAD_OPK_BUF &&
+                    (operand.handle == b.drafter.proposal || operand.handle == head_logits))
+                    return false;
+        }
+        return true;
+    };
+    CHECK(drafter_silent(h));
+    CHECK(!drafter_silent(q));  /* negative control: a real draft pass must fail the silence test */
 
     /* And the trunk's own step, with the drafter silent. */
     const auto dec = kit(b, { 1, 1, 1, 1 }, {});
     const auto d = run_passes(b, spark25_bf16::step, { dec.get() });
     CHECK_PASSES(b, d);
-    for (const auto& i : d[0]->issues) {
-        const RecOp* o = b.op_of(i.op);
-        REQUIRE(o != nullptr);
-        CHECK(o->op != "dflash_select");
-    }
+    CHECK(drafter_silent(*d[0]));
 }
 
 TEST(a_drafter_is_refused_when_the_pair_or_the_depth_is_wrong) {
@@ -696,7 +717,7 @@ TEST(a_drafter_is_refused_when_the_pair_or_the_depth_is_wrong) {
     }
     /* A library that only has the older per-query window or candidate-pruned selector must refuse
      * DSpark declaration, not silently substitute an operation with different semantics. */
-    for (const char* op : {"attn_paged_anchor_window", "dflash_markov_greedy"}) {
+    for (const char* op : {"attn_paged_anchor_window", "dflash_markov_greedy_f32"}) {
         MetaKV k = with_dspark(spark_meta());
         RadBuilder b;
         b.refuse.insert(op);
@@ -751,7 +772,7 @@ TEST(the_int8_trunk_carries_the_same_drafter) {
     CHECK_EQ(b.drafter.window, 513);
     CHECK(find_w(b, "dspark.fc.weight") != nullptr);
     CHECK_EQ(count_op(b, "attn_paged_anchor_window"), 1);
-    CHECK_EQ(count_op(b, "dflash_markov_greedy"), 1);
+    CHECK_EQ(count_op(b, "dflash_markov_greedy_f32"), 1);
     CHECK_EQ(count_op(b, "dflash_select"), 0);
     const auto ver = kit(b, std::vector<int>(4, 8), {});
     const auto ctx_pass = context_pass(b, *ver);

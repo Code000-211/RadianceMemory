@@ -1386,6 +1386,8 @@ static const RadOpSchema kSchemas[] = {
   "The DSpark reference walk: score all vocabulary ids at each position as draft_logit[token] + "
   "sum_r pred[previous_token][r] * succ[token][r], select the greatest score (lower id breaks "
   "ties), then use that token as the next predecessor." },
+{ "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "Full-vocabulary greedy Markov walk with F32 base logits and BF16 codebooks." },
 { "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
   "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
   "is the anchor, each selected node's children are the valid candidates at the next position "
@@ -2400,6 +2402,10 @@ SIMPLE("ref_dflash_markov_greedy", "dflash_markov_greedy", "draft",
        "DSpark's full-vocabulary greedy Markov walk",
        "bf16 logits and codebooks, f32/i32 tile winners, i32 tokens out",
        ref_dflash_markov_greedy),
+SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
+       "Full-vocabulary greedy Markov walk with F32 base logits",
+       "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
+       ref_dflash_markov_greedy_f32),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),

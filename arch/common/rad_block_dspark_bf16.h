@@ -73,8 +73,8 @@
  *
  * `dflash_markov_greedy` scans the full vocabulary at every position and greedily chooses the
  * largest biased score, following the structure of the pinned reference's serial Markov walk.
- * BF16 base logits, reduction order and tie behavior can differ from that reference. It does not
- * prune to the base head's top K, use a joint-path heap, or apply confidence to logits.
+ * Base logits are F32; reduction order and tie behavior can still differ from the reference. It
+ * does not prune to the base head's top K, use a joint-path heap, or apply confidence to logits.
  *
  * The confidence head (`conf_proj`, one sigmoid a position predicting acceptance) is imported and
  * ignored: it exists to let a serving loop cut the block short, this engine's depth is fixed at
@@ -156,7 +156,7 @@ struct DsparkBF16 {
         rad_buf gate_up = 0; rad_buf ff = 0;
 
         /* ---- the head and the walk, one row per draft position */
-        rad_buf dlog = 0;   /* [srows, n_vocab] bf16  full-vocabulary draft logits */
+        rad_buf dlog = 0;   /* [srows, n_vocab] f32 full-vocabulary draft logits */
         rad_buf best_score = 0; /* [max_seqs, ceil(n_vocab/64)] f32 partial argmax scores */
         rad_buf best_token = 0; /* [max_seqs, ceil(n_vocab/64)] i32 partial argmax ids */
         rad_buf tokens = 0; /* [max_seqs, steps] i32  the draft; the engine reads it by name */
@@ -567,12 +567,12 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
      * greedy Markov op scans all vocabulary entries at every position and feeds each winning id
      * into the next position's bigram bias.
      */
-    op_dlogits = rw(b, RAD_OP(b, "gemm_nt",
-                              RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", g.n_vocab),
-                                         RAD_INT("K", E), RAD_STR("dtype", "bf16")),
+    op_dlogits = rw(b, RAD_OP(b, "logits_gemm",
+                              RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n_vocab", g.n_vocab),
+                                         RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
                               RAD_WEIGHTS(w_head)),
                    {w.h}, {w.dlog});
-    op_markov = rw(b, RAD_OP(b, "dflash_markov_greedy",
+    op_markov = rw(b, RAD_OP(b, "dflash_markov_greedy_f32",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
                                         RAD_INT("steps", cfg.steps()), RAD_INT("rank", cfg.rank),
                                         RAD_INT("n_vocab", g.n_vocab_all),
@@ -884,7 +884,7 @@ inline int declare_dspark(DsparkBF16* ds, DsparkBF16::Wire* w, rad_kvgroup* kv, 
     dw.attn  = decl_b(b, nm.f("ds_attn"), RAD_BF16, {qr, qd});
     dw.gate_up = decl_b(b, nm.f("ds_gate_up"), RAD_BF16, {qr, 2 * dg.n_ff});
     dw.ff    = decl_b(b, nm.f("ds_ff"), RAD_BF16, {qr, dg.n_ff});
-    dw.dlog  = decl_b(b, nm.f("ds_dlog"), RAD_BF16, {sr, dg.n_vocab});
+    dw.dlog  = decl_b(b, nm.f("ds_dlog"), RAD_F32, {sr, dg.n_vocab});
     const int64_t n_markov_tiles = (dg.n_vocab_all + 63) / 64;
     dw.best_score = decl_b(b, nm.f("ds_markov_score"), RAD_F32,
                            {dg.max_seqs, n_markov_tiles});

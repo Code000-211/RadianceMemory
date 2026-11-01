@@ -3364,17 +3364,20 @@ candidates, and what enters the head from the trunk.
 
 | op | params | operands |
 |---|---|---|
-| `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
+| `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | BF16 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
+| `dflash_markov_greedy_f32` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | F32 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
 
 `dflash_markov_greedy` implements the DSpark full-vocabulary greedy walk, not DFlash2's
 candidate-lattice selector. For every position it adds `sum_r pred[previous,r] * succ[token,r]`
 to every vocabulary logit, chooses the greatest biased score (ties to the lower token id), and
 uses that id as the next predecessor. The explicit tile outputs are scratch for the device's
-vocabulary-wide reduction; their row pitches may differ. The current graph passes BF16 base logits,
-whereas the pinned llama.cpp reference uses F32 logits, and the reduction orders also differ.
-Its CPU argmax chooses the last equal maximum; its GPU reduction uses a backend-specific order.
-This op's lower-id tie rule is not a claim of reference tie equivalence. Near-tie proposal
-equivalence is therefore not established.
+vocabulary-wide reduction; their row pitches may differ. The F32 variant uses the same BF16
+codebooks (`dtype=bf16`) but takes F32 base logits; it is a separate operation so an older BF16-only
+kernel cannot silently resolve it. The DSpark graph uses `logits_gemm` and the F32 variant. The
+pinned llama.cpp reference also uses F32 base logits, but reduction orders may differ. Its CPU
+argmax chooses the last equal maximum; its GPU reduction uses a backend-specific order. This op's
+lower-id tie rule is not a claim of reference tie equivalence. Near-tie proposal equivalence is
+therefore not established.
 
 ### DFlash2
 

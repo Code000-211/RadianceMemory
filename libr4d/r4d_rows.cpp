@@ -3399,6 +3399,8 @@ static const RadOpSchema kSchemas[] = {
            "DSpark's exact greedy Markov walk: add the full-vocabulary bilinear bias to each "
            "draft-head logit, choose the greatest token (ties to the lower id), then use it as the "
            "next position's predecessor."),
+    SCHEMA("dflash_markov_greedy_f32", pDflashMarkov, oDflashMarkov,
+           "DSpark full-vocabulary greedy walk with F32 base logits and BF16 codebooks."),
     SCHEMA("dflash_tree", pDflashTree, oDflashTree,
            "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
            "a taken node's children are the valid candidates at the next position, each with log "
@@ -9605,6 +9607,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cDflashMarkov), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_markov_greedy, nullptr, nullptr, nullptr,
   r4d_shape_dflash_markov },
+
+{ "dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "dflash",
+  "Full-vocabulary DSpark greedy walk with F32 base logits",
+  "steps >= 1, rank a multiple of 32 and <= 512, 64 vocabulary ids per scratch tile",
+  "f32 logits, bf16 codebooks, i32 anchor, f32/i32 tile winners, i32 tokens out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDflashMarkov), NOTUNE,
+  nullptr, nullptr, r4d_rad_dflash_markov_greedy_f32, nullptr, nullptr, nullptr,
+  r4d_shape_dflash_markov_f32 },
 
 { "dflash_select_bf16", "dflash_select", "dflash",
   "DFlash2 candidate selector: the low-rank edge scores and the greedy walk over them, one "

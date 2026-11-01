@@ -832,16 +832,18 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
  * `dflash_select`: no top-K candidate restriction is applied, and the result at one position is
  * the predecessor for the next. Scratch is a 64-token tile decomposition used by the device row;
  * the reference writes the same tile winners before selecting the global winner. */
-int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
+static int ref_markov_greedy(const RadArgs* a, uint32_t logits_dtype) {
     if (a->n_t < 7) return RAD_E_INVAL;
     const RadTensor *logits = &a->t[0], *anchor = &a->t[1], *pred = &a->t[2];
     const RadTensor *succ = &a->t[3], *tile_scores = &a->t[4], *tile_tokens = &a->t[5];
     const RadTensor *out = &a->t[6];
     if (!logits->data || !anchor->data || !pred->data || !succ->data ||
         !tile_scores->data || !tile_tokens->data || !out->data) return RAD_E_INVAL;
-    if (logits->dtype != RAD_BF16 || pred->dtype != RAD_BF16 || succ->dtype != RAD_BF16 ||
+    if (logits->dtype != logits_dtype || pred->dtype != RAD_BF16 || succ->dtype != RAD_BF16 ||
         tile_scores->dtype != RAD_F32 || tile_tokens->dtype != RAD_I32 || out->dtype != RAD_I32)
         return RAD_E_DTYPE;
+    /* The device requires I32 anchors and reports invalid anchor tensors as shape errors. */
+    if (anchor->dtype != RAD_I32) return RAD_E_SHAPE;
 
     const int64_t steps = p_int(a, "steps", 0);
     const int64_t R = p_int(a, "rank", 0);
@@ -879,10 +881,12 @@ int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
                 int64_t best_token = first;
                 const int64_t lb = rowoff(logits, row, V);
                 for (int64_t token = first; token < end; ++token) {
-                    float score = ldt(logits, lb + token * ls);
+                    const float base = ldt(logits, lb + token * ls);
+                    float score = logits_dtype == RAD_F32 ? 0.0f : base;
                     const int64_t sb = rowoff(succ, token, R);
                     for (int64_t r = 0; r < R; ++r)
                         score += previous[(size_t)r] * ldt(succ, sb + r * ss);
+                    if (logits_dtype == RAD_F32) score += base;
                     if (score > best || (score == best && token < best_token)) {
                         best = score;
                         best_token = token;
@@ -901,6 +905,14 @@ int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
+    return ref_markov_greedy(a, RAD_BF16);
+}
+
+int ref_dflash_markov_greedy_f32(const RadArgs* a, RadStream) {
+    return ref_markov_greedy(a, RAD_F32);
 }
 
 /* ------------------------------------------------------------- dflash_tree */

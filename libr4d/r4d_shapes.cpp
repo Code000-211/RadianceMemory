@@ -2225,3 +2225,10 @@ extern "C" int r4d_shape_dflash_markov(const RadParam* p, int n_p, int operand,
     };
     R4D_PICK(l);
 }
+
+extern "C" int r4d_shape_dflash_markov_f32(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int rc = r4d_shape_dflash_markov(p, n_p, operand, out);
+    if (rc == RAD_OK && operand == 0) out->dtype = RAD_F32;
+    return rc;
+}

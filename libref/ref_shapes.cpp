@@ -2240,7 +2240,8 @@ int ref_dflash_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
 }
 
 /* The full-vocabulary DSpark Markov walk. Its tile planes hold one exact local max per 64 ids. */
-int ref_dflash_markov_greedy_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+static int ref_markov_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                            uint32_t logits_dtype, const char* op) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t steps = gi(p, n_p, "steps", 0);
     const int64_t R = gi(p, n_p, "rank", 0);
@@ -2251,14 +2252,21 @@ int ref_dflash_markov_greedy_shape(const RadParam* p, int n_p, int operand, RadO
     const int64_t rows = M * steps;
     const int64_t tiles = (nv + 63) / 64;
     Opd o;
-    o.t((uint32_t)RAD_BF16, { rows, nv });                          /* logits */
+    o.t(logits_dtype, { rows, nv });                                 /* logits */
     o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);        /* anchor */
     o.t((uint32_t)RAD_BF16, { nv, R });                            /* pred */
     o.t((uint32_t)RAD_BF16, { nv, R });                            /* succ */
     o.t((uint32_t)RAD_F32, { M, tiles });                           /* tile_scores */
     o.t_idx_dt((uint32_t)RAD_I32, { M, tiles }, nv, -1, 0);        /* tile_tokens */
     o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);        /* tokens */
-    return o.finish("dflash_markov_greedy", operand, out);
+    return o.finish(op, operand, out);
+}
+
+int ref_dflash_markov_greedy_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_markov_shape(p, n_p, operand, out, RAD_BF16, "dflash_markov_greedy");
+}
+int ref_dflash_markov_greedy_f32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_markov_shape(p, n_p, operand, out, RAD_F32, "dflash_markov_greedy_f32");
 }
 
 /* dflash_select's operands, then `nodes` tokens and parents a sequence. */
