@@ -156,7 +156,11 @@ These are end-to-end request measurements (prefill plus decode and service overh
 throughput or task scores. Every response must report positive integer prompt usage and exactly
 `--max-tokens` generated tokens with a `length` finish (EOS is ignored for this fixed-work smoke).
 Missing, zero or short counts fail the run rather than producing a successful throughput receipt.
-Runtime/model/plugin hashes are checked again before writing the receipt; use a fresh `--out`:
+The prompt file is parsed and hashed from the same byte snapshot and rechecked before receipt; the
+private server uses a unique served model ID and is checked for identity and liveness. Requests per
+repeat must be at least the largest requested concurrency. This is a client concurrency level, not
+proof that requests actually overlapped in a server batch. Runtime/model/plugin hashes are also
+checked again before writing the receipt; use a fresh `--out`:
 
 ```sh
 python3 tests/spark25_qos.py \\

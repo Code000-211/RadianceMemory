@@ -7,6 +7,7 @@ strings at the requested concurrency levels. It records artifact hashes, p50/p95
 latency, and aggregate generated-token throughput; it does not claim task quality.
 """
 import argparse
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -18,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 from spark25_validation import plugin_hashes, sha256
@@ -32,9 +34,9 @@ def quantile(values, q):
     return values[lo] if lo + 1 == len(values) else values[lo] + (at - lo) * (values[lo + 1] - values[lo])
 
 
-def prompts_from(path):
+def prompts_from(path, raw):
     prompts = []
-    for line_no, line in enumerate(Path(path).read_text().splitlines(), 1):
+    for line_no, line in enumerate(raw.decode('utf-8').splitlines(), 1):
         if not line:
             continue
         row = json.loads(line)
@@ -72,6 +74,15 @@ def request(url, model, prompt, max_tokens, timeout):
             "completion_tokens": completed, "finish_reason": "length"}
 
 
+def verify_server(url, served, proc):
+    if proc.poll() is not None:
+        raise RuntimeError("candidate server exited during measurement")
+    with urllib.request.urlopen(url + "/v1/models", timeout=5) as response:
+        models = json.load(response)
+    if served not in {item.get("id") for item in models.get("data", [])} or proc.poll() is not None:
+        raise RuntimeError("private server identity does not match the launched candidate")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--radiance", required=True, type=Path)
@@ -94,7 +105,9 @@ def main():
 
     radiance, home, model = args.radiance.resolve(), args.home.resolve(), args.model.resolve()
     prompt_path, out = args.prompts.resolve(), args.out.resolve()
-    prompts = prompts_from(prompt_path)
+    prompt_bytes = prompt_path.read_bytes()
+    prompt_hash = hashlib.sha256(prompt_bytes).hexdigest()
+    prompts = prompts_from(prompt_path, prompt_bytes)
     concurrencies = [int(x) for x in args.concurrency.split(",")]
     if not concurrencies or any(x < 1 for x in concurrencies):
         p.error("--concurrency must be comma-separated positive integers")
@@ -102,6 +115,8 @@ def main():
             args.max_model_len < 1 or args.max_num_batched_tokens < 1 or args.gpu_headroom_mib < 0 or
             not math.isfinite(args.timeout) or args.timeout <= 0):
         p.error("counts/limits/timeout must be positive and finite; headroom must be nonnegative")
+    if args.requests < max(concurrencies):
+        p.error("requests per repeat must be at least the largest requested concurrency")
     for path in (radiance, model):
         if not path.is_file():
             p.error(f"not a file: {path}")
@@ -112,7 +127,7 @@ def main():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    served = "spark-qos"
+    served = "spark-qos-" + uuid.uuid4().hex
     command = [str(radiance), "--model", str(model), "--radiance-home", str(home),
                "--kernels", args.kernels, "--host", "127.0.0.1", "--port", str(port),
                "--served-model-name", served, "--tp", str(args.tp), "--kv-cache-dtype", "bf16",
@@ -123,7 +138,7 @@ def main():
     receipt = {"model": str(model), "model_sha256": sha256(model),
                "radiance": str(radiance), "radiance_sha256": sha256(radiance),
                "radiance_home": str(home), "prompt_file": str(prompt_path),
-               "prompt_file_sha256": sha256(prompt_path), "kernels": args.kernels,
+               "prompt_file_sha256": prompt_hash, "kernels": args.kernels,
                "tp": args.tp, "kv_cache_dtype": "bf16", "prefix_cache": False,
                "speculation": 0, "max_num_seqs": max(concurrencies),
                "max_model_len": args.max_model_len,
@@ -158,6 +173,7 @@ def main():
         else:
             raise TimeoutError(f"Radiance did not become ready; see {out / 'server.log'}")
 
+        verify_server(url, served, proc)
         for concurrency in concurrencies:
             samples = []
             started = time.perf_counter()
@@ -184,6 +200,7 @@ def main():
                        "generated_tokens": generated,
                        "aggregate_completion_tokens_per_second": generated / wall if wall else 0.0,
                        "samples": samples}
+            verify_server(url, served, proc)
             receipt["results"][str(concurrency)] = summary
             print(f"concurrency={concurrency} requests={len(samples)} p50={summary['latency_seconds']['p50']:.3f}s "
                   f"p95={summary['latency_seconds']['p95']:.3f}s max={summary['latency_seconds']['max']:.3f}s "
@@ -197,8 +214,8 @@ def main():
             proc.wait()
         server_log.close()
     if (plugin_hashes(home) != plugins or sha256(radiance) != receipt["radiance_sha256"] or
-            sha256(model) != receipt["model_sha256"]):
-        raise ValueError("runtime, model or plugin inventory changed during the measurement")
+            sha256(model) != receipt["model_sha256"] or sha256(prompt_path) != prompt_hash):
+        raise ValueError("runtime, model, prompt file or plugin inventory changed during the measurement")
     report = out / "qos.json"
     report.write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"QoS receipt: {report}")

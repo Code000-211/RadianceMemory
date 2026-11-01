@@ -160,13 +160,16 @@ def main():
         command = [str(radiance), "--model", str(model), *common, "--kld-ref", str(ref_dir),
                    "--kld-out", str(report)]
         candidate_sha256 = sha256(model)
+        row_path = Path(str(report) + ".rows")
+        # A success without fresh output must never reuse an earlier score on retry.
+        report.unlink(missing_ok=True)
+        row_path.unlink(missing_ok=True)
         subprocess.run(command, env=os.environ.copy(), check=True)
         scored = json.loads(report.read_text())
         validate_report(scored, ref_dir, reference, corpus, model, expected_rows)
         if sha256(model) != candidate_sha256:
             p.error(f"{name}: candidate changed during scoring")
         values = scored["all"]["kld"]
-        row_path = Path(str(report) + ".rows")
         raw = row_path.read_bytes()
         if len(raw) != expected_rows * 16:
             p.error(f"{name}: unexpected per-position rows size {len(raw)}")

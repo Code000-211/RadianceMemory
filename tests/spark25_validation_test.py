@@ -311,12 +311,76 @@ class MeasurementTests(unittest.TestCase):
                     "choices": [{"finish_reason": "length"}]}
         with patch.object(sys, "argv", args), patch.object(qos.subprocess, "Popen", return_value=proc), \
                 patch.object(qos.urllib.request, "urlopen", side_effect=lambda *a, **k: self.response(response)), \
-                contextlib.redirect_stdout(io.StringIO()):
+                patch.object(qos, "verify_server"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(qos.main(), 0)
         receipt = json.loads((output / "qos.json").read_text())
         self.assertIn("architectures/fixture.so", receipt["architecture_shared_objects"])
         self.assertEqual(receipt["results"]["1"]["generated_tokens"], 2)
         proc.terminate.assert_called_once()
+
+    def test_reuse_rejects_stale_or_partial_scorer_output(self):
+        self.record_quality()
+        for output in ('none', 'report', 'rows'):
+            with self.subTest(output=output):
+                # Restore an old valid report, then simulate a successful incomplete scorer.
+                if not (self.out / 'run.json').exists():
+                    self.record_quality('--reuse-reference')
+                def incomplete(command, **kwargs):
+                    report = self.out / 'full-kld.json'
+                    rows = Path(str(report) + '.rows')
+                    old_report, old_rows = self.saved_outputs
+                    if output == 'report':
+                        report.write_bytes(old_report)
+                    if output == 'rows':
+                        rows.write_bytes(old_rows)
+                self.saved_outputs = ((self.out / 'full-kld.json').read_bytes(),
+                                      (self.out / 'full-kld.json.rows').read_bytes())
+                with patch.object(sys, 'argv', self.quality_args('--reuse-reference')), \
+                        patch.object(quality.subprocess, 'run', side_effect=incomplete):
+                    with self.assertRaises(FileNotFoundError):
+                        quality.main()
+                self.assertFalse((self.out / 'run.json').exists())
+
+    def test_qos_rejects_fewer_requests_than_concurrency(self):
+        args = ['spark25_qos.py', '--radiance', str(self.runtime), '--home', str(self.home),
+                '--model', str(self.candidate), '--prompts', str(self.corpus), '--out', str(self.root / 'qos'),
+                '--requests', '1', '--concurrency', '4']
+        with patch.object(sys, 'argv', args), contextlib.redirect_stderr(io.StringIO()), \
+                patch.object(qos.subprocess, 'Popen') as start:
+            with self.assertRaises(SystemExit):
+                qos.main()
+        start.assert_not_called()
+
+    def test_qos_rejects_foreign_server_and_dead_child(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        with patch.object(qos.urllib.request, 'urlopen', return_value=self.response({'data': [{'id': 'foreign'}]})):
+            with self.assertRaisesRegex(RuntimeError, 'identity'):
+                qos.verify_server('http://localhost', 'unique-id', proc)
+        proc.poll.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, 'exited'):
+            qos.verify_server('http://localhost', 'unique-id', proc)
+        proc.poll.return_value = None
+        with patch.object(qos.urllib.request, 'urlopen', return_value=self.response({'data': [{'id': 'unique-id'}]})):
+            qos.verify_server('http://localhost', 'unique-id', proc)
+
+    def test_qos_rejects_prompt_file_replacement_after_snapshot(self):
+        output = self.root / 'changed-qos'
+        args = ['spark25_qos.py', '--radiance', str(self.runtime), '--home', str(self.home),
+                '--model', str(self.candidate), '--prompts', str(self.corpus), '--out', str(output),
+                '--requests', '1', '--repeats', '1', '--concurrency', '1', '--max-tokens', '2']
+        proc = Mock()
+        proc.poll.return_value = None
+        response = {'usage': {'prompt_tokens': 3, 'completion_tokens': 2},
+                    'choices': [{'finish_reason': 'length'}]}
+        def change(*args):
+            self.corpus.write_text('{"prompt":"different"}\n')
+        with patch.object(sys, 'argv', args), patch.object(qos.subprocess, 'Popen', return_value=proc), \
+                patch.object(qos.urllib.request, 'urlopen', side_effect=lambda *a, **k: self.response(response)), \
+                patch.object(qos, 'verify_server', side_effect=change), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'prompt file'):
+                qos.main()
+        self.assertFalse((output / 'qos.json').exists())
 
     def test_failed_qos_does_not_emit_success_receipt(self):
         output = self.root / "qos"
@@ -326,7 +390,8 @@ class MeasurementTests(unittest.TestCase):
         proc = Mock()
         proc.poll.return_value = None
         with patch.object(sys, "argv", args), patch.object(qos.subprocess, "Popen", return_value=proc), \
-                patch.object(qos.urllib.request, "urlopen", side_effect=lambda *a, **k: self.response({})):
+                patch.object(qos.urllib.request, "urlopen", side_effect=lambda *a, **k: self.response({})), \
+                patch.object(qos, "verify_server"):
             with self.assertRaisesRegex(ValueError, "missing usage"):
                 qos.main()
         proc.terminate.assert_called_once()
