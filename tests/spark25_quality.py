@@ -33,13 +33,19 @@ class ScoreStaging:
     def __init__(self, out):
         self.path = Path(tempfile.mkdtemp(prefix=".spark25-score-", dir=out))
         self.keep = False
+        self.published = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, traceback):
         if not self.keep:
-            shutil.rmtree(self.path)
+            try:
+                shutil.rmtree(self.path)
+            except OSError as cleanup_error:
+                state = "published" if self.published else "not published"
+                print(f"spark25_quality: cleanup failed; results {state}; "
+                      f"staging remains at {self.path}: {cleanup_error}", file=sys.stderr)
 
 
 def parse_candidate(spec):
@@ -239,6 +245,7 @@ def main():
                 os.replace(source, destination)
                 promoted.append(destination)
             os.replace(receipt_temp, out / "run.json")
+            staging.published = True
         except BaseException as publication_error:
             # Continue after individual rollback errors; retain all remaining backups on failure.
             rollback_errors = []

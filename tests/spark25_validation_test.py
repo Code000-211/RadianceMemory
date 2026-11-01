@@ -403,6 +403,31 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual([path.read_bytes() for path in paths], original)
                 self.assertFalse((self.out / 'run.json').exists())
 
+    def test_cleanup_failure_reports_publication_state_and_preserves_original_error(self):
+        for scoring_fails in (False, True):
+            with self.subTest(scoring_fails=scoring_fails):
+                self.out = self.root / f'cleanup-{scoring_fails}'
+                errors = io.StringIO()
+                def run(command, **kwargs):
+                    if scoring_fails and '--kld-ref' in command:
+                        raise ValueError('original scoring failure')
+                    return self.fake_runtime(command, **kwargs)
+                with patch.object(sys, 'argv', self.quality_args()), \
+                        patch.object(quality.subprocess, 'run', side_effect=run), \
+                        patch.object(quality.shutil, 'rmtree', side_effect=PermissionError('cleanup denied')), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+                    if scoring_fails:
+                        with self.assertRaisesRegex(ValueError, 'original scoring failure'):
+                            quality.main()
+                    else:
+                        self.assertEqual(quality.main(), 0)
+                self.assertEqual((self.out / 'run.json').exists(), not scoring_fails)
+                self.assertIn('results not published' if scoring_fails else 'results published', errors.getvalue())
+                self.assertIn('cleanup denied', errors.getvalue())
+                retained = list(self.out.glob('.spark25-score-*'))
+                self.assertEqual(len(retained), 1)
+                self.assertIn(str(retained[0]), errors.getvalue())
+
     def test_rollback_failure_retains_backup_and_restores_other_scores(self):
         self.record_quality()
         paths = (self.out / 'full-kld.json', self.out / 'full-kld.json.rows')
