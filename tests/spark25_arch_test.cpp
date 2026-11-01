@@ -602,6 +602,58 @@ TEST(a_dspark_drafter_is_declared_over_the_trunk) {
     CHECK(notes.find("after layer(s) 1, 3") != std::string::npos);
 }
 
+/* HIP rmsnorm/sigmoid/scale_rows declare __restrict__ in and out. The production graph must not
+ * pass the same allocation to both, including the Spark-gated attention path. */
+TEST(dspark_restrict_ops_do_not_alias_input_and_output) {
+    auto name = [](const RadBuilder& b, rad_buf h) -> std::string {
+        return h && h <= (rad_buf)b.bufs.size() ? b.bufs[h - 1].name : "?";
+    };
+    auto is_draft = [&](const RadBuilder& b, rad_buf h) {
+        const std::string n = name(b, h);
+        return n.rfind("ds_", 0) == 0 || n.rfind("draft", 0) == 0;
+    };
+    auto check = [&](const RadBuilder& b) {
+        REQUIRE(find_b(b, "ds_cn"));
+        REQUIRE(find_b(b, "ds_gaten"));
+        REQUIRE(find_b(b, "ds_attng"));
+        int checked = 0;
+        for (const auto& o : b.ops) {
+            if (o.op != "rmsnorm" && o.op != "sigmoid" && o.op != "scale_rows") continue;
+            bool draft = false;
+            for (rad_buf h : o.reads) draft = draft || is_draft(b, h);
+            for (rad_buf h : o.writes) draft = draft || is_draft(b, h);
+            if (!draft) continue;
+            ++checked;
+            for (rad_buf w : o.writes) {
+                for (rad_buf r : o.reads) {
+                    CHECK(r != w);
+                    if (r == w)
+                        fprintf(stderr, "aliased %s on %s\n", o.op.c_str(), name(b, w).c_str());
+                }
+            }
+        }
+        CHECK(checked >= 3);
+    };
+    {
+        MetaKV k = with_dspark(spark_meta());
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(7);
+        REQUIRE_EQ(spark25_bf16::declare(&b, k.meta(), &ctx), RAD_OK);
+        check(b);
+    }
+    {
+        MetaKV k = with_dspark(spark_meta());
+        k.m.quant = "w8a8_fwht128";
+        k.set("quantization_config.quant_method", "w8a8")
+         .set("quantization_config.fmt", "fwht128");
+        RadBuilder b;
+        spark_iq8r_encodings(b);
+        RadBuildCtx ctx = spec_ctx(7);
+        REQUIRE_EQ(spark25_w8a8::declare(&b, k.meta(), &ctx), RAD_OK);
+        check(b);
+    }
+}
+
 TEST(the_drafter_passes_run_and_the_draft_is_proposed_from_the_block) {
     MetaKV k = with_dspark(spark_meta());
     RadBuilder b;

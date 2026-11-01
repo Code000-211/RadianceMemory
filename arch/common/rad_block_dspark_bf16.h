@@ -142,17 +142,17 @@ struct DsparkBF16 {
         /* ---- the context pass, one row per committed token */
         rad_buf src = 0;    /* [max_tok, n_taps * n_embd]  the trunk's taps, read only */
         rad_buf srcn = 0;   /* [max_tok, n_taps * n_embd]  each tap normed, same layout */
-        rad_buf c = 0;      /* [max_tok, n_embd]           fc's output, then normed in place */
-        rad_buf ck = 0;     /* [max_tok, kv_dim]           one layer's K, reused across layers */
+        rad_buf c = 0, cn = 0; /* [max_tok, n_embd] fc output and separately normed context */
+        rad_buf ck = 0, ckn = 0; /* [max_tok, kv_dim] projected and optionally normed K */
         rad_buf cv = 0;     /* [max_tok, kv_dim]           and its V */
 
         /* ---- the query pass, `block` rows per sequence */
         rad_buf x = 0;      /* [qrows, n_embd] f32   the drafter's residual stream */
         rad_buf delta = 0;  /* [qrows, n_embd] f32   the block a projection just wrote */
         rad_buf h = 0;      /* [qrows, n_embd] bf16  the normed stream, and every linear's output */
-        rad_buf q = 0, k = 0, v = 0;
-        rad_buf gate = 0;   /* [qrows, n_head]       one sigmoid a head */
-        rad_buf attn = 0;   /* [qrows, q_dim] */
+        rad_buf q = 0, k = 0, v = 0, qn = 0, kn = 0;
+        rad_buf gate = 0, gaten = 0; /* [qrows, n_head] projection and sigmoid */
+        rad_buf attn = 0, attng = 0; /* [qrows, q_dim] attention and gated attention */
         rad_buf gate_up = 0; rad_buf ff = 0;
 
         /* ---- the head and the walk, one row per draft position */
@@ -377,7 +377,7 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                                RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
                                RAD_STR("q_dtype", "bf16"), RAD_STR("kv_dtype", g.kv_dtype)),
                     RAD_NOWEIGHTS),
-                {w.q}, {w.attn});
+                {cfg.qk_norm ? w.qn : w.q}, {w.attn});
     if (!op_attn) return DS_REFUSED("op_attn");
 
     /* ---------------------------------------------------------------- the context pass
@@ -401,15 +401,15 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                                        RAD_F64("eps", g.eps), RAD_F64("wadd", 0.0),
                                        RAD_STR("dtype", "bf16")),
                             RAD_WEIGHTS(w_hnorm)),
-                   {w.c}, {w.c});           /* in place: a row's scale is computed before it is written */
+                   {w.c}, {w.cn});
     if (!op_cfc || !op_cnorm) return DS_REFUSED("op_cfc", "op_cnorm");
 
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
         /* One op per weight: an op's declared weight list gives each weight its prefetch interval
          * and residency class. */
-        op_ck[i] = gemm(crows, kvd, E, w_k[i], w.c, w.ck);
-        op_cv[i] = gemm(crows, kvd, E, w_v[i], w.c, w.cv);
+        op_ck[i] = gemm(crows, kvd, E, w_k[i], w.cn, w.ck);
+        op_cv[i] = gemm(crows, kvd, E, w_v[i], w.cn, w.cv);
         if (!op_ck[i] || !op_cv[i]) return DS_REFUSED("op_ck[i]", "op_cv[i]");
         if (cfg.qk_norm) {
             op_cknorm[i] = rw(b, RAD_OP(b, "rmsnorm",
@@ -418,7 +418,7 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                                                    RAD_F64("eps", g.eps), RAD_F64("wadd", 0.0),
                                                    RAD_STR("dtype", "bf16")),
                                         RAD_WEIGHTS(w_kn[i])),
-                              {w.ck}, {w.ck});
+                              {w.ck}, {w.ckn});
             if (!op_cknorm[i]) return DS_REFUSED("op_cknorm[i]");
         }
     }
@@ -428,14 +428,14 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
      * row is rotated by its own absolute position, as the reference's single concatenated rope
      * does. */
     op_crope = rw(b, decl_rope(b, g, crows, g.head_dim, g.n_head_kv, 0, rot, "neox"),
-                  {w.ck}, {w.ck});
+                  {cfg.qk_norm ? w.ckn : w.ck}, {cfg.qk_norm ? w.ckn : w.ck});
     op_cstore = rw(b, RAD_OP(b, "kv_store",
                       RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("head_dim", g.head_dim),
                                  RAD_INT("n_head_kv", g.n_head_kv),
                                  RAD_INT("block_size", rad_kv_block_size(b, kv)),
                                  RAD_STR("kv_dtype", g.kv_dtype)),
                       RAD_NOWEIGHTS),
-                  {w.ck, w.cv}, {});
+                  {cfg.qk_norm ? w.ckn : w.ck, w.cv}, {});
     if (!op_crope || !op_cstore) return DS_REFUSED("op_crope", "op_cstore");
 
     /* ---------------------------------------------------------------- the query pass
@@ -484,7 +484,7 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
         op_qp[i] = gemm(qrows, qd, E, w_q[i], w.h, w.q);
         op_kp[i] = gemm(qrows, kvd, E, w_k[i], w.h, w.k);
         op_vp[i] = gemm(qrows, kvd, E, w_v[i], w.h, w.v);
-        op_op[i] = gemm(qrows, E, qd, w_o[i], w.attn, w.h);
+        op_op[i] = gemm(qrows, E, qd, w_o[i], cfg.gate ? w.attng : w.attn, w.h);
         op_fnorm[i] = rw(b, RAD_OP(b, "rmsnorm",
                                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
                                               RAD_F64("eps", g.eps), RAD_F64("wadd", 0.0),
@@ -502,13 +502,13 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                                                RAD_INT("n", g.head_dim), RAD_F64("eps", g.eps),
                                                RAD_F64("wadd", 0.0), RAD_STR("dtype", "bf16")),
                                     RAD_WEIGHTS(w_qn[i])),
-                          {w.q}, {w.q});
+                          {w.q}, {w.qn});
             op_kn[i] = rw(b, RAD_OP(b, "rmsnorm",
                                     RAD_PARAMS(RAD_RANGE("M", 1, qrows * g.n_head_kv),
                                                RAD_INT("n", g.head_dim), RAD_F64("eps", g.eps),
                                                RAD_F64("wadd", 0.0), RAD_STR("dtype", "bf16")),
                                     RAD_WEIGHTS(w_kn[i])),
-                          {w.k}, {w.k});
+                          {w.k}, {w.kn});
             if (!op_qn[i] || !op_kn[i]) return DS_REFUSED("op_qn[i]", "op_kn[i]");
         }
         if (cfg.gate) {
@@ -518,29 +518,29 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
     }
 
     op_qrope = rw(b, decl_rope(b, g, qrows, g.head_dim, g.n_head, 0, rot, "neox"),
-                  {w.q}, {w.q});
+                  {cfg.qk_norm ? w.qn : w.q}, {cfg.qk_norm ? w.qn : w.q});
     op_krope = rw(b, decl_rope(b, g, qrows, g.head_dim, g.n_head_kv, 0, rot, "neox"),
-                  {w.k}, {w.k});
+                  {cfg.qk_norm ? w.kn : w.k}, {cfg.qk_norm ? w.kn : w.k});
     op_store = rw(b, RAD_OP(b, "kv_store",
                      RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head_kv", g.n_head_kv),
                                 RAD_INT("block_size", rad_kv_block_size(b, kv)),
                                 RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
-                 {w.k, w.v}, {});
+                 {cfg.qk_norm ? w.kn : w.k, w.v}, {});
     /* The gate the trunk uses too: one sigmoid a head, then one scale a head's whole row. */
     if (cfg.gate) {
         op_sig = rw(b, RAD_OP(b, "sigmoid",
                               RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_head),
                                          RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
-                    {w.gate}, {w.gate});
+                    {w.gate}, {w.gaten});
         op_gate_heads = rw(b, RAD_OP(b, "scale_rows",
                                      RAD_PARAMS(RAD_RANGE("M", 1, qrows * g.n_head),
                                                 RAD_INT("n", g.head_dim), RAD_STR("act", "none"),
                                                 RAD_STR("dtype", "bf16")),
                                      RAD_NOWEIGHTS),
-                           {w.attn, w.gate}, {w.attn});
+                           {w.attn, w.gaten}, {w.attng});
         if (!op_sig || !op_gate_heads) return DS_REFUSED("op_sig", "op_gate_heads");
     }
     /* `act_mul` with the activation the drafter was trained with: exact-erf gelu for the Spark
@@ -604,17 +604,17 @@ inline void DsparkBF16::context(RadCtx* c, const RadBatch* batch) const {
     }
     RAD_ISSUE_N(c, op_cfc, T, cfg.tap_norm ? brows(w.srcn, T) : brows(w.src, T), RAD_W(w_fc),
                 brows(w.c, T));
-    RAD_ISSUE_N(c, op_cnorm, T, brows(w.c, T), RAD_W(w_hnorm), brows(w.c, T));
+    RAD_ISSUE_N(c, op_cnorm, T, brows(w.c, T), RAD_W(w_hnorm), brows(w.cn, T));
 
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
-        RAD_ISSUE_N(c, op_ck[i], T, brows(w.c, T), RAD_W(w_k[i]), brows(w.ck, T));
-        RAD_ISSUE_N(c, op_cv[i], T, brows(w.c, T), RAD_W(w_v[i]), brows(w.cv, T));
+        RAD_ISSUE_N(c, op_ck[i], T, brows(w.cn, T), RAD_W(w_k[i]), brows(w.ck, T));
+        RAD_ISSUE_N(c, op_cv[i], T, brows(w.cn, T), RAD_W(w_v[i]), brows(w.cv, T));
         if (cfg.qk_norm)
             RAD_ISSUE_N(c, op_cknorm[i], T * g.n_head_kv, brows(w.ck, T), RAD_W(w_kn[i]),
-                        brows(w.ck, T));
-        RAD_ISSUE_N(c, op_crope, T, brows(w.ck, T), praw(batch->positions, RAD_I32, T));
-        RAD_ISSUE_N(c, op_cstore, T, brows(w.ck, T), brows(w.cv, T),
+                        brows(w.ckn, T));
+        RAD_ISSUE_N(c, op_crope, T, brows(cfg.qk_norm ? w.ckn : w.ck, T), praw(batch->positions, RAD_I32, T));
+        RAD_ISSUE_N(c, op_cstore, T, brows(cfg.qk_norm ? w.ckn : w.ck, T), brows(w.cv, T),
                     praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
     }
 }
@@ -643,18 +643,18 @@ inline void DsparkBF16::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_kp[i], T, brows(w.h, T), RAD_W(w_k[i]), brows(w.k, T));
         RAD_ISSUE_N(c, op_vp[i], T, brows(w.h, T), RAD_W(w_v[i]), brows(w.v, T));
         if (cfg.qk_norm) {
-            RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
+            RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.qn, T));
             RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv, brows(w.k, T), RAD_W(w_kn[i]),
-                        brows(w.k, T));
+                        brows(w.kn, T));
         }
-        RAD_ISSUE_N(c, op_qrope, T, brows(w.q, T), pos);
-        RAD_ISSUE_N(c, op_krope, T, brows(w.k, T), pos);
+        RAD_ISSUE_N(c, op_qrope, T, brows(cfg.qk_norm ? w.qn : w.q, T), pos);
+        RAD_ISSUE_N(c, op_krope, T, brows(cfg.qk_norm ? w.kn : w.k, T), pos);
         /* The block's own K and V go into the cache past `seqused`, which is how every row of the
          * block attends to every other; the next context pass overwrites them, which is the
          * reference's `crop(start)`. */
-        RAD_ISSUE_N(c, op_store, T, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
+        RAD_ISSUE_N(c, op_store, T, brows(cfg.qk_norm ? w.kn : w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
                     kv_cache(kv, first_layer + i));
-        RAD_ISSUE_N(c, op_attn, batch->max_q_len, brows(w.q, T), kv_cache(kv, first_layer + i),
+        RAD_ISSUE_N(c, op_attn, batch->max_q_len, brows(cfg.qk_norm ? w.qn : w.q, T), kv_cache(kv, first_layer + i),
                     praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
                     praw(used, RAD_I32, batch->n_seq), RAD_NONE, RAD_NONE,
                     praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1), brows(w.attn, T));
@@ -662,13 +662,15 @@ inline void DsparkBF16::step(RadCtx* c, const RadBatch* batch) const {
             /* One gate a head, applied to that head's whole row of the attention output, before
              * o_proj. View [rows, heads * dim] and [rows, heads] as one row a head. */
             RAD_ISSUE_N(c, op_gp[i], T, brows(w.h, T), RAD_W(w_gate[i]), brows(w.gate, T));
-            RAD_ISSUE_N(c, op_sig, T, brows(w.gate, T), brows(w.gate, T));
+            RAD_ISSUE_N(c, op_sig, T, brows(w.gate, T), brows(w.gaten, T));
             const RadOperand heads = RAD_P_T2(rad_buf_ptr(c, w.attn), RAD_BF16, T * g.n_head,
                                               g.head_dim);
-            const RadOperand gates = RAD_P_T2(rad_buf_ptr(c, w.gate), RAD_BF16, T * g.n_head, 1);
-            RAD_ISSUE_N(c, op_gate_heads, T * g.n_head, heads, gates, RAD_NONE, heads);
+            const RadOperand gates = RAD_P_T2(rad_buf_ptr(c, w.gaten), RAD_BF16, T * g.n_head, 1);
+            const RadOperand gated = RAD_P_T2(rad_buf_ptr(c, w.attng), RAD_BF16, T * g.n_head,
+                                              g.head_dim);
+            RAD_ISSUE_N(c, op_gate_heads, T * g.n_head, heads, gates, RAD_NONE, gated);
         }
-        RAD_ISSUE_N(c, op_op[i], T, brows(w.attn, T), RAD_W(w_o[i]), brows(w.h, T));
+        RAD_ISSUE_N(c, op_op[i], T, brows(cfg.gate ? w.attng : w.attn, T), RAD_W(w_o[i]), brows(w.h, T));
         RAD_ISSUE_N(c, op_widen2, T, brows(w.h, T), brows(w.delta, T));
         RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.delta, T), brows(w.x, T));
 
@@ -872,16 +874,26 @@ inline int declare_dspark(DsparkBF16* ds, DsparkBF16::Wire* w, rad_kvgroup* kv, 
     dw.src   = taps.src;
     dw.srcn  = decl_b(b, nm.f("ds_srcn"), RAD_BF16, {dg.max_tok, c.n_taps * dg.n_embd});
     dw.c     = decl_b(b, nm.f("ds_c"),  RAD_BF16, {dg.max_tok, dg.n_embd});
+    dw.cn    = decl_b(b, nm.f("ds_cn"), RAD_BF16, {dg.max_tok, dg.n_embd});
     dw.ck    = decl_b(b, nm.f("ds_ck"), RAD_BF16, {dg.max_tok, kvd});
     dw.cv    = decl_b(b, nm.f("ds_cv"), RAD_BF16, {dg.max_tok, kvd});
+    if (c.qk_norm) dw.ckn = decl_b(b, nm.f("ds_ckn"), RAD_BF16, {dg.max_tok, kvd});
     dw.x     = decl_b(b, nm.f("ds_x"), RAD_F32, {qr, dg.n_embd});
     dw.delta = decl_b(b, nm.f("ds_delta"), RAD_F32, {qr, dg.n_embd});
     dw.h     = decl_b(b, nm.f("ds_h"), RAD_BF16, {qr, dg.n_embd});
     dw.q     = decl_b(b, nm.f("ds_q"), RAD_BF16, {qr, qd});
     dw.k     = decl_b(b, nm.f("ds_k"), RAD_BF16, {qr, kvd});
     dw.v     = decl_b(b, nm.f("ds_v"), RAD_BF16, {qr, kvd});
+    if (c.qk_norm) {
+        dw.qn = decl_b(b, nm.f("ds_qn"), RAD_BF16, {qr, qd});
+        dw.kn = decl_b(b, nm.f("ds_kn"), RAD_BF16, {qr, kvd});
+    }
     dw.gate  = decl_b(b, nm.f("ds_gate"), RAD_BF16, {qr, dg.n_head});
     dw.attn  = decl_b(b, nm.f("ds_attn"), RAD_BF16, {qr, qd});
+    if (c.gate) {
+        dw.gaten = decl_b(b, nm.f("ds_gaten"), RAD_BF16, {qr, dg.n_head});
+        dw.attng = decl_b(b, nm.f("ds_attng"), RAD_BF16, {qr, qd});
+    }
     dw.gate_up = decl_b(b, nm.f("ds_gate_up"), RAD_BF16, {qr, 2 * dg.n_ff});
     dw.ff    = decl_b(b, nm.f("ds_ff"), RAD_BF16, {qr, dg.n_ff});
     dw.dlog  = decl_b(b, nm.f("ds_dlog"), RAD_F32, {sr, dg.n_vocab});
@@ -893,7 +905,9 @@ inline int declare_dspark(DsparkBF16* ds, DsparkBF16::Wire* w, rad_kvgroup* kv, 
     /* The proposal buffer (RadDrafterDecl::proposal): a block pass proposes through the drafter's
      * own walk, never through the sampler's token buffer. */
     dw.tokens = decl_b(b, nm.f("ds_tokens"), RAD_I32, {dg.max_seqs, c.steps()});
-    if (!dw.srcn || !dw.c || !dw.ck || !dw.cv || !dw.x || !dw.delta || !dw.h || !dw.q || !dw.k ||
+    if (!dw.srcn || !dw.c || !dw.cn || !dw.ck || !dw.cv ||
+        (c.qk_norm && (!dw.ckn || !dw.qn || !dw.kn)) ||
+        (c.gate && (!dw.gaten || !dw.attng)) || !dw.x || !dw.delta || !dw.h || !dw.q || !dw.k ||
         !dw.v || !dw.gate || !dw.attn || !dw.gate_up || !dw.ff || !dw.dlog ||
         !dw.best_score || !dw.best_token || !dw.tokens)
         return RAD_E_INVAL;
