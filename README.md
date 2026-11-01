@@ -247,19 +247,27 @@ holder lets go.
 
 ```mermaid
 flowchart TB
-    subgraph turn1 [turn 1: decode]
-        T1[sequence A] -->|sweep| C1["entry 700 := cold(slot 42)<br/>slot 42 refs = 1"]
+    subgraph S1["Turn 1 - decode"]
+        A1["Sequence A"]
+        C1["Entry 700 becomes cold, slot 42<br/>slot 42 refs = 1"]
     end
-    subgraph publish [turn 1 ends: publish]
-        C1 --> PC["prefix cache entry for block 700<br/>holds cold(slot 42)<br/>slot 42 refs = 2"]
-        T1 -->|sequence freed| R1["slot 42 refs = 1<br/>(the cache's)"]
+    subgraph S2["Turn 1 ends - publish"]
+        PC["Prefix cache entry for block 700<br/>holds cold slot 42<br/>slot 42 refs = 2"]
+        R1["Sequence A freed<br/>slot 42 refs = 1, the cache's"]
     end
-    subgraph turn2 [turn 2: same conversation + new message]
-        L[lookup hits the whole chain,<br/>cold entries included] --> AD["sequence B adopts cold(slot 42)<br/>slot 42 refs = 2"]
-        AD --> PR["dense step promotes:<br/>new pool block, copy back<br/>B remembers origin = slot 42"]
-        PR --> RD["later sweep: block unchanged<br/>→ re-point to slot 42, no copy"]
+    subgraph S3["Turn 2 - same conversation plus a new message"]
+        L["Lookup hits the whole chain,<br/>cold entries included"]
+        AD["Sequence B adopts cold slot 42<br/>slot 42 refs = 2"]
+        PR["Dense step promotes:<br/>new pool block, copy back,<br/>B remembers origin slot 42"]
+        RD["Later sweep, block unchanged:<br/>re-point to slot 42, no copy"]
     end
+    A1 -->|sweep| C1
+    C1 --> PC
+    PC --> R1
     R1 --> L
+    L --> AD
+    AD --> PR
+    PR --> RD
 ```
 
 * **A hit is a copy, not a recompute.** On Flash-Next a warm 8 887-token prefill went from 1 601 ms
