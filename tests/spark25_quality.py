@@ -86,6 +86,9 @@ def main():
 
     inputs = [radiance, reference, corpus, *(model for _, model in candidates)]
     inputs += [path.resolve() for path in (args.provenance, args.calibration_manifest) if path]
+    # Plugin symlinks can point outside the home; protect the target bytes too.
+    inputs += [path.resolve() for sub in ("kernels", "architectures", "quantizers")
+               for path in (home / sub).rglob("*.so")]
     destinations = [out / "run.json"]
     for name, _ in candidates:
         report = out / f"{name}-kld.json"
@@ -93,8 +96,8 @@ def main():
     if out == home or home in out.parents:
         p.error("output directory must not be inside the plugin home")
     for dest in destinations:
-        if dest.is_symlink() or dest.resolve() in inputs:
-            p.error(f"output path collides with an input or symlink: {dest}")
+        if dest.is_symlink() or dest.resolve() in inputs or (dest.exists() and not dest.is_file()):
+            p.error(f"output path collides with an input, symlink or non-file: {dest}")
     if ref_dir.is_symlink():
         p.error("reference output directory must not be a symlink")
     if any(path == ref_dir or ref_dir in path.parents for path in inputs):
@@ -208,9 +211,26 @@ def main():
 
         verify_inputs()
         reference_provenance(ref_dir, reference_inputs, reuse=True)
-        for source, destination in staged_outputs:
-            os.replace(source, destination)
-    (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+        receipt_temp = Path(staging) / "new-run.json"
+        receipt_temp.write_text(json.dumps(run, indent=2) + "\n")
+        backups = []
+        promoted = []
+        try:
+            for index, (source, destination) in enumerate(staged_outputs):
+                backup = Path(staging) / f"backup-{index}"
+                if destination.exists():
+                    os.replace(destination, backup)
+                    backups.append((backup, destination))
+                os.replace(source, destination)
+                promoted.append(destination)
+            os.replace(receipt_temp, out / "run.json")
+        except BaseException:
+            # Retain previous scores if any promotion or receipt publication fails.
+            for destination in reversed(promoted):
+                destination.unlink(missing_ok=True)
+            for backup, destination in reversed(backups):
+                os.replace(backup, destination)
+            raise
     print(f"Run receipt: {out / 'run.json'}")
     print("Per-position rows are available as <name>-kld.json.rows; replay severe positions with "
           "tests/spark25_kld_tail.py. These are top-128-plus-tail KL values, not full-vocabulary KL.")

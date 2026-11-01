@@ -4,6 +4,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -261,10 +262,10 @@ class MeasurementTests(unittest.TestCase):
                 with patch.object(tail.subprocess, "Popen", side_effect=start), patch.object(tail, "get", side_effect=get):
                     if foreign:
                         with self.assertRaisesRegex(ValueError, "private server identity"):
-                            with tail.candidate_server(run, candidate, common, self.root / "server.log"):
+                            with tail.candidate_server(run, candidate, common, self.root / f"server-{foreign}.log"):
                                 self.fail("must not expose an unrelated server")
                     else:
-                        with tail.candidate_server(run, candidate, common, self.root / "server.log") as server:
+                        with tail.candidate_server(run, candidate, common, self.root / f"server-{foreign}.log") as server:
                             command = server["command"]
                             self.assertEqual(command[command.index("--model") + 1], str(self.candidate))
                             self.assertTrue(server["model"].startswith("spark-tail-"))
@@ -358,6 +359,63 @@ class MeasurementTests(unittest.TestCase):
                         quality.main()
                 self.assertEqual(colliding.read_bytes(), b'irreplaceable input')
                 execute.assert_not_called()
+
+    def test_quality_protects_external_plugin_symlink_targets(self):
+        for name in ('run.json', 'full-kld.json', 'full-kld.json.rows'):
+            with self.subTest(name=name):
+                self.out = self.root / ('plugin-' + name)
+                self.out.mkdir()
+                target = self.out / name
+                target.write_bytes(b'plugin target')
+                plugin = self.home / 'kernels/fixture.so'
+                plugin.unlink()
+                plugin.symlink_to(target)
+                with patch.object(sys, 'argv', self.quality_args()), \
+                        patch.object(quality.subprocess, 'run') as execute, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        quality.main()
+                self.assertEqual(target.read_bytes(), b'plugin target')
+                execute.assert_not_called()
+
+    def test_quality_rolls_back_scores_on_promotion_or_receipt_failure(self):
+        for failure_name in ('full-kld.json.rows', 'run.json'):
+            with self.subTest(failure_name=failure_name):
+                self.out = self.root / ('promotion-' + failure_name)
+                self.record_quality()
+                paths = (self.out / 'full-kld.json', self.out / 'full-kld.json.rows')
+                original = [path.read_bytes() for path in paths]
+                real_replace = os.replace
+                failed = False
+                def fail_once(src, dst):
+                    nonlocal failed
+                    if not failed and Path(dst) == self.out / failure_name:
+                        failed = True
+                        raise OSError('simulated promotion failure')
+                    return real_replace(src, dst)
+                with patch.object(sys, 'argv', self.quality_args('--reuse-reference')), \
+                        patch.object(quality.subprocess, 'run', side_effect=self.fake_runtime), \
+                        patch.object(quality.os, 'replace', side_effect=fail_once), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(OSError, 'simulated promotion failure'):
+                        quality.main()
+                self.assertTrue(failed)
+                self.assertEqual([path.read_bytes() for path in paths], original)
+                self.assertFalse((self.out / 'run.json').exists())
+
+    def test_tail_log_cannot_truncate_model_or_follow_symlink(self):
+        self.record_quality()
+        run, candidate, _, _, common = self.bind_tail()
+        before = self.candidate.read_bytes()
+        log = self.root / 'tail.server.log'
+        log.symlink_to(self.candidate)
+        for target in (log, self.candidate):
+            with self.subTest(target=target), patch.object(tail.subprocess, 'Popen') as start:
+                with self.assertRaises(FileExistsError):
+                    with tail.candidate_server(run, candidate, common, target):
+                        self.fail('must not start')
+                start.assert_not_called()
+                self.assertEqual(self.candidate.read_bytes(), before)
 
     def test_qos_log_symlink_cannot_truncate_model(self):
         output = self.root / 'symlink-qos'

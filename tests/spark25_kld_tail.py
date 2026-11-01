@@ -88,7 +88,8 @@ def candidate_server(run, candidate, common, log_path):
     url = f"http://127.0.0.1:{port}"
     command = [run["radiance"], "--model", candidate["model"], *common,
                "--host", "127.0.0.1", "--port", str(port), "--served-model-name", model]
-    with log_path.open("w") as log:
+    # Never truncate a prior artifact or follow a symlink to a model/input.
+    with log_path.open("x") as log:
         env = os.environ.copy()
         env.pop("HF_TOKEN", None)
         proc = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
