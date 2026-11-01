@@ -157,7 +157,8 @@ def main():
         }
     env = os.environ.copy()
     env.pop("HF_TOKEN", None)
-    server_log = (out / "server.log").open("w+")
+    # Exclusive create refuses existing files and symlinks, including symlinks to inputs.
+    server_log = (out / "server.log").open("x+")
     proc = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)
     url = f"http://127.0.0.1:{port}"
     try:
@@ -217,7 +218,8 @@ def main():
             sha256(model) != receipt["model_sha256"] or sha256(prompt_path) != prompt_hash):
         raise ValueError("runtime, model, prompt file or plugin inventory changed during the measurement")
     report = out / "qos.json"
-    report.write_text(json.dumps(receipt, indent=2) + "\n")
+    with report.open("x") as stream:
+        stream.write(json.dumps(receipt, indent=2) + "\n")
     print(f"QoS receipt: {report}")
     return 0
 

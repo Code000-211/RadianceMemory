@@ -340,6 +340,39 @@ class MeasurementTests(unittest.TestCase):
                     with self.assertRaises(FileNotFoundError):
                         quality.main()
                 self.assertFalse((self.out / 'run.json').exists())
+                self.assertEqual((self.out / 'full-kld.json').read_bytes(), self.saved_outputs[0])
+                self.assertEqual((self.out / 'full-kld.json.rows').read_bytes(), self.saved_outputs[1])
+
+    def test_quality_rejects_output_collisions_before_deleting_inputs(self):
+        for name in ('full-kld.json', 'full-kld.json.rows', 'run.json'):
+            with self.subTest(name=name):
+                self.out = self.root / ('collision-' + name)
+                self.out.mkdir()
+                colliding = self.out / name
+                colliding.write_bytes(b'irreplaceable input')
+                self.candidate = colliding
+                with patch.object(sys, 'argv', self.quality_args()), \
+                        patch.object(quality.subprocess, 'run') as execute, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        quality.main()
+                self.assertEqual(colliding.read_bytes(), b'irreplaceable input')
+                execute.assert_not_called()
+
+    def test_qos_log_symlink_cannot_truncate_model(self):
+        output = self.root / 'symlink-qos'
+        output.mkdir()
+        (output / 'server.log').symlink_to(self.candidate)
+        before = self.candidate.read_bytes()
+        args = ['spark25_qos.py', '--radiance', str(self.runtime), '--home', str(self.home),
+                '--model', str(self.candidate), '--prompts', str(self.corpus), '--out', str(output),
+                '--requests', '1', '--concurrency', '1']
+        with patch.object(sys, 'argv', args), patch.object(qos.subprocess, 'Popen') as start:
+            with self.assertRaises(FileExistsError):
+                qos.main()
+        self.assertEqual(self.candidate.read_bytes(), before)
+        self.assertFalse((output / 'qos.json').exists())
+        start.assert_not_called()
 
     def test_qos_rejects_fewer_requests_than_concurrency(self):
         args = ['spark25_qos.py', '--radiance', str(self.runtime), '--home', str(self.home),

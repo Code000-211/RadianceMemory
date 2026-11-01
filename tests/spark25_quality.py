@@ -20,6 +20,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import tempfile
 
 
 from spark25_validation import (fnv1a64, plugin_hashes, reference_provenance, sha256,
@@ -83,6 +84,21 @@ def main():
                              str(ref_dir), "--kld-out", str(out / f"{name}-kld.json")]))
         return 0
 
+    inputs = [radiance, reference, corpus, *(model for _, model in candidates)]
+    inputs += [path.resolve() for path in (args.provenance, args.calibration_manifest) if path]
+    destinations = [out / "run.json"]
+    for name, _ in candidates:
+        report = out / f"{name}-kld.json"
+        destinations.extend((report, Path(str(report) + ".rows")))
+    if out == home or home in out.parents:
+        p.error("output directory must not be inside the plugin home")
+    for dest in destinations:
+        if dest.is_symlink() or dest.resolve() in inputs:
+            p.error(f"output path collides with an input or symlink: {dest}")
+    if ref_dir.is_symlink():
+        p.error("reference output directory must not be a symlink")
+    if any(path == ref_dir or ref_dir in path.parents for path in inputs):
+        p.error("an input is inside the reference output directory")
     out.mkdir(parents=True, exist_ok=True)
     # A failed retry must not leave a previous run's receipt looking like its result.
     (out / "run.json").unlink(missing_ok=True)
@@ -155,41 +171,45 @@ def main():
                          "status_porcelain": git("status", "--porcelain")}
 
     expected_rows = ref_meta.get("rows")
-    for name, model in candidates:
-        report = out / f"{name}-kld.json"
-        command = [str(radiance), "--model", str(model), *common, "--kld-ref", str(ref_dir),
-                   "--kld-out", str(report)]
-        candidate_sha256 = sha256(model)
-        row_path = Path(str(report) + ".rows")
-        # A success without fresh output must never reuse an earlier score on retry.
-        report.unlink(missing_ok=True)
-        row_path.unlink(missing_ok=True)
-        subprocess.run(command, env=os.environ.copy(), check=True)
-        scored = json.loads(report.read_text())
-        validate_report(scored, ref_dir, reference, corpus, model, expected_rows)
-        if sha256(model) != candidate_sha256:
-            p.error(f"{name}: candidate changed during scoring")
-        values = scored["all"]["kld"]
-        raw = row_path.read_bytes()
-        if len(raw) != expected_rows * 16:
-            p.error(f"{name}: unexpected per-position rows size {len(raw)}")
-        row_values = struct.unpack("<" + "f" * (expected_rows * 4), raw)
-        kl = [row_values[i * 4] for i in range(expected_rows)]
-        # core/kld.cpp's A/S - log(S) can retain tiny signed roundoff near zero.
-        if not all(math.isfinite(value) for value in kl):
-            p.error(f"{name}: non-finite coarsened KL row")
-        run["candidates"][name] = {"model": str(model), "sha256": candidate_sha256,
-                                   "report": str(report), "report_sha256": sha256(report),
-                                   "rows": str(row_path), "rows_sha256": sha256(row_path),
-                                   "metrics": scored["all"],
-                                   "positions_over_1_nat": sum(x > 1.0 for x in kl)}
-        print(f"{name}: {expected_rows} positions; ref_form={scored['ref_form']}; "
-              f"mean={values['mean']:.6g}, p99={values['p99']:.6g}, "
-              f"p99.9={values['p99_9']:.6g}, max={values['max']:.6g}, "
-              f">1 nat={run['candidates'][name]['positions_over_1_nat']}")
+    with tempfile.TemporaryDirectory(prefix=".spark25-score-", dir=out) as staging:
+        staged_outputs = []
+        for name, model in candidates:
+            report = out / f"{name}-kld.json"
+            row_path = Path(str(report) + ".rows")
+            staged_report = Path(staging) / report.name
+            staged_rows = Path(str(staged_report) + ".rows")
+            command = [str(radiance), "--model", str(model), *common, "--kld-ref", str(ref_dir),
+                       "--kld-out", str(staged_report)]
+            candidate_sha256 = sha256(model)
+            subprocess.run(command, env=os.environ.copy(), check=True)
+            scored = json.loads(staged_report.read_text())
+            validate_report(scored, ref_dir, reference, corpus, model, expected_rows)
+            if sha256(model) != candidate_sha256:
+                p.error(f"{name}: candidate changed during scoring")
+            values = scored["all"]["kld"]
+            raw = staged_rows.read_bytes()
+            if len(raw) != expected_rows * 16:
+                p.error(f"{name}: unexpected per-position rows size {len(raw)}")
+            row_values = struct.unpack("<" + "f" * (expected_rows * 4), raw)
+            kl = [row_values[i * 4] for i in range(expected_rows)]
+            # core/kld.cpp's A/S - log(S) can retain tiny signed roundoff near zero.
+            if not all(math.isfinite(value) for value in kl):
+                p.error(f"{name}: non-finite coarsened KL row")
+            run["candidates"][name] = {"model": str(model), "sha256": candidate_sha256,
+                                       "report": str(report), "report_sha256": sha256(staged_report),
+                                       "rows": str(row_path), "rows_sha256": sha256(staged_rows),
+                                       "metrics": scored["all"],
+                                       "positions_over_1_nat": sum(x > 1.0 for x in kl)}
+            staged_outputs.extend(((staged_report, report), (staged_rows, row_path)))
+            print(f"{name}: {expected_rows} positions; ref_form={scored['ref_form']}; "
+                  f"mean={values['mean']:.6g}, p99={values['p99']:.6g}, "
+                  f"p99.9={values['p99_9']:.6g}, max={values['max']:.6g}, "
+                  f">1 nat={run['candidates'][name]['positions_over_1_nat']}")
 
-    verify_inputs()
-    reference_provenance(ref_dir, reference_inputs, reuse=True)
+        verify_inputs()
+        reference_provenance(ref_dir, reference_inputs, reuse=True)
+        for source, destination in staged_outputs:
+            os.replace(source, destination)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     print(f"Run receipt: {out / 'run.json'}")
     print("Per-position rows are available as <name>-kld.json.rows; replay severe positions with "
