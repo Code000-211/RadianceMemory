@@ -403,6 +403,37 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual([path.read_bytes() for path in paths], original)
                 self.assertFalse((self.out / 'run.json').exists())
 
+    def test_rollback_failure_retains_backup_and_restores_other_scores(self):
+        self.record_quality()
+        paths = (self.out / 'full-kld.json', self.out / 'full-kld.json.rows')
+        original = [path.read_bytes() for path in paths]
+        real_replace = os.replace
+        failures = []
+        def fail_publish_and_one_restore(src, dst):
+            src, dst = Path(src), Path(dst)
+            if dst == self.out / 'run.json':
+                failures.append('publish')
+                raise OSError('publication blocked')
+            if src.name == 'backup-1':
+                failures.append('restore')
+                raise OSError('restore blocked')
+            return real_replace(src, dst)
+        with patch.object(sys, 'argv', self.quality_args('--reuse-reference')), \
+                patch.object(quality.subprocess, 'run', side_effect=self.fake_runtime), \
+                patch.object(quality.os, 'replace', side_effect=fail_publish_and_one_restore), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'publication blocked.*recover backups') as error:
+                quality.main()
+        self.assertEqual(failures, ['publish', 'restore'])
+        self.assertIsInstance(error.exception.__cause__, OSError)
+        self.assertEqual(paths[0].read_bytes(), original[0])
+        self.assertFalse(paths[1].exists())
+        retained = list(self.out.glob('.spark25-score-*'))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / 'backup-1').read_bytes(), original[1])
+        self.assertIn(str(retained[0]), str(error.exception))
+        self.assertFalse((self.out / 'run.json').exists())
+
     def test_tail_log_cannot_truncate_model_or_follow_symlink(self):
         self.record_quality()
         run, candidate, _, _, common = self.bind_tail()

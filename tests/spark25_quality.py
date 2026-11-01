@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 import struct
 import subprocess
@@ -25,6 +26,20 @@ import tempfile
 
 from spark25_validation import (fnv1a64, plugin_hashes, reference_provenance, sha256,
                                 validate_reference, validate_report)
+
+
+class ScoreStaging:
+    """Clean normally, but retain recoverable backups if rollback itself fails."""
+    def __init__(self, out):
+        self.path = Path(tempfile.mkdtemp(prefix=".spark25-score-", dir=out))
+        self.keep = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if not self.keep:
+            shutil.rmtree(self.path)
 
 
 def parse_candidate(spec):
@@ -174,12 +189,12 @@ def main():
                          "status_porcelain": git("status", "--porcelain")}
 
     expected_rows = ref_meta.get("rows")
-    with tempfile.TemporaryDirectory(prefix=".spark25-score-", dir=out) as staging:
+    with ScoreStaging(out) as staging:
         staged_outputs = []
         for name, model in candidates:
             report = out / f"{name}-kld.json"
             row_path = Path(str(report) + ".rows")
-            staged_report = Path(staging) / report.name
+            staged_report = staging.path / report.name
             staged_rows = Path(str(staged_report) + ".rows")
             command = [str(radiance), "--model", str(model), *common, "--kld-ref", str(ref_dir),
                        "--kld-out", str(staged_report)]
@@ -211,25 +226,37 @@ def main():
 
         verify_inputs()
         reference_provenance(ref_dir, reference_inputs, reuse=True)
-        receipt_temp = Path(staging) / "new-run.json"
+        receipt_temp = staging.path / "new-run.json"
         receipt_temp.write_text(json.dumps(run, indent=2) + "\n")
         backups = []
         promoted = []
         try:
             for index, (source, destination) in enumerate(staged_outputs):
-                backup = Path(staging) / f"backup-{index}"
+                backup = staging.path / f"backup-{index}"
                 if destination.exists():
                     os.replace(destination, backup)
                     backups.append((backup, destination))
                 os.replace(source, destination)
                 promoted.append(destination)
             os.replace(receipt_temp, out / "run.json")
-        except BaseException:
-            # Retain previous scores if any promotion or receipt publication fails.
+        except BaseException as publication_error:
+            # Continue after individual rollback errors; retain all remaining backups on failure.
+            rollback_errors = []
             for destination in reversed(promoted):
-                destination.unlink(missing_ok=True)
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError as exc:
+                    rollback_errors.append(f"remove {destination}: {exc}")
             for backup, destination in reversed(backups):
-                os.replace(backup, destination)
+                try:
+                    os.replace(backup, destination)
+                except OSError as exc:
+                    rollback_errors.append(f"restore {backup} -> {destination}: {exc}")
+            if rollback_errors:
+                staging.keep = True
+                raise RuntimeError(f"score publication failed ({publication_error}); rollback "
+                                   f"incomplete; recover backups in {staging.path}: "
+                                   + "; ".join(rollback_errors)) from publication_error
             raise
     print(f"Run receipt: {out / 'run.json'}")
     print("Per-position rows are available as <name>-kld.json.rows; replay severe positions with "
@@ -240,6 +267,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (KeyError, OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"spark25_quality: {exc}", file=sys.stderr)
         sys.exit(1)
