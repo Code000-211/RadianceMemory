@@ -356,6 +356,13 @@ if(TARGET laya_decision_test)
   set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
+# kv_autoquant_test runs rad-autoquant, the per-layer KV calibration driver, against a stand-in for
+# the engine that it writes itself, so it needs the tool and nothing the engine loads.
+if(TARGET kv_autoquant_test)
+  target_compile_definitions(kv_autoquant_test PRIVATE RAD_AUTOQUANT="$<TARGET_FILE:rad-autoquant>")
+  add_dependencies(kv_autoquant_test rad-autoquant)
+endif()
+
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
 # includes every abi/ header as strict C11, so a header only C++ accepts fails the build.
 if(TARGET abi_layout_test)

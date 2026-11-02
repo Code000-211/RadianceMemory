@@ -2,7 +2,7 @@
 
 Every flag of every tool, with examples. Start with [GUIDE.md](GUIDE.md).
 
-Six binaries and the `rad-export` script are installed beside `radiance`; the shell harnesses
+Seven binaries and the `rad-export` script are installed beside `radiance`; the shell harnesses
 live in `scripts/`:
 
 | | |
@@ -14,6 +14,7 @@ live in `scripts/`:
 | [`rad-tune`](#rad-tune) | benchmark each kernel's tunable space at this model's shapes, on this machine |
 | [`rad-schemas`](#rad-schemas) | print and diff the op schemas plugins declare |
 | [`rad-tokcheck`](#rad-tokcheck) | compare the tokeniser with its reference encoder and with HuggingFace's ids over real text, and time it |
+| [`rad-autoquant`](#rad-autoquant) | a `--kv-recipe` from measurement: each attention layer's KV layout, least KL under an average bit budget |
 | [`radiance --kld-*`](#the-kl-mode) | KL divergence of a quantised model against the bf16 one, at every position of a corpus |
 | [`scripts/`](#the-shell-harnesses) | bring a model up, measure it, assert on what comes back |
 
@@ -894,6 +895,57 @@ t = st.load_file("model.language_model.layers.3.mlp.down_proj.input.safetensors"
 k = int((np.sqrt(8 * t.size + 1) - 1) / 2)
 H = np.zeros((k, k), np.float32); H[np.triu_indices(k)] = t; H = H + np.triu(H, 1).T
 ```
+
+## rad-autoquant
+
+```
+radiance --model M.rad <serve flags> --kv-cache-dtype bf16 --kld-record REF --kld-corpus LONG.jsonl
+rad-autoquant --kld-ref REF --layers 3,7,...,63 --bits 6 -o M.kvrecipe -- --model M.rad <serve flags>
+
+  --kld-ref DIR       the reference: this model with a bf16 cache, over long documents
+  --layers N,N,...    the model's attention layers, numbered as the checkpoint numbers them
+  --bits B            the average bits a cached K or V element may cost, scales included
+  -o FILE             the recipe (GUIDE.md §4.4, --kv-recipe)
+  --layouts L,L,...   the layouts to choose from; default every one a recipe names, and fp8,
+                      the base, is always among them
+  --work DIR          each run's recipe, KL report and log (default FILE.work)
+  --min-context N     refuse a reference with a document shorter than N tokens (default 32768);
+                      0 measures any
+  --radiance PATH     the engine (default: radiance beside the tool)
+```
+
+Chooses each trunk attention layer's KV layout for a `--kv-recipe` (GUIDE.md §4.4). It runs the
+KL mode (`--kld-ref`) once with every listed layer `fp8`, the base, and once for every layer and
+every narrower layout with that layer alone narrowed, so a model of L attention layers and C
+layouts costs 1 + L (C - 1) prefills of the corpus (33 for Qwen3.8-27B's 16 layers). A layer's
+cost in a layout is its run's mean KL above the base's; a run that lands under the base is noise
+and costs nothing. Taking the costs as adding up across layers, it then picks the assignment of
+least summed cost whose bits fit the budget, exactly (a knapsack solved over the bits spent,
+`core/kv_autoquant.h`), and writes the recipe with the measurements and the predicted mean KL in
+its comments. Where a narrower layout measures no cost the wider one is kept. Every layout a
+recipe names is a candidate, so a layout added to the recipe set is calibrated with no change to
+the tool.
+
+The budget counts the bits of a group of 32 K and 32 V elements with their scales: `fp8` 8 an
+element, `fp8_v4` 6.25, `k6_v4` 5.5. `--bits 8` keeps every layer `fp8`, `--bits 5.5` narrows
+every one to `k6_v4`, and in between the bits go to the layers whose KL moves most.
+
+The reference must be the same model, flags and corpus with a bf16 cache, so that a run's KL is
+what its cache costs and nothing of the weights' quantisation. The flags after `--` go to every
+run unchanged; the cache and KL flags are the tool's (`--kv-cache-dtype`, `--kv-recipe`,
+`--kld-*` there are refused). Each run's recipe, `--kld-out` report and log stay in the work
+directory, and a failed run stops the tool with its log's last lines and no recipe written.
+
+**Long documents.** A narrowed layer's error is paid where attention reaches far back, which a
+short document never asks for: a few hundred tokens of context would rank every layer harmless.
+So the tool refuses a reference with a document shorter than `--min-context` tokens (32768 by
+default), naming it. A smaller bound is the explicit override; record the reference with
+`--max-model-len` covering the longest document, and score only the tail (`score_from`) to keep
+the reference small without shortening the context the scored positions see.
+
+The costs are measured one layer at a time and summed, so the recipe's real KL can differ from
+the prediction where layers' errors interact; score the written recipe with `--kld-ref` and
+`--kv-recipe` before deploying it.
 
 ---
 

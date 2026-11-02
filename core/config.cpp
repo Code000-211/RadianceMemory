@@ -518,17 +518,43 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
 }
 
 /* ------------------------------------------------------------------ --kv-recipe */
+/* The layouts a recipe can name, widest first: the name in the file, the RAD_KVQ_* the plugin
+ * declares, and what one group of 32 K elements and 32 V elements costs in bits, scales included
+ * (the unit rad-autoquant's bit budget is counted in). A row added here is a recipe word and a
+ * calibration candidate at once. */
+struct KvLayout { const char* name; int kvq; int group_bits; };
+static const KvLayout kKvLayouts[] = {
+    /* E4M3 K and V; the descales are per (sequence, head), nothing a group. */
+    { "fp8",    RAD_KVQ_NONE, 32 * 8 + 32 * 8 },
+    /* V int4 with an f16 scale a group: 25/32 of fp8. */
+    { "fp8_v4", RAD_KVQ_V4,   32 * 8 + (32 * 4 + 16) },
+    /* K int6 too, its own f16 scale: 22/32. */
+    { "k6_v4",  RAD_KVQ_K6V4, (32 * 6 + 16) + (32 * 4 + 16) },
+};
+
 int kv_layout_of(const char* name) {
     if (!name) return -1;
-    if (!std::strcmp(name, "fp8"))    return RAD_KVQ_NONE;
-    if (!std::strcmp(name, "fp8_v4")) return RAD_KVQ_V4;
-    if (!std::strcmp(name, "k6_v4"))  return RAD_KVQ_K6V4;
+    for (const KvLayout& l : kKvLayouts)
+        if (!std::strcmp(name, l.name)) return l.kvq;
     return -1;
 }
 
 const char* kv_layout_name(int kvq) {
-    return kvq == RAD_KVQ_NONE ? "fp8" : kvq == RAD_KVQ_V4 ? "fp8_v4"
-         : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.name;
+    return nullptr;
+}
+
+int kv_layout_group_bits(int kvq) {
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.group_bits;
+    return -1;
+}
+
+std::vector<int> kv_layouts() {
+    std::vector<int> v;
+    for (const KvLayout& l : kKvLayouts) v.push_back(l.kvq);
+    return v;
 }
 
 /* One `layer N LAYOUT` line per attention layer, `layer N LAYOUT rotated` for a layer that stores
@@ -596,7 +622,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
 std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
     std::string s;
     for (int rot : { 0, (int)RAD_KVQ_ROTATED })
-        for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+        for (int q : kv_layouts()) {
             std::string layers;
             for (size_t l = 0; l < recipe.size(); ++l)
                 if (recipe[l] == (q | rot)) layers += (layers.empty() ? "" : ", ") + std::to_string(l);

@@ -1229,6 +1229,11 @@ int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int3
  * anything else. */
 int         kv_layout_of(const char* name);
 const char* kv_layout_name(int kvq);
+/* Every recipe layout's RAD_KVQ_*, widest first, and what a group of 32 K and 32 V elements of
+ * one costs in bits with its scales (fp8 512, fp8_v4 400, k6_v4 352); -1 for anything else.
+ * Rotation (RAD_KVQ_ROTATED) does not change the bits. */
+std::vector<int> kv_layouts();
+int              kv_layout_group_bits(int kvq);
 /* The recipe's layers, layout by layout, the rotated ones last, for the startup log: "fp8 at
  * layers 3, 7; k6_v4 at layer 11; k6_v4 rotated at layer 15". */
 std::string kv_recipe_summary(const std::vector<int32_t>& recipe);

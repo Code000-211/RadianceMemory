@@ -983,6 +983,13 @@ sparse decode, the gate folded into the attention), since each would skip a rota
 summary lists rotated layers apart (`k6_v4 rotated at layer 11`). What rotation buys a layout in
 KL has not been measured yet.
 
+**A measured recipe.** `rad-autoquant` writes the recipe from the KL mode: it measures each layer
+in each layout against a bf16-cache reference over long documents and picks, per layer, the
+layouts of least total KL within an average bit budget (`--bits 6`: between `k6_v4`'s 5.5 and
+`fp8`'s 8). A reference whose documents are shorter than 32768 tokens is refused unless the bound
+is lowered. The flags, the cost of the runs and what the prediction assumes are in
+[TOOLS.md](TOOLS.md#rad-autoquant).
+
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities
 rounded to E4M3) or both as fp8 WMMA over an `fp8`, `fp8_v4` or `k6_v4` cache (the int4 V and
