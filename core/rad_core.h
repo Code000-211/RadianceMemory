@@ -855,6 +855,14 @@ struct Config {
      * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
      * another name. */
     std::string kv_cache_dtype = "bf16";
+    /* --kv-recipe FILE: each attention layer's cache layout, from the fp8 set (fp8, fp8_v4,
+     * k6_v4), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
+     * checked at parse, so a malformed file stops the start before the model is opened; the plugin
+     * then checks it against the model's layers (RadBuildCtx::kv_recipe). `kv_recipe` is indexed
+     * by layer, a RAD_KVQ_* or -1 where the file names no such layer, and empty without a recipe.
+     * A recipe narrows the fp8 cache, so it needs --kv-cache-dtype fp8. */
+    std::string kv_recipe_path;
+    std::vector<int32_t> kv_recipe;
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
     /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
@@ -1211,5 +1219,16 @@ struct Config {
  * so `rad-info --model X` and `radiance --model X` agree on what a flag means. */
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
+/* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* or -1.
+ * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
+ * is then left empty. */
+int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out);
+/* A recipe's RAD_KVQ_* by its name in the file (fp8, fp8_v4, k6_v4), and back; -1 / null for
+ * anything else. */
+int         kv_layout_of(const char* name);
+const char* kv_layout_name(int kvq);
+/* The recipe's layers, layout by layout, for the startup log: "fp8 at layers 3, 7; k6_v4 at
+ * 11, 15". */
+std::string kv_recipe_summary(const std::vector<int32_t>& recipe);
 void config_usage(const char* argv0);
 }

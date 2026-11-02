@@ -132,6 +132,13 @@ struct Model {
     int64_t n_rot = 0;
 
     rad_kvgroup kv_full = 0, kv_state = 0, kv_conv = 0;
+    /* The trunk's attention groups by RAD_KVQ_* layout (0 where no layer has it), each layout's
+     * `kv_dtype` and pager fragment, and each trunk layer's layout. `kv_full` is the last
+     * attention layer's group, which the MTP head shares; without --kv-recipe it is the only one. */
+    rad_kvgroup      kv_q[3] = {};
+    const char*      kv_dt[3] = {};
+    int64_t          kv_page_bytes[3] = {};
+    std::vector<int> kvq;
     /* PLE lives on exactly one layer; -1 when the checkpoint has none or this build does not
      * declare that layer. */
     PleLayer    ple;
@@ -667,36 +674,116 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * rows for these layers). A token's row is 25 or 22 * head_dim / 16 bytes instead of
          * 2 * head_dim, so the group is declared at half that and the core sizes pages from it;
          * only those kernels read the layout. The MTP head's layer shares this group. The engine
-         * asks only for a layout probe() offered. */
-        const int kvq = fd.dtype == RAD_F8E4M3 ? ctx->kv_quant : RAD_KVQ_NONE;
-        const char* kvq_name = kvq == RAD_KVQ_V4 ? "fp8_v4" : kvq == RAD_KVQ_K6V4 ? "k6_v4"
-                                                                                 : nullptr;
-        if (kvq != RAD_KVQ_NONE && !kvq_name) {
-            fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n", kvq);
-            return RAD_E_UNSUPPORTED;
+         * asks only for a layout probe() offered.
+         *
+         * --kv-recipe (RadBuildCtx::kv_recipe) chooses the layout per attention layer instead, as
+         * qwen35_fp8 does: layers of one layout share a group, one layout throughout is the flag's
+         * single `kv_attn` (so a uniform recipe is the flag's program), and mixed layouts name
+         * their groups by layout. The MTP head is not a recipe layer; it takes the last attention
+         * layer's group. Only the attention cache takes a recipe: the indexer's block keys
+         * (`kv_qsa_bkey`) and its tail keep their own dtype. */
+        auto kvq_name = [](int q) -> const char* {
+            return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+        };
+        const bool f8 = fd.dtype == RAD_F8E4M3;
+        std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
+        if (ctx->kv_recipe) {
+            if (!f8) {
+                fprintf(stderr, "radiance: a KV recipe chooses layouts of the fp8 cache, and this "
+                                "cache is %s\n", rad_dtype_name(fd.dtype));
+                return RAD_E_UNSUPPORTED;
+            }
+            for (int64_t l = 0; l < ctx->n_kv_recipe; ++l) {
+                const int q = ctx->kv_recipe[l];
+                if (q < 0) continue;
+                if (l >= g.n_layer || !is_full_attention(l, interval)) {
+                    fprintf(stderr, "radiance: KV recipe: layer %lld keeps no attention cache in "
+                                    "this model (%lld layers, full attention every %lld from "
+                                    "%lld)\n", (long long)l, (long long)g.n_layer,
+                            (long long)interval, (long long)(interval - 1));
+                    return RAD_E_UNSUPPORTED;
+                }
+                if (q != RAD_KVQ_NONE && !kvq_name(q)) {
+                    fprintf(stderr, "radiance: KV recipe: layer %lld asks for layout %d, which "
+                                    "this plugin does not know\n", (long long)l, q);
+                    return RAD_E_UNSUPPORTED;
+                }
+                kvq_of[(size_t)l] = q;
+            }
+            for (int64_t l = 0; l < g.n_layer; ++l)
+                if (is_full_attention(l, interval) &&
+                    (l >= ctx->n_kv_recipe || ctx->kv_recipe[l] < 0)) {
+                    fprintf(stderr, "radiance: KV recipe: attention layer %lld has no entry; a "
+                                    "recipe names every one\n", (long long)l);
+                    return RAD_E_UNSUPPORTED;
+                }
+        } else if (f8) {
+            if (ctx->kv_quant != RAD_KVQ_NONE && !kvq_name(ctx->kv_quant)) {
+                fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n",
+                        ctx->kv_quant);
+                return RAD_E_UNSUPPORTED;
+            }
+            for (int& q : kvq_of) q = ctx->kv_quant;
         }
-        /* A rank's ratio: twelve at one and two ranks, six at four (each KV head replicated
-         * across a rank pair). */
-        if (kvq_name && !(g.head_dim == 256 && (g.gqa() == 12 || g.gqa() == 6))) {
-            fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim 256 and a "
-                            "rank's gqa 12 or 6 only; this rank is head_dim %lld, gqa %lld\n",
-                    kvq_name, (long long)g.head_dim, (long long)g.gqa());
-            return RAD_E_UNSUPPORTED;
+        /* The groups, in RAD_KVQ_* order, each refused outside libr4d's geometry with the first
+         * layer that asked for it. A rank's ratio: twelve at one and two ranks, six at four (each
+         * KV head replicated across a rank pair). */
+        int n_layouts = 0;
+        bool used[3] = {};
+        for (int64_t l = 0; l < g.n_layer; ++l) {
+            const int q = kvq_of[(size_t)l];
+            if (!is_full_attention(l, interval) || used[q]) continue;
+            used[q] = true;
+            ++n_layouts;
+            if (kvq_name(q) && !(g.head_dim == 256 && (g.gqa() == 12 || g.gqa() == 6))) {
+                if (ctx->kv_recipe)
+                    fprintf(stderr, "radiance: KV recipe: layer %lld asks for %s, which has "
+                                    "libr4d rows at head_dim 256 and a rank's gqa 12 or 6 only; "
+                                    "this rank is head_dim %lld, gqa %lld\n", (long long)l,
+                            kvq_name(q), (long long)g.head_dim, (long long)g.gqa());
+                else
+                    fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim "
+                                    "256 and a rank's gqa 12 or 6 only; this rank is head_dim "
+                                    "%lld, gqa %lld\n", kvq_name(q), (long long)g.head_dim,
+                            (long long)g.gqa());
+                return RAD_E_UNSUPPORTED;
+            }
         }
-        const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
-        fd.head_dim = g.head_dim * row16 / 32;
-        m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
+        for (int q = RAD_KVQ_NONE; q <= RAD_KVQ_K6V4; ++q) {
+            if (!used[q] && !(q == RAD_KVQ_NONE && n_layouts == 0)) continue;
+            const char* name = kvq_name(q);
+            const int64_t row16 = q == RAD_KVQ_V4 ? 25 : q == RAD_KVQ_K6V4 ? 22 : 32;
+            RadKVGroupDecl qd = fd;
+            qd.head_dim = g.head_dim * row16 / 32;
+            m.kv_q[q] = rad_decl_kv_group(b, n_layouts > 1
+                                                 ? nm.f("kv_attn_%s", name ? name : "fp8")
+                                                 : nm.f("kv_attn"), &qd);
+            if (!m.kv_q[q]) return RAD_E_INVAL;
+            /* The pager's `block_bytes` (arch/common/rad_qsa.h): one layer's fragment of a block in
+             * this layout, K and V of `ratio` tokens. */
+            m.kv_page_bytes[q] = rad_dtype_bytes(qd.dtype, 2 * m.qsacfg.ratio * qd.n_head_kv *
+                                                           qd.head_dim);
+            m.kv_dt[q] = name ? name : rad_dtype_name(fd.dtype);
+            if (name)
+                rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld "
+                            "bytes a token and head instead of %lld", name,
+                         q == RAD_KVQ_V4 ? "E4M3" : "int6", (long long)(g.head_dim * row16 / 16),
+                         (long long)(2 * g.head_dim));
+        }
+        /* `kv_full`, `g` and the indexer's config keep the last attention layer's group, which the
+         * MTP head shares; each trunk layer takes its own beside its attention block. */
+        int last_q = RAD_KVQ_NONE;
+        for (int64_t l = g.n_layer - 1; l >= 0; --l)
+            if (is_full_attention(l, interval)) { last_q = kvq_of[(size_t)l]; break; }
+        if (n_layouts == 0) last_q = RAD_KVQ_NONE;
+        m.kvq     = std::move(kvq_of);
+        m.kv_full = m.kv_q[last_q];
         /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
          * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
         m.qsacfg.page = ctx->kv_residency != 0 && !g.attn_zero;
-        m.qsacfg.page_block_bytes = rad_dtype_bytes(fd.dtype, 2 * m.qsacfg.ratio * fd.n_head_kv *
-                                                              fd.head_dim);
-        g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
-        if (kvq_name)
-            rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a "
-                        "token and head instead of %lld", kvq_name,
-                     kvq == RAD_KVQ_V4 ? "E4M3" : "int6", (long long)(g.head_dim * row16 / 16),
-                     (long long)(2 * g.head_dim));
+        m.qsacfg.page_block_bytes = m.kv_page_bytes[last_q];
+        /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
+        g.kv_dtype = m.kv_dt[last_q];
 
         RadKVGroupDecl sd{};
         sd.kind         = RAD_KV_LINEAR;
@@ -1107,13 +1194,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * on every step. */
                 lay.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
             }
-            RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
+            /* The layer's own layout (--kv-recipe), on a copy: the block keeps its geometry. */
+            const int kq = m.kvq[(size_t)l];
+            const rad_kvgroup kv = m.kv_q[kq];
+            Geom ga = g;
+            ga.kv_dtype = m.kv_dt[kq];
+            RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kv));
             /* An attention-zero rank keeps no attention cache: its block is a fill of zeros
              * (rad_block_attn_gated_fp8.h), and the indexer reads only the shared block table. The
              * call is idempotent. */
-            if (g.attn_zero && m.kv_full) RAD_ARCH_TRY(rad_kv_group_zero(b, m.kv_full));
+            if (g.attn_zero && kv) RAD_ARCH_TRY(rad_kv_group_zero(b, kv));
             lay.attn.ar_out_take = lay.hc_mix.ar_take();
-            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
+            RAD_ARCH_TRY(lay.attn.declare(b, nm, ga, (int)l, kv, m.n_rot, aw, as,
                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));
             /* The indexer, after the attention block so its ops sit where the sparse attention
              * reads them. It reads the same normed fp8 input as the projections
@@ -1127,7 +1219,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      pre, (long long)l);
                 qc.k_norm  = nm.ckpt("%s.%lld.self_attn.indexer.k_layernorm.weight",
                                      pre, (long long)l);
-                qc.kv_attn  = m.kv_full;
+                qc.kv_attn  = kv;
+                qc.page_block_bytes = m.kv_page_bytes[kq];
                 qc.emit_sel = lay.attn.qsa_sel != 0;
                 RAD_ARCH_TRY(lay.qsa.declare(b, nm, g, (int)l, qc, m.qsaw, aw.h,
                                              &m.kv_qsa_bkey));
@@ -1720,6 +1813,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+    /* --kv-recipe: declare() takes each attention layer's layout from it, among those above. */
+    out->kv_recipe_ok = 1;
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;
     return RAD_OK;

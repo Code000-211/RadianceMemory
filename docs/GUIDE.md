@@ -935,6 +935,43 @@ engine, against the bf16 model on 17 long log-analysis documents (60 368 scored 
 The decode spread is run to run; the three are the same speed there. Each layout's row and the
 kernels that read it are in [OPS.md](OPS.md#the-kv-cache-operand).
 
+**A layout per layer.** `--kv-recipe FILE` (with `--kv-cache-dtype fp8`) chooses the layout of
+each trunk attention layer from the same set, so a layer that tolerates fewer bits takes `k6_v4`
+while a sensitive one keeps `fp8`. The file has one line per attention layer, the layer numbered
+as the checkpoint numbers it (`blk.N`, `model.layers.N`); `#` starts a comment:
+
+```
+# Qwen3.8-27B: full attention every fourth layer from 3
+layer 3  fp8
+layer 7  k6_v4
+layer 11 fp8_v4
+...
+layer 63 k6_v4
+```
+
+The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
+line that is not three words, a layer number that is not one, a layout outside `fp8`, `fp8_v4`
+and `k6_v4`, a layer named twice, or no layer at all. At startup the server refuses the flag,
+naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
+MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
+layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
+for a layer that keeps no attention cache (a delta-net layer, or one past the trunk) and an
+attention layer the file leaves out, naming the layer. The MTP head is not a recipe layer: it
+shares the last attention layer's cache and layout, and a drafter's own cache stays fp8. On
+Qwen3.8-Flash-Next only the attention cache takes a recipe; the QSA indexer's block keys keep
+their own cache, and each layer's pager (`--kv-residency-mib`) moves its own layout's fragment.
+
+Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`), and the
+pool is split so every group holds the same tokens, each paying its own page. Startup logs the
+groups beside the rest of the pool (`kv:`) and then the recipe and what it buys:
+
+```
+kv recipe q38.kvrecipe: fp8 at layers 3, 7; k6_v4 at layers 11, 15, ...; the pool holds N tokens
+```
+
+A recipe that gives every attention layer one layout is that layout's `--kv-cache-dtype`: one
+group under the flag's name, the same program and the same bytes.
+
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities
 rounded to E4M3) or both as fp8 WMMA over an `fp8`, `fp8_v4` or `k6_v4` cache (the int4 V and
@@ -2094,6 +2131,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, one `layer N LAYOUT` line a layer; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |

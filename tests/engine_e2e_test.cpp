@@ -803,6 +803,29 @@ TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* --kv-recipe at startup: the tiny qwen35 checkpoint's plugin declares one cache layout for every
+ * layer (RadArchProbe::kv_recipe_ok is 0), so a recipe it would quietly store as plain E4M3 is
+ * refused, naming the file and the plugin, before anything is declared. */
+TEST(a_kv_recipe_the_plugin_cannot_declare_per_layer_is_refused_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir dir{ "kvrecipe" };
+    const std::string recipe = dir / "r.kvrecipe";
+    FILE* fp = std::fopen(recipe.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    std::fputs("layer 3 fp8\n", fp);
+    std::fclose(fp);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0",
+                                       "--kv-cache-dtype", "fp8", "--kv-recipe", recipe }, {}, 120);
+    const bool named = has(r.log, "--kv-recipe " + recipe + ": the '") &&
+                       has(r.log, "plugin does not declare its KV cache per layer");
+    if (r.status == 0 || r.status == 124 || !named)
+        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
+    CHECK(r.status != 0);
+    CHECK(r.status != 124);
+    CHECK(named);
+}
+
 /* --draft-coupling's answers before any request: a value other than off/on is refused by the flag
  * parse, and a model whose drafter has no per-round draw to couple is refused at bringup. The same
  * model with the flag off is the control: it starts, so the refusals are the flag's and not the

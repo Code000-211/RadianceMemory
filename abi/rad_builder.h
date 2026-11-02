@@ -306,6 +306,23 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_residency;
+
+    /* ---- appended in ABI 34 (a per-layer KV recipe) */
+    /* --kv-recipe: the trunk's attention layer l keeps its cache in layout kv_recipe[l], a
+     * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, or -1 where the recipe names no layer l
+     * (l < n_kv_recipe; past it there is no entry either). Null without a recipe, and then
+     * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
+     * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has
+     * RadArchProbe::kv_recipe_ok and, for each layout the recipe names, that layout's bit in
+     * kv_quant_ok. The plugin refuses an entry for a layer that keeps no attention cache, and an
+     * attention layer with none, naming the layer: a recipe written for another model must not
+     * load as a near miss. A recipe giving every layer one layout is that layout's
+     * --kv-cache-dtype, the same program byte for byte.
+     *
+     * Both past the old end (the padding after kv_residency stays padding, as the layout rule
+     * requires: tests/abi_layout_test.cpp). */
+    const int32_t* kv_recipe;
+    int32_t        n_kv_recipe;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */
@@ -1641,6 +1658,12 @@ typedef struct RadArchProbe {
      * gen_patches answer for them. */
     int64_t gen_max_pixels;
     int64_t gen_max_refs;
+
+    /* ---- appended in ABI 34 (a per-layer KV recipe) */
+    /* Nonzero when the plugin declares each attention layer's cache from RadBuildCtx::kv_recipe.
+     * --kv-recipe is refused at startup with the plugin named when this is 0: a plugin that
+     * ignored the recipe would store every layer as plain E4M3. */
+    int32_t kv_recipe_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

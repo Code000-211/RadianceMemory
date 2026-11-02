@@ -24,8 +24,11 @@ extern "C" {
  * the same sparse attention group: RadKVGroupDecl gained residency_window; RadKVGroupBatch the
  * residency store (device base, slot size and count, per-layer offsets), the pager's per-row
  * scratch pages and its counter; RadBuildCtx gained kv_residency; and a paged block-table entry
- * a third meaning, cold (-2 - slot; rad_kv_cold_entry in rad_runtime.h). */
-#define RAD_ABI_VERSION 33u
+ * a third meaning, cold (-2 - slot; rad_kv_cold_entry in rad_runtime.h).
+ *
+ * 34: a per-layer KV recipe (--kv-recipe): RadBuildCtx gained n_kv_recipe and kv_recipe,
+ * RadArchProbe kv_recipe_ok. */
+#define RAD_ABI_VERSION 34u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

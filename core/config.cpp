@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -91,6 +92,9 @@ static const Flag g_flags[] = {
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
+    { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, a 'layer N\n"
+                                        "LAYOUT' line a layer (docs/GUIDE.md); needs\n"
+                                        "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
                                         "and is lossy; the qwen35 plugins serve it" },
@@ -513,6 +517,90 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
     return true;
 }
 
+/* ------------------------------------------------------------------ --kv-recipe */
+int kv_layout_of(const char* name) {
+    if (!name) return -1;
+    if (!std::strcmp(name, "fp8"))    return RAD_KVQ_NONE;
+    if (!std::strcmp(name, "fp8_v4")) return RAD_KVQ_V4;
+    if (!std::strcmp(name, "k6_v4"))  return RAD_KVQ_K6V4;
+    return -1;
+}
+
+const char* kv_layout_name(int kvq) {
+    return kvq == RAD_KVQ_NONE ? "fp8" : kvq == RAD_KVQ_V4 ? "fp8_v4"
+         : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+}
+
+/* One `layer N LAYOUT` line per attention layer; `#` starts a comment, blank lines are skipped.
+ * Layer numbers are the checkpoint's (blk.N), so a recipe reads against the model's own config.
+ * Strict: a word the format does not have, a layer named twice, or a layout outside the set is a
+ * refusal with its line, never a skipped line, since a recipe that loads short is a different
+ * deployment from the one its author measured. Which layers keep an attention cache only the
+ * plugin knows, so that check is the plugin's (RadBuildCtx::kv_recipe). */
+int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out) {
+    /* Past any model in this tree by far; it bounds the array the engine hands the plugin. */
+    constexpr long kMaxLayer = 4096;
+    out->clear();
+    std::vector<int32_t> r;
+    std::istringstream in(text);
+    std::string line;
+    for (int ln = 1; std::getline(in, line); ++ln) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::istringstream words(line);
+        std::string kw, num, layout, extra;
+        if (!(words >> kw)) continue;
+        if (kw != "layer") {
+            RAD_ERR("%s line %d: '%s' is not a recipe line; each is 'layer N LAYOUT'", name, ln,
+                    kw.c_str());
+            return RAD_E_INVAL;
+        }
+        if (!(words >> num >> layout) || (words >> extra)) {
+            RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words", name, ln);
+            return RAD_E_INVAL;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const long l = std::strtol(num.c_str(), &end, 10);
+        if (errno || !end || *end || num[0] == '-' || num[0] == '+' || l >= kMaxLayer) {
+            RAD_ERR("%s line %d: layer '%s' is not a layer number (0 to %ld)", name, ln,
+                    num.c_str(), kMaxLayer - 1);
+            return RAD_E_INVAL;
+        }
+        const int q = kv_layout_of(layout.c_str());
+        if (q < 0) {
+            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; fp8, fp8_v4 or k6_v4", name,
+                    ln, l, layout.c_str());
+            return RAD_E_INVAL;
+        }
+        if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);
+        if (r[(size_t)l] >= 0) {
+            RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
+            return RAD_E_INVAL;
+        }
+        r[(size_t)l] = q;
+    }
+    if (r.empty()) {
+        RAD_ERR("%s names no layer; each attention layer needs a 'layer N LAYOUT' line", name);
+        return RAD_E_INVAL;
+    }
+    *out = std::move(r);
+    return RAD_OK;
+}
+
+std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
+    std::string s;
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+        std::string layers;
+        for (size_t l = 0; l < recipe.size(); ++l)
+            if (recipe[l] == q) layers += (layers.empty() ? "" : ", ") + std::to_string(l);
+        if (layers.empty()) continue;
+        s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) + " at layer" +
+             (layers.find(',') != std::string::npos ? "s " : " ") + layers;
+    }
+    return s;
+}
+
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
@@ -614,6 +702,20 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->kv_cache_dtype = v;
+        }
+        else if (S("--kv-recipe")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            std::ifstream f(v, std::ios::binary);
+            if (!f) {
+                RAD_ERR("--kv-recipe: cannot read '%s'", v);
+                return RAD_E_INVAL;
+            }
+            const std::string text((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+            const std::string name = std::string("--kv-recipe ") + v;
+            const int rc = kv_recipe_parse(text, name.c_str(), &c->kv_recipe);
+            if (rc != RAD_OK) return rc;
+            c->kv_recipe_path = v;
         }
         else if (S("--state-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1277,6 +1379,15 @@ int config_parse(int argc, char** argv, Config* c) {
      * (--kv-residency-mib, spec §7.3) keeps it on the card and demotes what the window does not
      * cover. Both rewrite the same group's selection and own its blocks' placement, so one server
      * runs one of them. */
+    /* Every layout a recipe names narrows the E4M3 cache (RadBuildCtx::kv_recipe), and a drafter's
+     * cache stays E4M3; under bf16 or one of the narrow names the two flags would say two things
+     * about the same layers. */
+    if (!c->kv_recipe.empty() && c->kv_cache_dtype != "fp8") {
+        RAD_ERR("--kv-recipe %s sets each attention layer's layout within the fp8 cache, and "
+                "--kv-cache-dtype is %s; pass --kv-cache-dtype fp8", c->kv_recipe_path.c_str(),
+                c->kv_cache_dtype.c_str());
+        return RAD_E_INVAL;
+    }
     if (c->kv_resident > 0 && c->residency_mib > 0) {
         RAD_ERR("--kv-resident and --kv-residency-mib are two ways to keep a sparse attention "
                 "group's KV off the card -- streaming from host memory with a ring on the card, or "
@@ -1356,6 +1467,7 @@ const ShowRow kShow[] = {
     { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
+    { "--kv-recipe",          [](const Config& c) { return or_none(c.kv_recipe_path, "none"); } },
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },

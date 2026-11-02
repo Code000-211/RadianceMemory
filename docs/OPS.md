@@ -1157,6 +1157,12 @@ declares bound it lower.
 `RadKVGroupBatch` carries the slot mapping, the block table and the sequence lengths, but the pool
 base belongs to the block manager, not the batch.
 
+**Under a per-layer recipe each layer names its own group.** `--kv-recipe`
+(`RadBuildCtx::kv_recipe`) puts the layers of one layout in one group, so `RAD_KV(group, layer)`
+names the group of the layer's layout and the ops on it carry that layout's `kv_dtype`
+(`fp8_e4m3`, `fp8_v4`, `k6_v4`). No op or row changes: a layer reads a cache in one layout, as
+under `--kv-cache-dtype`.
+
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first
 (`kv_resolve`, under "Sparse attention (QSA)"), and every other op reads the cache as before.

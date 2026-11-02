@@ -494,6 +494,17 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
     return out;
 }
 
+/* --kv-recipe reads its file at parse, so its legal value is a file that exists: a one-line
+ * recipe, written once. */
+std::string inventory_recipe() {
+    const std::string path = radtest::tmp_path("inventory.kvrecipe");
+    if (FILE* fp = std::fopen(path.c_str(), "w")) {
+        std::fputs("layer 3 k6_v4\n", fp);
+        std::fclose(fp);
+    }
+    return path;
+}
+
 /* A legal value for every option that takes one, with any option it cannot be given without. */
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
@@ -508,6 +519,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--kv-recipe", { inventory_recipe(), "--kv-cache-dtype", "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
@@ -838,6 +850,84 @@ TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
+}
+
+/* --kv-recipe FILE: one `layer N LAYOUT` line an attention layer, comments and blank lines
+ * skipped, read at parse into the per-layer form the plugin gets (a RAD_KVQ_* or -1 by layer). */
+TEST(a_kv_recipe_file_is_read_into_one_layout_a_layer) {
+    const std::string path = radtest::tmp_path("mixed.kvrecipe");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    const std::string body = "# Qwen3.8-27B, a 0.04 KL budget\n"
+                             "\n"
+                             "layer 3 fp8      # the first attention layer keeps fp8\n"
+                             "layer 7\tk6_v4\n"
+                             "  layer 11 fp8_v4\n";
+    CHECK_EQ(std::fwrite(body.data(), 1, body.size(), fp), body.size());
+    std::fclose(fp);
+
+    Config c;
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }, &c), RAD_OK);
+    CHECK_EQ(c.kv_recipe_path, path);
+    const std::vector<int32_t> want = { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_K6V4,
+                                        -1, -1, -1, RAD_KVQ_V4 };
+    CHECK(c.kv_recipe == want);
+    CHECK_EQ(kv_recipe_summary(c.kv_recipe),
+             std::string("fp8 at layer 3; fp8_v4 at layer 11; k6_v4 at layer 7"));
+    CHECK_EQ(kv_recipe_summary({ RAD_KVQ_V4, -1, RAD_KVQ_V4 }), std::string("fp8_v4 at layers 0, 2"));
+
+    /* Every layout is a narrowing of the fp8 cache, so the recipe needs that flag, given before
+     * or after it; bf16 (the default) and the uniform narrow names are refused. */
+    CHECK_EQ(parse_fresh({ "--kv-recipe", path.c_str(), "--kv-cache-dtype", "fp8" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--kv-recipe", path.c_str() }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "k6_v4", "--kv-recipe", path.c_str() }),
+             RAD_E_INVAL);
+    unlink(path.c_str());
+    CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }),
+             RAD_E_INVAL);   /* gone */
+
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.kv_recipe.empty());
+}
+
+/* A recipe that loads short is a deployment nobody measured, so every malformed line is refused
+ * with the file and the line named, and nothing of it is kept. */
+TEST(a_malformed_kv_recipe_is_refused_by_name_and_line) {
+    const char* name = "--kv-recipe r.txt";
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, name, &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        CHECK(has(err, name));
+        return err;
+    };
+    CHECK(has(refusal("layer 3 fp8\nlayers 7 fp8\n"), "line 2: 'layers' is not a recipe line"));
+    CHECK(has(refusal("layer 3\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+    CHECK(has(refusal("layer 3 fp8 k6_v4\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+    CHECK(has(refusal("layer -3 fp8\n"), "layer '-3' is not a layer number"));
+    CHECK(has(refusal("layer three fp8\n"), "layer 'three' is not a layer number"));
+    CHECK(has(refusal("layer 3x fp8\n"), "layer '3x' is not a layer number"));
+    CHECK(has(refusal("layer 4096 fp8\n"), "layer '4096' is not a layer number"));
+    CHECK(has(refusal("layer 3 k4_v2\n"), "line 1: layer 3: 'k4_v2' is not a KV layout"));
+    CHECK(has(refusal("layer 3 bf16\n"), "'bf16' is not a KV layout"));
+    CHECK(has(refusal("layer 3 fp8\n# again\nlayer 3 k6_v4\n"), "line 3: layer 3 is named twice"));
+    CHECK(has(refusal(""), "names no layer"));
+    CHECK(has(refusal("# only a comment\n\n"), "names no layer"));
+
+    /* The flag refuses the same file by its path. */
+    const std::string path = radtest::tmp_path("bad.kvrecipe");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    std::fputs("layer 3 fp8\nlayer 7 int2\n", fp);
+    std::fclose(fp);
+    int rc = RAD_OK;
+    const std::string err = stderr_of(
+        [&] { rc = parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }); });
+    CHECK_EQ(rc, RAD_E_INVAL);
+    CHECK(has(err, "--kv-recipe " + path + " line 2: layer 7: 'int2' is not a KV layout"));
 }
 
 /* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens

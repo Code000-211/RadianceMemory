@@ -728,6 +728,43 @@ TEST(kv_configure_reports_and_sizes) {
     CHECK_EQ(full->n_blocks, ((1ll << 20) - 8 * 16384 - RAD_ALIGN_UNIT) / 2048);
 }
 
+/* A --kv-recipe of mixed layouts reaches the core as one attention group per layout, each declared
+ * at its row's bytes over two as E4M3 columns (qwen35_fp8: 32 at fp8, 22 at k6_v4 for head_dim
+ * 32). The pool is split so every group holds the same tokens, each paying its own page, so the
+ * narrow layers buy context: four fp8 layers cost 4 x 2048 bytes a block, one fp8 and three k6_v4
+ * layers 2048 + 3 x 1408. */
+TEST(a_mixed_kv_recipe_sizes_the_pool_from_each_layouts_own_page) {
+    auto group = [](const char* name, int64_t head_dim, std::vector<int> layers) {
+        KVGroupInfo k;
+        k.name = name;
+        k.decl.kind = RAD_KV_FULL;
+        k.decl.dtype = RAD_F8E4M3;
+        k.decl.n_head_kv = 2;
+        k.decl.head_dim = head_dim;
+        k.block_size = 16;
+        k.layers = std::move(layers);
+        return k;
+    };
+    Fixture uni, mix;
+    uni.cfg.checkpoint_slots = mix.cfg.checkpoint_slots = 0;
+    CHECK_OK(uni.build_groups({ null_group(), group("kv_attn", 32, { 3, 7, 11, 15 }) }));
+    CHECK_OK(mix.build_groups({ null_group(), group("kv_attn_fp8", 32, { 3 }),
+                                group("kv_attn_k6_v4", 22, { 7, 11, 15 }) }));
+    const KVGroupPlan* u  = uni.kv.plan(1);
+    const KVGroupPlan* f8 = mix.kv.plan(1);
+    const KVGroupPlan* k6 = mix.kv.plan(2);
+    REQUIRE(u && f8 && k6);
+    CHECK_EQ(u->bytes_per_block, 4 * 2048ll);
+    CHECK_EQ(f8->bytes_per_block, 2048ll);
+    CHECK_EQ(k6->bytes_per_block, 3 * 1408ll);
+    CHECK_EQ(f8->n_blocks, k6->n_blocks);   /* one block table: the same tokens in every layer */
+    const int64_t page = f8->bytes_per_block + k6->bytes_per_block;
+    CHECK(f8->n_blocks * page <= (1ll << 20));
+    CHECK((f8->n_blocks + 1) * page > (1ll << 20) - 2 * RAD_ALIGN_UNIT);
+    CHECK(f8->n_blocks > u->n_blocks);
+    CHECK_EQ(f8->n_blocks, ((1ll << 20) - 2 * RAD_ALIGN_UNIT) / page);
+}
+
 TEST(kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap) {
     /* One block table serves every rank (Engine::serve), so every rank's paged groups hold the
      * same block count. With unequal pools (here 1 MiB and 2 MiB), Engine::configure_kv plans each

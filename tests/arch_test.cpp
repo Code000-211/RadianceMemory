@@ -13,6 +13,8 @@
 #include "arch_fakes.h"
 
 #include <array>
+#include <cstring>
+#include <map>
 #include <dlfcn.h>
 #include <sstream>
 #include <thread>
@@ -9134,6 +9136,202 @@ TEST(qwen35_fp8_quantised_kv_is_refused_outside_h256_gqa6) {
     }
 }
 
+namespace {
+
+/* --kv-recipe, as the engine hands it over (RadBuildCtx::kv_recipe): indexed by layer, a
+ * RAD_KVQ_* or -1. The fixture's attention layers are 3 and 7 (eight layers, interval 4), and its
+ * MTP head is bound at 8. */
+std::vector<int32_t> q35_recipe(int at3, int at7) {
+    std::vector<int32_t> r(8, -1);
+    r[3] = at3;
+    r[7] = at7;
+    return r;
+}
+
+RadBuildCtx with_recipe(RadBuildCtx c, const std::vector<int32_t>& r) {
+    c.kv_dtype    = RAD_F8E4M3;
+    c.kv_recipe   = r.data();
+    c.n_kv_recipe = (int32_t)r.size();
+    return c;
+}
+
+/* The first difference between two recorded programs, or "" when there is none: every op with
+ * its parameters, weights and declared uses, every buffer, weight and KV group declaration byte
+ * for byte, the layer bindings and the notes. */
+std::string program_diff(const RadBuilder& a, const RadBuilder& b) {
+    if (a.ops.size() != b.ops.size()) return "op count";
+    for (size_t i = 0; i < a.ops.size(); ++i) {
+        const RecOp& x = a.ops[i];
+        const RecOp& y = b.ops[i];
+        const std::string at = "op " + std::to_string(i) + " (" + x.op + ")";
+        if (x.op != y.op || x.w != y.w || x.reads != y.reads || x.writes != y.writes ||
+            x.resolved != y.resolved || x.p.size() != y.p.size())
+            return at;
+        for (size_t j = 0; j < x.p.size(); ++j) {
+            const RecParam& p = x.p[j];
+            const RecParam& q = y.p[j];
+            if (p.key != q.key || p.kind != q.kind || p.ival != q.ival || p.ihi != q.ihi ||
+                p.dval != q.dval || p.sval != q.sval)
+                return at + ", parameter " + p.key;
+        }
+    }
+    if (a.bufs.size() != b.bufs.size()) return "buffer count";
+    for (size_t i = 0; i < a.bufs.size(); ++i) {
+        const RadBufDecl& x = a.bufs[i].d;
+        const RadBufDecl& y = b.bufs[i].d;
+        if (a.bufs[i].name != b.bufs[i].name || x.dtype != y.dtype || x.rank != y.rank ||
+            std::memcmp(x.shape, y.shape, sizeof x.shape) || x.kind != y.kind ||
+            x.domain != y.domain || x.kv != y.kv)
+            return "buffer " + a.bufs[i].name;
+    }
+    if (a.weights.size() != b.weights.size()) return "weight count";
+    for (size_t i = 0; i < a.weights.size(); ++i)
+        if (a.weights[i].name != b.weights[i].name) return "weight " + a.weights[i].name;
+    if (a.kv_groups.size() != b.kv_groups.size()) return "KV group count";
+    for (size_t i = 0; i < a.kv_groups.size(); ++i) {
+        const RecKV& x = a.kv_groups[i];
+        const RecKV& y = b.kv_groups[i];
+        if (x.name != y.name || std::memcmp(&x.d, &y.d, sizeof x.d) || x.zero != y.zero ||
+            x.replicated != y.replicated || x.dense != y.dense)
+            return "KV group " + x.name;
+    }
+    if (a.binds != b.binds) return "layer bindings";
+    if (a.notes != b.notes) return "notes";
+    return "";
+}
+
+}  /* namespace */
+
+/* A recipe giving every attention layer one layout is that layout's --kv-cache-dtype: the same
+ * ops with the same parameters, the same buffers, one group under the same name at the same
+ * declared row, so the same bytes a token and the same pages. fp8 included (kv_quant 0), and the
+ * MTP head bound into that group as before. */
+TEST(a_uniform_kv_recipe_is_the_matching_kv_cache_dtype_byte_for_byte) {
+    MetaKV mk = q35fp8_meta();
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+        RadBuildCtx flag = spec_ctx(0, 1, 3);
+        flag.kv_dtype = RAD_F8E4M3;
+        flag.kv_quant = q;
+        RadBuilder a;
+        REQUIRE_EQ(qwen35_fp8::declare(&a, mk.meta(), &flag), RAD_OK);
+
+        const std::vector<int32_t> r = q35_recipe(q, q);
+        const RadBuildCtx rc = with_recipe(spec_ctx(0, 1, 3), r);
+        RadBuilder b;
+        REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &rc), RAD_OK);
+        CHECK_EQ(program_diff(a, b), std::string());
+        CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+        CHECK_EQ(rad_kv_layer_bytes(&b, 1), rad_kv_layer_bytes(&a, 1));
+        const auto dec = kit(b, { 1, 1 }, {});
+        const auto v = run_passes(b, qwen35_fp8::step, { dec.get() });
+        CHECK_PASSES(b, v);
+    }
+}
+
+/* A recipe mixing layouts: a group per layout, named by it and declared at that layout's row
+ * (256 E4M3 columns for fp8, 176 for k6_v4), each attention layer bound to its own and its ops
+ * banding on its own kv_dtype. The MTP head is no recipe layer; it shares the last attention
+ * layer's group. A step's cache operands name the layer's own group. */
+TEST(a_mixed_kv_recipe_declares_each_layers_cache_in_its_own_layout) {
+    MetaKV mk = q35fp8_meta();
+    const std::vector<int32_t> r = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_K6V4);
+    const RadBuildCtx ctx = with_recipe(spec_ctx(0, 1, 3), r);
+    RadBuilder b;
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    REQUIRE(b.kv_groups.size() >= 2);
+    CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_fp8"));
+    CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k6_v4"));
+    for (int i : { 0, 1 }) {
+        CHECK_EQ(b.kv_groups[(size_t)i].d.kind, RAD_KV_FULL);
+        CHECK_EQ(b.kv_groups[(size_t)i].d.dtype, (uint32_t)RAD_F8E4M3);
+        CHECK_EQ(b.kv_groups[(size_t)i].d.n_head_kv, 4);
+    }
+    CHECK_EQ(b.kv_groups[0].d.head_dim, 256);
+    CHECK_EQ(b.kv_groups[1].d.head_dim, 176);
+    /* A page of one layer: block x 4 heads x the declared row, K and V. */
+    CHECK_EQ(rad_kv_layer_bytes(&b, 1), b.kv_block * 4 * 256 * 2);
+    CHECK_EQ(rad_kv_layer_bytes(&b, 2), b.kv_block * 4 * 176 * 2);
+    CHECK(noted(b, "kv cache k6_v4"));
+
+    std::map<int, rad_kvgroup> bound;
+    for (const auto& [layer, g] : b.binds)
+        if (g == 1 || g == 2) bound[layer] = g;
+    CHECK_EQ(bound.size(), (size_t)3);
+    CHECK_EQ(bound[3], (rad_kvgroup)1);
+    CHECK_EQ(bound[7], (rad_kvgroup)2);
+    CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+
+    const auto dec = kit(b, { 1, 1 }, {});
+    const auto pre = kit(b, {}, { 6 }, 20);
+    for (const Kit* k : { dec.get(), pre.get() }) {
+        const auto v = run_passes(b, qwen35_fp8::step, { k });
+        CHECK_PASSES(b, v);
+        int fp8 = 0, k6 = 0;
+        for (const auto& i : v[0]->issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            for (const RadOperand& d : i.opd) {
+                if (d.kind != RAD_OPK_KV || (d.handle != 1 && d.handle != 2)) continue;
+                const std::string kd = pstr(o, "kv_dtype");
+                if (d.handle == 1) {
+                    CHECK_EQ(d.offset, (int64_t)3);
+                    CHECK_EQ(kd, std::string("fp8_e4m3"));
+                    ++fp8;
+                } else {
+                    CHECK_EQ(d.offset, (int64_t)7);
+                    CHECK_EQ(kd, std::string("k6_v4"));
+                    ++k6;
+                }
+            }
+        }
+        CHECK(fp8 > 0);
+        CHECK_EQ(fp8, k6);   /* the same ops on either layer, each on its own cache */
+    }
+}
+
+/* What the engine checks before declare is the plugin's say (RadArchProbe): qwen35_fp8 and
+ * qwen4exp_fp8 read a recipe (a plugin that does not is refused --kv-recipe by name). What only the
+ * plugin knows is checked at declare, and each refusal names the layer: an entry for a delta-net
+ * layer or one past the trunk, an attention layer the recipe leaves out, and a narrow layout on a
+ * geometry libr4d has no rows for. */
+TEST(a_kv_recipe_the_model_cannot_serve_is_refused_naming_the_layer) {
+    MetaKV mk = q35fp8_meta();
+    RadArchProbe p{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
+    CHECK_EQ(p.kv_recipe_ok, 1);
+    RadModelMeta m4 = qwen4exp_meta();
+    RadArchProbe p4{};
+    CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
+    CHECK_EQ(p4.kv_recipe_ok, 1);
+
+    auto refusal = [&](MetaKV& meta, const std::vector<int32_t>& r) {
+        const RadBuildCtx ctx = with_recipe(build_ctx(), r);
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, meta.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    std::vector<int32_t> gdn = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    gdn[2] = RAD_KVQ_V4;
+    CHECK(has(refusal(mk, gdn), "layer 2 keeps no attention cache"));
+    std::vector<int32_t> past = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    past.resize(10, -1);
+    past[9] = RAD_KVQ_NONE;
+    CHECK(has(refusal(mk, past), "layer 9 keeps no attention cache"));
+    CHECK(has(refusal(mk, q35_recipe(RAD_KVQ_V4, -1)), "attention layer 7 has no entry"));
+    CHECK(has(refusal(mk, { -1, -1, -1, RAD_KVQ_NONE }), "attention layer 7 has no entry"));
+
+    MetaKV gqa12 = q35fp8_meta();
+    gqa12.m.n_head_kv = 2;
+    CHECK(has(refusal(gqa12, q35_recipe(RAD_KVQ_NONE, RAD_KVQ_K6V4)), "layer 7 asks for k6_v4"));
+    /* fp8 throughout needs no narrow rows, so that recipe serves the same geometry. */
+    const std::vector<int32_t> f8 = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    const RadBuildCtx ok = with_recipe(build_ctx(), f8);
+    RadBuilder b;
+    CHECK_EQ(qwen35_fp8::declare(&b, gqa12.meta(), &ok), RAD_OK);
+}
+
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob
  * defaults on in this family; without it the weights sum to about 0.4), fp8a8 grouped GEMMs over
  * the expert planes, and the shared expert folded into the gather behind a sigmoid gate. */
@@ -9803,6 +10001,127 @@ TEST(flashnext_steps_lint_clean_at_one_two_and_four_ranks) {
                                       { ver.get(), his.get(), r2.get(), r3.get() }, rank, world);
             CHECK_PASSES(b, v);
         }
+}
+
+/* Flash-Next takes a recipe as qwen35_fp8 does. One layout on both attention layers is that
+ * layout's --kv-cache-dtype at one, two and four ranks: the same ops and parameters, one `kv_attn`
+ * group at the flag's row, the MTP head behind it, and with the residency store asked for the same
+ * pager fragment. The indexer's block keys and tail are no recipe's (spec, out of scope), so they
+ * are the flag's too. */
+TEST(a_uniform_kv_recipe_on_flashnext_is_the_matching_kv_cache_dtype_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuildCtx flag = q4_ctx(rank, world);
+                flag.kv_dtype     = RAD_F8E4M3;
+                flag.kv_quant     = q;
+                flag.kv_residency = 1;
+                RadBuilder a;
+                a.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &flag), RAD_OK);
+
+                r[3] = r[7] = q;
+                RadBuildCtx rc = with_recipe(q4_ctx(rank, world), r);
+                rc.kv_residency = 1;
+                RadBuilder b;
+                b.encs = a.encs;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &rc), RAD_OK);
+                CHECK_EQ(program_diff(a, b), std::string());
+                CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            }
+}
+
+/* A mixed recipe on Flash-Next: fp8_v4 at layer 3 and k6_v4 at layer 7 are two groups, declared at
+ * 200 and 176 E4M3 columns, each layer bound to its own and the MTP head (layer 8) to layer 7's.
+ * Each layer's indexer pages its own group's fragment (K and V of a four-token page at its row),
+ * and the steps lint clean at one, two and four ranks with every cache operand naming the layer's
+ * own group and every attention banding on that group's kv_dtype. */
+TEST(a_mixed_kv_recipe_on_flashnext_declares_each_layers_cache_in_its_own_layout) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = RAD_KVQ_V4;
+    r[7] = RAD_KVQ_K6V4;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_fp8_v4"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k6_v4"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 200);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 176);
+            CHECK_EQ(b.kv_groups[0].zero, b.kv_groups[1].zero);
+            const bool has_cache = !b.kv_groups[0].zero;
+
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound.size(), (size_t)3);
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+
+            /* The pagers in declaration order: layer 3's, layer 7's, the head's. */
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 200));
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 176));
+                CHECK_EQ(page[2], page[1]);
+            } else {
+                CHECK(page.empty());
+            }
+
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on[3] = {};
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd) {
+                        if (d.kind != RAD_OPK_KV || (d.handle != 1 && d.handle != 2)) continue;
+                        CHECK_EQ(d.offset, (int64_t)(d.handle == 1 ? 3 : 7));
+                        const std::string kd = pstr(o, "kv_dtype");
+                        if (!kd.empty())
+                            CHECK_EQ(kd, std::string(d.handle == 1 ? "fp8_v4" : "k6_v4"));
+                        ++on[d.handle];
+                    }
+                }
+                if (has_cache) CHECK(on[1] > 0 && on[1] == on[2]);
+            }
+        }
+}
+
+/* A recipe Flash-Next cannot serve is refused naming the layer: an entry for a delta-net layer, an
+ * attention layer left out, and a narrow layout at a geometry libr4d has no rows for (gqa 8). */
+TEST(a_kv_recipe_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const std::vector<int32_t>& r) {
+        const RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, { -1, -1, RAD_KVQ_NONE, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_NONE }),
+              "layer 2 keeps no attention cache"));
+    CHECK(has(refusal(mk, { -1, -1, -1, RAD_KVQ_V4 }), "attention layer 7 has no entry"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    CHECK(has(refusal(gqa8, { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_K6V4 }),
+              "layer 7 asks for k6_v4"));
 }
 
 /* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked

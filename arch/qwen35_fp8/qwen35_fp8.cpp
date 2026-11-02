@@ -144,6 +144,12 @@ struct Model {
     int64_t        n_main = 0;
 
     rad_kvgroup kv_full = 0, kv_state = 0, kv_conv = 0;
+    /* The trunk's attention groups by RAD_KVQ_* layout (0 where no layer has it), and each trunk
+     * layer's layout. `kv_full` is the last attention layer's group, which the MTP head shares;
+     * without --kv-recipe it is the only one. */
+    rad_kvgroup      kv_q[3] = {};
+    const char*      kv_dt[3] = {};   /* each layout's `kv_dtype`, as the rows band on it */
+    std::vector<int> kvq;
 
     /* The trunk's linears are int8 (LinearFP8::i8), learned before the activations are declared
      * because it decides whether they carry an int8 code pair. Only qwen35_w8a8 sets it. */
@@ -641,28 +647,107 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * scales, K E4M3 as above or int6 the same way (libr4d's fp8_v4 / k6_v4 rows). A token's row
      * is 25 or 22 * head_dim / 16 bytes instead of 2 * head_dim, so the group is declared at half
      * that and the core sizes pages from it; only those kernels read the layout. The drafter's
-     * group stays E4M3 (declare_dflash2). The engine asks only for a layout probe() offered. */
-    const int kvq = fd.dtype == RAD_F8E4M3 ? ctx->kv_quant : RAD_KVQ_NONE;
-    const char* kvq_name = kvq == RAD_KVQ_V4 ? "fp8_v4" : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
-    if (kvq != RAD_KVQ_NONE && !kvq_name) {
-        fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n", kvq);
-        return RAD_E_UNSUPPORTED;
+     * group stays E4M3 (declare_dflash2). The engine asks only for a layout probe() offered.
+     *
+     * --kv-recipe (RadBuildCtx::kv_recipe) chooses the layout per attention layer instead. Layers
+     * of one layout share a group, so a layer's cache is its group's row and the core sizes each
+     * group's pages, and splits the pool between them, as it does for any two paged groups. One
+     * layout throughout is one group named and declared as the flag declares it, so a uniform
+     * recipe is the flag's program; mixed layouts name their groups by layout. The MTP head is
+     * not a recipe layer: it is bound into the last attention layer's group (below) and takes
+     * that layer's layout, as it takes the flag's. */
+    auto kvq_name = [](int q) -> const char* {
+        return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+    };
+    const bool f8 = fd.dtype == RAD_F8E4M3;
+    std::vector<int> kvq_of((size_t)m.n_main, RAD_KVQ_NONE);   /* per trunk layer */
+    if (ctx->kv_recipe) {
+        if (!f8) {
+            fprintf(stderr, "radiance: a KV recipe chooses layouts of the fp8 cache, and this "
+                            "cache is %s\n", rad_dtype_name(fd.dtype));
+            return RAD_E_UNSUPPORTED;
+        }
+        for (int64_t l = 0; l < ctx->n_kv_recipe; ++l) {
+            const int q = ctx->kv_recipe[l];
+            if (q < 0) continue;
+            if (l >= m.n_main || !is_full_attention(l, interval)) {
+                fprintf(stderr, "radiance: KV recipe: layer %lld keeps no attention cache in this "
+                                "model (%lld layers, full attention every %lld from %lld)\n",
+                        (long long)l, (long long)m.n_main, (long long)interval,
+                        (long long)(interval - 1));
+                return RAD_E_UNSUPPORTED;
+            }
+            if (q != RAD_KVQ_NONE && !kvq_name(q)) {
+                fprintf(stderr, "radiance: KV recipe: layer %lld asks for layout %d, which this "
+                                "plugin does not know\n", (long long)l, q);
+                return RAD_E_UNSUPPORTED;
+            }
+            kvq_of[(size_t)l] = q;
+        }
+        for (int64_t l = 0; l < m.n_main; ++l)
+            if (is_full_attention(l, interval) &&
+                (l >= ctx->n_kv_recipe || ctx->kv_recipe[l] < 0)) {
+                fprintf(stderr, "radiance: KV recipe: attention layer %lld has no entry; a recipe "
+                                "names every one\n", (long long)l);
+                return RAD_E_UNSUPPORTED;
+            }
+    } else if (f8) {
+        if (ctx->kv_quant != RAD_KVQ_NONE && !kvq_name(ctx->kv_quant)) {
+            fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n",
+                    ctx->kv_quant);
+            return RAD_E_UNSUPPORTED;
+        }
+        for (int& q : kvq_of) q = ctx->kv_quant;
     }
-    if (kvq_name && !(g.head_dim == 256 && g.n_head == 6 * g.n_head_kv)) {
-        fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim 256, gqa 6 "
-                        "only; this model is head_dim %lld, gqa %lld\n", kvq_name,
-                (long long)g.head_dim, (long long)(g.n_head_kv ? g.n_head / g.n_head_kv : 0));
-        return RAD_E_UNSUPPORTED;
+    /* The groups, in RAD_KVQ_* order, each refused outside libr4d's geometry with the first layer
+     * that asked for it. */
+    int n_layouts = 0;
+    bool used[3] = {};
+    for (int64_t l = 0; l < m.n_main; ++l)
+        if (is_full_attention(l, interval) && !used[kvq_of[(size_t)l]]) {
+            used[kvq_of[(size_t)l]] = true;
+            ++n_layouts;
+            const char* name = kvq_name(kvq_of[(size_t)l]);
+            if (name && !(g.head_dim == 256 && g.n_head == 6 * g.n_head_kv)) {
+                if (ctx->kv_recipe)
+                    fprintf(stderr, "radiance: KV recipe: layer %lld asks for %s, which has "
+                                    "libr4d rows at head_dim 256, gqa 6 only; this model is "
+                                    "head_dim %lld, gqa %lld\n", (long long)l, name,
+                            (long long)g.head_dim,
+                            (long long)(g.n_head_kv ? g.n_head / g.n_head_kv : 0));
+                else
+                    fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim "
+                                    "256, gqa 6 only; this model is head_dim %lld, gqa %lld\n",
+                            name, (long long)g.head_dim,
+                            (long long)(g.n_head_kv ? g.n_head / g.n_head_kv : 0));
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+    for (int q = RAD_KVQ_NONE; q <= RAD_KVQ_K6V4; ++q) {
+        if (!used[q] && !(q == RAD_KVQ_NONE && n_layouts == 0)) continue;
+        const char* name = kvq_name(q);
+        const int64_t row16 = q == RAD_KVQ_V4 ? 25 : q == RAD_KVQ_K6V4 ? 22 : 32;
+        RadKVGroupDecl qd = fd;
+        qd.head_dim = g.head_dim * row16 / 32;
+        m.kv_q[q] = rad_decl_kv_group(b, n_layouts > 1
+                                             ? nm.f("kv_attn_%s", name ? name : "fp8")
+                                             : nm.f("kv_attn"), &qd);
+        if (name)
+            rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a "
+                        "token and head instead of %lld", name, q == RAD_KVQ_V4 ? "E4M3" : "int6",
+                     (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
     }
-    const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
-    fd.head_dim = g.head_dim * row16 / 32;
-    m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
-    /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
-    g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
-    if (kvq_name)
-        rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a token "
-                    "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
-                 (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
+    /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. A
+     * layer's own is set beside its attention block; `g` keeps the last attention layer's, which
+     * the MTP head shares. */
+    int last_q = RAD_KVQ_NONE;
+    for (int64_t l = m.n_main - 1; l >= 0; --l)
+        if (is_full_attention(l, interval)) { last_q = kvq_of[(size_t)l]; break; }
+    for (int q = RAD_KVQ_NONE; q <= RAD_KVQ_K6V4; ++q)
+        m.kv_dt[q] = kvq_name(q) ? kvq_name(q) : rad_dtype_name(fd.dtype);
+    m.kvq      = std::move(kvq_of);
+    m.kv_full  = m.kv_q[last_q];
+    g.kv_dtype = m.kv_dt[last_q];
 
     /* The SSM state cache is f32, or f16 under --state-cache-dtype f16 (RadBuildCtx::state_dtype).
      *
@@ -1049,8 +1134,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             as.q_norm = nm.ckpt("%s.%lld.self_attn.q_norm.weight",    pre, (long long)l);
             as.k_norm = nm.ckpt("%s.%lld.self_attn.k_norm.weight",    pre, (long long)l);
             as.o      = nm.ckpt("%s.%lld.self_attn.o_proj.weight",    pre, (long long)l);
-            RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
-            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
+            /* The layer's own layout (--kv-recipe), on a copy: the block keeps its geometry. */
+            const int q = m.kvq[(size_t)l];
+            Geom ga = g;
+            ga.kv_dtype = m.kv_dt[q];
+            RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_q[q]));
+            RAD_ARCH_TRY(lay.attn.declare(b, nm, ga, (int)l, m.kv_q[q], m.n_rot, aw, as,
                                           f.mix_fold, false, f.mix_ar_in, f.mix_ar_out));
         } else {
             GdnFP8::Src gs{};
@@ -1661,6 +1750,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+    /* --kv-recipe: declare() takes each attention layer's layout from it, among those above. */
+    out->kv_recipe_ok = 1;
     /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
     out->state_f16_ok = 1;
     const char* da = rad_meta_gets(meta, "draft.architectures", "");

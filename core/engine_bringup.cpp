@@ -985,6 +985,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.kv_dtype = cfg_.kv_cache_dtype == "bf16" ? RAD_BF16 : RAD_F8E4M3;
     bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4
                 : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
+    /* --kv-recipe: each attention layer's layout, read by a plugin that said it reads it (declare
+     * below refuses the flag otherwise). Config owns the array for the life of the engine. */
+    if (!cfg_.kv_recipe.empty()) {
+        bc.kv_recipe   = cfg_.kv_recipe.data();
+        bc.n_kv_recipe = (int32_t)cfg_.kv_recipe.size();
+    }
     bc.attn_prefill_fp8 = cfg_.attn_prefill_fp8;
     bc.tp_attn_rows = cfg_.tp_attn_rows;
     bc.weight_prefetch_off = cfg_.weight_prefetch ? 0 : 1;
@@ -1173,6 +1179,29 @@ int Engine::declare() {
         if (!(pb.kv_quant_ok & (1 << q))) {
             RAD_ERR("--kv-cache-dtype %s: the '%s' plugin does not serve it for this model "
                     "(fp8 does)", cfg_.kv_cache_dtype.c_str(), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    /* --kv-recipe likewise: a plugin that does not say it reads the recipe
+     * (RadArchProbe::kv_recipe_ok) would store every layer as plain E4M3, and one that does may
+     * still lack a layout's rows for this model (kv_quant_ok). The refusal names the first layer
+     * that asks for the missing layout; which layers keep an attention cache is the plugin's to
+     * check, at declare. */
+    if (!cfg_.kv_recipe.empty()) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        if (!pb.kv_recipe_ok) {
+            RAD_ERR("--kv-recipe %s: the '%s' plugin does not declare its KV cache per layer "
+                    "(--kv-cache-dtype sets one layout for every layer)",
+                    cfg_.kv_recipe_path.c_str(), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        for (size_t l = 0; l < cfg_.kv_recipe.size(); ++l) {
+            const int q = cfg_.kv_recipe[l];
+            if (q <= RAD_KVQ_NONE || (pb.kv_quant_ok & (1 << q))) continue;
+            RAD_ERR("--kv-recipe %s: layer %zu asks for %s, which the '%s' plugin does not serve "
+                    "for this model (fp8 does)", cfg_.kv_recipe_path.c_str(), l,
+                    kv_layout_name(q), plugins_.arch_plugin.c_str());
             return RAD_E_UNSUPPORTED;
         }
     }
@@ -3729,6 +3758,20 @@ int Engine::configure_kv() {
     }
 
     RAD_INFO("kv: %s", ranks_[0]->kv.report().c_str());
+    /* A recipe's layers by layout, and what they buy: the least any trunk attention group holds,
+     * which is what a sequence can reach (the per-group lines above carry the rest). */
+    if (!cfg_.kv_recipe.empty()) {
+        const KVManager& kv = ranks_[0]->kv;
+        int64_t tokens = -1;
+        for (int32_t g = 0; g < kv.n_groups(); ++g) {
+            const KVGroupPlan* p = kv.plan(g);
+            if (!p || p->kind != RAD_KV_FULL || p->drafter || p->zero) continue;
+            const int64_t t = kv.total_blocks(g) * p->block_size;
+            if (tokens < 0 || t < tokens) tokens = t;
+        }
+        RAD_INFO("kv recipe %s: %s; the pool holds %lld tokens", cfg_.kv_recipe_path.c_str(),
+                 kv_recipe_summary(cfg_.kv_recipe).c_str(), (long long)tokens);
+    }
     kvstream_report(stream, stream_host, (int)ranks_.size());
     /* The prefix cache's report: on or off, groups covered and skipped. It names the two things
      * that silently disable caching on a hybrid model: a windowed group cannot be served a prefix,
