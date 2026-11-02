@@ -927,11 +927,11 @@ recipe names is a candidate, so a layout added to the recipe set is calibrated w
 the tool.
 
 The budget counts the bits of a group of 32 K and 32 V elements with their scales: `fp8` 8 an
-element, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5. `--bits 8` keeps every layer `fp8`, `--bits
-4.5` narrows every one to `k4h_v4`, and in between the bits go to the layers whose KL moves most.
-`k4h_v4` is written `layer N k4h_v4` and loads rotated (GUIDE.md §4.4). Only `qwen4exp_fp8` serves
-it, so on another model the default candidates stop at the first `k4h_v4` run, refused at startup:
-pass `--layouts fp8_v4,k6_v4` there.
+element, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h` 3.5. `--bits 8` keeps every layer
+`fp8`, `--bits 3.5` narrows every one to `k4h_v2h`, and in between the bits go to the layers whose
+KL moves most. `k4h_v4` and `k4h_v2h` are written `layer N k4h_v4` and load rotated (GUIDE.md
+§4.4). Only `qwen4exp_fp8` serves them, so on another model the default candidates stop at the
+first `k4h_v4` run, refused at startup: pass `--layouts fp8_v4,k6_v4` there.
 
 The reference must be the same model, flags and corpus with a bf16 cache, so that a run's KL is
 what its cache costs and nothing of the weights' quantisation. The flags after `--` go to every

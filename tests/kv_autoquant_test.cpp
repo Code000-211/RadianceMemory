@@ -34,6 +34,7 @@ KvCandidate fp8(double kl = 0)   { return { RAD_KVQ_NONE, 512, kl }; }
 KvCandidate v4(double kl)        { return { RAD_KVQ_V4,   400, kl }; }
 KvCandidate k6v4(double kl)      { return { RAD_KVQ_K6V4, 352, kl }; }
 KvCandidate k4h(double kl)       { return { RAD_KVQ_K4H,  288, kl }; }
+KvCandidate k4hv2h(double kl)    { return { RAD_KVQ_K4HV2H, 224, kl }; }
 
 /* Every assignment, for the least summed KL within `budget`; -1 when none fits. */
 double brute_force(const std::vector<std::vector<KvCandidate>>& layers, int64_t budget) {
@@ -65,13 +66,15 @@ std::vector<int> kvq_of(const std::vector<std::vector<KvCandidate>>& layers,
 /* ================================================================== the solver */
 
 TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
-    CHECK(kv_layouts() ==
-          std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4, RAD_KVQ_K4H }));
-    /* fp8's 8 bits an element, and the 25/32, 22/32 and 18/32 of it docs/GUIDE.md §4.4 states. */
+    CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4, RAD_KVQ_K4H,
+                                             RAD_KVQ_K4HV2H }));
+    /* fp8's 8 bits an element, and the 25/32, 22/32, 18/32 and 14/32 of it docs/GUIDE.md §4.4
+     * states. */
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_NONE), 512);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_V4), 400);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K6V4), 352);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4H), 288);
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4HV2H), 224);
     CHECK_EQ(kv_layout_group_bits(99), -1);
     for (int q : kv_layouts()) CHECK_EQ(kv_layout_of(kv_layout_name(q)), q);
 }
@@ -248,6 +251,8 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
         { { 15, RAD_KVQ_V4 }, 0.0000 }, { { 15, RAD_KVQ_K6V4 }, 0.0004 },
         { { 3, RAD_KVQ_K4H }, 0.0500 },  { { 7, RAD_KVQ_K4H }, 0.0001 },
         { { 11, RAD_KVQ_K4H }, 0.0500 }, { { 15, RAD_KVQ_K4H }, 0.0500 },
+        { { 3, RAD_KVQ_K4HV2H }, 0.0900 },  { { 7, RAD_KVQ_K4HV2H }, 0.0900 },
+        { { 11, RAD_KVQ_K4HV2H }, 0.0900 }, { { 15, RAD_KVQ_K4HV2H }, 0.0900 },
     };
     std::string t;
     for (const auto& [k, v] : cost)
@@ -260,8 +265,8 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
 
-    /* 1 + 4 layers x 3 narrower layouts, each with the engine's flags and the driver's. */
-    CHECK_EQ(b.lines(b.calls), 13);
+    /* 1 + 4 layers x 4 narrower layouts, each with the engine's flags and the driver's. */
+    CHECK_EQ(b.lines(b.calls), 17);
     const std::string calls = tiny::read_text(b.calls);
     CHECK(has(calls, "--model /m/x.rad --tp 2 --kv-cache-dtype fp8 --kv-recipe "));
     CHECK(has(calls, "--kld-ref " + b.ref + " --kld-out "));
@@ -270,7 +275,7 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     std::vector<std::vector<KvCandidate>> layers;
     for (int l : { 3, 7, 11, 15 })
         layers.push_back({ fp8(), v4(cost.at({ l, RAD_KVQ_V4 })), k6v4(cost.at({ l, RAD_KVQ_K6V4 })),
-                           k4h(cost.at({ l, RAD_KVQ_K4H })) });
+                           k4h(cost.at({ l, RAD_KVQ_K4H })), k4hv2h(cost.at({ l, RAD_KVQ_K4HV2H })) });
     KvAssignment want;
     REQUIRE_EQ(kv_autoquant_solve(layers, 1664, &want), RAD_OK);
     /* Layer 3 is the sensitive one: it keeps fp8, and the rest give up at least 384 bits, layer 7
@@ -363,8 +368,8 @@ TEST(the_driver_refuses_bad_arguments_and_stops_at_a_failed_run) {
     refused({ "--layers", "3,7", "--bits", "6" }, "no engine flags after --");
     refused({ "--layers", "3,3", "--bits", "6", "--", "--model", "m" }, "names layer 3 twice");
     refused({ "--layers", "3,x", "--bits", "6", "--", "--model", "m" }, "'x' is not a layer number");
-    refused({ "--layers", "3,7", "--bits", "4", "--", "--model", "m" },
-            "--bits 4 is under the narrowest layout's 4.50");
+    refused({ "--layers", "3,7", "--bits", "3", "--", "--model", "m" },
+            "--bits 3 is under the narrowest layout's 3.50");
     refused({ "--layers", "3,7", "--bits", "5.5", "--layouts", "fp8_v4", "--", "--model", "m" },
             "under the narrowest layout's 6.25");
     refused({ "--layers", "3,7", "--bits", "6", "--layouts", "k4_v2", "--", "--model", "m" },

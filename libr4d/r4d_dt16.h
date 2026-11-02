@@ -110,6 +110,27 @@ __device__ __forceinline__ void k4x8_to_f16x4w(uint32_t lo, uint32_t s2, uint32_
     }
 }
 
+// V's eight dims of one key from its code word `w`, as the two byte words the V widening of the
+// h256 attention kernels interleaves: `n` dims 0, 2, 4, 6 and `m` dims 1, 3, 5, 7, a byte each, so
+// that the f16 0x6400 | byte (1024 + byte) less VBias is the code's level, which times the group
+// scale is the value. int4 (fp8_v4, k6_v4, k4h_v4): eight two's complement nibbles, ^ 8 makes
+// them offset binary, VBias 1032. int2 (V2, k4h_v2h): eight codes in w's low 16 bits, dim d at bits
+// 2d; a code u goes in as 2u against VBias 1027, so the level is the odd 2u - 3 the store wrote
+// (libref/ref_attn.cpp). Both exact in f16.
+template<int V2>
+__device__ __forceinline__ void v_codes_nm(uint32_t w, uint32_t& n, uint32_t& m) {
+    if constexpr (V2) {
+        // Nibble j (dims 2j and 2j + 1) into byte j, then each byte's two codes apart, doubled.
+        const uint32_t s = (w & 0xFu) | ((w & 0xF0u) << 4) | ((w & 0xF00u) << 8) | ((w & 0xF000u) << 12);
+        n = (s & 0x03030303u) << 1;
+        m = (s >> 1) & 0x06060606u;
+    } else {
+        n = (w & 0x0F0F0F0Fu) ^ 0x08080808u;
+        m = ((w >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+    }
+}
+template<int V2> struct VBias { static constexpr float v = V2 ? 1027.0f : 1032.0f; };
+
 template<class D>
 __device__ __forceinline__ void fp8x8_to_16x4w(uint2 raw, uint32_t* w4) {
     #pragma unroll

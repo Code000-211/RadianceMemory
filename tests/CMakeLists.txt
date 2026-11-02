@@ -500,12 +500,12 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # forms, GLM's mHC read with its chunk split, the F32-scale E4M3 GEMM's forms, GLM's KDA
 # recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings, GLM's MoE decode
 # fusions, GLM's DSA scoring split by query rows, the Hadamard rotation of a rotated KV layer
-# (had_rotate), and the k4h_v4 cache's store (r4d_model_bf16.hip) and Flash-Next's paged attention
-# over it (the gqa12 and four-rank gqa6 units), whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
+# (had_rotate), and the k4h_v4 and k4h_v2h caches' stores (r4d_model_bf16.hip) and Flash-Next's
+# paged attention over them (the gqa12 and four-rank gqa6 units), whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
 # arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit, for the LoRA pair libref
-# itself when the test can load it, for KDA, the rotation and the k4h_v4 cache libref itself, and for the DSA split
+# itself when the test can load it, for KDA, the rotation and the k4h caches libref itself, and for the DSA split
 # the unsplit kernels. The other two, the M2XFP4 decode and tiled GEMMs, are checked against an f64 decode of
 # the weight.
 #
@@ -626,7 +626,7 @@ if(R4D_EMU_BUILT)
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it. had_rotate is held to libref's bytes, and needs it too, as
-  # does the k4h_v4 cache's store and attention.
+  # do the k4h_v4 and k4h_v2h caches' stores and attention.
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_had r4d_emu_k4h PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at

@@ -1175,7 +1175,7 @@ base belongs to the block manager, not the batch.
 **Under a per-layer recipe each layer names its own group.** `--kv-recipe`
 (`RadBuildCtx::kv_recipe`) puts the layers of one layout in one group, so `RAD_KV(group, layer)`
 names the group of the layer's layout and the ops on it carry that layout's `kv_dtype`
-(`fp8_e4m3`, `fp8_v4`, `k6_v4`, `k4h_v4`). No op or row changes: a layer reads a cache in one
+(`fp8_e4m3`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`). No op or row changes: a layer reads a cache in one
 layout, as under `--kv-cache-dtype`.
 A `rotated` layer's cache holds K and V rotated by `had_rotate`, issued over q, k and v before
 the store and over the output after the attention; the store and attention ops on it are the
@@ -1187,9 +1187,9 @@ int4 codes, then K's f16 group scales and V's, groups of 32 dims. `kv_store` qua
 to `absmax / 7` (the f32 quotient rounded once to f16, capped at 8188) and each element to
 `rint(x / scale)` clamped to ±7; `attn_paged` reads a code as code times its group's scale. Four
 bits hold K only rotated, so a k4h_v4 layer is always a rotated one: the recipe marks it so,
-`--kv-cache-dtype` does not take it, and a plugin refuses an entry without the rotation. It is the
-one packed layout libref serves (`kv_store` and `attn_paged` at `kv_dtype` `k4h_v4`; it refuses a
-cache of any other row width). libr4d has it on Flash-Next's QSA geometry: `kv_store_k4hv4`,
+`--kv-cache-dtype` does not take it, and a plugin refuses an entry without the rotation. It and
+`k4h_v2h` below are the packed layouts libref serves (`kv_store` and `attn_paged` at their
+`kv_dtype`; each refuses a cache of any other row width). libr4d has it on Flash-Next's QSA geometry: `kv_store_k4hv4`,
 byte-identical to libref, and `attn_prefill_h256_gqa12_k4hv4`, `attn_decode_h256_gqa12_k4hv4`
 and their `_gqa6_bs4_` twins (head_dim 256, 4-token pages; the decode rows serve the speculative
 verify too). The attention rows are k6_v4's kernels with K's codes widened as V's; there is no
@@ -1198,6 +1198,30 @@ never folds the gate into the merge. `r4d_emu_k4h` holds the store and every att
 libref in the host emulator: byte for byte where the softmax is decided, within the attention
 rounding elsewhere. A drawn k4h_v4 cache has no meaningful scales, so rad-kbench describes the
 store's operands and not the attention's.
+
+**`k4h_v2h` is `k4h_v4` with V in two bits** (`RAD_KVQ_K4HV2H`): a row of `14 * head_dim / 16`
+bytes, K's int4 codes, V's int2 codes (dim d in bits `2 * (d % 4)` of byte `d / 4`), K's scales,
+V's scales. K is stored as k4h_v4 stores it. V takes a variance normalisation after KVarN
+(Muller et al., arXiv 2606.03458), which finds that the errors that move a model are a token's
+magnitude coming out of the rounding wrong. For each group of 32 values x (bf16 times
+`1 / v_scale`):
+
+- `sum` = Σ x², in the kernel's order (per four dims `fma(x3, x3, fma(x2, x2, fma(x1, x1,
+  x0 * x0)))`, then a butterfly over the group's eight lanes, xor 4, 2, 1), then `fmin(sum,
+  FLT_MAX)`;
+- `rms` = `sqrt(sum / 32)`, and each level `c = clamp(2 * floor(x / rms) + 1, -3, 3)` (1 where
+  `rms` is 0), the nearest odd level of x in steps of one root mean square;
+- `scale` = `f16(min(sqrt(sum / Σ c²), 21824))`, which keeps the group's sum of squares, so the
+  token's magnitude survives the rounding; the code is `(c + 3) / 2`.
+
+`attn_paged` reads a code u as `(2u - 3) * scale`. What it leaves out of KVarN, and why: the
+paper balances a 128-token chunk across tokens and channels (its Alg. 1) and keeps a zero point;
+this cache is written a token at a time into 4-token pages, so no chunk exists at the store, the
+rotation has already evened the channels, and rotated values are centred. libref's `kv_store`
+(libref/ref_attn.cpp) is the contract. libr4d: `kv_store_k4hv2h`, byte-identical to libref, and
+`attn_prefill_h256_gqa12_k4hv2h`, `attn_decode_h256_gqa12_k4hv2h` and their `_gqa6_bs4_` twins,
+the k4h_v4 kernels with V's codes widened from two bits; `r4d_emu_k4h` holds them to libref as it
+holds k4h_v4's. rad-kbench describes the store's operands, not the attention's.
 
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first

@@ -951,7 +951,7 @@ layer 63 k6_v4
 
 The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
 line that is not three words, a layer number that is not one, a layout outside `fp8`, `fp8_v4`,
-`k6_v4` and `k4h_v4`, a layer named twice, or no layer at all. At startup the server refuses the flag,
+`k6_v4`, `k4h_v4` and `k4h_v2h`, a layer named twice, or no layer at all. At startup the server refuses the flag,
 naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
 MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
 layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
@@ -962,7 +962,7 @@ Qwen3.8-Flash-Next only the attention cache takes a recipe; the QSA indexer's bl
 their own cache, and each layer's pager (`--kv-residency-mib`) moves its own layout's fragment.
 
 Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`,
-`kv_attn_k4h_v4`), and the
+`kv_attn_k4h_v4`, `kv_attn_k4h_v2h`), and the
 pool is split so every group holds the same tokens, each paying its own page. Startup logs the
 groups beside the rest of the pool (`kv:`) and then the recipe and what it buys:
 
@@ -995,12 +995,28 @@ pages, gqa 12 at one and two ranks, gqa 6 at four); anywhere else startup refuse
 name. When the last attention layer is `k4h_v4` the MTP head, which shares its cache, rotates too.
 Its KL, its speed and whether rotation and four bits pay at long context are not measured yet.
 
+**Two-bit values: `k4h_v2h`.** `k4h_v4` with V in two bits: 224 bytes a token and head at
+head_dim 256 (14/32 of `fp8`), also recipe-only and always rotated (`layer 7 k4h_v2h` loads
+rotated), on the same plugin and geometry, the MTP head rotating behind it likewise. Two bits hold
+V only with a normalisation in front of the rounding, after KVarN (Muller et al., *KVarN:
+Variance-Normalized KV-Cache Quantization Mitigates Error Accumulation in Reasoning Tasks*,
+[arXiv 2606.03458](https://arxiv.org/abs/2606.03458)): its finding is that the quantisation errors
+that move a model are the largest ones, and that those are a token's magnitude coming out of the
+rounding wrong. Each group of 32 values of a token is divided by its own root mean square, rounded
+to the nearest of the four odd levels -3, -1, 1 and 3, and given the scale that keeps the group's
+sum of squares, so no token's magnitude moves; plain absmax rounding at two bits moves it by a
+tenth or more. This is the paper's method cut down to a cache written a token at a time: KVarN also
+balances each 128-token chunk across its channels, a scale that does not exist yet when a token
+is stored (and after the rotation the channels are near even anyway), and keeps a zero point that
+rotated values do not need. The exact rule is libref's `kv_store` (OPS.md). Its KL, its speed, and
+whether the per-channel half of KVarN would pay here, are not measured yet.
+
 **A measured recipe.** `rad-autoquant` writes the recipe from the KL mode: it measures each layer
 in each layout against a bf16-cache reference over long documents and picks, per layer, the
-layouts of least total KL within an average bit budget (`--bits 6`: between `k4h_v4`'s 4.5 and
-`fp8`'s 8). Its candidates are every recipe layout, `k4h_v4` included; on a model whose plugin
-does not serve it (`qwen35_fp8`), pass `--layouts fp8_v4,k6_v4` or the first `k4h_v4` run stops
-the calibration. A reference whose documents are shorter than 32768 tokens is refused unless the bound
+layouts of least total KL within an average bit budget (`--bits 6`: between `k4h_v2h`'s 3.5 and
+`fp8`'s 8). Its candidates are every recipe layout, `k4h_v4` and `k4h_v2h` included; on a model
+whose plugin does not serve them (`qwen35_fp8`), pass `--layouts fp8_v4,k6_v4` or the first
+`k4h_v4` run stops the calibration. A reference whose documents are shorter than 32768 tokens is refused unless the bound
 is lowered. The flags, the cost of the runs and what the prediction assumes are in
 [TOOLS.md](TOOLS.md#rad-autoquant).
 

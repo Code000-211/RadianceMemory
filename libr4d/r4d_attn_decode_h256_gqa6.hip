@@ -56,7 +56,10 @@
 #define O_KRAW  16777216
 // O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), with O_K6 the k6_v4
 // cache (int6 K, int4 V), with O_K4 the k4h_v4 cache (int4 K and V, stored rotated: the kernel
-// reads it as any other); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
+// reads it as any other), and O_K4 with O_V2 the k4h_v2h cache (int4 K, int2 V: V's codes two
+// bits, widened by v_codes_nm in r4d_dt16.h); a token's row layout is RadBuildCtx::kv_quant's
+// (abi/rad_builder.h).
+#define O_V2    4
 #define O_V4    33554432
 #define O_K6    67108864
 #define O_K4    1073741824
@@ -108,12 +111,15 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // k4h_v4 (r4d_attn_prefill_h256_gqa6.hip): k6_v4's walk, K's codes widened as V's.
     constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
     constexpr int KQ    = K6 || K4;
+    // k4h_v2h: k4h_v4 with V's codes two bits, K's scales after them.
+    constexpr int V2    = ((OPT & O_V2) && K4) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : K4 ? HEAD_DIM * 18 / 16
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : K4 ? HEAD_DIM * 18 / 16
                         : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
     constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM / 2 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16
+                        : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
@@ -296,7 +302,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
                                         + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
-                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                    v4c[r][j] = V2 ? *(const uint16_t*)(base + VOFF + o * 2)
+                                   : *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
@@ -315,13 +322,12 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
                                   : u < NP4)) : u < NP4)) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
-                // Two's complement nibbles; ^ 8 makes them offset binary (value + 8).
-                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                // Each key's codes as offset bytes, even dims in n, odd in m (r4d_dt16.h).
+                uint32_t n0, m0, n1, m1;
+                v_codes_nm<V2>(v4c[r][0], n0, m0);
+                v_codes_nm<V2>(v4c[r][1], n1, m1);
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                const h2 bias = { (_Float16)VBias<V2>::v, (_Float16)VBias<V2>::v };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
                                       + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];
                 #pragma unroll

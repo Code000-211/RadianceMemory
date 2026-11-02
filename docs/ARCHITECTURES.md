@@ -226,7 +226,7 @@ Three groups, which is why hybrid KV groups are first-class:
 
 | group | kind | geometry |
 |---|---|---|
-| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md). `--kv-recipe` (`qwen35_fp8`, `qwen4exp_fp8`) declares one such group per layout it names, `kv_attn_fp8` / `_fp8_v4` / `_k6_v4` (and on `qwen4exp_fp8` `_k4h_v4`, head_dim 144, always rotated), each layer bound to its own and the MTP head to the last attention layer's; a `rotated` layer's group is its layout's, holding K and V rotated by `had_rotate` (GUIDE §4.4) |
+| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md). `--kv-recipe` (`qwen35_fp8`, `qwen4exp_fp8`) declares one such group per layout it names, `kv_attn_fp8` / `_fp8_v4` / `_k6_v4` (and on `qwen4exp_fp8` `_k4h_v4` and `_k4h_v2h`, head_dim 144 and 112, always rotated), each layer bound to its own and the MTP head to the last attention layer's; a `rotated` layer's group is its layout's, holding K and V rotated by `had_rotate` (GUIDE §4.4) |
 | GDN recurrent state | `RAD_KV_LINEAR` | 48 layers, 48 states of 128 x 128 |
 | GDN conv state | `RAD_KV_CONV` | 48 layers, 2*16 + 48 = 80 heads x 128 = 10240 channels, a rolling `conv_width - 1 + n_spec` window |
 
@@ -438,8 +438,9 @@ to it as to the bf16 checkpoint, with each FP8 weight read through its scales.
 MTP head's layer, which shares it) is then declared at head_dim 200 or 176, a token's quantised row
 over two, and read by the gqa12 rows (gqa6 with 4-token pages at four ranks) of those layouts
 (docs/OPS.md). The indexer's key cache and tail keep their widths. A `--kv-recipe` may also name
-`k4h_v4` (rotated int4 K and V, head_dim 144, the same rows' geometry), a recipe-only layout that
-is always rotated; when the last attention layer takes it, the MTP head rotates with it.
+`k4h_v4` (rotated int4 K and V, head_dim 144, the same rows' geometry) or `k4h_v2h` (rotated
+int4 K, int2 V under KVarN's variance normalisation, head_dim 112), recipe-only layouts that are
+always rotated; when the last attention layer takes one, the MTP head rotates with it.
 
 `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe` is the served choice: four-bit codebook experts with
 ten protected experts left bf16, int8 block linears and lm_head, E4M3 mixing and MTP fc matrices,

@@ -92,8 +92,9 @@ static const Flag g_flags[] = {
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
-    { "--kv-recipe",          "FILE",   "each attention layer's layout from that set or k4h_v4\n"
-                                        "(rotated int4 K and V, 0.56; Flash-Next), a 'layer N\n"
+    { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, k4h_v4\n"
+                                        "(rotated int4 K and V, 0.56) or k4h_v2h (int2 V, 0.44;\n"
+                                        "both rotated, Flash-Next), a 'layer N\n"
                                         "LAYOUT [rotated]' line a layer (docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
@@ -533,6 +534,8 @@ static const KvLayout kKvLayouts[] = {
     { "k6_v4",  RAD_KVQ_K6V4, (32 * 6 + 16) + (32 * 4 + 16) },
     /* K int4 as well, stored rotated: 18/32. The rotation is part of the layout (below). */
     { "k4h_v4", RAD_KVQ_K4H,  (32 * 4 + 16) + (32 * 4 + 16) },
+    /* V int2 under KVarN's variance normalisation, rotated as k4h_v4: 14/32. */
+    { "k4h_v2h", RAD_KVQ_K4HV2H, (32 * 4 + 16) + (32 * 2 + 16) },
 };
 
 int kv_layout_of(const char* name) {
@@ -563,9 +566,9 @@ std::vector<int> kv_layouts() {
 /* One `layer N LAYOUT` line per attention layer, `layer N LAYOUT rotated` for a layer that stores
  * its K and V rotated (RAD_KVQ_ROTATED: the normalised Hadamard over head_dim, its query rotated
  * before the attention and the output back after it); `#` starts a comment, blank lines are
- * skipped. k4h_v4 is a rotated layout (RAD_KVQ_K4H): its line marks the layer rotated whether
- * or not it ends in `rotated`. Implied rather than demanded, because the name already says it
- * (the h is the Hadamard), a k4h_v4 layer without the rotation is not a deployment anyone can ask
+ * skipped. k4h_v4 and k4h_v2h are rotated layouts (RAD_KVQ_K4H, RAD_KVQ_K4HV2H): a line of
+ * either marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
+ * (the h is the Hadamard), a k4h layer without the rotation is not a deployment anyone can ask
  * for, and rad-autoquant writes every layout as `layer N LAYOUT` from the table above.
  * Layer numbers are the checkpoint's (blk.N), so a recipe reads against the model's own config.
  * Strict: a word the format does not have, a layer named twice, or a layout outside the set is a
@@ -606,8 +609,8 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const int q = kv_layout_of(layout.c_str());
         if (q < 0) {
-            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; fp8, fp8_v4, k6_v4 or "
-                    "k4h_v4", name, ln, l, layout.c_str());
+            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4 "
+                    "or k4h_v2h", name, ln, l, layout.c_str());
             return RAD_E_INVAL;
         }
         if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);
@@ -615,7 +618,8 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
             RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
             return RAD_E_INVAL;
         }
-        r[(size_t)l] = q | (mark.empty() && q != RAD_KVQ_K4H ? 0 : RAD_KVQ_ROTATED);
+        const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H;
+        r[(size_t)l] = q | (mark.empty() && !rotated_layout ? 0 : RAD_KVQ_ROTATED);
     }
     if (r.empty()) {
         RAD_ERR("%s names no layer; each attention layer needs a 'layer N LAYOUT' line", name);

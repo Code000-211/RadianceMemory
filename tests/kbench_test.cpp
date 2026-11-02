@@ -132,6 +132,12 @@ TEST(the_tolerance_reads_the_attention_and_cache_dtypes) {
     CHECK_EQ(kb::tolerance_for("attn_paged", geom({ { "q_dtype", "bf16" },
                                                     { "kv_dtype", "k4h_v4" } }), "out").rel_l2,
              2e-2);
+    /* k4h_v2h likewise: its store (kv_store_k4hv2h, the variance normalisation included) exactly. */
+    CHECK_EQ(kb::tolerance_for("kv_store", geom({ { "kv_dtype", "k4h_v2h" } }), "kv_cache").rel_l2,
+             0.0);
+    CHECK_EQ(kb::tolerance_for("attn_paged", geom({ { "q_dtype", "bf16" },
+                                                    { "kv_dtype", "k4h_v2h" } }), "out").rel_l2,
+             2e-2);
     /* The Hadamard rotation is libref's bytes on every row, so it is judged exactly. */
     CHECK_EQ(kb::tolerance_for("had_rotate", geom({ { "dtype", "bf16" } }), "x").rel_l2, 0.0);
     CHECK_EQ(kb::tolerance_for("gdn_kkt_solve", Geometry{}, "A").rel_l2, 2e-3);

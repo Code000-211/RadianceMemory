@@ -74,8 +74,9 @@
 // queries, r4d_selftest --perfpaged) and fp8 24.6 -> 22.7; the gain is largest once the KV no
 // longer fits the 64 MB Infinity Cache.
 #define O_KLATE 4194304
-// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache, O_V4 | O_K4 the k4h_v4 cache (see
-// r4d_attn_decode_h256_gqa6.hip).
+// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache, O_V4 | O_K4 the k4h_v4 cache, and with
+// O_V2 the k4h_v2h cache (see r4d_attn_decode_h256_gqa6.hip).
+#define O_V2      4
 #define O_V4    33554432
 #define O_K6    67108864
 #define O_K4    1073741824
@@ -153,12 +154,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     // after V's codes (RAD_KVQ_K4H). It takes k6_v4's staging with V's nibble widening on K.
     constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
     constexpr int KQ    = K6 || K4;                        // K int, widened from codes and scales
+    // k4h_v2h: k4h_v4 with V's codes two bits (v_codes_nm in r4d_dt16.h), K's scales after them.
+    constexpr int V2    = ((OPT & O_V2) && K4) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : K4 ? HEAD_DIM * 18 / 16
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : K4 ? HEAD_DIM * 18 / 16
                         : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
     constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM / 2 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16
+                        : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
@@ -328,7 +332,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
                                         + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
-                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                    v4c[r][j] = V2 ? *(const uint16_t*)(base + VOFF + o * 2)
+                                   : *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
@@ -343,13 +348,13 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             const int u = tid + r * NTHR;
             if (NP4 % NTHR == 0 || u < NP4) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
-                // Codes are two's complement nibbles; ^ 8 makes them offset binary (value + 8).
-                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                // Each key's codes as offset bytes, even dims in n, odd in m (v_codes_nm in
+                // r4d_dt16.h: int4 nibbles ^ 8 against 1032, or k4h_v2h's int2 doubled against 1027).
+                uint32_t n0, m0, n1, m1;
+                v_codes_nm<V2>(v4c[r][0], n0, m0);
+                v_codes_nm<V2>(v4c[r][1], n1, m1);
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                const h2 bias = { (_Float16)VBias<V2>::v, (_Float16)VBias<V2>::v };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
                 uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
                 #pragma unroll

@@ -980,7 +980,28 @@ TEST(a_k4h_v4_recipe_line_is_rotated_whether_or_not_it_says_so) {
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v4'"));
     std::vector<int32_t> out;
     err = stderr_of([&] { CHECK_EQ(kv_recipe_parse("layer 0 k4h\n", "r.txt", &out), RAD_E_INVAL); });
-    CHECK(has(err, "'k4h' is not a KV layout; fp8, fp8_v4, k6_v4 or k4h_v4"));
+    CHECK(has(err, "'k4h' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4 or k4h_v2h"));
+}
+
+/* k4h_v2h (int4 K, KVarN-normalised int2 V) is rotated as k4h_v4 is: its line loads rotated with
+ * or without the word, beside k4h_v4 in the summary, priced at 224 bits a 32 + 32 group (14/32 of
+ * fp8), and it is a recipe word only, never a --kv-cache-dtype. */
+TEST(a_k4h_v2h_recipe_line_is_rotated_and_priced_at_fourteen_thirty_seconds_of_fp8) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 0 k4h_v2h\nlayer 1 k4h_v4\nlayer 2 k4h_v2h rotated\n", "r.txt", &r),
+             RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_K4HV2H | rot, RAD_KVQ_K4H | rot,
+                                      RAD_KVQ_K4HV2H | rot }));
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("k4h_v4 rotated at layer 1; k4h_v2h rotated at layers 0, 2"));
+    CHECK_EQ(kv_layout_of("k4h_v2h"), (int)RAD_KVQ_K4HV2H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_K4HV2H)), std::string("k4h_v2h"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4HV2H), 224);
+    const std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "k4h_v2h" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v2h'"));
 }
 
 /* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens

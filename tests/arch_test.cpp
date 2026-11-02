@@ -10324,8 +10324,8 @@ TEST(a_k4h_v4_recipe_layer_on_flashnext_is_a_rotated_288_byte_cache_on_its_own_r
     RadModelMeta m4 = qwen4exp_meta();
     RadArchProbe p4{};
     CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
-    CHECK_EQ(p4.kv_quant_ok,
-             (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H));
+    CHECK_EQ(p4.kv_quant_ok, (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H) |
+                             (1 << RAD_KVQ_K4HV2H));
 
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
@@ -10457,6 +10457,107 @@ TEST(a_k4h_v4_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
                                         { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
                                           (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED })),
               "layer 7 asks for k4h_v4"));
+}
+
+/* k4h_v2h on Flash-Next (RAD_KVQ_K4HV2H: rotated int4 K, KVarN-normalised int2 V, 224 bytes a
+ * token and head, declared as 112 E4M3 columns) beside k4h_v4, at one, two and four ranks: the two
+ * are groups of their own in RAD_KVQ_* order, k4h_v2h's pager fragment its own; layer 7, the last
+ * attention layer, in k4h_v2h rotates and so does the MTP head behind it (its pass issues its four
+ * rotations); every op on k4h_v2h's group bands on kv_dtype k4h_v2h; and the steps lint clean. */
+TEST(a_k4h_v2h_recipe_layer_on_flashnext_is_a_rotated_224_byte_cache_and_its_head_rotates) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED;
+    r[7] = (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_k4h_v4"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k4h_v2h"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 144);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 112);
+            CHECK(noted(b, "kv cache k4h_v2h: rotated int4 K, variance-normalised int2 V"));
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 144));
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 112));
+                CHECK_EQ(rot_ops, 3);   /* layers 3 and 7, and the head */
+            }
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd)
+                        if (d.kind == RAD_OPK_KV && d.handle == 2) {
+                            const std::string kd = pstr(o, "kv_dtype");
+                            if (!kd.empty()) CHECK_EQ(kd, std::string("k4h_v2h"));
+                            ++on;
+                            break;
+                        }
+                }
+                if (has_cache) CHECK(on > 0);
+            }
+            /* The head's history pass after an MTP verify (one and two ranks, as for k4h_v4). */
+            if (world == 4) continue;
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            int head_rots = 0;
+            for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+            if (has_cache) CHECK_EQ(head_rots, 4);
+        }
+}
+
+/* k4h_v2h's refusals are k4h_v4's: without its rotation (a hand-built context), as every layer's
+ * --kv-cache-dtype, and where libr4d has no rows for it (gqa 8, which the probe does not offer). */
+TEST(a_k4h_v2h_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, RAD_KVQ_K4HV2H, -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for k4h_v2h unrotated"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_K4HV2H;
+    CHECK(has(refusal(mk, flag), "KV cache layout 4 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_K4HV2H), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                          (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED })),
+              "layer 7 asks for k4h_v2h"));
 }
 
 /* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked

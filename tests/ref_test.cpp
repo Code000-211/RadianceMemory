@@ -3351,18 +3351,22 @@ TEST(rotate_attend_rotate_back_equals_plain_attention_within_rounding) {
 /* ================================================================== the k4h_v4 cache */
 namespace {
 
-/* kv_store at kv_dtype k4h_v4 over a [blocks, nkv, bs, 18 * hd / 16] E4M3-declared cache. */
-int store_k4h(T& k, T& v, T& sm, T& kv, int64_t M, int64_t hd, int64_t nkv, int64_t bs) {
+/* kv_store at kv_dtype k4h_v4 over a [blocks, nkv, bs, 18 * hd / 16] E4M3-declared cache, or at
+ * `layout` k4h_v2h over 14 * hd / 16. */
+int store_k4h(T& k, T& v, T& sm, T& kv, int64_t M, int64_t hd, int64_t nkv, int64_t bs,
+              const char* layout = "k4h_v4") {
     A st; st.t(k).t(v).t(sm).t(kv)
              .i("M", M).i("head_dim", hd).i("n_head_kv", nkv).i("block_size", bs)
-             .s("kv_dtype", "k4h_v4");
+             .s("kv_dtype", layout);
     return run("kv_store", st);
 }
 
-/* attend()'s prefill over a k4h_v4 cache: bf16 q, k and v, optionally rotated as a recipe layer
- * is, the output in f32. */
+/* attend()'s prefill over a k4h_v4 (or `layout`) cache: bf16 q, k and v, optionally rotated as a
+ * recipe layer is, the output in f32. */
 std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<float>& k,
-                              const std::vector<float>& v, int64_t Tn, bool rotated) {
+                              const std::vector<float>& v, int64_t Tn, bool rotated,
+                              const char* layout = "k4h_v4") {
+    const int64_t r16 = std::strcmp(layout, "k4h_v2h") == 0 ? 14 : 18;
     const int64_t hd = 256, nh = 4, nkv = 2, bs = 16;
     T tq(RAD_BF16, {Tn, nh, hd}), tk(RAD_BF16, {Tn, nkv, hd}), tv(RAD_BF16, {Tn, nkv, hd});
     tq.f(q); tk.f(k); tv.f(v);
@@ -3375,14 +3379,14 @@ std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<flo
     std::vector<int64_t> slots;
     for (int64_t t = 0; t < Tn; ++t) slots.push_back(t);
     sm.n(slots);
-    T kv(RAD_F8E4M3, {1, nkv, bs, 18 * hd / 16});
-    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs));
+    T kv(RAD_F8E4M3, {1, nkv, bs, r16 * hd / 16});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, layout));
     T bt(RAD_I32, {1, 1}); bt.n({0});
     T su(RAD_I32, {1});    su.n({Tn});
     T out(RAD_BF16, {Tn, nh, hd});
     A at; at.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
              .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
-             .i("causal", 1).i("window", 0).s("q_dtype", "bf16").s("kv_dtype", "k4h_v4");
+             .i("causal", 1).i("window", 0).s("q_dtype", "bf16").s("kv_dtype", layout);
     CHECK_OK(run("attn_paged", at));
     if (rotated) CHECK_OK(had_rotate(out, hd, hd));
     std::vector<float> o((size_t)(Tn * nh * hd));
@@ -3532,6 +3536,216 @@ TEST(a_k4h_v4_cache_of_the_wrong_shape_is_refused) {
     A at; at.t(q).t(wide).t(bt).t(su).tnull().tnull().tnull().t(out)
              .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
              .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v4");
+    CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
+/* ================================================================== the k4h_v2h cache */
+namespace {
+
+/* Dim d of V in a k4h_v2h row of head_dim hd, by hand from abi/rad_builder.h: the odd level
+ * 2u - 3 times its group's f16 scale. */
+float v2h_value(const uint8_t* row, int64_t hd, int64_t d) {
+    const int u = (row[hd / 2 + d / 4] >> (2 * (d & 3))) & 3;
+    uint16_t sc;
+    std::memcpy(&sc, row + hd * 13 / 16 + (d / 32) * 2, 2);
+    return (float)(2 * u - 3) * rad_f16_to_f32(sc);
+}
+
+}  /* namespace */
+
+/* Worked by hand at head_dim 32, one group each (KVarN's variance normalisation as
+ * libref/ref_attn.cpp's header specifies it). Token 0's V repeats 3, 1, -1, -3: its sum of squares
+ * is 160, its root mean square sqrt(5), so each value over it floors to its own odd level (3 to
+ * 3, 1 to 1, -1 to -1, -3 to -3), and the scale that keeps the 160 is 1.0 -- codes 3, 2, 1, 0, a
+ * byte 0x1b. Token 1's V repeats 4, 0.5, -0.5, -1: sum 140, rms 2.09, levels 3, 1, -1, -1 (codes
+ * 3, 2, 1, 1, 0x5b), whose squares sum to 96, so the scale is sqrt(140 / 96) and the stored group
+ * keeps its sum of squares to the f16 rounding of the scale, where absmax rounding would have
+ * shrunk it. K is k4h_v4's, its scale after V's codes. The row is 28 bytes: K's codes, V's 8, K's
+ * scale, V's. */
+TEST(a_k4h_v2h_store_writes_odd_int2_levels_and_a_scale_that_keeps_the_group_energy) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, 0.0f), vx(64);
+    kx[0] = 7.0f; kx[1] = -3.5f;
+    const float a[4] = { 3, 1, -1, -3 }, b[4] = { 4, 0.5f, -0.5f, -1 };
+    for (int i = 0; i < 32; ++i) { vx[(size_t)i] = a[i % 4]; vx[(size_t)(32 + i)] = b[i % 4]; }
+    k.f(kx); v.f(vx);
+    T sm(RAD_I32, {2}); sm.n({0, 1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 28});
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2, "k4h_v2h"));
+    const uint8_t* r0 = kv.mem.data();
+    const uint8_t* r1 = r0 + 28;
+    CHECK_EQ((int)r0[0], 0xc7);                                       /* K: 7, -3.5 to -4 */
+    for (int i = 16; i < 24; ++i) CHECK_EQ((int)r0[i], 0x1b);
+    CHECK_EQ((int)r0[24], 0x00); CHECK_EQ((int)r0[25], 0x3c);       /* K's scale, 1.0 */
+    CHECK_EQ((int)r0[26], 0x00); CHECK_EQ((int)r0[27], 0x3c);       /* V's scale, 1.0 */
+    for (int i = 16; i < 24; ++i) CHECK_EQ((int)r1[i], 0x5b);
+    uint16_t s1;
+    std::memcpy(&s1, r1 + 26, 2);
+    CHECK_NEAR(rad_f16_to_f32(s1), std::sqrt(140.0f / 96.0f), 1e-3);
+    double e = 0;
+    for (int d = 0; d < 32; ++d) e += (double)v2h_value(r1, 32, d) * v2h_value(r1, 32, d);
+    CHECK_NEAR(e, 140.0, 140.0 * 1e-3);
+    CHECK_EQ(v2h_value(r1, 32, 0), rad_f16_to_f32(s1) * 3.0f);
+    CHECK_EQ(v2h_value(r1, 32, 3), -rad_f16_to_f32(s1));
+}
+
+/* The edges, as the kernel meets them: a group of zeros stores level +1 at scale 0 (reads 0); an
+ * infinity is clamped out of the sum (fmin with FLT_MAX), so it stores +3 at the 21824 cap (three
+ * times which is still an f16) and its finite neighbours +-1; a value exactly one root mean square
+ * up floors to +3, one down to -1 (the boundaries go up). */
+TEST(a_k4h_v2h_store_handles_zeros_infinity_and_boundaries_as_its_contract_says) {
+    T k(RAD_F32, {1, 1, 96}), v(RAD_F32, {1, 1, 96});
+    std::vector<float> vx(96, 0.0f);
+    vx[32] = INFINITY; vx[33] = 1.0f; vx[34] = -1.0f;
+    for (int i = 64; i < 96; ++i) vx[(size_t)i] = i & 1 ? -2.0f : 2.0f;   /* rms 2 */
+    v.f(vx);
+    T sm(RAD_I32, {1}); sm.n({0});
+    T kv(RAD_F8E4M3, {1, 1, 1, 84});
+    CHECK_OK(store_k4h(k, v, sm, kv, 1, 96, 1, 1, "k4h_v2h"));
+    const uint8_t* r = kv.mem.data();
+    for (int d = 0; d < 32; ++d) CHECK_EQ(v2h_value(r, 96, d), 0.0f);
+    CHECK_EQ((int)r[48], 0xaa);                                       /* four +1s */
+    CHECK_EQ(v2h_value(r, 96, 32), 3.0f * 21824.0f);
+    CHECK_EQ(v2h_value(r, 96, 33), 21824.0f);
+    CHECK_EQ(v2h_value(r, 96, 34), -21824.0f);
+    CHECK_EQ((int)r[48 + 16], 0x77);                                  /* 3, -1, 3, -1 */
+    uint16_t s2;
+    std::memcpy(&s2, r + 96 * 13 / 16 + 4, 2);
+    /* 32 * 4 over 16 * 9 + 16 * 1: the scale keeps the 128. */
+    CHECK_NEAR(rad_f16_to_f32(s2), std::sqrt(128.0f / 160.0f), 1e-3);
+}
+
+/* What the normalisation is for (KVarN, arXiv 2606.03458, §2.4 and Fig. 1): a token's magnitude
+ * coming out of the rounding wrong. Over rotated rows with token magnitudes spread across three
+ * decades, k4h_v2h keeps every token's V norm to the f16 rounding of its scales, where the same
+ * two bits rounded against the group's absmax (levels at +-1/3 and +-1 of it, KIVI's plain RTN)
+ * miss by a tenth or more; and its squared error is lower as well (here: worst token 0.00027
+ * against 0.18, relative squared error 0.104 against 0.185). */
+TEST(the_k4h_v2h_variance_normalisation_keeps_each_token_magnitude_where_absmax_int2_misses) {
+    const int64_t Tn = 64, hd = 256;
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> lm(std::log(1e-2f), std::log(10.0f));
+    T k(RAD_BF16, {Tn, 1, hd}), v(RAD_BF16, {Tn, 1, hd});
+    std::vector<float> vx((size_t)(Tn * hd));
+    for (int64_t t = 0; t < Tn; ++t) {
+        const float m = std::exp(lm(rng));
+        for (int64_t d = 0; d < hd; ++d) vx[(size_t)(t * hd + d)] = nd(rng) * m * (d == 9 ? 8.0f : 1.0f);
+    }
+    v.f(vx);
+    CHECK_OK(had_rotate(v, hd, hd));
+    for (int64_t i = 0; i < Tn * hd; ++i) vx[(size_t)i] = v.at(i);
+    T sm(RAD_I32, {Tn});
+    std::vector<int64_t> slots;
+    for (int64_t t = 0; t < Tn; ++t) slots.push_back(t);
+    sm.n(slots);
+    T kv(RAD_F8E4M3, {1, 1, Tn, 14 * hd / 16});
+    CHECK_OK(store_k4h(k, v, sm, kv, Tn, hd, 1, Tn, "k4h_v2h"));
+    double worst_varn = 0, worst_rtn = 0, se_varn = 0, se_rtn = 0, ss = 0;
+    for (int64_t t = 0; t < Tn; ++t) {
+        const uint8_t* row = kv.mem.data() + t * (14 * hd / 16);
+        double n = 0, nv = 0, nr = 0;
+        for (int64_t g = 0; g < hd; g += 32) {
+            float amax = 0;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(vx[(size_t)(t * hd + g + i)]));
+            const float s = amax / 3.0f;
+            for (int i = 0; i < 32; ++i) {
+                const float x = vx[(size_t)(t * hd + g + i)];
+                const float c = s > 0 ? std::fmin(std::fmax(2.0f * std::floor(x / (2.0f * s)) + 1.0f, -3.0f), 3.0f) : 0.0f;
+                const float xr = c * s, xv = v2h_value(row, hd, g + i);
+                n += (double)x * x; nv += (double)xv * xv; nr += (double)xr * xr;
+                se_varn += ((double)xv - x) * ((double)xv - x);
+                se_rtn += ((double)xr - x) * ((double)xr - x);
+            }
+        }
+        ss += n;
+        worst_varn = std::max(worst_varn, std::fabs(std::sqrt(nv / n) - 1.0));
+        worst_rtn = std::max(worst_rtn, std::fabs(std::sqrt(nr / n) - 1.0));
+    }
+    std::printf("    k4h_v2h: worst token norm error %.2g (absmax int2 %.2g), rel MSE %.3g (%.3g)\n",
+                worst_varn, worst_rtn, se_varn / ss, se_rtn / ss);
+    CHECK(worst_varn < 2e-3);
+    CHECK(worst_rtn > 0.1);
+    CHECK(se_varn < se_rtn);
+}
+
+/* As k4h_v4's: a k4h_v2h read is the level times its scale and then the fp8 path's arithmetic, so
+ * attention over a stored cache is attention over its dequantised values, bit for bit. */
+TEST(attention_over_a_k4h_v2h_cache_is_attention_over_its_dequantised_values) {
+    const int64_t Tn = 7, hd = 64, nh = 4, nkv = 2, bs = 4, nb = 2, row = 14 * hd / 16;
+    std::mt19937 rng(12);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    T tq(RAD_F32, {Tn, nh, hd}), tk(RAD_F32, {Tn, nkv, hd}), tv(RAD_F32, {Tn, nkv, hd});
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) st_dt(RAD_F32, tq.t.data, i, nd(rng));
+    for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+        st_dt(RAD_F32, tk.t.data, i, nd(rng));
+        st_dt(RAD_F32, tv.t.data, i, nd(rng));
+    }
+    T sm(RAD_I32, {Tn}); sm.n({4, 5, 6, 7, 0, 1, 2});
+    T kv(RAD_F8E4M3, {nb, nkv, bs, row});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, "k4h_v2h"));
+    T f(RAD_F32, {nb, nkv, bs, 2 * hd});
+    const uint8_t* c = kv.mem.data();
+    for (int64_t s = 0; s < nb * nkv * bs; ++s)
+        for (int64_t d = 0; d < hd; ++d) {
+            const uint8_t* r = c + s * row;
+            const int nib = (r[d / 2] >> (4 * (d & 1))) & 0xF;
+            uint16_t sc;
+            std::memcpy(&sc, r + hd * 3 / 4 + (d / 32) * 2, 2);
+            st_dt(RAD_F32, f.t.data, s * 2 * hd + d, (float)((nib ^ 8) - 8) * rad_f16_to_f32(sc));
+            st_dt(RAD_F32, f.t.data, s * 2 * hd + hd + d, v2h_value(r, hd, d));
+        }
+    T bt(RAD_I32, {1, 2}); bt.n({1, 0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T o2(RAD_F32, {Tn, nh, hd}), of(RAD_F32, {Tn, nh, hd});
+    A a2; a2.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(o2)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v2h");
+    CHECK_OK(run("attn_paged", a2));
+    A af; af.t(tq).t(f).t(bt).t(su).tnull().tnull().tnull().t(of)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", af));
+    int64_t same = 0;
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) same += o2.at(i) == of.at(i);
+    CHECK_EQ(same, Tn * nh * hd);
+    CHECK(o2.at(0) != 0.0f);
+}
+
+/* Why k4h_v2h is rotated too: V with an outlier channel, in two bits, loses the rest of that
+ * channel's group to the outlier's level, and the rotation spreads it first. K is exact both ways
+ * (zero), so the output error against exact attention is V's alone: 0.33 rotated against 0.86
+ * unrotated here. */
+TEST(k4h_v2h_with_its_rotation_beats_k4h_v2h_without_on_outlier_values) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(8);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd), 0.0f),
+                       v((size_t)(Tn * nkv * hd));
+    for (auto& x : q) x = nd(rng);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = nd(rng) * (i % hd == 5 ? 30.0f : 1.0f);
+    for (auto* w : { &q, &v })
+        for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+    const double e_plain = rel_l2(attend_k4h(q, k, v, Tn, false, "k4h_v2h"), exact);
+    const double e_rot = rel_l2(attend_k4h(q, k, v, Tn, true, "k4h_v2h"), exact);
+    std::printf("    k4h_v2h: unrotated vs exact %.3g, rotated vs exact %.3g\n", e_plain, e_rot);
+    CHECK(e_rot < 0.6 * e_plain);
+}
+
+/* The k4h_v2h row is 14 * head_dim / 16: k4h_v4's 18 at kv_dtype k4h_v2h is refused, by the store
+ * and the attention, before anything is written. */
+TEST(a_k4h_v2h_cache_of_the_wrong_shape_is_refused) {
+    T k(RAD_F32, {1, 1, 32}), v(RAD_F32, {1, 1, 32});
+    T sm(RAD_I32, {1}); sm.n({0});
+    T k4(RAD_F8E4M3, {1, 1, 1, 36});
+    CHECK_EQ(store_k4h(k, v, sm, k4, 1, 32, 1, 1, "k4h_v2h"), RAD_E_SHAPE);
+    T q(RAD_F32, {1, 1, 32}), out(RAD_F32, {1, 1, 32});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({1});
+    A at; at.t(q).t(k4).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v2h");
     CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
 }
 

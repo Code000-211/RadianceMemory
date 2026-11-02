@@ -75,12 +75,24 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [HD/2, HD)         V's int4 codes
  *     [HD, 17HD/16)      K's scales (absmax / 7)
  *     [17HD/16, 18HD/16) V's scales (absmax / 7)
+ *   RAD_KVQ_K4HV2H (k4h_v2h, ABI 37), 14 * HD / 16 bytes, K and V both stored rotated:
+ *     [0, HD/2)          K's int4 codes, as k4h_v4's
+ *     [HD/2, 3HD/4)      V's int2 codes, dim d in bits 2 * (d % 4) of byte d / 4
+ *     [3HD/4, 13HD/16)   K's scales (absmax / 7)
+ *     [13HD/16, 14HD/16) V's scales (variance-normalised, below)
  *
  * k4h_v4 is k6_v4 without K's high-bit words, K's codes and scales read as V's. Four-bit K holds
  * only where the rotation has spread K's outlier channels, so a k4h_v4 layer is always a rotated
  * one (RAD_KVQ_ROTATED below): its kv_recipe entry carries the flag, the engine never sets
  * kv_quant to it, and a plugin refuses an entry without the flag rather than store unrotated keys
  * in four bits.
+ *
+ * k4h_v2h is k4h_v4 with V in two bits, which hold only with KVarN's variance normalisation
+ * (arXiv 2606.03458): a V code u (0..3) is the odd value 2u - 3 (-3, -1, 1, 3) times its group's
+ * scale; the codes are the group's values over its root mean square rounded to the nearest odd
+ * level, and the scale keeps the group's sum of squares, so no token's magnitude moves in the
+ * rounding. libref's kv_store is the contract (libref/ref_attn.cpp, docs/OPS.md). Rotated always,
+ * as k4h_v4.
  *
  * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
@@ -89,7 +101,8 @@ enum {
     RAD_KVQ_NONE = 0,
     RAD_KVQ_V4   = 1,
     RAD_KVQ_K6V4 = 2,
-    RAD_KVQ_K4H  = 3
+    RAD_KVQ_K4H  = 3,
+    RAD_KVQ_K4HV2H = 4
 };
 
 /* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):
