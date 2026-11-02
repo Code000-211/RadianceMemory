@@ -818,8 +818,10 @@ __global__ __launch_bounds__(kThreads) void kv_store_streamed_kernel(
 // (absmax / 7). Four columns a thread as above, so a group of 32 is 8 lanes; head_dim is a multiple
 // of 32, so a group never straddles two heads. A token's row is `row` bytes. K6 is the k6_v4 store:
 // K as int6 in groups of 32 (absmax / 31) in the row layout of abi/rad_builder.h's RAD_KVQ_K6V4, V
-// as above after it.
-template <int K6>
+// as above after it. KM 2 is the k4h_v4 store (RAD_KVQ_K4H): K as int4 the way V is (absmax / 7),
+// its codes first, V's after them, then K's scales and V's; libref's kv_store holds it byte for byte.
+// KM 0 is fp8_v4, KM 1 k6_v4.
+template <int KM>
 __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
@@ -841,9 +843,25 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
             kf[e] = bf16_to_f32(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
             vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
         }
-        const uint32_t voff = K6 ? head_dim * 3 / 4 : head_dim;
-        const uint32_t vsoff = K6 ? head_dim * 21 / 16 : head_dim * 3 / 2;
-        if constexpr (K6) {
+        constexpr int K6 = KM == 1, K4 = KM == 2;
+        const uint32_t voff = K6 ? head_dim * 3 / 4 : K4 ? head_dim / 2 : head_dim;
+        const uint32_t vsoff = K6 ? head_dim * 21 / 16 : K4 ? head_dim * 17 / 16 : head_dim * 3 / 2;
+        if constexpr (K4) {
+            // V's quantiser below, on K: absmax / 7 over the group's 8 lanes, the scale at head_dim.
+            float kmax = fmaxf(fmaxf(fabsf(kf[0]), fabsf(kf[1])), fmaxf(fabsf(kf[2]), fabsf(kf[3])));
+            for (int m = 4; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
+            const __fp16 k16 = (__fp16)fminf(kmax / 7.0f, 8188.0f);
+            const float ksc = (float)k16;
+            uint32_t q[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float r = ksc > 0.0f ? rintf(kf[e] / ksc) : 0.0f;
+                q[e] = (uint32_t)((int)fminf(fmaxf(r, -7.0f), 7.0f)) & 0xFu;
+            }
+            *(uint16_t*)(c + d / 2) = (uint16_t)(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
+            if ((d & 31u) == 0)
+                *(uint16_t*)(c + head_dim + (d / 32) * 2) = __builtin_bit_cast(uint16_t, k16);
+        } else if constexpr (K6) {
             // A group of 32 is 8 lanes; its scale absmax / 31 in f16, codes 6-bit two's complement.
             float kmax = fmaxf(fmaxf(fabsf(kf[0]), fabsf(kf[1])), fmaxf(fabsf(kf[2]), fabsf(kf[3])));
             for (int m = 4; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
@@ -2415,10 +2433,10 @@ extern "C" int r4d_rad_kv_store_fp8(const RadArgs* a, RadStream stream) {
                              (float)ks, (float)vs, stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* The fp8_v4 and k6_v4 stores: the cache's last extent is a token's row, 25 or 22 * head_dim / 16
- * bytes. */
-static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
-    const long long r16 = k6 ? 22 : 25;
+/* The fp8_v4, k6_v4 and k4h_v4 stores (km 0, 1, 2): the cache's last extent is a token's row, 25,
+ * 22 or 18 * head_dim / 16 bytes. */
+static int kv_store_q4(const RadArgs* a, RadStream stream, int km) {
+    const long long r16 = km == 2 ? 18 : km == 1 ? 22 : 25;
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g, r16);
     if (rc != RAD_OK) return rc;
@@ -2429,7 +2447,14 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
     if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
     long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
     long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
-    if (k6)
+    if (km == 2)
+        return R4D_EMIT(stream, kv_store_fp8v4_kernel<2>, dim3((uint32_t)g.T), dim3(kThreads), 0,
+                        (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
+                        (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
+                        (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                        (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
+                        (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+    if (km == 1)
         return R4D_EMIT(stream, kv_store_fp8v4_kernel<1>, dim3((uint32_t)g.T), dim3(kThreads), 0,
                         (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
                         (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
@@ -2445,6 +2470,7 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
 }
 extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 0); }
 extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }
+extern "C" int r4d_rad_kv_store_k4hv4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 2); }
 
 /* The store of a streamed group: kv_store's geometry and conversion (E4M3, or bf16 with no
  * descales), plus the residency map `res` (read, never written: residency is the resolve's) and the

@@ -950,8 +950,8 @@ layer 63 k6_v4
 ```
 
 The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
-line that is not three words, a layer number that is not one, a layout outside `fp8`, `fp8_v4`
-and `k6_v4`, a layer named twice, or no layer at all. At startup the server refuses the flag,
+line that is not three words, a layer number that is not one, a layout outside `fp8`, `fp8_v4`,
+`k6_v4` and `k4h_v4`, a layer named twice, or no layer at all. At startup the server refuses the flag,
 naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
 MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
 layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
@@ -961,7 +961,8 @@ shares the last attention layer's cache and layout, and a drafter's own cache st
 Qwen3.8-Flash-Next only the attention cache takes a recipe; the QSA indexer's block keys keep
 their own cache, and each layer's pager (`--kv-residency-mib`) moves its own layout's fragment.
 
-Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`), and the
+Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`,
+`kv_attn_k4h_v4`), and the
 pool is split so every group holds the same tokens, each paying its own page. Startup logs the
 groups beside the rest of the pool (`kv:`) and then the recipe and what it buys:
 
@@ -983,10 +984,23 @@ sparse decode, the gate folded into the attention), since each would skip a rota
 summary lists rotated layers apart (`k6_v4 rotated at layer 11`). What rotation buys a layout in
 KL has not been measured yet.
 
+**Four-bit keys: `k4h_v4`.** A recipe layout of its own, not a `--kv-cache-dtype`: K and V both as
+int4 in groups of 32 with an f16 scale, 288 bytes a token and head at head_dim 256 (18/32 of
+`fp8`), always rotated. Unrotated keys carry outlier channels that four bits cannot hold beside
+the rest of their group, so `layer 7 k4h_v4` is read as `layer 7 k4h_v4 rotated` (the `h` is the
+Hadamard; writing `rotated` is allowed and changes nothing), and the summary says `k4h_v4 rotated`.
+Implied rather than demanded, so the recipe `rad-autoquant` writes from the layout table is the
+rotated deployment. Only `qwen4exp_fp8` serves it, at Flash-Next's QSA geometry (head_dim 256, 4-token
+pages, gqa 12 at one and two ranks, gqa 6 at four); anywhere else startup refuses the layer by
+name. When the last attention layer is `k4h_v4` the MTP head, which shares its cache, rotates too.
+Its KL, its speed and whether rotation and four bits pay at long context are not measured yet.
+
 **A measured recipe.** `rad-autoquant` writes the recipe from the KL mode: it measures each layer
 in each layout against a bf16-cache reference over long documents and picks, per layer, the
-layouts of least total KL within an average bit budget (`--bits 6`: between `k6_v4`'s 5.5 and
-`fp8`'s 8). A reference whose documents are shorter than 32768 tokens is refused unless the bound
+layouts of least total KL within an average bit budget (`--bits 6`: between `k4h_v4`'s 4.5 and
+`fp8`'s 8). Its candidates are every recipe layout, `k4h_v4` included; on a model whose plugin
+does not serve it (`qwen35_fp8`), pass `--layouts fp8_v4,k6_v4` or the first `k4h_v4` run stops
+the calibration. A reference whose documents are shorter than 32768 tokens is refused unless the bound
 is lowered. The flags, the cost of the runs and what the prediction assumes are in
 [TOOLS.md](TOOLS.md#rad-autoquant).
 

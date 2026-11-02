@@ -10314,6 +10314,151 @@ TEST(a_kv_recipe_flashnext_cannot_serve_is_refused_naming_the_layer) {
               "layer 7 asks for k6_v4"));
 }
 
+/* k4h_v4 on Flash-Next (RAD_KVQ_K4H: rotated int4 K, int4 V, 288 bytes a token and head, declared
+ * as 144 E4M3 columns), the layer libr4d's gqa12 and four-rank gqa6 rows serve, at one, two and
+ * four ranks: the probe offers it beside fp8_v4 and k6_v4; layer 3 in k4h_v4 and layer 7 in k6_v4
+ * are two groups in RAD_KVQ_* order, layer 3 paging its own 144-column fragment; a rank with a
+ * cache rotates layer 3's q, k and v before its k4h_v4 store and its output after its attention,
+ * every op on its group bands on kv_dtype k4h_v4, and the steps lint clean. */
+TEST(a_k4h_v4_recipe_layer_on_flashnext_is_a_rotated_288_byte_cache_on_its_own_rows) {
+    RadModelMeta m4 = qwen4exp_meta();
+    RadArchProbe p4{};
+    CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
+    CHECK_EQ(p4.kv_quant_ok,
+             (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H));
+
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED;
+    r[7] = RAD_KVQ_K6V4;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_k6_v4"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k4h_v4"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 176);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 144);
+            CHECK(noted(b, "kv cache k4h_v4: rotated int4 K, int4 V"));
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)2);
+            CHECK_EQ(bound[7], (rad_kvgroup)1);
+            CHECK_EQ(bound[8], (rad_kvgroup)1);   /* the MTP head, behind layer 7 */
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 144));
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 176));
+                CHECK_EQ(rot_ops, 1);   /* layer 3's; the head, behind k6_v4, is unrotated */
+            }
+
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd)
+                        if (d.kind == RAD_OPK_KV && d.handle == 2) {
+                            const std::string kd = pstr(o, "kv_dtype");
+                            if (!kd.empty()) CHECK_EQ(kd, std::string("k4h_v4"));
+                            ++on;
+                            break;
+                        }
+                }
+                if (!has_cache) continue;
+                CHECK(on > 0);
+                std::vector<std::string> seq;
+                for (const std::string& e : around_layer(b, *v[0], 3))
+                    if (e.rfind("rot:", 0) == 0 || e == "kv_store" || e.rfind("attn_paged", 0) == 0)
+                        seq.push_back(e);
+                const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "kv_store" };
+                REQUIRE(seq.size() >= head.size() + 2);
+                CHECK(std::vector<std::string>(seq.begin(), seq.begin() + 4) == head);
+                CHECK_EQ(seq.back(), std::string("rot:out"));
+            }
+        }
+}
+
+/* A k4h_v4 group holds rotated K and V only, so when the last attention layer is k4h_v4 the MTP
+ * head that shares its group rotates too: the declaration has the head's rotation beside layer
+ * 7's, the verify, the head's history pass and its rounds lint clean, and the head's pass issues
+ * its four rotations. The same recipe with layer 7 rotated over k6_v4 keeps the head unrotated. */
+TEST(the_mtp_head_behind_a_k4h_v4_layer_on_flashnext_rotates_with_it) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int q : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K6V4 })
+        for (int world : { 1, 2 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> r(8, -1);
+                r[3] = RAD_KVQ_NONE;
+                r[7] = q | RAD_KVQ_ROTATED;
+                const RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                REQUIRE_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+                const bool has_cache = !b.kv_groups[0].zero;
+                int rot_ops = 0;
+                for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+                if (has_cache) CHECK_EQ(rot_ops, q == RAD_KVQ_K4H ? 2 : 1);
+                const auto ver = kit(b, std::vector<int>(4, 4), {});
+                const auto his = history_pass(b, *ver);
+                const auto r2 = round_pass(b, 4, 2);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get(), r2.get() },
+                                          rank, world);
+                CHECK_PASSES(b, v);
+                int head_rots = 0;
+                for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+                if (has_cache) CHECK_EQ(head_rots, q == RAD_KVQ_K4H ? 4 : 0);
+            }
+}
+
+/* What Flash-Next cannot serve in k4h_v4 is refused naming the layer: the layout without its
+ * rotation (a hand-built context; the recipe parser never makes one), the layout as every layer's
+ * --kv-cache-dtype (only a recipe asks for a rotated layout), and a geometry libr4d has no k4h_v4
+ * rows for (gqa 8), where the probe does not offer it either. */
+TEST(a_k4h_v4_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, RAD_KVQ_K4H, -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for k4h_v4 unrotated"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_K4H;
+    CHECK(has(refusal(mk, flag), "KV cache layout 3 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_K4H), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                          (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED })),
+              "layer 7 asks for k4h_v4"));
+}
+
 /* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked
  * for the residency store: a window is declared on every QSA attention group, so the store is the
  * gate. Off, the declaration holds no `qsa_page` and is the one a server keeping every block

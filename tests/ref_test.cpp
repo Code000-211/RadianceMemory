@@ -3348,6 +3348,193 @@ TEST(rotate_attend_rotate_back_equals_plain_attention_within_rounding) {
     CHECK(rel_l2(r16, p16d) > 0.0);
 }
 
+/* ================================================================== the k4h_v4 cache */
+namespace {
+
+/* kv_store at kv_dtype k4h_v4 over a [blocks, nkv, bs, 18 * hd / 16] E4M3-declared cache. */
+int store_k4h(T& k, T& v, T& sm, T& kv, int64_t M, int64_t hd, int64_t nkv, int64_t bs) {
+    A st; st.t(k).t(v).t(sm).t(kv)
+             .i("M", M).i("head_dim", hd).i("n_head_kv", nkv).i("block_size", bs)
+             .s("kv_dtype", "k4h_v4");
+    return run("kv_store", st);
+}
+
+/* attend()'s prefill over a k4h_v4 cache: bf16 q, k and v, optionally rotated as a recipe layer
+ * is, the output in f32. */
+std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<float>& k,
+                              const std::vector<float>& v, int64_t Tn, bool rotated) {
+    const int64_t hd = 256, nh = 4, nkv = 2, bs = 16;
+    T tq(RAD_BF16, {Tn, nh, hd}), tk(RAD_BF16, {Tn, nkv, hd}), tv(RAD_BF16, {Tn, nkv, hd});
+    tq.f(q); tk.f(k); tv.f(v);
+    if (rotated) {
+        CHECK_OK(had_rotate(tq, hd, hd));
+        CHECK_OK(had_rotate(tk, hd, hd));
+        CHECK_OK(had_rotate(tv, hd, hd));
+    }
+    T sm(RAD_I32, {Tn});
+    std::vector<int64_t> slots;
+    for (int64_t t = 0; t < Tn; ++t) slots.push_back(t);
+    sm.n(slots);
+    T kv(RAD_F8E4M3, {1, nkv, bs, 18 * hd / 16});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs));
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T out(RAD_BF16, {Tn, nh, hd});
+    A at; at.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "bf16").s("kv_dtype", "k4h_v4");
+    CHECK_OK(run("attn_paged", at));
+    if (rotated) CHECK_OK(had_rotate(out, hd, hd));
+    std::vector<float> o((size_t)(Tn * nh * hd));
+    for (size_t i = 0; i < o.size(); ++i) o[i] = out.at((int64_t)i);
+    return o;
+}
+
+}  /* namespace */
+
+/* Worked by hand at head_dim 32, one group each: K's absmax is 7, so its scale is 1.0 (f16
+ * 0x3c00) and its codes are the values rounded to even -- 3.5 to 4, 2.5 to 2, -0.5 to 0 -- packed
+ * two a byte, dim 2i in the low nibble (-7 is 0x9). V is all zero, so its scale is 0 and its codes
+ * 0. The row is K's 16 code bytes, V's 16, K's scale, V's scale; the other slot of the block keeps
+ * its bytes, and a slot of -1 writes nothing. */
+TEST(a_k4h_v4_store_writes_int4_codes_and_an_absmax_over_seven_scale_a_group) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, 0.0f);
+    const float g[] = { 7, -7, 3.5f, 2.5f, 1, -0.5f, 6.75f, 0 };
+    for (int i = 0; i < 8; ++i) kx[(size_t)i] = g[i];
+    for (int i = 32; i < 64; ++i) kx[(size_t)i] = 100.0f;   /* token 1, dropped */
+    k.f(kx);
+    T sm(RAD_I32, {2}); sm.n({1, -1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 36});
+    std::vector<uint8_t> fill(72, 0x5a);
+    kv.raw(fill);
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2));
+    const uint8_t* b = kv.mem.data();
+    for (int i = 0; i < 36; ++i) CHECK_EQ((int)b[i], 0x5a);          /* slot 0: untouched */
+    const uint8_t* r = b + 36;                                        /* slot 1: token 0 */
+    CHECK_EQ((int)r[0], 0x97);    /* 7, -7 */
+    CHECK_EQ((int)r[1], 0x24);    /* 4, 2 */
+    CHECK_EQ((int)r[2], 0x01);    /* 1, -0 */
+    CHECK_EQ((int)r[3], 0x07);    /* 6.75 to 7, 0 */
+    for (int i = 4; i < 32; ++i) CHECK_EQ((int)r[i], 0);
+    CHECK_EQ((int)r[32], 0x00); CHECK_EQ((int)r[33], 0x3c);         /* K's scale, 1.0 */
+    CHECK_EQ((int)r[34], 0x00); CHECK_EQ((int)r[35], 0x00);         /* V's scale, 0 */
+}
+
+/* The scale is absmax / 7 rounded to f16, and a group past 8188 * 7 is capped there so the codes
+ * clamp at +-7 and seven times the scale stays finite. A NaN drops out of the absmax and stores
+ * the clamp's -7; an infinity is the cap's +7. */
+TEST(a_k4h_v4_store_caps_the_scale_and_clamps_nan_and_infinity) {
+    T k(RAD_F32, {1, 1, 32}), v(RAD_F32, {1, 1, 32});
+    std::vector<float> kx(32, 0.0f), vx(32, 0.0f);
+    kx[0] = 1e6f; kx[1] = -2e5f;
+    vx[0] = 0.7f; vx[1] = std::nanf(""); vx[2] = INFINITY;
+    k.f(kx); v.f(vx);
+    T sm(RAD_I32, {1}); sm.n({0});
+    T kv(RAD_F8E4M3, {1, 1, 1, 36});
+    CHECK_OK(store_k4h(k, v, sm, kv, 1, 32, 1, 1));
+    const uint8_t* r = kv.mem.data();
+    uint16_t ks, vs;
+    std::memcpy(&ks, r + 32, 2);
+    std::memcpy(&vs, r + 34, 2);
+    CHECK_EQ(rad_f16_to_f32(ks), 8188.0f);
+    CHECK_EQ(rad_f16_to_f32(vs), 8188.0f);   /* inf / 7 capped */
+    CHECK_EQ((int)r[0], 0x97);                /* 1e6 to +7, -2e5 to -7 */
+    CHECK_EQ((int)r[16], 0x90);               /* 0.7 to 0, NaN to -7 */
+    CHECK_EQ((int)r[17] & 0xF, 0x7);          /* inf to +7 */
+}
+
+/* A k4h_v4 read is code times scale and then the fp8 path's arithmetic, so attention over a stored
+ * cache is attention over its dequantised values, bit for bit: here an f32 cache holding exactly
+ * those values, built from the stored bytes, gives the same output. */
+TEST(attention_over_a_k4h_v4_cache_is_attention_over_its_dequantised_values) {
+    const int64_t Tn = 7, hd = 64, nh = 4, nkv = 2, bs = 4, nb = 2;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    T tq(RAD_F32, {Tn, nh, hd}), tk(RAD_F32, {Tn, nkv, hd}), tv(RAD_F32, {Tn, nkv, hd});
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) st_dt(RAD_F32, tq.t.data, i, nd(rng));
+    for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+        st_dt(RAD_F32, tk.t.data, i, nd(rng) * (i % hd == 9 ? 20.0f : 1.0f));
+        st_dt(RAD_F32, tv.t.data, i, nd(rng));
+    }
+    T sm(RAD_I32, {Tn}); sm.n({4, 5, 6, 7, 0, 1, 2});   /* block 1, then block 0 */
+    T kv(RAD_F8E4M3, {nb, nkv, bs, 18 * hd / 16});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs));
+    /* The same slots, dequantised by hand from the row layout. */
+    T f(RAD_F32, {nb, nkv, bs, 2 * hd});
+    const uint8_t* c = kv.mem.data();
+    const int64_t row = 18 * hd / 16;
+    for (int64_t s = 0; s < nb * nkv * bs; ++s)
+        for (int which = 0; which < 2; ++which)
+            for (int64_t d = 0; d < hd; ++d) {
+                const uint8_t* r = c + s * row;
+                const int nib = (r[which * hd / 2 + d / 2] >> (4 * (d & 1))) & 0xF;
+                uint16_t sc;
+                std::memcpy(&sc, r + hd + which * hd / 16 + (d / 32) * 2, 2);
+                st_dt(RAD_F32, f.t.data, s * 2 * hd + which * hd + d,
+                      (float)((nib ^ 8) - 8) * rad_f16_to_f32(sc));
+            }
+    T bt(RAD_I32, {1, 2}); bt.n({1, 0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T o4(RAD_F32, {Tn, nh, hd}), of(RAD_F32, {Tn, nh, hd});
+    A a4; a4.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(o4)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v4");
+    CHECK_OK(run("attn_paged", a4));
+    A af; af.t(tq).t(f).t(bt).t(su).tnull().tnull().tnull().t(of)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", af));
+    int64_t same = 0;
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) same += o4.at(i) == of.at(i);
+    CHECK_EQ(same, Tn * nh * hd);
+    CHECK(o4.at(0) != 0.0f);
+}
+
+/* Why k4h_v4 is a rotated layout: four-bit keys with an outlier channel lose every other channel of
+ * its group to rounding, and the rotation spreads the outlier first. The values make V exact both
+ * ways (seven times a one-hot row stores exactly, and so does its rotation, +-7/16 everywhere), so
+ * the output is the attention weights themselves and its error is K's alone. The rotated k4h_v4
+ * path has about half the unrotated layout's error against the exact attention (0.069 against
+ * 0.145 here). */
+TEST(k4h_v4_with_its_rotation_beats_k4h_v4_without_on_outlier_keys) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd)),
+                       v((size_t)(Tn * nkv * hd), 0.0f);
+    for (auto& x : q) x = nd(rng);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = nd(rng) * (i % hd == 5 ? 30.0f : 1.0f);
+    for (int64_t t = 0; t < Tn; ++t)
+        for (int64_t h = 0; h < nkv; ++h) v[(size_t)((t * nkv + h) * hd + 40 + t)] = 7.0f;
+    for (auto* w : { &q, &k, &v })
+        for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+    const double e_plain = rel_l2(attend_k4h(q, k, v, Tn, false), exact);
+    const double e_rot = rel_l2(attend_k4h(q, k, v, Tn, true), exact);
+    std::printf("    k4h_v4: unrotated vs exact %.3g, rotated vs exact %.3g\n", e_plain, e_rot);
+    CHECK(e_rot < 0.6 * e_plain);
+}
+
+/* The layout's shape is the reference's to check: a cache whose last extent is not 18 * head_dim
+ * / 16 bytes, or a head_dim that is not whole groups, is refused before anything is written. */
+TEST(a_k4h_v4_cache_of_the_wrong_shape_is_refused) {
+    T k(RAD_F32, {1, 1, 32}), v(RAD_F32, {1, 1, 32});
+    T sm(RAD_I32, {1}); sm.n({0});
+    T wide(RAD_F8E4M3, {1, 1, 1, 64});
+    CHECK_EQ(store_k4h(k, v, sm, wide, 1, 32, 1, 1), RAD_E_SHAPE);
+    T k48(RAD_F32, {1, 1, 48}), v48(RAD_F32, {1, 1, 48});
+    T odd(RAD_F8E4M3, {1, 1, 1, 54});
+    CHECK_EQ(store_k4h(k48, v48, sm, odd, 1, 48, 1, 1), RAD_E_SHAPE);
+    T q(RAD_F32, {1, 1, 32}), out(RAD_F32, {1, 1, 32});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({1});
+    A at; at.t(q).t(wide).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v4");
+    CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
 TEST(op_attn_dense) {
     const float sc = 1.0f / 1.41421356f;
     T q(RAD_F32, {2, 1, 2}); q.f({1, 0, 0, 1});

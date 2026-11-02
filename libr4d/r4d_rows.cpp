@@ -4340,6 +4340,24 @@ static const RadConstraint cAttnDecodeGqH256G6Bs4K6v4[] = {
     C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k6_v4"),
     C_EQ("group", 128), C_IN("act", "sigmoid"),
 };
+/* The k4h_v4 cache on the same two ratios: the k6_v4 rows' constraints at its kv_dtype, with no
+ * gated-merge row (a rotated layer never folds its gate into the merge). */
+static const RadConstraint cAttnPrefillH256G12K4hv4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 12), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4"),
+};
+static const RadConstraint cAttnDecodeH256G12K4hv4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 12), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 5), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4"),
+};
+static const RadConstraint cAttnPrefillH256G6Bs4K4hv4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4"),
+};
+static const RadConstraint cAttnDecodeH256G6Bs4K4hv4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4"),
+};
 static const RadConstraint cAttnPrefillH128G8Fp8[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
@@ -5625,6 +5643,8 @@ static const RadConstraint cKvStoreFp8v4[] = { C_GE("block_size", 1), C_DIV("hea
                                                C_IN("kv_dtype", "fp8_v4") };
 static const RadConstraint cKvStoreK6v4[] = { C_GE("block_size", 1), C_DIV("head_dim", 32),
                                               C_IN("kv_dtype", "k6_v4") };
+static const RadConstraint cKvStoreK4hv4[] = { C_GE("block_size", 1), C_DIV("head_dim", 32),
+                                               C_IN("kv_dtype", "k4h_v4") };
 static const RadConstraint cRopeRow[]   = { C_GE("head_dim", 1),
                                             C_IN("mode", "neox mrope gptj imrope axial") };
 /* The vision tower's rows. The GEMM stages 16-byte chunks, so K is a multiple of 8; the norm and
@@ -6427,6 +6447,18 @@ static const RadKernelInfo kKernels[] = {
   ROW(cKvStoreK6v4), NOTUNE,
   nullptr, nullptr, r4d_rad_kv_store_k6v4, nullptr, nullptr, nullptr,
   nullptr },
+
+/* Byte-identical to libref's kv_store at kv_dtype k4h_v4 (tests/r4d_emu/test_k4h.cpp). */
+{ "kv_store_k4hv4", "kv_store", "attn",
+  "scatter k and v into a paged k4h_v4 cache, one workgroup a token",
+  "cache exactly [n_blocks, kv_heads, block_size, 18*head_dim/16]; head_dim a multiple of 32; a "
+  "negative or out-of-range slot stores nothing",
+  "bf16 k / v (already rotated), int4 K and int4 V in groups of 32 with f16 scales, i32 slot "
+  "mapping; byte-identical to libref",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvStoreK4hv4), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_store_k4hv4, nullptr, nullptr, nullptr,
+  r4d_shape_kv_store },
 
 /* The store of a streamed KV group: the host mirror always, the ring slot when resident. One
  * workgroup a token, two destinations; the mirror's row pitch is the block's, so a token's bytes
@@ -7463,6 +7495,54 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_attn_decode_gq_h256_gqa6_k6v4, r4d_rad_attn_decode_h256_gqa6_k6v4_scratch,
   nullptr, nullptr,
   nullptr, nullptr, r4d_fuse_attn_paged_gate_quant },
+
+/* The k4h_v4 cache (RAD_KVQ_K4H: int4 K and V in groups of 32 with f16 scales, 288 bytes a token,
+ * stored rotated) at both ratios: k6_v4's kernels with K's codes widened as V's. Held to libref's
+ * attn_paged over stored caches in the emulator (tests/r4d_emu/test_k4h.cpp); a drawn cache has no
+ * meaningful scales, so the rows describe no operands to rad-kbench. */
+{ "attn_prefill_h256_gqa12_k4hv4", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 12 queries per kv head, paged block 4, varlen",
+  "bf16 query, k4h_v4 kv cache (int4 K and V, each in groups of 32 with f16 scales, stored "
+  "rotated), bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G12K4hv4), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_k4hv4, r4d_rad_attn_prefill_h256_gqa12_k4hv4_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa12_k4hv4", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, k4h_v4 kv cache (int4 K and V, each in groups of 32 with f16 scales, stored "
+  "rotated), bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G12K4hv4), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa12_k4hv4, r4d_rad_attn_decode_h256_gqa12_k4hv4_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_prefill_h256_gqa6_bs4_k4hv4", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 6 queries per kv head, paged block 4, varlen",
+  "bf16 query, k4h_v4 kv cache (int4 K and V, each in groups of 32 with f16 scales, stored "
+  "rotated), bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G6Bs4K4hv4), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_k4hv4, r4d_rad_attn_prefill_h256_gqa6_k4hv4_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa6_bs4_k4hv4", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, k4h_v4 kv cache (int4 K and V, each in groups of 32 with f16 scales, stored "
+  "rotated), bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4K4hv4), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_k4hv4, r4d_rad_attn_decode_h256_gqa6_k4hv4_scratch,
+  nullptr, nullptr,
+  nullptr },
 
 { "attn_prefill_h128_gqa8_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",

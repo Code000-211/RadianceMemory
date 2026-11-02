@@ -1175,11 +1175,29 @@ base belongs to the block manager, not the batch.
 **Under a per-layer recipe each layer names its own group.** `--kv-recipe`
 (`RadBuildCtx::kv_recipe`) puts the layers of one layout in one group, so `RAD_KV(group, layer)`
 names the group of the layer's layout and the ops on it carry that layout's `kv_dtype`
-(`fp8_e4m3`, `fp8_v4`, `k6_v4`). No op or row changes: a layer reads a cache in one layout, as
-under `--kv-cache-dtype`.
+(`fp8_e4m3`, `fp8_v4`, `k6_v4`, `k4h_v4`). No op or row changes: a layer reads a cache in one
+layout, as under `--kv-cache-dtype`.
 A `rotated` layer's cache holds K and V rotated by `had_rotate`, issued over q, k and v before
 the store and over the output after the attention; the store and attention ops on it are the
 layout's, unchanged.
+
+**`k4h_v4` is the rotated int4 layout** (`RAD_KVQ_K4H`, abi/rad_builder.h): a token's row in a
+(block, head) page is `18 * head_dim / 16` bytes of the E4M3-declared group, K's int4 codes, V's
+int4 codes, then K's f16 group scales and V's, groups of 32 dims. `kv_store` quantises each group
+to `absmax / 7` (the f32 quotient rounded once to f16, capped at 8188) and each element to
+`rint(x / scale)` clamped to ±7; `attn_paged` reads a code as code times its group's scale. Four
+bits hold K only rotated, so a k4h_v4 layer is always a rotated one: the recipe marks it so,
+`--kv-cache-dtype` does not take it, and a plugin refuses an entry without the rotation. It is the
+one packed layout libref serves (`kv_store` and `attn_paged` at `kv_dtype` `k4h_v4`; it refuses a
+cache of any other row width). libr4d has it on Flash-Next's QSA geometry: `kv_store_k4hv4`,
+byte-identical to libref, and `attn_prefill_h256_gqa12_k4hv4`, `attn_decode_h256_gqa12_k4hv4`
+and their `_gqa6_bs4_` twins (head_dim 256, 4-token pages; the decode rows serve the speculative
+verify too). The attention rows are k6_v4's kernels with K's codes widened as V's; there is no
+`attn_paged_gate_quant` row, because a rotated layer turns its output back before the gate and
+never folds the gate into the merge. `r4d_emu_k4h` holds the store and every attention row to
+libref in the host emulator: byte for byte where the softmax is decided, within the attention
+rounding elsewhere. A drawn k4h_v4 cache has no meaningful scales, so rad-kbench describes the
+store's operands and not the attention's.
 
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first

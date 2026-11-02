@@ -29,10 +29,11 @@ using namespace rad;
 
 namespace {
 
-/* The three recipe layouts at their prices (bits a group of 32 K and 32 V elements). */
+/* The recipe layouts at their prices (bits a group of 32 K and 32 V elements). */
 KvCandidate fp8(double kl = 0)   { return { RAD_KVQ_NONE, 512, kl }; }
 KvCandidate v4(double kl)        { return { RAD_KVQ_V4,   400, kl }; }
 KvCandidate k6v4(double kl)      { return { RAD_KVQ_K6V4, 352, kl }; }
+KvCandidate k4h(double kl)       { return { RAD_KVQ_K4H,  288, kl }; }
 
 /* Every assignment, for the least summed KL within `budget`; -1 when none fits. */
 double brute_force(const std::vector<std::vector<KvCandidate>>& layers, int64_t budget) {
@@ -64,11 +65,13 @@ std::vector<int> kvq_of(const std::vector<std::vector<KvCandidate>>& layers,
 /* ================================================================== the solver */
 
 TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
-    CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4 }));
-    /* fp8's 8 bits an element, and the 25/32 and 22/32 of it docs/GUIDE.md §4.4 states. */
+    CHECK(kv_layouts() ==
+          std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4, RAD_KVQ_K4H }));
+    /* fp8's 8 bits an element, and the 25/32, 22/32 and 18/32 of it docs/GUIDE.md §4.4 states. */
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_NONE), 512);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_V4), 400);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K6V4), 352);
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4H), 288);
     CHECK_EQ(kv_layout_group_bits(99), -1);
     for (int q : kv_layouts()) CHECK_EQ(kv_layout_of(kv_layout_name(q)), q);
 }
@@ -233,7 +236,8 @@ struct Bench {
 
 /* Four attention layers with costs from a table: one run with every layer fp8 and one for each
  * layer in each narrower layout, the costs the runs' means above the base, the assignment the
- * solver's on those costs, and a recipe the server's own --kv-recipe parse loads. */
+ * solver's on those costs, and a recipe the server's own --kv-recipe parse loads -- a k4h_v4
+ * layer, written as `layer 7 k4h_v4`, loaded rotated. */
 TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     Bench b;
     REQUIRE(b.dir.ok());
@@ -242,6 +246,8 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
         { { 7, RAD_KVQ_V4 }, 0.0001 },  { { 7, RAD_KVQ_K6V4 }, 0.0002 },
         { { 11, RAD_KVQ_V4 }, 0.0003 }, { { 11, RAD_KVQ_K6V4 }, 0.0030 },
         { { 15, RAD_KVQ_V4 }, 0.0000 }, { { 15, RAD_KVQ_K6V4 }, 0.0004 },
+        { { 3, RAD_KVQ_K4H }, 0.0500 },  { { 7, RAD_KVQ_K4H }, 0.0001 },
+        { { 11, RAD_KVQ_K4H }, 0.0500 }, { { 15, RAD_KVQ_K4H }, 0.0500 },
     };
     std::string t;
     for (const auto& [k, v] : cost)
@@ -254,8 +260,8 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
 
-    /* 1 + 4 layers x 2 narrower layouts, each with the engine's flags and the driver's. */
-    CHECK_EQ(b.lines(b.calls), 9);
+    /* 1 + 4 layers x 3 narrower layouts, each with the engine's flags and the driver's. */
+    CHECK_EQ(b.lines(b.calls), 13);
     const std::string calls = tiny::read_text(b.calls);
     CHECK(has(calls, "--model /m/x.rad --tp 2 --kv-cache-dtype fp8 --kv-recipe "));
     CHECK(has(calls, "--kld-ref " + b.ref + " --kld-out "));
@@ -263,14 +269,15 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     /* The solver on the table's costs, in the driver's units, is what was written. */
     std::vector<std::vector<KvCandidate>> layers;
     for (int l : { 3, 7, 11, 15 })
-        layers.push_back({ fp8(), v4(cost.at({ l, RAD_KVQ_V4 })), k6v4(cost.at({ l, RAD_KVQ_K6V4 })) });
+        layers.push_back({ fp8(), v4(cost.at({ l, RAD_KVQ_V4 })), k6v4(cost.at({ l, RAD_KVQ_K6V4 })),
+                           k4h(cost.at({ l, RAD_KVQ_K4H })) });
     KvAssignment want;
     REQUIRE_EQ(kv_autoquant_solve(layers, 1664, &want), RAD_OK);
-    /* Layer 3 is the sensitive one: it keeps fp8, and the rest give up the 384 bits, layer 7 to
-     * k6_v4 where layer 15's would cost more (0.0005 against 0.0008 for the same saving). */
+    /* Layer 3 is the sensitive one: it keeps fp8, and the rest give up at least 384 bits, layer 7
+     * to k4h_v4, which costs it less than k6_v4 (0.0004 against 0.0005 in all). */
     CHECK(kvq_of(layers, want) ==
-          std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_K6V4, RAD_KVQ_V4, RAD_KVQ_V4 }));
-    CHECK_NEAR(want.kl, 0.0005, 1e-12);
+          std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_K4H, RAD_KVQ_V4, RAD_KVQ_V4 }));
+    CHECK_NEAR(want.kl, 0.0004, 1e-12);
 
     Config c;
     Argv a({ "--model", "/m/x.rad", "--kv-cache-dtype", "fp8", "--kv-recipe", b.out });
@@ -278,7 +285,9 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     const std::vector<int32_t> got = c.kv_recipe;
     REQUIRE_EQ(got.size(), (size_t)16);
     const std::vector<int> picked = kvq_of(layers, want);
-    for (size_t i = 0; i < 4; ++i) CHECK_EQ(got[(size_t)(3 + 4 * i)], picked[i]);
+    for (size_t i = 0; i < 4; ++i) CHECK_EQ(got[(size_t)(3 + 4 * i)] & RAD_KVQ_LAYOUT, picked[i]);
+    CHECK_EQ(got[7], (int32_t)(RAD_KVQ_K4H | RAD_KVQ_ROTATED));
+    CHECK(has(tiny::read_text(b.out), "layer 7 k4h_v4\n"));
     for (size_t l = 0; l < got.size(); ++l)
         if (l % 4 != 3) CHECK_EQ(got[l], -1);
 
@@ -286,12 +295,12 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# every layer fp8: mean KL 0.040000"));
     CHECK(has(recipe, "#       3    4.000e-03    9.000e-03"));
-    CHECK(has(recipe, "# chosen: 6.5000 bits an element"));
+    CHECK(has(recipe, "# chosen: 6.2500 bits an element"));
     for (const char* f : { "base.kvrecipe", "base.json", "base.log", "layer3_k6_v4.json" }) {
         struct stat st{};
         CHECK(::stat((b.out + ".work/" + f).c_str(), &st) == 0);
     }
-    CHECK(has(log, "model.kvrecipe: 6.5000 bits an element"));
+    CHECK(has(log, "model.kvrecipe: 6.2500 bits an element"));
 
     /* --layouts narrows the set; fp8 stays as the base, and the room for one fp8 layer goes to
      * layer 3, whose fp8_v4 costs most. */
@@ -354,8 +363,8 @@ TEST(the_driver_refuses_bad_arguments_and_stops_at_a_failed_run) {
     refused({ "--layers", "3,7", "--bits", "6" }, "no engine flags after --");
     refused({ "--layers", "3,3", "--bits", "6", "--", "--model", "m" }, "names layer 3 twice");
     refused({ "--layers", "3,x", "--bits", "6", "--", "--model", "m" }, "'x' is not a layer number");
-    refused({ "--layers", "3,7", "--bits", "5", "--", "--model", "m" },
-            "--bits 5 is under the narrowest layout's 5.50");
+    refused({ "--layers", "3,7", "--bits", "4", "--", "--model", "m" },
+            "--bits 4 is under the narrowest layout's 4.50");
     refused({ "--layers", "3,7", "--bits", "5.5", "--layouts", "fp8_v4", "--", "--model", "m" },
             "under the narrowest layout's 6.25");
     refused({ "--layers", "3,7", "--bits", "6", "--layouts", "k4_v2", "--", "--model", "m" },

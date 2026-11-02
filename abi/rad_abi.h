@@ -30,8 +30,11 @@ extern "C" {
  * RadArchProbe kv_recipe_ok.
  *
  * 35: a kv_recipe entry a second meaning, RAD_KVQ_ROTATED beside the layout (rad_builder.h); no
- * struct moved. A plugin built at 34 would read a rotated layer as a layout it does not know. */
-#define RAD_ABI_VERSION 35u
+ * struct moved. A plugin built at 34 would read a rotated layer as a layout it does not know.
+ *
+ * 36: a fourth kv_quant / kv_recipe layout, RAD_KVQ_K4H (k4h_v4: rotated int4 K, int4 V;
+ * rad_builder.h), and its bit in RadArchProbe::kv_quant_ok; no struct moved. */
+#define RAD_ABI_VERSION 36u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

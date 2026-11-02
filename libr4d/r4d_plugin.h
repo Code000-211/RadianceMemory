@@ -411,6 +411,15 @@ int64_t r4d_rad_attn_prefill_h256_gqa6_k6v4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_k6v4(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa6_k6v4(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_k6v4_scratch(const RadArgs*);
+/* The k4h_v4 cache (int4 K and V, stored rotated) on both: prefill and decode, no gated merge. */
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv4_scratch(const RadArgs*);
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);
@@ -857,6 +866,7 @@ int r4d_rad_kv_store        (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8    (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8v4  (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k6v4   (const RadArgs*, RadStream);
+int r4d_rad_kv_store_k4hv4  (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_cols(const RadArgs*, RadStream);
 

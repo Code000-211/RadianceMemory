@@ -499,12 +499,13 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # expert_scale, the QSA block selection, the runtime-LoRA pair, the F32 routing projection's tile
 # forms, GLM's mHC read with its chunk split, the F32-scale E4M3 GEMM's forms, GLM's KDA
 # recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings, GLM's MoE decode
-# fusions, GLM's DSA scoring split by query rows and the Hadamard rotation of a rotated KV layer
-# (had_rotate), whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
+# fusions, GLM's DSA scoring split by query rows, the Hadamard rotation of a rotated KV layer
+# (had_rotate), and the k4h_v4 cache's store (r4d_model_bf16.hip) and Flash-Next's paged attention
+# over it (the gqa12 and four-rank gqa6 units), whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
 # arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit, for the LoRA pair libref
-# itself when the test can load it, for KDA and the rotation libref itself, and for the DSA split
+# itself when the test can load it, for KDA, the rotation and the k4h_v4 cache libref itself, and for the DSA split
 # the unsplit kernels. The other two, the M2XFP4 decode and tiled GEMMs, are checked against an f64 decode of
 # the weight.
 #
@@ -522,11 +523,14 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_fp8_f32scale.hip ${R4D_DIR}/r4d_kda.hip
                 ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip ${R4D_DIR}/r4d_had_rotate.hip
-                ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip)
-# The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
-# this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
+                ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
+                ${R4D_DIR}/r4d_attn_paged_h256_gqa12.hip ${R4D_DIR}/r4d_attn_paged_h256_gqa6_bs4.hip
+                ${R4D_DIR}/r4d_model_bf16.hip)
+# The M2XFP4 units' plugin entries and the paged attention call cfg readers that r4d_rows.cpp
+# defines, which is not in this build: cfg_stub.cpp defines them at their axis defaults, in both
+# arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 had)
+                  dsa m2xfp4 had k4h)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -568,7 +572,7 @@ else()
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_had.cpp
-                ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_k4h.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -585,7 +589,8 @@ else()
         list(APPEND objs ${dir}/${stem}.o)
       endif()
     endforeach()
-    # test_lora and test_kda open libref with dlopen to hold the emulated kernels to it.
+    # test_lora, test_kda, test_had and test_k4h open libref with dlopen to hold the emulated
+    # kernels to it.
     set(dl "")
     foreach(l ${CMAKE_DL_LIBS})
       list(APPEND dl -l${l})
@@ -605,7 +610,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 had)
+  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 had k4h)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -616,12 +621,13 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_had
+                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_had r4d_emu_k4h
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
-  # rounding, and that test needs it. had_rotate is held to libref's bytes, and needs it too.
-  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_had PROPERTIES
+  # rounding, and that test needs it. had_rotate is held to libref's bytes, and needs it too, as
+  # does the k4h_v4 cache's store and attention.
+  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_had r4d_emu_k4h PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.

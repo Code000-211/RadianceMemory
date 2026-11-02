@@ -2436,7 +2436,8 @@ SIMPLE("ref_lora_expand_mm", "lora_expand_mm", "gemm",
 
 ROW("ref_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
-    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales, or the "
+    "k4h_v4 cache (int4 K and V in groups of 32 with f16 scales)",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
 ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
@@ -2454,7 +2455,9 @@ SIMPLE("ref_attn_na3d", "attn_na3d", "attn", "3-D neighborhood attention over a 
 SIMPLE("ref_sam_attn", "sam_attn", "attn",
        "SAM tower attention: windowed tiles with decomposed relative position", DT_FLOAT,
        ref_sam_attn),
-ROW("ref_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
+ROW("ref_kv_store", "kv_store", "attn",
+    "scatter k and v into the paged cache; kv_dtype k4h_v4 quantises each group of 32 to int4 "
+    "with an f16 absmax / 7 scale", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_kv_store, nullptr),
 ROW("ref_kv_store_streamed", "kv_store_streamed", "attn",

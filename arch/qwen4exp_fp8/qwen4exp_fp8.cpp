@@ -135,9 +135,9 @@ struct Model {
     /* The trunk's attention groups by RAD_KVQ_* layout (0 where no layer has it), each layout's
      * `kv_dtype` and pager fragment, and each trunk layer's layout. `kv_full` is the last
      * attention layer's group, which the MTP head shares; without --kv-recipe it is the only one. */
-    rad_kvgroup      kv_q[3] = {};
-    const char*      kv_dt[3] = {};
-    int64_t          kv_page_bytes[3] = {};
+    rad_kvgroup      kv_q[4] = {};
+    const char*      kv_dt[4] = {};
+    int64_t          kv_page_bytes[4] = {};
     std::vector<int> kvq;
     /* Each trunk layer's RAD_KVQ_ROTATED (a `rotated` recipe line): AttnGatedFP8::rotate. */
     std::vector<char> kvrot;
@@ -683,9 +683,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * single `kv_attn` (so a uniform recipe is the flag's program), and mixed layouts name
          * their groups by layout. The MTP head is not a recipe layer; it takes the last attention
          * layer's group. Only the attention cache takes a recipe: the indexer's block keys
-         * (`kv_qsa_bkey`) and its tail keep their own dtype. */
+         * (`kv_qsa_bkey`) and its tail keep their own dtype.
+         *
+         * k4h_v4 (int4 K and V, 18 * head_dim / 16 bytes) is recipe-only and always rotated
+         * (RAD_KVQ_K4H in abi/rad_builder.h): an entry without the rotation, or the layout as
+         * every layer's kv_quant, is refused rather than store unrotated keys in four bits. */
         auto kvq_name = [](int q) -> const char* {
-            return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+            return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4"
+                 : q == RAD_KVQ_K4H ? "k4h_v4" : nullptr;
         };
         const bool f8 = fd.dtype == RAD_F8E4M3;
         std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
@@ -713,6 +718,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                     "this plugin does not know\n", (long long)l, q);
                     return RAD_E_UNSUPPORTED;
                 }
+                if (q == RAD_KVQ_K4H && !(ctx->kv_recipe[l] & RAD_KVQ_ROTATED)) {
+                    fprintf(stderr, "radiance: KV recipe: layer %lld asks for k4h_v4 unrotated; "
+                                    "its four-bit keys hold only rotated\n", (long long)l);
+                    return RAD_E_UNSUPPORTED;
+                }
                 kvq_of[(size_t)l] = q;
                 rot_of[(size_t)l] = (ctx->kv_recipe[l] & RAD_KVQ_ROTATED) != 0;
             }
@@ -724,7 +734,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     return RAD_E_UNSUPPORTED;
                 }
         } else if (f8) {
-            if (ctx->kv_quant != RAD_KVQ_NONE && !kvq_name(ctx->kv_quant)) {
+            if (ctx->kv_quant != RAD_KVQ_NONE &&
+                (!kvq_name(ctx->kv_quant) || ctx->kv_quant == RAD_KVQ_K4H)) {
                 fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n",
                         ctx->kv_quant);
                 return RAD_E_UNSUPPORTED;
@@ -735,7 +746,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * layer that asked for it. A rank's ratio: twelve at one and two ranks, six at four (each
          * KV head replicated across a rank pair). */
         int n_layouts = 0;
-        bool used[3] = {};
+        bool used[4] = {};
         for (int64_t l = 0; l < g.n_layer; ++l) {
             const int q = kvq_of[(size_t)l];
             if (!is_full_attention(l, interval) || used[q]) continue;
@@ -755,10 +766,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 return RAD_E_UNSUPPORTED;
             }
         }
-        for (int q = RAD_KVQ_NONE; q <= RAD_KVQ_K6V4; ++q) {
+        for (int q = RAD_KVQ_NONE; q <= RAD_KVQ_K4H; ++q) {
             if (!used[q] && !(q == RAD_KVQ_NONE && n_layouts == 0)) continue;
             const char* name = kvq_name(q);
-            const int64_t row16 = q == RAD_KVQ_V4 ? 25 : q == RAD_KVQ_K6V4 ? 22 : 32;
+            const int64_t row16 = q == RAD_KVQ_V4    ? 25
+                                : q == RAD_KVQ_K6V4  ? 22
+                                : q == RAD_KVQ_K4H   ? 18 : 32;
             RadKVGroupDecl qd = fd;
             qd.head_dim = g.head_dim * row16 / 32;
             m.kv_q[q] = rad_decl_kv_group(b, n_layouts > 1
@@ -773,7 +786,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (name)
                 rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld "
                             "bytes a token and head instead of %lld", name,
-                         q == RAD_KVQ_V4 ? "E4M3" : "int6", (long long)(g.head_dim * row16 / 16),
+                         q == RAD_KVQ_V4 ? "E4M3" : q == RAD_KVQ_K6V4 ? "int6" : "rotated int4",
+                         (long long)(g.head_dim * row16 / 16),
                          (long long)(2 * g.head_dim));
         }
         /* `kv_full`, `g` and the indexer's config keep the last attention layer's group, which the
@@ -785,6 +799,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.kvq     = std::move(kvq_of);
         m.kvrot   = std::move(rot_of);
         m.kv_full = m.kv_q[last_q];
+        /* A k4h_v4 group holds rotated K and V only, so the MTP head behind such a layer rotates
+         * as the trunk's layers in it do; any other group keeps the head unrotated. */
+        m.mtp.attn.rotate = last_q == RAD_KVQ_K4H;
         /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
          * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
         m.qsacfg.page = ctx->kv_residency != 0 && !g.attn_zero;
@@ -1811,15 +1828,15 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0)
         out->draft_depth = 3;
     out->shape_probe_ok = 1;      /* declare() writes scratch under shape_probe */
-    /* --kv-cache-dtype fp8_v4 / k6_v4: libr4d has their rows for the QSA layers' geometry
-     * (head_dim 256, twelve queries per KV head; gqa6 with 4-token pages at four ranks), so other
-     * geometries are refused at startup rather than in declare. */
+    /* --kv-cache-dtype fp8_v4 / k6_v4, and k4h_v4 (a recipe's, rotated): libr4d has their rows
+     * for the QSA layers' geometry (head_dim 256, twelve queries per KV head; gqa6 with 4-token
+     * pages at four ranks), so other geometries are refused at startup rather than in declare. */
     {
         const long long hd  = meta->head_dim ? meta->head_dim
                                              : (meta->n_head ? meta->n_embd / meta->n_head : 0);
         const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
-            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
+            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H);
     }
     /* --kv-recipe: declare() takes each attention layer's layout from it, among those above,
      * and its rotation (RAD_KVQ_ROTATED, on any of them: AttnGatedFP8::rotate). */

@@ -140,6 +140,11 @@ inline emu_v8f emu_wmma_bf16(emu_v8bf a, emu_v8bf b, emu_v8f c) {
 #define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) emu_wmma_bf16((a), (b), (c))
 typedef _Float16 emu_v8h __attribute__((ext_vector_type(8)));
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
+/* the __fp16 fragments of r4d_dt16.h, the same bits */
+typedef __fp16 emu_v8fp16 __attribute__((ext_vector_type(8)));
+inline emu_v8f emu_wmma_f16(emu_v8fp16 a, emu_v8fp16 b, emu_v8f c) {
+    return emu_wmma_f16(__builtin_bit_cast(emu_v8h, a), __builtin_bit_cast(emu_v8h, b), c);
+}
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) emu_wmma_f16((a), (b), (c))
 /* v_wmma_f32_16x16x16_fp8_fp8 (gfx12, wave32): the bf16 form's layout with eight E4M3 bytes a
  * lane, element e in byte e. Each output is c plus its 16 products in k order: not the hardware's

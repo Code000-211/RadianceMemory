@@ -959,6 +959,30 @@ TEST(a_kv_recipe_line_ending_in_rotated_marks_that_layer_rotated) {
     CHECK(has(refusal("layer 3 rotated fp8\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
 }
 
+/* k4h_v4 (four-bit K and V) is a rotated layout: a `layer N k4h_v4` line marks the layer rotated
+ * as `layer N k4h_v4 rotated` does, so a recipe rad-autoquant writes from the layout table (no
+ * `rotated` word) is the rotated deployment, and an unrotated k4h_v4 layer cannot be asked for.
+ * It is priced at 288 bits a 32 + 32 group, 18/32 of fp8, and --kv-cache-dtype does not take it. */
+TEST(a_k4h_v4_recipe_line_is_rotated_whether_or_not_it_says_so) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 0 k4h_v4\nlayer 1 k4h_v4 rotated\nlayer 2 fp8\n", "r.txt", &r),
+             RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_K4H | rot, RAD_KVQ_K4H | rot, RAD_KVQ_NONE }));
+    CHECK_EQ(kv_recipe_summary(r), std::string("fp8 at layer 2; k4h_v4 rotated at layers 0, 1"));
+    CHECK_EQ(kv_layout_of("k4h_v4"), (int)RAD_KVQ_K4H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_K4H)), std::string("k4h_v4"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4H), 288);
+
+    std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "k4h_v4" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v4'"));
+    std::vector<int32_t> out;
+    err = stderr_of([&] { CHECK_EQ(kv_recipe_parse("layer 0 k4h\n", "r.txt", &out), RAD_E_INVAL); });
+    CHECK(has(err, "'k4h' is not a KV layout; fp8, fp8_v4, k6_v4 or k4h_v4"));
+}
+
 /* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
  * rounded up to the group's page at startup. The mode flag is gone, and a launch line that still
  * passes it is refused by name rather than silently served without streaming. */

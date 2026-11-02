@@ -21,6 +21,17 @@
  *   causal = 0   key j is visible when j <  seqused[s]
  *   window > 0   causal: additionally pos - j < window; non-causal: |pos - j| < window, which is
  *                the two-sided reading libr4d's h128 kernel documents.
+ *
+ * ============================== The k4h_v4 cache ==============================
+ *
+ * `kv_dtype` k4h_v4 (RAD_KVQ_K4H in abi/rad_builder.h) is the one packed layout this reference
+ * stores and reads: a token's row is 18 * head_dim / 16 bytes of an E4M3-declared cache, K's int4
+ * codes, V's int4 codes, then an f16 scale per 32 dims for K and for V. A store quantises each
+ * group of 32 to absmax / 7 (the f32 quotient rounded once to f16, capped at 8188 so seven times
+ * it stays finite) and each element to rint(x / scale) clamped to +-7; the attention reads a code
+ * c as c times its group's scale, in f32, then exactly as it reads an fp8 element. Rotation is not
+ * the cache's business: the layer rotates (had_rotate) before the store and after the attention.
+ * fp8_v4 and k6_v4 have no reference here; their rows are checked on the card (r4d_selftest).
  */
 #include "ref_common.h"
 #include "rad_yarn.h"
@@ -72,6 +83,46 @@ struct KvDyn  {
     float operator()(const void* p, int64_t i) const { return ld_dt(dt, p, i); }
 };
 
+/* ---- k4h_v4 (see the file header) */
+inline bool kv_is_k4h(const RadArgs* a) {
+    const char* s = p_str(a, "kv_dtype", nullptr);
+    return s && std::strcmp(s, "k4h_v4") == 0;
+}
+
+/* Dim d of K (v 0) or V (v 1) in a k4h_v4 row of head_dim hd: the code times its group's scale. */
+inline float k4h_at(const uint8_t* row, int64_t hd, int v, int64_t d) {
+    const int nib = (row[v * hd / 2 + d / 2] >> (4 * (d & 1))) & 0xF;
+    uint16_t s;
+    std::memcpy(&s, row + hd + v * hd / 16 + (d / 32) * 2, 2);
+    return (float)((nib ^ 8) - 8) * f16_to_f32(s);
+}
+
+/* One group of 32 values into 16 bytes of codes and an f16 scale. fmax drops a NaN as libr4d's
+ * reduction does, whatever the order; a group of NaNs takes the cap, and each NaN code the clamp's
+ * -7, the same as the kernel's fminf(fmaxf(NaN, -7), 7). */
+inline void k4h_group(const float* x, uint8_t* codes, uint8_t* scale) {
+    float amax = std::fabs(x[0]);
+    for (int i = 1; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint16_t s16 = f32_to_f16(std::fmin(amax / 7.0f, 8188.0f));
+    const float sc = f16_to_f32(s16);
+    for (int i = 0; i < 32; i += 2) {
+        int q[2];
+        for (int e = 0; e < 2; ++e) {
+            const float r = sc > 0.0f ? std::rint(x[i + e] / sc) : 0.0f;
+            q[e] = (int)std::fmin(std::fmax(r, -7.0f), 7.0f) & 0xF;
+        }
+        codes[i / 2] = (uint8_t)(q[0] | (q[1] << 4));
+    }
+    std::memcpy(scale, &s16, 2);
+}
+
+/* A store's reciprocal descale as libr4d forms it: 1 / k_scale in double, rounded once. */
+inline float inv_scale(const RadArgs* a, const char* k) {
+    const RadParam* p = p_find(a, k);
+    const double v = p && p->kind == RAD_P_F64 ? p->dval : (double)p_f32(a, k, 1.0f);
+    return (float)(1.0 / v);
+}
+
 }  /* namespace */
 
 /* ------------------------------------------------------------------ attn_paged */
@@ -118,7 +169,12 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
     const int64_t q_len = cus ? 0 : rows / n_seq;
     if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
-    if (kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+    /* k4h_v4: a byte row of 18 * head_dim / 16 a token, its groups whole. */
+    const bool k4h = kv_is_k4h(a);
+    if (k4h && (kv->rank != 4 || kv->dtype != RAD_F8E4M3 || head_dim % 32 ||
+                kv->shape[3] != 18 * head_dim / 16 || kv->stride[3] != 1))
+        return RAD_E_SHAPE;
+    if (!k4h && kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
 
     const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
     const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
@@ -148,7 +204,8 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
         float* const sc = ws_get((size_t)std::max<int64_t>(jcap, 1));
         REF_FOR_DYN
         for (int64_t idx = 0; idx < total; ++idx) {
-            auto unit = [&](auto kl) {
+            /* `kat(base, d)` and `vat(base, d)`: dim d of K and V in the token row at `base`. */
+            auto unit = [&](auto kat, auto vat) {
                 const int64_t h   = idx % q_heads;
                 const int64_t tok = idx / q_heads;          /* the dense query row */
                 /* The owning sequence and the row's index within its query. */
@@ -222,16 +279,16 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                     if (kb[0] >= 0 && kb[1] >= 0 && kb[2] >= 0 && kb[3] >= 0) {
                         for (int64_t d = 0; d < head_dim; ++d) {
                             const float qd = qf[d];
-                            dot[0] += qd * (kl(kv->data, kb[0] + d * kvv.sd) * kds);
-                            dot[1] += qd * (kl(kv->data, kb[1] + d * kvv.sd) * kds);
-                            dot[2] += qd * (kl(kv->data, kb[2] + d * kvv.sd) * kds);
-                            dot[3] += qd * (kl(kv->data, kb[3] + d * kvv.sd) * kds);
+                            dot[0] += qd * (kat(kb[0], d) * kds);
+                            dot[1] += qd * (kat(kb[1], d) * kds);
+                            dot[2] += qd * (kat(kb[2], d) * kds);
+                            dot[3] += qd * (kat(kb[3], d) * kds);
                         }
                     } else {
                         for (int u = 0; u < nk; ++u) {
                             if (kb[u] < 0) continue;
                             for (int64_t d = 0; d < head_dim; ++d)
-                                dot[u] += qf[d] * (kl(kv->data, kb[u] + d * kvv.sd) * kds);
+                                dot[u] += qf[d] * (kat(kb[u], d) * kds);
                         }
                     }
                     for (int u = 0; u < nk; ++u) {
@@ -258,18 +315,28 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                     if (kb < 0) continue;
                     const float w = ref_exp(sc[j] - mx);
                     sum += w;
-                    const int64_t vb = kb + head_dim * kvv.sd;
                     for (int64_t d = 0; d < head_dim; ++d)
-                        acc[d] += w * (kl(kv->data, vb + d * kvv.sd) * vds);
+                        acc[d] += w * (vat(kb, d) * vds);
                 }
                 const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
                 for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
             };
-            switch (kv->dtype) {
-                case RAD_F32:    unit(KvFix<RAD_F32>{}); break;
-                case RAD_BF16:   unit(KvFix<RAD_BF16>{}); break;
-                case RAD_F8E4M3: unit(KvFix<RAD_F8E4M3>{}); break;
-                default:         unit(KvDyn{ kv->dtype }); break;
+            const void* const kvd = kv->data;
+            auto plain = [&](auto kl) {
+                unit([&](int64_t b, int64_t d) { return kl(kvd, b + d * kvv.sd); },
+                     [&](int64_t b, int64_t d) { return kl(kvd, b + (head_dim + d) * kvv.sd); });
+            };
+            if (k4h) {
+                const uint8_t* const kb8 = (const uint8_t*)kvd;
+                unit([&](int64_t b, int64_t d) { return k4h_at(kb8 + b, head_dim, 0, d); },
+                     [&](int64_t b, int64_t d) { return k4h_at(kb8 + b, head_dim, 1, d); });
+            } else {
+                switch (kv->dtype) {
+                    case RAD_F32:    plain(KvFix<RAD_F32>{}); break;
+                    case RAD_BF16:   plain(KvFix<RAD_BF16>{}); break;
+                    case RAD_F8E4M3: plain(KvFix<RAD_F8E4M3>{}); break;
+                    default:         plain(KvDyn{ kv->dtype }); break;
+                }
             }
         }
     }
@@ -561,8 +628,15 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     const int64_t block_size = p_int(a, "block_size", 0);
     int64_t kv_heads = p_int(a, "n_head_kv", kv->rank == 4 ? kv->shape[1] : 0);
     if (head_dim <= 0 || block_size <= 0 || kv_heads <= 0) return RAD_E_SHAPE;
+    /* k4h_v4: a byte row of 18 * head_dim / 16 a token (the file header), at the shape the plugin
+     * declares the group, rows dense. */
+    const bool k4h = kv_is_k4h(a);
+    if (k4h && (kv->rank != 4 || kv->dtype != RAD_F8E4M3 || head_dim % 32 ||
+                kv->shape[3] != 18 * head_dim / 16 || kv->stride[3] != 1 ||
+                kv->stride[2] != kv->shape[3]))
+        return RAD_E_SHAPE;
     if (kv->rank == 4 && (kv->shape[1] != kv_heads || kv->shape[2] != block_size ||
-                          kv->shape[3] < 2 * head_dim)) return RAD_E_SHAPE;
+                          (!k4h && kv->shape[3] < 2 * head_dim))) return RAD_E_SHAPE;
 
     const int64_t M = numel(sm);
     if (M <= 0 || numel(k) < M * kv_heads * head_dim) return RAD_E_SHAPE;
@@ -584,6 +658,30 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     for (int64_t t = 0; t < M; ++t) {
         const int64_t slot = ld_int(sm->dtype, sm->data, offlin(sm, t));
         if (slot >= 0 && n_blocks > 0 && slot / block_size >= n_blocks) return RAD_E_SHAPE;
+    }
+
+    if (k4h) {
+        const float kin = inv_scale(a, "k_scale"), vin = inv_scale(a, "v_scale");
+        uint8_t* const c = (uint8_t*)kv->data;
+        REF_PAR_FOR(M * kv_heads * head_dim * 2)
+        for (int64_t t = 0; t < M; ++t) {
+            const int64_t slot = ld_int(sm->dtype, sm->data, offlin(sm, t));
+            if (slot < 0) continue;
+            const int64_t blk = slot / block_size, off = slot % block_size;
+            for (int64_t h = 0; h < kv_heads; ++h) {
+                uint8_t* const row = c + blk * kvv.sb + h * kvv.sh + off * kvv.so;
+                for (int64_t g = 0; g < head_dim; g += 32) {
+                    float kx[32], vx[32];
+                    for (int i = 0; i < 32; ++i) {
+                        kx[i] = ldt(k, t * k_rs + h * k_hs + (g + i) * k_ds) * kin;
+                        vx[i] = ldt(v, t * v_rs + h * v_hs + (g + i) * v_ds) * vin;
+                    }
+                    k4h_group(kx, row + g / 2, row + head_dim + (g / 32) * 2);
+                    k4h_group(vx, row + head_dim / 2 + g / 2, row + head_dim * 17 / 16 + (g / 32) * 2);
+                }
+            }
+        }
+        return RAD_OK;
     }
 
     REF_PAR_FOR(M * kv_heads * head_dim * 2)

@@ -70,6 +70,17 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [3HD/4, 5HD/4)     V's int4 codes
  *     [5HD/4, 21HD/16)   K's scales (absmax / 31)
  *     [21HD/16, 22HD/16) V's scales (absmax / 7)
+ *   RAD_KVQ_K4H (k4h_v4, ABI 36), 18 * HD / 16 bytes, K and V both stored rotated:
+ *     [0, HD/2)          K's int4 codes, as V's codes above
+ *     [HD/2, HD)         V's int4 codes
+ *     [HD, 17HD/16)      K's scales (absmax / 7)
+ *     [17HD/16, 18HD/16) V's scales (absmax / 7)
+ *
+ * k4h_v4 is k6_v4 without K's high-bit words, K's codes and scales read as V's. Four-bit K holds
+ * only where the rotation has spread K's outlier channels, so a k4h_v4 layer is always a rotated
+ * one (RAD_KVQ_ROTATED below): its kv_recipe entry carries the flag, the engine never sets
+ * kv_quant to it, and a plugin refuses an entry without the flag rather than store unrotated keys
+ * in four bits.
  *
  * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
@@ -77,7 +88,8 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
 enum {
     RAD_KVQ_NONE = 0,
     RAD_KVQ_V4   = 1,
-    RAD_KVQ_K6V4 = 2
+    RAD_KVQ_K6V4 = 2,
+    RAD_KVQ_K4H  = 3
 };
 
 /* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):

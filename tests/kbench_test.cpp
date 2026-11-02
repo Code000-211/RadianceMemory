@@ -125,6 +125,13 @@ TEST(the_tolerance_reads_the_attention_and_cache_dtypes) {
              3e-2);
     CHECK_EQ(kb::tolerance_for("rope_table", geom({ { "dtype", "f32" } }), "cos").rel_l2, 1e-5);
     CHECK_EQ(kb::tolerance_for("rope", Geometry{}, "qkv").rel_l2, 2e-3);
+    /* The k4h_v4 store is libref's bytes (kv_store_k4hv4), judged exactly; its attention by the
+     * query's dtype, as over any cache. */
+    CHECK_EQ(kb::tolerance_for("kv_store", geom({ { "kv_dtype", "k4h_v4" } }), "kv_cache").rel_l2,
+             0.0);
+    CHECK_EQ(kb::tolerance_for("attn_paged", geom({ { "q_dtype", "bf16" },
+                                                    { "kv_dtype", "k4h_v4" } }), "out").rel_l2,
+             2e-2);
     /* The Hadamard rotation is libref's bytes on every row, so it is judged exactly. */
     CHECK_EQ(kb::tolerance_for("had_rotate", geom({ { "dtype", "bf16" } }), "x").rel_l2, 0.0);
     CHECK_EQ(kb::tolerance_for("gdn_kkt_solve", Geometry{}, "A").rel_l2, 2e-3);

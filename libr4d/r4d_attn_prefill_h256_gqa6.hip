@@ -74,9 +74,11 @@
 // queries, r4d_selftest --perfpaged) and fp8 24.6 -> 22.7; the gain is largest once the KV no
 // longer fits the 64 MB Infinity Cache.
 #define O_KLATE 4194304
-// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
+// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache, O_V4 | O_K4 the k4h_v4 cache (see
+// r4d_attn_decode_h256_gqa6.hip).
 #define O_V4    33554432
 #define O_K6    67108864
+#define O_K4    1073741824
 // O_PSPLIT: a KV split for launches with too few workgroups to fill the card (r4d_prefill_splits
 // in r4d_attn_prefill_split.h). blockIdx.x is qtile * a.splits + split, and the workgroup walks
 // only its segment of the sequence's tiles, cut as r4d_attn_tps cuts them (the partition the
@@ -147,17 +149,22 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int BTS   = (OPT & O_BTS)   ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // k4h_v4: K's int4 codes where k6_v4 keeps its low nibbles, no high-bit words, K's scales
+    // after V's codes (RAD_KVQ_K4H). It takes k6_v4's staging with V's nibble widening on K.
+    constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
+    constexpr int KQ    = K6 || K4;                        // K int, widened from codes and scales
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : K4 ? HEAD_DIM * 18 / 16
+                        : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
     // fp8_v4 takes none of the three (KLATE, the assume, the scale pack): they gain at 100k but lose
     // 3-7 % at 25k and 50k.
-    constexpr int OLDV4 = V4 && !K6;
+    constexpr int OLDV4 = V4 && !KQ;
     constexpr int KLATE = ((OPT & O_KLATE) && KWIDE && !KVP && !OLDV4) ? 1 : 0;
     constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
     constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
@@ -186,7 +193,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = PV8 ? 8.0f : D::GROW;   // e4m3 max is 448 = 2^8.8
     static_assert(!KWIDE || KPASS == 1, "the wide K fetch is one straight-line pass");
-    static_assert(!K6 || KWIDE, "k6_v4 K is staged sixteen dims a thread");
+    static_assert(!KQ || KWIDE, "k6_v4 and k4h_v4 K are staged sixteen dims a thread");
     static_assert((!QK8 && !PV8) || CTG, "the 8-bit fragment maps are written for CONTIG");
 
     constexpr int KSTR8 = HEAD_DIM + 8, VSTR8 = TILE + 8;
@@ -391,6 +398,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     const uint2 lo = *(const uint2*)(rp + ch * 8);
                     kreg[p] = make_uint4(lo.x, lo.y, *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4),
                                          *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
+                } else if (K4) {
+                    // k4h_v4: the chunk's sixteen codes and its group's scale; no high bits.
+                    const uint8_t* rp = (const uint8_t*)a.kv + o;
+                    const uint2 lo = *(const uint2*)(rp + ch * 8);
+                    kreg[p] = make_uint4(lo.x, lo.y, 0u,
+                                         *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
                 } else if (KWIDE) {
                     kreg[p] = *(const uint4*)((const uint8_t*)a.kv + o + ch * 16);
                 } else {
@@ -429,13 +442,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
                 const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
                 if (KWIDE && key >= TILE) continue;
-                if constexpr (QK8 && K6) {
-                    // k6_v4: widen to f16 as below, then round each value once to e4m3
+                if constexpr (QK8 && KQ) {
+                    // k6_v4, k4h_v4: widen to f16 as below, then round each value once to e4m3
                     const uint4 r = kreg[p];
                     #pragma unroll
                     for (int q = 0; q < 2; ++q) {
                         uint32_t w4[4];
-                        k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
+                        else k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         *(uint2*)(&sK8[key * KSTR8 + ch * KEL + 8 * q]) =
                             make_uint2(pk_fp8x4_h(w4[0], w4[1]), pk_fp8x4_h(w4[2], w4[3]));
                     }
@@ -455,6 +469,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     } else {
                         const uint4 r = kreg[p];
                         if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
                         else fp8x8_to_16x4w<D>(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y), w4);
                     }
                     *(uint2*)(kd + 8 * q)     = make_uint2(w4[0], w4[1]);

@@ -16,6 +16,7 @@
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
 #include "r4d_chain.h"
+#include "r4d_launch.h"  // R4D_DYN_LDS: the merge's dynamic LDS, which tests/r4d_emu supplies
 #include <algorithm>
 #include <type_traits>
 
@@ -53,10 +54,12 @@
 // fragment for fp8, 16 for bf16), costing 2 or 4 x HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold
 // converted fragments and cost occupancy. Results are unchanged.
 #define O_KRAW  16777216
-// O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), and with O_K6 the
-// k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
+// O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), with O_K6 the k6_v4
+// cache (int6 K, int4 V), with O_K4 the k4h_v4 cache (int4 K and V, stored rotated: the kernel
+// reads it as any other); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V4    33554432
 #define O_K6    67108864
+#define O_K4    1073741824
 // The two views of R4DArgs (r4d.h), compiled in only where a row asks for them, since the h256
 // instances sit at the 256-VGPR bound and a runtime pitch and head map spill there:
 //   QLD    q rows at R4DArgs::q_ld (attn_paged_qrow), not dense.
@@ -102,17 +105,22 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // k4h_v4 (r4d_attn_prefill_h256_gqa6.hip): k6_v4's walk, K's codes widened as V's.
+    constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
+    constexpr int KQ    = K6 || K4;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : K4 ? HEAD_DIM * 18 / 16
+                        : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
     static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
-    static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
-                  "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
+    static_assert(!KQ || (!KLDS && (OPT & O_CONTIG) && !KRAW),
+                  "k6_v4 and k4h_v4 K are widened from the paged cache, a lane's eight dims "
+                  "contiguous");
     static_assert(!V4 || (OPT & O_F16), "fp8_v4 widens to f16");
     constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
     constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
@@ -155,7 +163,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // The launch is NTHR threads. Stated (k6_v4), so the V4 rounds wholly below NP4 lose their range
     // test: as exec-masked blocks, each round's loads issued only after the previous round's returned.
     // fp8_v4 keeps the tested rounds: batched there, its 4-row steps ran 6 % slower.
-    if constexpr (K6) __builtin_assume(tid < NTHR);
+    if constexpr (KQ) __builtin_assume(tid < NTHR);
     const int c = lane & 15, h = lane >> 4;
 
     const int sp = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
@@ -268,7 +276,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
     // The pair's two scales stay apart until storeV4 packs them: packed here, the fetch is waited on
     // right after it is issued. fp8_v4 packs here, as the prefill kernel does.
-    constexpr int OLDV4 = V4 && !K6;
+    constexpr int OLDV4 = V4 && !KQ;
     uint32_t v4c[U4][2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
@@ -276,7 +284,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
             const int u = tid + r * NTHR;
             // k6_v4, a partial round (NWARPS 3: the third, warps 0-1): u < NP4 <=> warp < (NP4 - r NTHR)
             // / 32 when NP4 is a multiple of 32, tested on the wave-uniform warp: a scalar branch.
-            if (NP4 % NTHR == 0 || (K6 ? ((r + 1) * NTHR <= NP4
+            if (NP4 % NTHR == 0 || (KQ ? ((r + 1) * NTHR <= NP4
                 || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
                                   : u < NP4)) : u < NP4)) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
@@ -303,7 +311,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
             const int u = tid + r * NTHR;
             // k6_v4, a partial round (NWARPS 3: the third, warps 0-1): u < NP4 <=> warp < (NP4 - r NTHR)
             // / 32 when NP4 is a multiple of 32, tested on the wave-uniform warp: a scalar branch.
-            if (NP4 % NTHR == 0 || (K6 ? ((r + 1) * NTHR <= NP4
+            if (NP4 % NTHR == 0 || (KQ ? ((r + 1) * NTHR <= NP4
                 || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
                                   : u < NP4)) : u < NP4)) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
@@ -494,6 +502,12 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                         k6x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
                                        *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * t), h,
                                        sb | (sb << 16), w4);
+                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
+                    } else if constexpr (K4) {
+                        // k4h_v4: this lane's eight dims from their codes and the group's scale.
+                        uint32_t w4[4];
+                        const uint32_t sb = *(const uint16_t*)(grow + KSOFF + (t >> 1) * 2);
+                        k4x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h), sb | (sb << 16), w4);
                         kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     } else {
                         const uint8_t* kp = grow + 16 * t;
@@ -886,7 +900,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ, int SPAN = 0>
 __device__ __forceinline__
 void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
 {
-    extern __shared__ float sw[];
+    R4D_DYN_LDS(float, sw);
     __shared__ float red[HEAD_DIM];
     const int job = blockIdx.x, d = threadIdx.x;
     const int tok = job / a.q_heads;

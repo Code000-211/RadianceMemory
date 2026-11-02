@@ -446,7 +446,9 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, Rad
 #if R4D_ATTN_H256 && R4D_ATTN_V4
 /* ---- the fp8_v4 cache (a token's row 25 * 256 / 16 = 400 bytes: E4M3 K, int4 V, f16 scales) and
  * the k6_v4 cache (352 bytes: int6 K, int4 V), prefill, decode and decode with the gate and
- * quantiser in the merge. */
+ * quantiser in the merge; the k4h_v4 cache (288 bytes: int4 K and V, stored rotated), prefill and
+ * decode only, since a rotated layer rotates its output back before the gate and so never folds
+ * the gate into the merge (arch/common/rad_block_attn_gated_fp8.h). */
 #define G8_V4_ENTRIES(TAG, ROWB, XOPT)                                                        \
 extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG##_scratch)(const RadArgs* a) { \
     return g8_prefill_scratch(a, ROWB);                                                        \
@@ -467,7 +469,8 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h256_gqa, _##TAG)(const RadArgs* a,   
     const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
     if (rc != RAD_OK) return rc;                                                               \
     return g8_decode_launch<256, 0, (XOPT)>(&r, stream);                                       \
-}                                                                                              \
+}
+#define G8_V4_GQ_ENTRY(TAG, ROWB, XOPT)                                                       \
 extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a,               \
                                                                RadStream stream) {             \
     R4DArgs r;                                                                                 \
@@ -479,6 +482,10 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a,
     return g8_decode_launch<256, 0, (XOPT)>(&r, stream, &gq);                                  \
 }
 G8_V4_ENTRIES(fp8v4, 400, O_V4)
+G8_V4_GQ_ENTRY(fp8v4, 400, O_V4)
 G8_V4_ENTRIES(k6v4, 352, O_V4 | O_K6)
+G8_V4_GQ_ENTRY(k6v4, 352, O_V4 | O_K6)
+G8_V4_ENTRIES(k4hv4, 288, O_V4 | O_K4)
 #undef G8_V4_ENTRIES
+#undef G8_V4_GQ_ENTRY
 #endif

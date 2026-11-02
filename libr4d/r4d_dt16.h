@@ -92,6 +92,24 @@ __device__ __forceinline__ void k6x8_to_f16x4w(uint32_t lo, uint32_t hb, int hal
     }
 }
 
+// Eight K dims of the k4h_v4 cache as four f16 dwords, dims (2i, 2i+1) in dword i, from `lo`, their
+// int4 codes as k6x8_to_f16x4w takes the low nibbles, and the group scale `s2`. The codes are V's
+// (two's complement, ^ 8 is offset binary u), so this is V's widening on K: (1024 + u - 1032) * s,
+// rounded once.
+__device__ __forceinline__ void k4x8_to_f16x4w(uint32_t lo, uint32_t s2, uint32_t* w4) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const uint32_t ev = (lo & 0x0F0F0F0Fu) ^ 0x08080808u;
+    const uint32_t od = ((lo >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+    const h2 s = __builtin_bit_cast(h2, s2);
+    const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
+        const uint32_t x = __builtin_amdgcn_perm(od, ev, sel) | 0x64006400u;
+        w4[b] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(h2, x) - bias) * s);
+    }
+}
+
 template<class D>
 __device__ __forceinline__ void fp8x8_to_16x4w(uint2 raw, uint32_t* w4) {
     #pragma unroll
