@@ -13,6 +13,8 @@
  *                  and carries the 1/sqrt(group) normalisation, as r4d_had_quant_act_i8 does. A
  *                  rotation block may not cross a tensor-parallel shard, so the width must divide
  *                  the per-rank n.
+ *   had_rotate     the rotation width again, and nothing is quantised: the op multiplies by
+ *                  1/sqrt(group) itself, since no scale follows to fold it into.
  *
  * ============================== The rotation ==============================
  *
@@ -345,6 +347,39 @@ int ref_quant_cols_fp8(const RadArgs* a, RadStream) {
             stt(y, rowoff(y, r, n) + c * ys, v);
         }
         stt(s, c * ss, sc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ had_rotate */
+/* The normalised rotation on its own: each `group`-wide block of x (in its logical order, rows of
+ * `n`) becomes H x / sqrt(group), rounded to x's dtype in place. H / sqrt(group) is orthogonal and
+ * symmetric, so it is its own inverse: rotating q and k leaves q.k unchanged, and rotating v then
+ * the attention output gives back the output (an attention output is a weighted sum of v rows),
+ * which is how a layer's KV is stored rotated with its attention kernel unchanged (--kv-recipe
+ * `rotated`, docs/OPS.md). In exact arithmetic; here each pass rounds once to x's dtype, so twice
+ * is x within that rounding.
+ *
+ * The butterflies are fwht's (ref_common.h), the order r4d_fwht.h's wave transform keeps, then one
+ * f32 multiply by had_norm(group) and the store's rounding: libr4d's row is held to these bytes. */
+int ref_had_rotate(const RadArgs* a, RadStream) {
+    if (!have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* x = &a->t[0];
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", 0);
+    if (n <= 0 || g < 2 || !pow2(g) || n % g) return RAD_E_SHAPE;
+    if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (x->dtype != RAD_BF16 && x->dtype != RAD_F16 && x->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t nel = numel(x);
+    if (nel <= 0 || nel % n) return RAD_E_SHAPE;
+    const int64_t blocks = nel / g;
+    const float s = had_norm(g);
+
+    REF_PAR_FOR(nel)
+    for (int64_t b = 0; b < blocks; ++b) {
+        float buf[REF_HAD_MAX];
+        for (int64_t i = 0; i < g; ++i) buf[i] = ldt(x, offlin(x, b * g + i));
+        fwht(buf, g);
+        for (int64_t i = 0; i < g; ++i) stt(x, offlin(x, b * g + i), buf[i] * s);
     }
     return RAD_OK;
 }

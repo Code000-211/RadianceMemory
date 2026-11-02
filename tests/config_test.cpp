@@ -930,6 +930,35 @@ TEST(a_malformed_kv_recipe_is_refused_by_name_and_line) {
     CHECK(has(err, "--kv-recipe " + path + " line 2: layer 7: 'int2' is not a KV layout"));
 }
 
+/* A recipe line may end in `rotated`: that layer's K and V are stored rotated by the normalised
+ * Hadamard (RAD_KVQ_ROTATED beside its layout, on any layout), and the startup summary names the
+ * rotated layers apart. Any other fourth word is refused like any other malformed line. */
+TEST(a_kv_recipe_line_ending_in_rotated_marks_that_layer_rotated) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 3 fp8 rotated\nlayer 7 k6_v4\nlayer 11 k6_v4 rotated # KVarN\n"
+                             "layer 15 fp8_v4\n",
+                             "r.txt", &r),
+             RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    const std::vector<int32_t> want = { -1, -1, -1, RAD_KVQ_NONE | rot, -1, -1, -1, RAD_KVQ_K6V4,
+                                        -1, -1, -1, RAD_KVQ_K6V4 | rot, -1, -1, -1, RAD_KVQ_V4 };
+    CHECK(r == want);
+    CHECK_EQ(kv_recipe_summary(r), std::string("fp8_v4 at layer 15; k6_v4 at layer 7; fp8 rotated "
+                                               "at layer 3; k6_v4 rotated at layer 11"));
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 3 fp8 rotate\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+    CHECK(has(refusal("layer 3 fp8 rotated rotated\n"), "or 'layer N LAYOUT rotated'"));
+    CHECK(has(refusal("layer 3 rotated fp8\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+}
+
 /* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
  * rounded up to the group's page at startup. The mode flag is gone, and a launch line that still
  * passes it is refused by name rather than silently served without streaming. */

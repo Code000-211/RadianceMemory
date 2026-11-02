@@ -1196,8 +1196,10 @@ int Engine::declare() {
                     cfg_.kv_recipe_path.c_str(), plugins_.arch_plugin.c_str());
             return RAD_E_UNSUPPORTED;
         }
+        /* A rotated layer is its layout's rows behind a separate op (had_rotate), so only the
+         * layout asks the plugin for rows. */
         for (size_t l = 0; l < cfg_.kv_recipe.size(); ++l) {
-            const int q = cfg_.kv_recipe[l];
+            const int q = cfg_.kv_recipe[l] < 0 ? -1 : cfg_.kv_recipe[l] & RAD_KVQ_LAYOUT;
             if (q <= RAD_KVQ_NONE || (pb.kv_quant_ok & (1 << q))) continue;
             RAD_ERR("--kv-recipe %s: layer %zu asks for %s, which the '%s' plugin does not serve "
                     "for this model (fp8 does)", cfg_.kv_recipe_path.c_str(), l,

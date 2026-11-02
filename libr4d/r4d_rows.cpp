@@ -1192,6 +1192,11 @@ static const RadOperandSpec oQuantActFp8[] = {
     { "scale", RAD_OPD_OUT, 0 },
 };
 
+/* `had_rotate` rotates in place (libref declared this schema first). */
+static const RadOperandSpec oHadRotate[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+};
+
 /* `givens_rotate` is ParoQuant's activation side for the 16-bit GEMMs. libref declared this
  * schema first (the loader refuses two that differ). The tables are the "givens" encoding's, as
  * weight operands; see libref/ref_quant.cpp for the contract and r4d_givens_rotate.hip. */
@@ -3600,6 +3605,13 @@ static const RadOpSchema kSchemas[] = {
            "residual factor of `group` folded into its scale -- so the consuming GEMM is the "
            "unrotated one, unchanged. Substituting it for quant_act_fp8, or the reverse, produces "
            "a model that runs and is wrong."),
+    SCHEMA("had_rotate", pQuantActFp8, oHadRotate,
+           "x = H x / sqrt(group) in place, for each `group`-wide block of each row of `n` (n a "
+           "multiple of `group`, a power of two): the Walsh-Hadamard butterflies at ascending "
+           "strides, then one f32 multiply by 1/sqrt(group) and x's rounding. H / sqrt(group) is "
+           "its own inverse, so rotating q and k keeps every score and rotating v and then the "
+           "attention output gives back the output, within that rounding. Nothing is quantised "
+           "and nothing is folded elsewhere."),
     SCHEMA("qsa_work", pQsaWork, oQsaWork,
            "the blocks that became complete this step, gathered into the three operands "
            "qsa_block_key takes: `ratio` consecutive rows of `stage` a block, its destination "
@@ -4976,6 +4988,13 @@ static const RadConstraint cQuantActFp8[] = {
  * butterfly, matching no rotated weight block). */
 static const RadConstraint cHadQuantActFp8[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+/* had_rotate: a whole number of groups a row, at the two head widths a rotated KV layer has. */
+static const RadConstraint cHadRotate128[] = {
+    C_DIV("n", 128), C_EQ("group", 128), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cHadRotate256[] = {
+    C_DIV("n", 256), C_EQ("group", 256), C_IN("dtype", "bf16"),
 };
 /* ParoQuant's dense rotation: the same whole-group rule, and `out` one of the two quantisers its
  * epilogue has. */
@@ -8786,6 +8805,25 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cHadQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_had_quant_act_fp8, nullptr, nullptr, nullptr,
   r4d_shape_quant_act_fp8 },
+
+/* The rotation alone (a rotated KV layer's q, k, v and output), byte-identical to libref's: one wave
+ * a group, r4d_fwht_wave in registers, then the normalisation and bf16's rounding. */
+{ "had_rotate_g128_bf16", "had_rotate", "quant",
+  "the normalised 128-wide Hadamard, in place",
+  "n a multiple of 128 and group 128; rows at one pitch",
+  "bf16 inout, the f32 transform rounded once; byte-identical to libref",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHadRotate128), NOTUNE,
+  nullptr, nullptr, r4d_rad_had_rotate, nullptr, nullptr, nullptr,
+  r4d_shape_had_rotate },
+{ "had_rotate_g256_bf16", "had_rotate", "quant",
+  "the normalised 256-wide Hadamard, in place",
+  "n a multiple of 256 and group 256; rows at one pitch",
+  "bf16 inout, the f32 transform rounded once; byte-identical to libref",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHadRotate256), NOTUNE,
+  nullptr, nullptr, r4d_rad_had_rotate, nullptr, nullptr, nullptr,
+  r4d_shape_had_rotate },
 
 { "givens_dense_quant", "givens_dense_quant", "quant",
   "ParoQuant's rotation as a dense 128 x 128 f16 matrix a (part, group) on the matrix cores, then "

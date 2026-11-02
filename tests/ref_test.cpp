@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -980,7 +981,7 @@ TEST(op_vocabulary) {
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
-        "had_quant_act_i8g",
+        "had_quant_act_i8g", "had_rotate",
         "gram_accum",
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
@@ -3174,6 +3175,177 @@ TEST(op_attn_paged_rows_before_the_context) {
     const float w0 = std::exp(-sc), sum = w0 + 1.0f;
     CHECK_NEAR(out.at(6), w0 / sum, 1e-6);
     CHECK_NEAR(out.at(7), 1.0f / sum, 1e-6);
+}
+
+/* ================================================================== the rotation alone */
+namespace {
+
+int had_rotate(T& x, int64_t n, int64_t g) {
+    A a;
+    a.t(x).i("M", numel(&x.t) / n).i("n", n).i("group", g)
+     .s("dtype", x.t.dtype == RAD_F32 ? "f32" : "bf16");
+    return run("had_rotate", a);
+}
+
+}  /* namespace */
+
+/* Worked by hand. Width 4: the butterflies take [1, 2, 3, 4] to [3, -1, 7, -1] at stride 1 and to
+ * [10, -2, -4, 0] at stride 2, and 1/sqrt(4) = 1/2 gives [5, -1, -2, 0]; the same op on that gives
+ * [1, 2, 3, 4] back, exactly, since every step is exact. Width 8 has an odd log2, so its factor is
+ * 1/2 times 1/sqrt(2) rounded to f32, and a one-hot input comes out as that factor in all eight
+ * places. A row of two groups rotates each alone. */
+TEST(had_rotate_is_the_normalised_hadamard_and_its_own_inverse) {
+    T x(RAD_F32, {2, 4}); x.f({1, 2, 3, 4,   0, 0, 2, 0});
+    CHECK_OK(had_rotate(x, 4, 4));
+    const float r1[] = {5, -1, -2, 0,   1, 1, -1, -1};
+    for (int i = 0; i < 8; ++i) CHECK_EQ(x.at(i), r1[i]);
+    CHECK_OK(had_rotate(x, 4, 4));
+    const float r0[] = {1, 2, 3, 4,   0, 0, 2, 0};
+    for (int i = 0; i < 8; ++i) CHECK_EQ(x.at(i), r0[i]);
+
+    T e(RAD_BF16, {1, 8}); e.f({1, 0, 0, 0, 0, 0, 0, 0});
+    CHECK_OK(had_rotate(e, 8, 8));
+    const float s8 = rad_bf16_to_f32(rad_f32_to_bf16(0.5f * 0.70710678118654752f));
+    for (int i = 0; i < 8; ++i) CHECK_EQ(e.at(i), s8);
+
+    T two(RAD_F32, {1, 4}); two.f({1, 3, 1, 3});
+    CHECK_OK(had_rotate(two, 4, 2));   /* n 4 in groups of 2: [4, -2] / sqrt(2), twice */
+    const float r = 0.70710678118654752f;
+    CHECK_EQ(two.at(0), 4 * r); CHECK_EQ(two.at(1), -2 * r);
+    CHECK_EQ(two.at(2), 4 * r); CHECK_EQ(two.at(3), -2 * r);
+}
+
+/* What the op does not define is refused, never rotated at some other width. */
+TEST(had_rotate_refuses_a_width_it_cannot_rotate_whole) {
+    T x(RAD_F32, {1, 12}); x.f({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    CHECK_EQ(had_rotate(x, 12, 3), RAD_E_SHAPE);    /* not a power of two */
+    CHECK_EQ(had_rotate(x, 12, 8), RAD_E_SHAPE);    /* a row is not whole groups */
+    CHECK_EQ(had_rotate(x, 8, 8), RAD_E_SHAPE);     /* the tensor is not whole rows */
+    CHECK_EQ(x.at(0), 1.0f);
+    T i8(RAD_I8, {1, 4});
+    CHECK_EQ(had_rotate(i8, 4, 4), RAD_E_DTYPE);
+    T none(RAD_F32, {0, 4});
+    CHECK_EQ(had_rotate(none, 4, 4), RAD_E_SHAPE);   /* zero rows is not a call */
+}
+
+namespace {
+
+/* One causal prefill of `T` tokens through kv_store and attn_paged, at head_dim 256, four query
+ * heads over two KV heads, one 16-slot block of an unquantised cache of q's dtype. `rotated` runs
+ * q, k and v through had_rotate before the store and the output after the attention, as a rotated
+ * recipe layer does. The output in f32. */
+std::vector<float> attend(uint32_t dt, const std::vector<float>& q, const std::vector<float>& k,
+                          const std::vector<float>& v, int64_t Tn, bool rotated) {
+    const int64_t hd = 256, nh = 4, nkv = 2, bs = 16;
+    const char* dn = dt == RAD_F32 ? "f32" : "bf16";
+    T tq(dt, {Tn, nh, hd}), tk(dt, {Tn, nkv, hd}), tv(dt, {Tn, nkv, hd});
+    tq.f(q); tk.f(k); tv.f(v);
+    if (rotated) {
+        CHECK_OK(had_rotate(tq, hd, hd));
+        CHECK_OK(had_rotate(tk, hd, hd));
+        CHECK_OK(had_rotate(tv, hd, hd));
+    }
+    T sm(RAD_I32, {Tn});
+    std::vector<int64_t> slots;
+    for (int64_t t = 0; t < Tn; ++t) slots.push_back(t);
+    sm.n(slots);
+    T kv(dt, {1, nkv, bs, 2 * hd});
+    A st; st.t(tk).t(tv).t(sm).t(kv)
+             .i("M", Tn).i("head_dim", hd).i("n_head_kv", nkv).i("block_size", bs).s("kv_dtype", dn);
+    CHECK_OK(run("kv_store", st));
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T out(dt, {Tn, nh, hd});
+    A at; at.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", dn).s("kv_dtype", dn);
+    CHECK_OK(run("attn_paged", at));
+    if (rotated) CHECK_OK(had_rotate(out, hd, hd));
+    std::vector<float> o((size_t)(Tn * nh * hd));
+    for (size_t i = 0; i < o.size(); ++i) o[i] = out.at((int64_t)i);
+    return o;
+}
+
+/* The same attention in double from the unrounded inputs, the truth both paths round towards. */
+std::vector<double> attend_f64(const std::vector<float>& q, const std::vector<float>& k,
+                               const std::vector<float>& v, int64_t Tn) {
+    const int64_t hd = 256, nh = 4, nkv = 2;
+    std::vector<double> o((size_t)(Tn * nh * hd), 0.0);
+    for (int64_t t = 0; t < Tn; ++t)
+        for (int64_t h = 0; h < nh; ++h) {
+            const int64_t kh = h / (nh / nkv);
+            std::vector<double> sc((size_t)(t + 1));
+            double mx = -1e300, sum = 0;
+            for (int64_t j = 0; j <= t; ++j) {
+                double d = 0;
+                for (int64_t i = 0; i < hd; ++i)
+                    d += (double)q[(size_t)((t * nh + h) * hd + i)] *
+                         (double)k[(size_t)((j * nkv + kh) * hd + i)];
+                sc[(size_t)j] = d / std::sqrt((double)hd);
+                mx = std::max(mx, sc[(size_t)j]);
+            }
+            for (auto& x : sc) { x = std::exp(x - mx); sum += x; }
+            for (int64_t j = 0; j <= t; ++j)
+                for (int64_t i = 0; i < hd; ++i)
+                    o[(size_t)((t * nh + h) * hd + i)] +=
+                        sc[(size_t)j] / sum * (double)v[(size_t)((j * nkv + kh) * hd + i)];
+        }
+    return o;
+}
+
+double rel_l2(const std::vector<float>& a, const std::vector<double>& b) {
+    double num = 0, den = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        num += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+        den += b[i] * b[i];
+    }
+    return std::sqrt(num / den);
+}
+
+}  /* namespace */
+
+/* The ticket's equivalence, on the reference: rotate q, k and v, store and attend over an
+ * unquantised cache, rotate the output back, and the result is the plain attention's within
+ * rounding. The keys carry an outlier channel (a hundred times the rest), the input rotation is
+ * for. At f32 the two paths agree to a few f32 ulps of the output; at bf16, where each extra pass
+ * rounds every element once more, both stay within bf16's rounding of the exact attention (taken
+ * in double from the same inputs) and of each other. */
+TEST(rotate_attend_rotate_back_equals_plain_attention_within_rounding) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd)),
+                       v((size_t)(Tn * nkv * hd));
+    for (auto& x : q) x = nd(rng);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = nd(rng) * (i % hd == 5 ? 100.0f : 1.0f) * 0.1f;
+    for (auto& x : v) x = nd(rng);
+    /* Rounded to bf16 once, so both dtypes start from the same values. */
+    for (auto* w : { &q, &k, &v })
+        for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+
+    const std::vector<float> p32 = attend(RAD_F32, q, k, v, Tn, false);
+    const std::vector<float> r32 = attend(RAD_F32, q, k, v, Tn, true);
+    std::vector<double> p32d(p32.begin(), p32.end());
+    const double d32 = rel_l2(r32, p32d);
+    std::printf("    f32:  rotated vs plain %.3g, plain vs exact %.3g, rotated vs exact %.3g\n",
+                d32, rel_l2(p32, exact), rel_l2(r32, exact));
+    CHECK(d32 < 1e-5);
+    CHECK(rel_l2(r32, exact) < 1e-5);
+
+    const std::vector<float> p16 = attend(RAD_BF16, q, k, v, Tn, false);
+    const std::vector<float> r16 = attend(RAD_BF16, q, k, v, Tn, true);
+    std::vector<double> p16d(p16.begin(), p16.end());
+    const double d16 = rel_l2(r16, p16d), e_plain = rel_l2(p16, exact), e_rot = rel_l2(r16, exact);
+    std::printf("    bf16: rotated vs plain %.3g, plain vs exact %.3g, rotated vs exact %.3g\n",
+                d16, e_plain, e_rot);
+    /* bf16 keeps 8 significant bits: one rounding is at most 2^-9 relative, about 2e-3. The
+     * rotated path rounds q, k, v and the output once more each, so a few of those. */
+    CHECK(e_plain < 4e-3);
+    CHECK(e_rot < 8e-3);
+    CHECK(d16 < 8e-3);
+    /* And not by accident: the outlier channel moved, so the rotated cache held other numbers. */
+    CHECK(rel_l2(r16, p16d) > 0.0);
 }
 
 TEST(op_attn_dense) {
@@ -9827,6 +9999,7 @@ std::vector<Geo> geometries() {
         G("quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_cols_fp8", "M", 3, a.i("M", R).i("n", 32).s("dtype", "f32")),
         G("had_quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("had_rotate", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("rmsnorm_had_quant_i8", "M", 3, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)

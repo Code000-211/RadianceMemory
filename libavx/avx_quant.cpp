@@ -579,6 +579,38 @@ AVX_KERNEL(had_quant_act_i8g) {
     return had_quant_q8(a, 127.0f);
 }
 
+/* ------------------------------------------------------------------ had_rotate */
+/* The normalised rotation alone, in place (libref/ref_quant.cpp: ref_had_rotate): fwht_row's
+ * butterflies, then one f32 multiply by 1/sqrt(group) and x's rounding. The factor is formed as
+ * libref's had_norm forms it (a power of two, times 1/sqrt(2) rounded to f32 when log2(g) is odd),
+ * not as 1/sqrt((float)g), so the bytes are libref's and libr4d's. */
+AVX_KERNEL(had_rotate) {
+    if (!rad_args_have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* x = &a->t[0];
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", 0);
+    if (n <= 0 || g < 2 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
+    if (g > AVX_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (x->dtype != RAD_BF16 && x->dtype != RAD_F16 && x->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t nel = numel(x), rows = nel / n;
+    if (nel <= 0 || nel % n != 0) return RAD_E_SHAPE;
+    int k = 0;
+    while (((int64_t)1 << k) < g) ++k;
+    const float half = std::ldexp(1.0f, -(k / 2));
+    const float s = (k & 1) ? half * 0.70710678118654752f : half;
+
+    AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)n);
+        /* in_row may hand back x itself (dense f32); rotate a copy, then store it over x. */
+        const float* v = in_row(x, rowoff(x, r, n), n, buf);
+        if (v != buf) std::memcpy(buf, v, (size_t)n * sizeof(float));
+        fwht_row(buf, n, g);
+        scale_row(buf, n, s);
+        out_row(x, rowoff(x, r, n), n, buf);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------- givens_rotate */
 /* ParoQuant's activation side for a 16-bit GEMM: each row is divided by its channel scales and
  * rotated by `stages` rounds of disjoint Givens pairs, once per part, parts side by side in y.

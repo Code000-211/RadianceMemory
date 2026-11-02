@@ -139,6 +139,8 @@ struct Model {
     const char*      kv_dt[3] = {};
     int64_t          kv_page_bytes[3] = {};
     std::vector<int> kvq;
+    /* Each trunk layer's RAD_KVQ_ROTATED (a `rotated` recipe line): AttnGatedFP8::rotate. */
+    std::vector<char> kvrot;
     /* PLE lives on exactly one layer; -1 when the checkpoint has none or this build does not
      * declare that layer. */
     PleLayer    ple;
@@ -687,6 +689,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         };
         const bool f8 = fd.dtype == RAD_F8E4M3;
         std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
+        std::vector<char> rot_of((size_t)g.n_layer, 0);
         if (ctx->kv_recipe) {
             if (!f8) {
                 fprintf(stderr, "radiance: a KV recipe chooses layouts of the fp8 cache, and this "
@@ -694,8 +697,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 return RAD_E_UNSUPPORTED;
             }
             for (int64_t l = 0; l < ctx->n_kv_recipe; ++l) {
-                const int q = ctx->kv_recipe[l];
-                if (q < 0) continue;
+                if (ctx->kv_recipe[l] < 0) continue;
+                /* The layout, and apart from it whether the layer runs rotated, which any layout
+                 * can: the rotation is an op of its own beside the layout's rows. */
+                const int q = ctx->kv_recipe[l] & ~RAD_KVQ_ROTATED;
                 if (l >= g.n_layer || !is_full_attention(l, interval)) {
                     fprintf(stderr, "radiance: KV recipe: layer %lld keeps no attention cache in "
                                     "this model (%lld layers, full attention every %lld from "
@@ -709,6 +714,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     return RAD_E_UNSUPPORTED;
                 }
                 kvq_of[(size_t)l] = q;
+                rot_of[(size_t)l] = (ctx->kv_recipe[l] & RAD_KVQ_ROTATED) != 0;
             }
             for (int64_t l = 0; l < g.n_layer; ++l)
                 if (is_full_attention(l, interval) &&
@@ -777,6 +783,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (is_full_attention(l, interval)) { last_q = kvq_of[(size_t)l]; break; }
         if (n_layouts == 0) last_q = RAD_KVQ_NONE;
         m.kvq     = std::move(kvq_of);
+        m.kvrot   = std::move(rot_of);
         m.kv_full = m.kv_q[last_q];
         /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
          * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
@@ -1205,6 +1212,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * call is idempotent. */
             if (g.attn_zero && kv) RAD_ARCH_TRY(rad_kv_group_zero(b, kv));
             lay.attn.ar_out_take = lay.hc_mix.ar_take();
+            lay.attn.rotate = m.kvrot[(size_t)l] != 0;
             RAD_ARCH_TRY(lay.attn.declare(b, nm, ga, (int)l, kv, m.n_rot, aw, as,
                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));
             /* The indexer, after the attention block so its ops sit where the sparse attention
@@ -1813,7 +1821,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
-    /* --kv-recipe: declare() takes each attention layer's layout from it, among those above. */
+    /* --kv-recipe: declare() takes each attention layer's layout from it, among those above,
+     * and its rotation (RAD_KVQ_ROTATED, on any of them: AttnGatedFP8::rotate). */
     out->kv_recipe_ok = 1;
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;

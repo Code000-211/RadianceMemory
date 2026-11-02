@@ -1107,6 +1107,17 @@ int ref_givens_rotate_shape(const RadParam*, int, int, RadOpdDesc*) {
     return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: a described operand can only be drawn, and an index draw has repeats */
 }
 
+/* had_rotate: x alone, rotated in place, at the activation dtype. A width the reference cannot
+ * rotate (not a power of two, or past REF_HAD_MAX, 4096) is declined rather than described. */
+int ref_had_rotate_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), g = gi(p, n_p, "group", 0);
+    if (M <= 0 || n <= 0 || g < 2 || (g & (g - 1)) || g > 4096 || n % g)
+        return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });
+    return o.finish("had_rotate", operand, out);
+}
+
 /* The same extents as quant_act_fp8: `group` is both rotation width and scale granularity here,
  * unlike the int8 rotated forms, so the rotation changes the values, not the shapes. */
 int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

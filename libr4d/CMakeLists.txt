@@ -161,6 +161,8 @@ set(R4D_UNITS
   "r4d_gemm_iqr|"
   "r4d_iqr_embed|"
   "r4d_quant_act_fp8|"
+  # The normalised Hadamard rotation alone, in place (had_rotate: a rotated layer's q, k, v, output).
+  "r4d_had_rotate|"
   "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
   "r4d_gram_accum_fp8|"

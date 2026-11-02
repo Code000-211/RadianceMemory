@@ -551,6 +551,17 @@ static inline void fwht(float* v, int64_t g) {
 
 static inline bool pow2(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
 
+/* 1/sqrt(g) for a power of two g, the normalisation of `had_rotate`, formed so that every
+ * implementation forms the same float: a power of two, times 1/sqrt(2) rounded to f32 when log2(g)
+ * is odd. Both factors are exact or rounded once, and a product with a power of two is exact, so
+ * there is no libm call whose last bit could differ (libr4d/r4d_had_rotate.hip forms it so too). */
+static inline float had_norm(int64_t g) {
+    int k = 0;
+    while (((int64_t)1 << k) < g) ++k;
+    const float p = std::ldexp(1.0f, -(k / 2));
+    return (k & 1) ? p * 0.70710678118654752f : p;
+}
+
 /* ================================================================== the 8-bit group
  * One group of the block-scaled 8-bit quantisers (constants explained at ref_quant.cpp's
  * quant_act_fp8): `v(i)` for i < n is the group's values and `top` the largest code, 448 for E4M3

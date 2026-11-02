@@ -545,6 +545,7 @@ second of a clip apart and attends in windows of eight seconds:
 | `quant_act_i8` | `M`(range) `n` `group` `dtype` | `x` → `q`, `scale`, `asum`? |
 | `quant_act_i8g` | `M`(range) `n` `group` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_i8` | `M`(range) `n` `group` `dtype` | `x` → `q`, `scale` |
+| `had_rotate` | `M`(range) `n` `group` `dtype` | `x`:inout |
 | `rmsnorm_had_quant_i8` | `M`(range) `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_had_quant_i8` | `M`(range) `n` `group` `dtype` `act`:str/opt `mode`/opt | `a`, `b`? → `q`, `scale` |
 | `dequant` | `M`(range) `n` `group` `dtype` | `q`, `scale` → `y` |
@@ -620,6 +621,20 @@ with `i + h` where `(i & h) == 0`. The `1/sqrt(group)` is folded into the scale 
 to the values; dividing every element by a constant cannot change which int8 code it rounds to. A
 rotation block may not cross a tensor-parallel shard boundary, so the width must divide the
 per-rank `n`.
+
+**`had_rotate`** is the rotation alone, normalised and in place: each `group`-wide block of every
+row of `n` becomes `H x / sqrt(group)` in x's dtype. `n` is a multiple of `group`, a power of two.
+The butterflies are the ones above; then one f32 multiply by `1/sqrt(group)`, formed as a power of
+two times `1/sqrt(2)` rounded to f32 when `log2(group)` is odd (so every implementation multiplies
+by the same float), and x's rounding. `H / sqrt(group)` is orthogonal and symmetric, so it is its
+own inverse: with q and k rotated every score `q.k` is unchanged, and with v rotated the attention
+output is the rotated output, which a second `had_rotate` turns back. A layer marked `rotated` in a
+`--kv-recipe` (GUIDE §4.4) runs it over q, k and v before its cache store and over the attention
+output before its gate, so its cache holds rotated K and V and the attention and store kernels are
+the unrotated ones, unchanged. Nothing is quantised and no factor is left to a consumer, unlike
+every `had_*` quantiser. Exact to the reference's rounding: libr4d's rows (`group` 128 and 256,
+bf16) are byte-identical to libref (`r4d_emu_had`), and a rotated layer over a bf16 or E4M3 cache
+attends to within that rounding of an unrotated one (`ref_test`).
 
 `gated_had_quant_i8` takes the gate and up as two operands (libr4d's form), or one fused `gate_up`
 `[M, 2n]` with the gate first as `a` and `b` absent. `mode` is libr4d's integer spelling of `act`
@@ -1162,6 +1177,9 @@ base belongs to the block manager, not the batch.
 names the group of the layer's layout and the ops on it carry that layout's `kv_dtype`
 (`fp8_e4m3`, `fp8_v4`, `k6_v4`). No op or row changes: a layer reads a cache in one layout, as
 under `--kv-cache-dtype`.
+A `rotated` layer's cache holds K and V rotated by `had_rotate`, issued over q, k and v before
+the store and over the output after the attention; the store and attention ops on it are the
+layout's, unchanged.
 
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first

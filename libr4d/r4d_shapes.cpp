@@ -1844,6 +1844,16 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* had_rotate (r4d_had_rotate.hip): x alone, [M, n] bf16, rotated in place. The rows' groups only. */
+extern "C" int r4d_shape_had_rotate(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 0);
+    if ((g != 128 && g != 256) || n <= 0 || n % g) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = { opd(dt_act(p, n_p, "dtype"), M, n) };
+    R4D_PICK(l);
+}
+
 /* The QSA work list. `M` is the token count and `work` the block bound: two different extents,
  * hence two parameters. */
 extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

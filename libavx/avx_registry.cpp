@@ -216,6 +216,8 @@ static const RadParamSpec pGram[]       = { P_INT("M"), P_INT("n"), P_INT("group
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
 static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
+/* had_rotate rotates in place: a layer rotates its q, k, v and attention output where they lie. */
+static const RadOperandSpec oHadRotate[] = { INOUT("x") };
 static const RadParamSpec pQuantCols[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oQuantCols[] = { OPD("x"), OUT("y"), OUT("scale") };
 /* ParoQuant's rotation, as libref declares it: the tables come from the "givens" encoding
@@ -1057,6 +1059,9 @@ static const RadOpSchema kSchemas[] = {
 { "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
   "ParoQuant's rotation without a quantiser: x / rscale rotated by `stages` rounds of Givens "
   "pairs, `parts` copies side by side, in y's own dtype." },
+{ "had_rotate", ARR(pQuant), ARR(oHadRotate),
+  "x = H x / sqrt(group) in place, for each `group`-wide block of each row of `n` (n a multiple "
+  "of `group`, a power of two); its own inverse. libref's description." },
 { "had_quant_act_i8", ARR(pQuant), ARR(oHadQuant),
   "Walsh-Hadamard rotation at width `group`, then symmetric int8 with ONE scale per row carrying "
   "the 1/sqrt(group)." },
@@ -1699,6 +1704,9 @@ SIMPLE("avx_had_quant_act_i8g", "had_quant_act_i8g", "quant",
        "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
        "float in, i8 out, f32 scale per group; n a multiple of group",
        L(had_quant_act_i8g)),
+SIMPLE("avx_had_rotate", "had_rotate", "quant",
+       "normalised width-`group` Hadamard in place, its own inverse",
+       "bf16, f16 or f32 inout; n a multiple of group, a power of two", L(had_rotate)),
 SIMPLE("avx_givens_rotate", "givens_rotate", "quant",
        "channel scale and Givens rotations per part, in the output's dtype",
        "float in, float out; int32 pairs, f32 angles and channel scales", L(givens_rotate)),

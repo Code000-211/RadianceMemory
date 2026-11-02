@@ -93,7 +93,7 @@ static const Flag g_flags[] = {
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
     { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, a 'layer N\n"
-                                        "LAYOUT' line a layer (docs/GUIDE.md); needs\n"
+                                        "LAYOUT [rotated]' line a layer (docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
@@ -531,7 +531,10 @@ const char* kv_layout_name(int kvq) {
          : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
 }
 
-/* One `layer N LAYOUT` line per attention layer; `#` starts a comment, blank lines are skipped.
+/* One `layer N LAYOUT` line per attention layer, `layer N LAYOUT rotated` for a layer that stores
+ * its K and V rotated (RAD_KVQ_ROTATED: the normalised Hadamard over head_dim, its query rotated
+ * before the attention and the output back after it); `#` starts a comment, blank lines are
+ * skipped.
  * Layer numbers are the checkpoint's (blk.N), so a recipe reads against the model's own config.
  * Strict: a word the format does not have, a layer named twice, or a layout outside the set is a
  * refusal with its line, never a skipped line, since a recipe that loads short is a different
@@ -548,15 +551,17 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         const size_t hash = line.find('#');
         if (hash != std::string::npos) line.resize(hash);
         std::istringstream words(line);
-        std::string kw, num, layout, extra;
+        std::string kw, num, layout, mark, extra;
         if (!(words >> kw)) continue;
         if (kw != "layer") {
             RAD_ERR("%s line %d: '%s' is not a recipe line; each is 'layer N LAYOUT'", name, ln,
                     kw.c_str());
             return RAD_E_INVAL;
         }
-        if (!(words >> num >> layout) || (words >> extra)) {
-            RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words", name, ln);
+        if (!(words >> num >> layout) || ((words >> mark) && mark != "rotated") ||
+            (words >> extra)) {
+            RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words, or 'layer N "
+                    "LAYOUT rotated'", name, ln);
             return RAD_E_INVAL;
         }
         char* end = nullptr;
@@ -578,7 +583,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
             RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
             return RAD_E_INVAL;
         }
-        r[(size_t)l] = q;
+        r[(size_t)l] = q | (mark.empty() ? 0 : RAD_KVQ_ROTATED);
     }
     if (r.empty()) {
         RAD_ERR("%s names no layer; each attention layer needs a 'layer N LAYOUT' line", name);
@@ -590,14 +595,16 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
 
 std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
     std::string s;
-    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
-        std::string layers;
-        for (size_t l = 0; l < recipe.size(); ++l)
-            if (recipe[l] == q) layers += (layers.empty() ? "" : ", ") + std::to_string(l);
-        if (layers.empty()) continue;
-        s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) + " at layer" +
-             (layers.find(',') != std::string::npos ? "s " : " ") + layers;
-    }
+    for (int rot : { 0, (int)RAD_KVQ_ROTATED })
+        for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+            std::string layers;
+            for (size_t l = 0; l < recipe.size(); ++l)
+                if (recipe[l] == (q | rot)) layers += (layers.empty() ? "" : ", ") + std::to_string(l);
+            if (layers.empty()) continue;
+            s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
+                 (rot ? " rotated" : "") + " at layer" +
+                 (layers.find(',') != std::string::npos ? "s " : " ") + layers;
+        }
     return s;
 }
 

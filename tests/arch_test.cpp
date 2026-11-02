@@ -9332,6 +9332,132 @@ TEST(a_kv_recipe_the_model_cannot_serve_is_refused_naming_the_layer) {
     CHECK_EQ(qwen35_fp8::declare(&b, gqa12.meta(), &ok), RAD_OK);
 }
 
+namespace {
+
+/* What a pass does around one layer's cache, in issue order: each had_rotate named by the buffer
+ * it rotates (rot:q, rot:k, rot:v, rot:out), whichever layer issued it (the buffers are every
+ * layer's), and each op that reads or writes `layer`'s cache by its op name. */
+std::vector<std::string> around_layer(const RadBuilder& b, const RadCtx& c, int layer) {
+    std::vector<std::string> seq;
+    auto ends = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_rotate") {
+            const RadOperand& d = i.opd.at(0);
+            const std::string nm = d.handle >= 1 && d.handle <= b.bufs.size()
+                                       ? b.bufs[d.handle - 1].name : std::string("?");
+            seq.push_back(ends(nm, "attn_q") ? "rot:q" : ends(nm, "attn_k") ? "rot:k"
+                        : ends(nm, "attn_v") ? "rot:v" : ends(nm, "attn_out") ? "rot:out"
+                        : "rot:" + nm);
+            continue;
+        }
+        for (const RadOperand& d : i.opd)
+            if (d.kind == RAD_OPK_KV && d.offset == layer) { seq.push_back(o->op); break; }
+    }
+    return seq;
+}
+
+/* Two programs' ops, in order, leaving out the rotation and the folds a rotated layer does not
+ * declare: what remains must be the same ops with the same parameters. */
+std::string ops_but_rotation_diff(const RadBuilder& a, const RadBuilder& b) {
+    auto keep = [](const RecOp& o) {
+        return o.op != "had_rotate" && o.op != "qk_norm_rope_gate_kv_store" &&
+               o.op != "qk_norm_rope_gate_kv_store_streamed" && o.op != "attn_paged_gate_quant";
+    };
+    std::vector<const RecOp*> x, y;
+    for (const auto& o : a.ops) if (keep(o)) x.push_back(&o);
+    for (const auto& o : b.ops) if (keep(o)) y.push_back(&o);
+    if (x.size() != y.size()) return "op count";
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i]->op != y[i]->op || x[i]->p.size() != y[i]->p.size()) return "op " + x[i]->op;
+        for (size_t j = 0; j < x[i]->p.size(); ++j) {
+            const RecParam& p = x[i]->p[j];
+            const RecParam& q = y[i]->p[j];
+            if (p.key != q.key || p.ival != q.ival || p.ihi != q.ihi || p.dval != q.dval ||
+                p.sval != q.sval)
+                return "op " + x[i]->op + ", parameter " + p.key;
+        }
+    }
+    return "";
+}
+
+}  /* namespace */
+
+/* A recipe line ending in `rotated` (RAD_KVQ_ROTATED) runs that layer through had_rotate, and
+ * nothing else changes: in every pass the layer rotates its q, k and v after the prologue and
+ * before its store, and its attention output after the attention, over head_dim (256) at bf16;
+ * the unrotated layer issues no rotation. The cache is the layout's own -- the same groups and
+ * pages as the unrotated recipe -- and every op the two programs share has the same parameters, so
+ * the packed k6_v4 store and attention are the rows they were. Only the folds a rotation would
+ * have to sit inside are left out on the rotated layer (the prologue with the store in it). */
+TEST(a_rotated_kv_recipe_layer_rotates_q_k_v_and_its_output_around_an_unchanged_cache) {
+    MetaKV mk = q35fp8_meta();
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_K6V4 }) {
+        const std::vector<int32_t> plain = q35_recipe(q, q);
+        const std::vector<int32_t> rot = q35_recipe(q | RAD_KVQ_ROTATED, q);
+        const RadBuildCtx pc = with_recipe(spec_ctx(0, 1, 3), plain);
+        const RadBuildCtx rc = with_recipe(spec_ctx(0, 1, 3), rot);
+        RadBuilder a, b;
+        REQUIRE_EQ(qwen35_fp8::declare(&a, mk.meta(), &pc), RAD_OK);
+        REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &rc), RAD_OK);
+        CHECK_EQ(ops_but_rotation_diff(a, b), std::string());
+        REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+        for (size_t i = 0; i < a.kv_groups.size(); ++i) {
+            CHECK_EQ(a.kv_groups[i].name, b.kv_groups[i].name);
+            CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d, sizeof a.kv_groups[i].d));
+        }
+        CHECK(a.binds == b.binds);
+
+        int rot_ops = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "had_rotate") {
+                ++rot_ops;
+                CHECK_EQ(pint(&o, "n"), 256LL);
+                CHECK_EQ(pint(&o, "group"), 256LL);
+                CHECK_EQ(pstr(&o, "dtype"), std::string("bf16"));
+            }
+        CHECK_EQ(rot_ops, 1);
+        for (const auto& o : a.ops) CHECK(o.op != "had_rotate");
+
+        const auto dec = kit(b, { 1, 1 }, {});
+        const auto pre = kit(b, {}, { 6 }, 20);
+        for (const Kit* k : { dec.get(), pre.get() }) {
+            const auto v = run_passes(b, qwen35_fp8::step, { k });
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> want = { "rot:q", "rot:k", "rot:v", "kv_store",
+                                                    "attn_paged", "rot:out" };
+            CHECK(around_layer(b, *v[0], 3) == want);
+            /* Those four are the pass's only rotations: layer 7 and the MTP head issue none. */
+            int rots = 0;
+            for (const auto& i : v[0]->issues) rots += b.op_of(i.op)->op == "had_rotate";
+            CHECK_EQ(rots, 4);
+        }
+    }
+}
+
+/* What `rotated` marks is checked as the layout is: an entry with a bit the ABI does not define is
+ * a layout the plugin does not know, and a rotated layer still needs an attention cache. */
+TEST(a_rotated_kv_recipe_entry_is_refused_where_its_layer_or_layout_would_be) {
+    MetaKV mk = q35fp8_meta();
+    auto refusal = [&](const std::vector<int32_t>& r) {
+        const RadBuildCtx ctx = with_recipe(build_ctx(), r);
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    std::vector<int32_t> gdn = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    gdn[2] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED;
+    CHECK(has(refusal(gdn), "layer 2 keeps no attention cache"));
+    CHECK(has(refusal(q35_recipe(RAD_KVQ_NONE, RAD_KVQ_ROTATED | 0x200)),
+              "layer 7 asks for layout 512"));
+}
+
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob
  * defaults on in this family; without it the weights sum to about 0.4), fp8a8 grouped GEMMs over
  * the expert planes, and the shared expert folded into the gather behind a sigmoid gate. */
@@ -10099,6 +10225,66 @@ TEST(a_mixed_kv_recipe_on_flashnext_declares_each_layers_cache_in_its_own_layout
                     }
                 }
                 if (has_cache) CHECK(on[1] > 0 && on[1] == on[2]);
+            }
+        }
+}
+
+/* Flash-Next with layer 3 rotated over fp8_v4 and layer 7 plain k6_v4, at one, two and four ranks:
+ * a rank with an attention cache rotates layer 3's q, k and v before its store and its output after
+ * its attention, on the dense prefill and on the sparse decode, whose gate is then the separate
+ * gate op and not folded into the attention's merge (the merge would gate the rotated output).
+ * Layer 7 keeps that fold and issues no rotation; an attention-zero rank declares no rotation at
+ * all. The groups, pagers and every shared op's parameters are the unrotated recipe's. */
+TEST(a_rotated_kv_recipe_layer_on_flashnext_rotates_around_its_dense_and_sparse_attention) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> plain(8, -1), rot(8, -1);
+    plain[3] = RAD_KVQ_V4;
+    plain[7] = rot[7] = RAD_KVQ_K6V4;
+    rot[3] = (int)RAD_KVQ_V4 | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx pc = with_recipe(q4_ctx(rank, world), plain);
+            RadBuildCtx rc = with_recipe(q4_ctx(rank, world), rot);
+            pc.kv_residency = rc.kv_residency = 1;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &rc), RAD_OK);
+            CHECK_EQ(ops_but_rotation_diff(a, b), std::string());
+            REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+            for (size_t i = 0; i < a.kv_groups.size(); ++i)
+                CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d,
+                                   sizeof a.kv_groups[i].d));
+            const bool has_cache = !b.kv_groups[0].zero;
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            CHECK_EQ(rot_ops, has_cache ? 1 : 0);
+
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                if (!has_cache) continue;
+                /* The store, the attention launches (one per chunk of rows on the sparse path)
+                 * and the rotations; the pager and the resolve sit around them unchanged. */
+                std::vector<std::string> seq;
+                for (const std::string& e : around_layer(b, *v[0], 3))
+                    if (e.rfind("rot:", 0) == 0 || e == "kv_store" || e.rfind("attn_paged", 0) == 0)
+                        seq.push_back(e);
+                const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "kv_store" };
+                REQUIRE(seq.size() >= head.size() + 2);
+                CHECK(std::vector<std::string>(seq.begin(), seq.begin() + 4) == head);
+                CHECK_EQ(seq.back(), std::string("rot:out"));
+                for (size_t j = 4; j + 1 < seq.size(); ++j) CHECK_EQ(seq[j], std::string("attn_paged"));
+                /* Layer 3's four are the pass's only rotations. */
+                int rots = 0;
+                for (const auto& i : v[0]->issues) rots += b.op_of(i.op)->op == "had_rotate";
+                CHECK_EQ(rots, 4);
+                bool merged7 = false;
+                for (const std::string& e : around_layer(b, *v[0], 7))
+                    merged7 = merged7 || e == "attn_paged_gate_quant";
+                /* The decode kit takes the sparse path, where layer 7 still gates in its merge. */
+                if (k->b.n_seq == 4) CHECK(merged7);
             }
         }
 }

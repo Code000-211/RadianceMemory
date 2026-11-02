@@ -257,6 +257,8 @@ static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[]  = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadParamSpec pQuantCols[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oQuantCols[] = { OPD("x"), OUT("y"), OUT("scale") };
+/* had_rotate rotates in place: a layer rotates its q, k, v and attention output where they lie. */
+static const RadOperandSpec oHadRotate[] = { INOUT("x") };
 /* ParoQuant's rotation, one per part, to f16 for the 16-bit GEMMs. The tables are the "givens"
  * encoding's (abi/rad_encoding.h) and are weight operands, so they are placed with their weight. */
 static const RadParamSpec pGivensRotate[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
@@ -1405,6 +1407,14 @@ static const RadOpSchema kSchemas[] = {
   "dequant(a) is a * a_scale for fp8a8 and `a` itself for bf16, which passes no a_scale. "
   "`h` is [n, n] and INOUT: it is READ and added to, not stored. NOT gemm_nt with a transposed "
   "operand; that op contracts the last axis of both sides and this one contracts the first." },
+/* The rotation alone, normalised and in place: a layer's KV stored rotated (--kv-recipe
+ * `rotated`) with the attention kernels unchanged. */
+{ "had_rotate", ARR(pQuant), ARR(oHadRotate),
+  "x = H x / sqrt(group) in place, for each `group`-wide block of each row of `n` (n a multiple "
+  "of `group`, a power of two): the Walsh-Hadamard butterflies at ascending strides, then one f32 "
+  "multiply by 1/sqrt(group) and x's rounding. H / sqrt(group) is its own inverse, so rotating q "
+  "and k keeps every score and rotating v and then the attention output gives back the output, "
+  "within that rounding. Nothing is quantised and nothing is folded elsewhere." },
 { "had_quant_act_i8", ARR(pQuant), ARR(oHadQuant),
   "A Walsh-Hadamard rotation of width `group` along n, then symmetric int8 with ONE SCALE PER ROW "
   "carrying the 1/sqrt(group) normalisation. Here `group` is the rotation width, not the scale "
@@ -2390,6 +2400,9 @@ SIMPLE("ref_gram_accum", "gram_accum", "quant",
        "fp8_e4m3 plus an f32 scale per group, or bf16 with no scale, in; an f32 [n][n] "
        "accumulator READ and added to",
        ref_gram_accum),
+SIMPLE("ref_had_rotate", "had_rotate", "quant",
+       "normalised width-`group` Hadamard in place, its own inverse",
+       "bf16, f16 or f32 inout; n a multiple of group, a power of two", ref_had_rotate),
 SIMPLE("ref_had_quant_act_i8", "had_quant_act_i8", "quant",
        "Walsh-Hadamard rotation then symmetric int8", "float in, i8 out, f32 scale",
        ref_had_quant_act_i8),

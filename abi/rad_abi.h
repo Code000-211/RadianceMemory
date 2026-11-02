@@ -27,8 +27,11 @@ extern "C" {
  * a third meaning, cold (-2 - slot; rad_kv_cold_entry in rad_runtime.h).
  *
  * 34: a per-layer KV recipe (--kv-recipe): RadBuildCtx gained n_kv_recipe and kv_recipe,
- * RadArchProbe kv_recipe_ok. */
-#define RAD_ABI_VERSION 34u
+ * RadArchProbe kv_recipe_ok.
+ *
+ * 35: a kv_recipe entry a second meaning, RAD_KVQ_ROTATED beside the layout (rad_builder.h); no
+ * struct moved. A plugin built at 34 would read a rotated layer as a layout it does not know. */
+#define RAD_ABI_VERSION 35u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

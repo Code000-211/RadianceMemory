@@ -972,6 +972,17 @@ kv recipe q38.kvrecipe: fp8 at layers 3, 7; k6_v4 at layers 11, 15, ...; the poo
 A recipe that gives every attention layer one layout is that layout's `--kv-cache-dtype`: one
 group under the flag's name, the same program and the same bytes.
 
+**A rotated layer.** A line may end in `rotated` (`layer 11 k6_v4 rotated`): that layer stores its
+K and V rotated by the normalised Hadamard transform over head_dim, rotates its query the same way
+before the attention and the attention output back after it (`had_rotate`, OPS.md). The transform
+is its own inverse, so the layer computes the same attention, to the rounding of the four extra
+passes; what changes is what the cache holds, with an outlier channel spread over the whole head,
+which a narrow integer layout holds better. Any layout may be rotated, the layout's cache and
+kernels are unchanged, and the layer gives up the fused prologue-and-store (and, on Flash-Next's
+sparse decode, the gate folded into the attention), since each would skip a rotation. Startup's
+summary lists rotated layers apart (`k6_v4 rotated at layer 11`). What rotation buys a layout in
+KL has not been measured yet.
+
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities
 rounded to E4M3) or both as fp8 WMMA over an `fp8`, `fp8_v4` or `k6_v4` cache (the int4 V and
@@ -2131,7 +2142,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
-| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, one `layer N LAYOUT` line a layer; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |

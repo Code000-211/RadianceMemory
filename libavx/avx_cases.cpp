@@ -222,6 +222,10 @@ std::vector<Case> build_cases() {
                                     HS("dtype", "bf16") });
         add("had_quant_act_i8",   { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
+        add("had_rotate",         { HI("M", 5), HI("n", 256), HI("group", group),
+                                    HS("dtype", "bf16") });
+        add("had_rotate",         { HI("M", 5), HI("n", 256), HI("group", group),
+                                    HS("dtype", "f32") });
         add("dequant",            { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
         add("gated_had_quant_i8", { HI("M", 5), HI("n", 256), HI("group", group),

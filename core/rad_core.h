@@ -859,7 +859,8 @@ struct Config {
      * k6_v4), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
      * checked at parse, so a malformed file stops the start before the model is opened; the plugin
      * then checks it against the model's layers (RadBuildCtx::kv_recipe). `kv_recipe` is indexed
-     * by layer, a RAD_KVQ_* or -1 where the file names no such layer, and empty without a recipe.
+     * by layer, a RAD_KVQ_* (with RAD_KVQ_ROTATED for a `rotated` line) or -1 where the file names
+     * no such layer, and empty without a recipe.
      * A recipe narrows the fp8 cache, so it needs --kv-cache-dtype fp8. */
     std::string kv_recipe_path;
     std::vector<int32_t> kv_recipe;
@@ -1219,7 +1220,8 @@ struct Config {
  * so `rad-info --model X` and `radiance --model X` agree on what a flag means. */
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
-/* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* or -1.
+/* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
+ * RAD_KVQ_ROTATED where the line ends in `rotated`) or -1.
  * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
  * is then left empty. */
 int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out);
@@ -1227,8 +1229,8 @@ int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int3
  * anything else. */
 int         kv_layout_of(const char* name);
 const char* kv_layout_name(int kvq);
-/* The recipe's layers, layout by layout, for the startup log: "fp8 at layers 3, 7; k6_v4 at
- * 11, 15". */
+/* The recipe's layers, layout by layout, the rotated ones last, for the startup log: "fp8 at
+ * layers 3, 7; k6_v4 at layer 11; k6_v4 rotated at layer 15". */
 std::string kv_recipe_summary(const std::vector<int32_t>& recipe);
 void config_usage(const char* argv0);
 }

@@ -80,6 +80,17 @@ enum {
     RAD_KVQ_K6V4 = 2
 };
 
+/* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):
+ * the layer stores K and V rotated by the normalised Hadamard over head_dim (`had_rotate`,
+ * docs/OPS.md), rotates its query before the attention and the attention output back after it.
+ * The rotation is its own inverse, so the scores and the output are the unrotated ones (to the
+ * rounding of the extra passes), and the layout's store and attention rows read the rotated values
+ * as they read any others. RAD_KVQ_LAYOUT masks the layout out of an entry. */
+enum {
+    RAD_KVQ_LAYOUT  = 0xff,
+    RAD_KVQ_ROTATED = 0x100
+};
+
 /* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
  * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */
 enum {
@@ -309,12 +320,13 @@ typedef struct RadBuildCtx {
 
     /* ---- appended in ABI 34 (a per-layer KV recipe) */
     /* --kv-recipe: the trunk's attention layer l keeps its cache in layout kv_recipe[l], a
-     * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, or -1 where the recipe names no layer l
-     * (l < n_kv_recipe; past it there is no entry either). Null without a recipe, and then
+     * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, with RAD_KVQ_ROTATED set where that layer runs
+     * rotated (from ABI 35), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
+     * there is no entry either). Null without a recipe, and then
      * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
      * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has
      * RadArchProbe::kv_recipe_ok and, for each layout the recipe names, that layout's bit in
-     * kv_quant_ok. The plugin refuses an entry for a layer that keeps no attention cache, and an
+     * kv_quant_ok. A plugin with kv_recipe_ok serves RAD_KVQ_ROTATED on every layout it serves. The plugin refuses an entry for a layer that keeps no attention cache, and an
      * attention layer with none, naming the layer: a recipe written for another model must not
      * load as a near miss. A recipe giving every layer one layout is that layout's
      * --kv-cache-dtype, the same program byte for byte.
