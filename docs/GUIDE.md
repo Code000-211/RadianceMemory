@@ -887,8 +887,8 @@ as shipped, to calibrate or compare against. The bf16 Qwen3.8-Flash-Next (335 Gi
 cards at about 28 s a 32K-token step, so use large prefill steps:
 
 GLM-5.3-Flash lays its routed experts out by what the deployment needs. At four and eight cards each
-expert is split by width across every card, the shape its MXFP4 kernels are tuned for, and every expert
-must then fit in VRAM and the host pool. `--weights-disk-tier` keeps them whole on one card each, so they
+MXFP4 expert is split by width across every card, the shape its kernels are tuned for, and every expert
+must then fit in VRAM and the host pool. A container with any expert in another format stays whole. `--weights-disk-tier` keeps them whole on one card each, so they
 can stay on the drive, at about a third of the prefill speed and two thirds of the decode speed on 4 x
 R9700. Two cards always keep them whole.
 

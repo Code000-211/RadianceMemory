@@ -53,7 +53,8 @@ struct Model {
     /* Routed experts whole on their rank (288/world of them) instead of split by width across
      * every rank. Whole experts can be read from the drive, which two cards need; at four and
      * eight the width split is the shape the MXFP4 kernels are tuned for (prefill runs about three
-     * times faster), so it stays unless --weights-disk-tier asks for the drive. */
+     * times faster), so all-MXFP4 experts take it unless --weights-disk-tier asks for the drive.
+     * Anything else stays whole: a plain bf16 expert cannot be sliced at all. */
     bool whole_experts = false;
     std::vector<Layer> layers;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
@@ -80,6 +81,23 @@ struct Model {
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 static thread_local std::unique_ptr<Model> probe_model;
+
+/* Whether every routed expert is MXFP4, asked before any buffer is sized and of the same experts on
+ * every rank, so all ranks reach the same layout. It reads the container's entries and declares no
+ * name map, so it leaves the graph as it was. One expert in another format settles it: a protected
+ * bf16 expert is served only whole. No answer means no container entry, and what is not known to
+ * be MXFP4 stays whole. */
+static bool experts_are_mxfp4(RadBuilder* b, Names& nm) {
+    for (int l = 3; l < 45; ++l)
+        for (int ge = 0; ge < 288; ++ge)
+            for (const char* fmt : { "blk.%d.ffn_gate_up_exps.%d.weight",
+                                     "blk.%d.ffn_down_exps.%d.weight" }) {
+                RadEncoding e{};
+                if (!weight_enc(b, nm.f(fmt, l, ge), &e) || MoeFP8::format_of(e) != 8)
+                    return false;
+            }
+    return true;
+}
 
 static int64_t cfg(const RadModelMeta* m, const char* key, int64_t fallback) {
     char nested[160];
@@ -504,7 +522,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& nm = m.nm;
     m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
-    m.whole_experts = world == 2 || (world > 2 && ctx->expert_file_tier);
+    m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
+                                                   !experts_are_mxfp4(b, nm)));
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
     RAD_ARCH_TRY(mla_buffers(b, m));

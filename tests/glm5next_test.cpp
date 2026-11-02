@@ -1833,6 +1833,66 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     }
 }
 
+/* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
+ * and up, because a plain bf16 expert, even one protected among MXFP4 ones, cannot be sliced. */
+TEST(glm53_lays_out_its_experts_by_their_format) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    const auto bf = rad_enc_plain(RAD_BF16);
+    const auto declare = [&](const RadEncoding& first, const RadEncoding& rest, bool tier,
+                             int world, uint64_t* graph) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                   { "mtp.blk.45.ffn_down_exps", fp8 },
+                   { "blk.3.ffn_gate_up_exps.0.", first },
+                   { "blk.3.ffn_down_exps.0.", first },
+                   { "blk.3.ffn_gate_up_exps.1.", first },
+                   { "blk.3.ffn_down_exps.1.", first },
+                   { "ffn_gate_up_exps", rest },
+                   { "ffn_down_exps", rest },
+                   { "ffn_gate_up_shexp", rest },
+                   { "ffn_down_shexp", rest },
+                   { "ffn_gate_up.weight", fp8 },
+                   { "ffn_down.weight", fp8 } };
+        RadBuildCtx ctx = spec_ctx(0, world, 3);
+        ctx.max_tok = 4096;
+        ctx.max_seqs = 8;
+        ctx.max_ctx = 200000;
+        ctx.expert_file_tier = tier;
+        const int rc = glm5next::declare(&b, &meta, &ctx);
+        if (rc == RAD_OK) *graph = graph_hash(b);
+        return rc;
+    };
+    for (const int world : { 4, 8 }) {
+        uint64_t whole = 0, g = 0;
+        REQUIRE_EQ(declare(bf, bf, true, world, &whole), RAD_OK);
+        REQUIRE_EQ(declare(bf, bf, false, world, &g), RAD_OK);  /* was refused: slices every expert */
+        CHECK_EQ(g, whole);
+        REQUIRE_EQ(declare(fp8, fp8, true, world, &whole), RAD_OK);
+        REQUIRE_EQ(declare(fp8, fp8, false, world, &g), RAD_OK);
+        CHECK_EQ(g, whole);
+        REQUIRE_EQ(declare(mx, mx, true, world, &whole), RAD_OK);
+        uint64_t width = 0;
+        REQUIRE_EQ(declare(mx, mx, false, world, &width), RAD_OK);
+        CHECK(width != whole);
+        REQUIRE_EQ(declare(bf, mx, true, world, &whole), RAD_OK);
+        REQUIRE_EQ(declare(bf, mx, false, world, &g), RAD_OK);  /* a protected pair */
+        CHECK_EQ(g, whole);
+    }
+}
+
 /* ==================================================================== GLM-5.3's vision tower */
 namespace {
 
