@@ -70,7 +70,47 @@ typedef struct RadKVGroupBatch {
     int64_t     max_blocks;
     /* Null unless this group streams (RadKVStream). Trailing and zero-defaulted. */
     const RadKVStream* stream;
+    /* ---- window residency (ABI 33): what the pager (`qsa_page`) reads. All zero/null for a group that
+     * declares no residency window or whose store is closed, and then the group's table holds no
+     * cold entry and no pager op is issued.
+     *
+     * A paged `block_table` entry is one of three things (see rad_kv_cold_entry below):
+     *    >= 0       a pool block id: the block's bytes are in the pool
+     *    -1         empty: no block at that position
+     *    -2 - slot  cold: the block's bytes are in the residency store's slot `slot`
+     * Only a group declaring a residency window ever holds a cold entry. An op that dereferences
+     * the table as a pool block id (the attention, `qsa_score`'s liveness test on a dense table)
+     * must never see one: dense steps promote first, and the pager rewrites a selection before the
+     * attention reads it. */
+    /* The store's base as the card addresses it (host-mapped memory); null when the store is
+     * closed. Slot `s` starts at residency_store + s * residency_slot_bytes. */
+    void*          residency_store;
+    int64_t        residency_slot_bytes;
+    /* Host array indexed by model layer (the layer passed to rad_bind_layer_kv): the byte offset,
+     * from the start of a slot, of that layer's fragment of this group's block. Host memory: a
+     * plugin adds it to residency_store when it issues a layer's pager, and no kernel reads it. Fragments are one
+     * block of that layer's pool, so the fragment's size is the layer pool's block stride. Null
+     * when the store is closed. */
+    const int64_t* residency_layer_off;
+    /* Scratch pages, device: [n_rows, residency_scratch_pitch] pool block ids, one row per decode
+     * row of the step (n_seq_decode x (1 + n_spec)), each (topk + 1) pages. They are ordinary pool
+     * blocks the engine owns; a row's pages are valid for the step that wrote them only. */
+    const int32_t* residency_scratch;
+    int64_t        residency_scratch_pitch;
+    /* One int64 on the card (null: not counted). `qsa_page` adds the cold entries it rewrote, one
+     * per entry per layer launch, so it measures how much the window paged and not how often the
+     * step ran. The engine zeroes it once and reads it back when /stats asks; no step waits on it. */
+    int64_t*       residency_paged;
+    /* Slots in the residency store, so the pager can bound a cold entry's slot and see the store
+     * as the plane it is ([slots, residency_slot_bytes]); 0 when the store is closed. */
+    int64_t        residency_slots;
 } RadKVGroupBatch;
+
+/* The cold block-table entry: the block's bytes are in residency-store slot `slot` (>= 0). Its own
+ * inverse; a pool id (>= 0) and empty (-1) are not cold. */
+static inline int32_t rad_kv_cold_entry(int32_t slot)  { return -2 - slot; }
+static inline int     rad_kv_entry_cold(int32_t entry) { return entry <= -2; }
+static inline int32_t rad_kv_entry_slot(int32_t entry) { return -2 - entry; }
 
 typedef struct RadBatch {
     int      phase;              /* RAD_PHASE_* -- the run phase uses it to index bucket tables */

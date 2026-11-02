@@ -25,7 +25,9 @@
 #include "avx_common.h"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
+#include <vector>
 #include <type_traits>
 
 using namespace avx;
@@ -560,7 +562,7 @@ AVX_KERNEL(qsa_select) {
  * slot is -1, or that no sequence holds, writes nothing). At most `ring` rows a sequence write, so
  * the copy is serial. */
 AVX_KERNEL(qsa_tail_store) {
-    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *po = &a->t[1], *cu = &a->t[2], *st = &a->t[3];
     const RadTensor *sx = &a->t[4];
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
@@ -593,6 +595,64 @@ AVX_KERNEL(qsa_tail_store) {
         widen(k, t * k->stride[0], k->stride[1], n, buf);
         narrow(st, si * st->stride[0] + row * st->stride[2], st->stride[3], n, buf);
     }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_page */
+/* libref's ref_qsa_page (the statement of the contract is there): a cold entry (<= -2) of `sel`
+ * becomes its scratch page after block_bytes at the start of its store slot (this layer's view) are copied into that
+ * pool block. All refusals come before any write. A byte copy, so no vector code; the copies are
+ * independent (scratch pages are pairwise distinct) and are split across threads. */
+AVX_KERNEL(qsa_page) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *sel = &a->t[0], *st = &a->t[1], *pl = &a->t[2], *sc = &a->t[3];
+    const int64_t topk = p_int(a, "topk", 0), bb = p_int(a, "block_bytes", 0);
+    if (topk <= 0 || bb <= 0) return RAD_E_SHAPE;
+    /* `pool` is the layer's cache in its own shape -- [blocks, ...] of the group's dtype, as the
+     * core binds a KV operand -- and the pager moves bytes: a block is its leading stride's
+     * worth of elements, contiguous. `store` is [slots, slot_bytes] of bytes. */
+    if (sel->rank != 2 || sc->rank != 2 || st->rank != 2 || pl->rank < 2) return RAD_E_SHAPE;
+    const int64_t ebits = rad_dtype_bits(pl->dtype);
+    if (st->dtype != RAD_U8 || ebits <= 0 || ebits % 8) return RAD_E_DTYPE;
+    if (st->stride[1] != 1 || pl->stride[pl->rank - 1] != 1) return RAD_E_STRIDE;
+    /* A block's elements past the leading dimension are packed, so its bytes from its start are
+     * contiguous for `inner` elements; the pitch between blocks may be anything. */
+    int64_t inner = 1;
+    for (uint32_t d = pl->rank - 1; d >= 1; --d) {
+        if (pl->stride[d] != inner) return RAD_E_STRIDE;
+        inner *= pl->shape[d];
+    }
+    const int64_t pitch = pl->stride[0] * (ebits / 8);           /* bytes a block */
+    const int64_t M = sel->shape[0], w = topk + 1;
+    if (M <= 0 || sel->shape[1] < w || sc->shape[0] < M || sc->shape[1] < w) return RAD_E_SHAPE;
+    /* `store` is this layer's view of the store (the plugin folds the layer's offset in): row s
+     * is slot s, its first block_bytes are this layer's fragment. */
+    if (inner * (ebits / 8) < bb || pitch < bb || st->shape[1] < bb) return RAD_E_SHAPE;
+    const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
+    /* The cold positions as (sel offset, slot, page), validated before any write. */
+    int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
+    if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
+    std::vector<int64_t> cold;
+    std::vector<bool> used((size_t)blocks);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t j = 0; j < w; ++j) {
+            const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
+            if (e > -2) continue;
+            const int64_t slot = -2 - e, pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
+            if (slot >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
+            used[(size_t)pg] = true;
+            cold.push_back(so); cold.push_back(slot); cold.push_back(pg);
+        }
+    const int64_t n = (int64_t)cold.size() / 3;
+    const uint8_t* sb = (const uint8_t*)st->data;
+    uint8_t* pb = (uint8_t*)pl->data;
+    AVX_PARALLEL_FOR_IF(n * bb >= AVX_PAR_MIN && n > 1)
+    for (int64_t i = 0; i < n; ++i) {
+        std::memcpy(pb + cold[3 * i + 2] * pitch, sb + cold[3 * i + 1] * slot_b,
+                    (size_t)bb);
+        st_int_dt(sel->dtype, sel->data, cold[3 * i], cold[3 * i + 2]);
+    }
+    if (paged) *paged += n;   /* the optional counter operand (libref's ref_qsa_page) */
     return RAD_OK;
 }
 

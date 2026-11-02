@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 
 using namespace ref;
@@ -999,7 +1000,7 @@ TEST(op_vocabulary) {
         "rmsnorm_rows", "rope_rows", "gemm_nt_q_short", "gemm_nt_q_gated_wide",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
-        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
+        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "qsa_page", "dflash_conv",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -8915,6 +8916,145 @@ TEST(qsa_work_gathers_completing_blocks_from_the_tail_and_the_batch) {
     for (int c = 0; c < 3; ++c) CHECK_EQ(bp3.iat(1 * 3 + c), 1000LL * (c + 1) + 1);
 }
 
+namespace {
+/* A pager fixture: a store of `slots` slots of two layers' fragments (`bb` bytes each; byte value
+ * 1 + slot * 16 + layer * 8 + i, so a copy from the wrong slot or layer is visible) and a pool of
+ * `blocks` blocks of `bb` bytes, every byte 0xEE. */
+struct Page {
+    static constexpr int64_t bb = 8, slots = 5, blocks = 12;
+    T sel, store, pool, scratch;
+    int64_t M, topk;
+    Page(const std::vector<int64_t>& s, const std::vector<int64_t>& sc, int64_t topk_, int64_t layer)
+        : sel(RAD_I32, {(int64_t)s.size() / (topk_ + 1), topk_ + 1}),
+          store(RAD_U8, {slots, 2 * bb}), pool(RAD_U8, {blocks, bb}),
+          scratch(RAD_I32, {(int64_t)s.size() / (topk_ + 1), topk_ + 1}),
+          M((int64_t)s.size() / (topk_ + 1)), topk(topk_) {
+        sel.n(s); scratch.n(sc);
+        for (int64_t i = 0; i < slots * 2 * bb; ++i) store.mem[(size_t)i] = (uint8_t)(1 + i / (2 * bb) * 16 + i % (2 * bb) / bb * 8 + i % bb);
+        std::fill(pool.mem.begin(), pool.mem.end(), (uint8_t)0xEE);
+        /* The operand is this layer's view, as the plugin passes it: the layer's offset folded
+         * into the base, each row still a whole slot apart. */
+        store.t.data = store.mem.data() + layer * bb;
+        store.t.shape[1] = bb;
+    }
+    int go(T* paged = nullptr) {
+        A a; a.t(sel).t(store).t(pool).t(scratch);
+        if (paged) a.t(*paged);
+        a.i("M", M).i("topk", topk).i("blocks", 6).i("seqs", 1).i("block_bytes", bb);
+        return run("qsa_page", a);
+    }
+    /* The bytes of pool block `b` equal layer `layer`'s fragment of store slot `slot`. */
+    bool holds(int64_t b, int64_t slot, int64_t layer) const {
+        return std::memcmp(pool.mem.data() + b * bb, store.mem.data() + slot * 2 * bb + layer * bb, (size_t)bb) == 0;
+    }
+    bool untouched(int64_t b) const {
+        for (int64_t i = 0; i < bb; ++i) if (pool.mem[(size_t)(b * bb + i)] != 0xEE) return false;
+        return true;
+    }
+};
+}  /* namespace */
+
+/* qsa_page with no cold entry changes nothing: resident ids and -1 pass through, the pool is not
+ * written, and the scratch plane is not even read for them (it holds garbage ids). */
+TEST(qsa_page_leaves_a_selection_without_cold_entries_alone) {
+    Page p({ 3, 7, -1, 0, 11, -1 }, { 99, -5, 0, 1, 2, 3 }, 2, 0);
+    CHECK_OK(p.go());
+    const std::vector<int64_t> want = { 3, 7, -1, 0, 11, -1 };
+    for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(p.sel.iat((int64_t)i), want[i]);
+    for (int64_t b = 0; b < Page::blocks; ++b) CHECK(p.untouched(b));
+}
+
+/* All cold: every entry becomes its scratch page, which holds the store slot's bytes for the
+ * layer asked, not the other layer's and not another slot's. */
+TEST(qsa_page_copies_the_layers_fragment_of_every_cold_entry) {
+    for (int64_t layer = 0; layer < 2; ++layer) {
+        Page p({ rad_kv_cold_entry(4), rad_kv_cold_entry(0), rad_kv_cold_entry(2) }, { 6, 7, 8 }, 2, layer);
+        CHECK_OK(p.go());
+        CHECK_EQ(p.sel.iat(0), 6LL); CHECK_EQ(p.sel.iat(1), 7LL); CHECK_EQ(p.sel.iat(2), 8LL);
+        CHECK(p.holds(6, 4, layer)); CHECK(p.holds(7, 0, layer)); CHECK(p.holds(8, 2, layer));
+        CHECK(!p.holds(6, 4, 1 - layer));
+        CHECK(p.untouched(5)); CHECK(p.untouched(9));
+    }
+}
+
+/* Mixed, over several rows and with a cold tail entry (the partial page is the last column): a
+ * cold entry is rewritten, a resident one and a -1 are kept, and the scratch page of a position
+ * that stays resident is not written even though the plane names one. */
+/* The core binds a KV operand in its layer's own shape -- [blocks, kv_heads, block_size, 2 *
+ * head_dim] of the group's dtype -- not as a byte plane, and the pager moves bytes whatever that
+ * shape is: a block is its leading stride, contiguous. The same cold entries copy the same bytes
+ * into a bf16 rank-4 view of the pool as into the byte plane, and a pool whose block has a gap
+ * inside it is refused (a gap between blocks is only a pitch, and fine). */
+TEST(qsa_page_moves_bytes_whatever_the_pools_shape_and_dtype) {
+    Page p({ rad_kv_cold_entry(4), rad_kv_cold_entry(0), rad_kv_cold_entry(2) }, { 6, 7, 8 }, 2, 1);
+    /* 8 bytes a block = 4 bf16 elements as 1 kv head x 2 tokens x 2 values, packed. */
+    p.pool.t.dtype = RAD_BF16;
+    p.pool.t.rank = 4;
+    p.pool.t.shape[0] = Page::blocks; p.pool.t.shape[1] = 1; p.pool.t.shape[2] = 2; p.pool.t.shape[3] = 2;
+    p.pool.t.stride[0] = 4; p.pool.t.stride[1] = 4; p.pool.t.stride[2] = 2; p.pool.t.stride[3] = 1;
+    CHECK_OK(p.go());
+    CHECK_EQ(p.sel.iat(0), 6LL); CHECK_EQ(p.sel.iat(1), 7LL); CHECK_EQ(p.sel.iat(2), 8LL);
+    CHECK(p.holds(6, 4, 1)); CHECK(p.holds(7, 0, 1)); CHECK(p.holds(8, 2, 1));
+    CHECK(p.untouched(5)); CHECK(p.untouched(9));
+
+    Page q({ rad_kv_cold_entry(1), -1 }, { 3, 4 }, 1, 0);
+    q.pool.t.dtype = RAD_BF16;
+    q.pool.t.rank = 3;
+    q.pool.t.shape[0] = Page::blocks / 2; q.pool.t.shape[1] = 2; q.pool.t.shape[2] = 2;
+    q.pool.t.stride[0] = 8; q.pool.t.stride[1] = 4; q.pool.t.stride[2] = 1;  /* a gap inside a block */
+    CHECK_EQ(q.go(), (int)RAD_E_STRIDE);
+    CHECK(q.untouched(3));
+}
+
+TEST(qsa_page_rewrites_only_the_cold_entries_of_each_row_including_the_tail) {
+    Page p({ 3, rad_kv_cold_entry(1), rad_kv_cold_entry(3),      /* row 0: resident, cold, cold tail */
+             rad_kv_cold_entry(2), -1, 9,                         /* row 1: cold, empty, resident */
+             -1, -1, -1,                                          /* row 2: nothing selected */
+             5, 6, rad_kv_cold_entry(0) },                        /* row 3: cold tail only */
+           { 0, 1, 2,  3, 4, 5,  6, 7, 8,  9, 10, 11 }, 2, 1);
+    CHECK_OK(p.go());
+    const std::vector<int64_t> want = { 3, 1, 2,  3, -1, 9,  -1, -1, -1,  5, 6, 11 };
+    for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(p.sel.iat((int64_t)i), want[i]);
+    CHECK(p.holds(1, 1, 1)); CHECK(p.holds(2, 3, 1)); CHECK(p.holds(3, 2, 1)); CHECK(p.holds(11, 0, 1));
+    for (int64_t b : { 0, 4, 5, 6, 7, 8, 9, 10 }) CHECK(p.untouched(b));
+}
+
+/* A bad cold entry is refused before any byte moves: a slot past the store, a scratch page past the
+ * pool, and two cold positions that would write one page. */
+TEST(qsa_page_refuses_a_cold_entry_it_cannot_serve_before_writing) {
+    Page a({ rad_kv_cold_entry(0), rad_kv_cold_entry(Page::slots) }, { 1, 2 }, 1, 0);
+    CHECK_EQ(a.go(), (int)RAD_E_INVAL);
+    CHECK(a.untouched(1)); CHECK_EQ(a.sel.iat(0), (int64_t)rad_kv_cold_entry(0));
+    Page b({ rad_kv_cold_entry(0), rad_kv_cold_entry(1) }, { 1, Page::blocks }, 1, 0);
+    CHECK_EQ(b.go(), (int)RAD_E_INVAL);
+    CHECK(b.untouched(1));
+    Page c({ rad_kv_cold_entry(0), rad_kv_cold_entry(1) }, { 4, 4 }, 1, 0);
+    CHECK_EQ(c.go(), (int)RAD_E_INVAL);
+    CHECK(c.untouched(4));
+}
+
+/* The optional counter operand: the pager adds the cold entries it rewrote (not the width of the
+ * selection) to what it already holds, launch after launch, so a caller reads how much a run paged
+ * with one copy at the end. A refused launch adds nothing, and a selection with no cold entry adds
+ * nothing. */
+TEST(qsa_page_adds_the_cold_entries_it_rewrote_to_its_counter) {
+    T paged(RAD_I64, {1});
+    paged.n({ 40 });
+    Page a({ 3, rad_kv_cold_entry(1), rad_kv_cold_entry(3),  rad_kv_cold_entry(2), -1, 9 },
+           { 0, 1, 2,  3, 4, 5 }, 2, 0);
+    CHECK_OK(a.go(&paged));
+    CHECK_EQ(paged.iat(0), 43LL);
+    Page none({ 3, 7, -1 }, { 0, 1, 2 }, 2, 0);
+    CHECK_OK(none.go(&paged));
+    CHECK_EQ(paged.iat(0), 43LL);
+    Page bad({ rad_kv_cold_entry(0), rad_kv_cold_entry(Page::slots) }, { 1, 2 }, 1, 0);
+    CHECK_EQ(bad.go(&paged), (int)RAD_E_INVAL);
+    CHECK_EQ(paged.iat(0), 43LL);
+    Page again({ rad_kv_cold_entry(4), 2 }, { 5, 6 }, 1, 0);
+    CHECK_OK(again.go(&paged));
+    CHECK_EQ(paged.iat(0), 44LL);
+}
+
 /* dflash_conv: tap 0 always, tap 1 only past a block's first row; each tap's coefficient is base
  * plus its group's delta, read from the first taps * NG columns of a twice-as-wide row. */
 TEST(dflash_conv_resets_its_taps_at_each_block) {
@@ -9757,6 +9897,8 @@ std::vector<Geo> geometries() {
                                     .s("dtype", "bf16")),
         G("qsa_work", "M", 6, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                               .i("work", 8).s("dtype", "bf16")),
+        G("qsa_page", "M", 4, a.i("M", R).i("topk", 3).i("blocks", 6).i("seqs", 2)
+                              .i("block_bytes", 16)),
         G("dflash_conv", "T", 6, a.i("T", R).i("hidden_size", 32).i("taps", 2).i("group_size", 16)
                                  .i("NG", 2).i("block_size", 4).s("dtype", "bf16")),
         G("scale_rows", "M", 3, a.i("M", R).i("n", 8).s("act", "sigmoid").s("dtype", "f32")),

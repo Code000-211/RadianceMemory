@@ -119,6 +119,10 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         e["snapshots"]   = s.snapshots;
         e["snap_bytes"]  = s.snap_bytes;
         e["resume_tokens"] = s.resume_tokens;
+        /* Overlapping across sessions that share blocks; see SessionStat. */
+        e["kv_residency"] = { { "demoted", s.res_demoted }, { "promoted", s.res_promoted },
+                              { "skipped", s.res_skipped }, { "link_bytes", s.res_link_bytes },
+                              { "freed_bytes", s.res_freed_bytes } };
         a.push_back(std::move(e));
         dev += s.on_device; host += s.on_host;
         snaps += s.snapshots;
@@ -313,6 +317,23 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         /* Leading indicator beside the lagging hit rate: past ~75% kv utilisation the cache
          * starts dropping prefixes the next turn wants. */
         o["prefix_evictions"] = (double)m.prefix_evictions;
+        /* Window residency (spec §7.3). `demoted`/`promoted` count blocks moved between VRAM and
+         * the pinned store, `skipped` blocks a sweep left because they were shared or the store was
+         * full, and `misses` promotions a step needed because its selection named a cold block. All
+         * zero while --kv-residency-mib is 0 or no group declares a window. */
+        o["kv_residency"] = json::object();
+        o["kv_residency"]["demoted"]    = m.res_demoted;
+        o["kv_residency"]["promoted"]   = m.res_promoted;
+        o["kv_residency"]["skipped"]    = m.res_skipped;
+        o["kv_residency"]["misses"]     = m.res_misses;
+        o["kv_residency"]["host_bytes"] = m.res_host_bytes;
+        o["kv_residency"]["cap_bytes"]  = m.res_cap_bytes;
+        o["kv_residency"]["freed_bytes"] = m.res_freed_bytes;
+        o["kv_residency"]["link_bytes"]  = m.res_link_bytes;
+        o["kv_residency"]["scratch_bytes"] = m.res_scratch_bytes;
+        /* Cold entries the pager rewrote to scratch pages (summed over layers and decode rows),
+         * counted on the card and read back per poll; nonzero is the proof a step read paged bytes. */
+        o["kv_residency"]["paged_in"] = m.res_paged_in;
         /* Linear-state caching, separate from the attention hit rate: a hybrid prompt can be
          * fully attention-cached and still re-run every recurrent layer over its prefix, since
          * the two hit at different granularities. Zero on a model with no recurrent state. */

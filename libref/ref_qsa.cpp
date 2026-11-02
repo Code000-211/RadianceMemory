@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 using namespace ref;
@@ -177,7 +178,7 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
  * ascending order (a row whose slot is -1, or that no sequence holds, writes nothing). Every other
  * row of `state` keeps its contents. */
 int ref_qsa_tail_store(const RadArgs* a, RadStream) {
-    if (!have(a, 5)) return RAD_E_INVAL;
+    if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *po = &a->t[1], *cu = &a->t[2], *st = &a->t[3];
     const RadTensor *sx = &a->t[4];
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
@@ -203,6 +204,72 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
         for (int64_t d = 0; d < n; ++d)
             stt(st, db + d * st->stride[3], ldt(k, t * k->stride[0] + d * k->stride[1]));
     }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_page */
+/* The pager: for each position (m, j) of `sel` holding a cold entry (<= -2), the `block_bytes` at
+ * the start of store slot -2 - entry (this layer's view, docs/OPS.md) are copied into pool block scratch[m][j], and the entry
+ * becomes that block id. Resident (>= 0) and empty (-1) entries are left alone, so a row without a
+ * cold entry is a no-op. Every position has one writer and the scratch ids of cold positions are
+ * pairwise distinct, so no two copies overlap. The device kernel is held to these bytes.
+ *
+ * Refused before any write (RAD_E_INVAL): a slot outside the store,
+ * a scratch id outside the pool, or two cold positions sharing a scratch page.
+ *
+ * An optional fifth operand, one i64, is the pager's counter: the entries this call rewrote are
+ * added to it (not stored), so a caller reads how much the window paged over many launches. */
+int ref_qsa_page(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *sel = &a->t[0], *st = &a->t[1], *pl = &a->t[2], *sc = &a->t[3];
+    const int64_t topk = p_int(a, "topk", 0), bb = p_int(a, "block_bytes", 0);
+    if (topk <= 0 || bb <= 0) return RAD_E_SHAPE;
+    /* `pool` is the layer's cache in its own shape -- [blocks, ...] of the group's dtype, as the
+     * core binds a KV operand -- and the pager moves bytes: a block is its leading stride's
+     * worth of elements, contiguous. `store` is [slots, slot_bytes] of bytes. */
+    if (sel->rank != 2 || sc->rank != 2 || st->rank != 2 || pl->rank < 2) return RAD_E_SHAPE;
+    const int64_t ebits = rad_dtype_bits(pl->dtype);
+    if (st->dtype != RAD_U8 || ebits <= 0 || ebits % 8) return RAD_E_DTYPE;
+    if (st->stride[1] != 1 || pl->stride[pl->rank - 1] != 1) return RAD_E_STRIDE;
+    /* A block's elements past the leading dimension are packed, so its bytes from its start are
+     * contiguous for `inner` elements; the pitch between blocks may be anything. */
+    int64_t inner = 1;
+    for (uint32_t d = pl->rank - 1; d >= 1; --d) {
+        if (pl->stride[d] != inner) return RAD_E_STRIDE;
+        inner *= pl->shape[d];
+    }
+    const int64_t pitch = pl->stride[0] * (ebits / 8);           /* bytes a block */
+    const int64_t M = sel->shape[0], w = topk + 1;
+    if (M <= 0 || sel->shape[1] < w || sc->shape[0] < M || sc->shape[1] < w) return RAD_E_SHAPE;
+    /* `store` is this layer's view of the store (the plugin folds the layer's offset in): row s
+     * is slot s, its first block_bytes are this layer's fragment. */
+    if (inner * (ebits / 8) < bb || pitch < bb || st->shape[1] < bb) return RAD_E_SHAPE;
+    const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
+    int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
+    if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
+    int64_t n_cold = 0;
+    std::vector<bool> used((size_t)blocks);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t j = 0; j < w; ++j) {
+            const int64_t e = ldi(sel, m * sel->stride[0] + j * sel->stride[1]);
+            if (e > -2) continue;
+            const int64_t slot = -2 - e, pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
+            if (slot >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
+            used[(size_t)pg] = true;
+            ++n_cold;
+        }
+    const uint8_t* sb = (const uint8_t*)st->data;
+    uint8_t* pb = (uint8_t*)pl->data;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t j = 0; j < w; ++j) {
+            const int64_t so = m * sel->stride[0] + j * sel->stride[1];
+            const int64_t e = ldi(sel, so);
+            if (e > -2) continue;
+            const int64_t pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
+            std::memcpy(pb + pg * pitch, sb + (-2 - e) * slot_b, (size_t)bb);
+            st_int(sel->dtype, sel->data, so, pg);
+        }
+    if (paged) *paged += n_cold;
     return RAD_OK;
 }
 

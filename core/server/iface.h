@@ -86,6 +86,19 @@ struct SchedMetrics {
     /* Removed by --prefix-cache-ttl, cumulative. Not evictions: nothing wanted the memory. */
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;
     int64_t prefix_released = 0, prefix_ckpt_released = 0;
+    /* Window residency (spec §7.3): blocks a sparse consumer's window does not cover, moved to the
+     * pinned store and back. `res_misses` is the link traffic a step paid because its selection
+     * named a cold block.
+     *
+     * `res_paged_in` is the pager's own count: cold entries it rewrote to scratch pages, summed
+     * over QSA layers and decode rows, read from a counter on the card (rank 0). It is the proof
+     * that paging happened, and is not per session. All zero with --kv-residency-mib 0. */
+    int64_t res_demoted = 0, res_promoted = 0, res_skipped = 0, res_misses = 0;
+    int64_t res_host_bytes = 0, res_cap_bytes = 0;
+    int64_t res_freed_bytes = 0;     /* VRAM the demotions gave back to the pool */
+    int64_t res_link_bytes = 0;      /* bytes over the link, both directions */
+    int64_t res_scratch_bytes = 0;   /* VRAM the pager's scratch pages hold */
+    int64_t res_paged_in = 0;        /* cold entries the pager rewrote (card counter, rank 0) */
     /* Decoupled prefix caching (spec §7.3). `prefix_hit_rate` is the attention hit rate, as in
      * vLLM. The linear side hits at a different granularity (whole checkpoints, not blocks), so
      * it is reported separately, with token counts and checkpoints written. */
@@ -173,6 +186,13 @@ struct SessionStat {
     int64_t     snap_bytes = 0;
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
+    /* Window-residency counters for the session's sequence (spec §7.3), over its life. These
+     * overlap between sessions that share blocks: a block moved while one session's sequence
+     * held it is counted for that sequence only, though other sessions' prefixes may name it, so
+     * the sum over sessions is not the server's kv_residency (which counts each move once, and
+     * also moves of sequences whose session is gone). Zero with residency off. */
+    int64_t     res_demoted = 0, res_promoted = 0, res_skipped = 0;
+    int64_t     res_link_bytes = 0, res_freed_bytes = 0;
     bool        moving = false;   /* a transfer is outstanding */
 };
 

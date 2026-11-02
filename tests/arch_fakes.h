@@ -264,6 +264,17 @@ extern "C" int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
     return rad_dtype_bytes(d.dtype, 2 * b->kv_block * nh * d.head_dim);
 }
 
+/* The sparse consumer's reach (spec §7.3). Recorded on the group it names, so a test can assert
+ * that a QSA layer annotates its attention group and leaves the block-key group alone; the real
+ * builder's refusals (non-paged kind, two disagreeing numbers) are exercised by the core's own
+ * tests, which link it. */
+extern "C" int rad_kv_set_residency_window(RadBuilder* b, rad_kvgroup g, int64_t tokens) {
+    if (g == 0 || (size_t)g > b->kv_groups.size()) return RAD_E_INVAL;
+    if (tokens < 0) return RAD_E_INVAL;
+    b->kv_groups[(size_t)g - 1].d.residency_window = tokens;
+    return RAD_OK;
+}
+
 extern "C" int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
     b->binds.push_back({layer, g});
     return RAD_OK;

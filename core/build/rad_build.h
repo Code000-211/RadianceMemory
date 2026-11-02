@@ -117,6 +117,9 @@ public:
     int64_t     kv_block_size(rad_kvgroup g);
     int64_t     kv_layer_bytes(rad_kvgroup g);
     int         bind_layer_kv(int layer, rad_kvgroup g);
+    /* The sparse consumer's reach (RadKVGroupDecl::residency_window). Refuses a group whose
+     * consumer is not a paged attention group, and a second, different number. */
+    int         set_residency_window(rad_kvgroup g, int64_t tokens);
     rad_op      decl_op      (const char* op, const RadParam* p, int n_p,
                               const rad_weight* w, int n_w);
     int         op_resolved  (rad_op h) const;

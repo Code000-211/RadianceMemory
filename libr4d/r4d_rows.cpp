@@ -1412,6 +1412,26 @@ static const RadOperandSpec oKvResolve[] = {
     { "kv_cache",   RAD_OPD_INOUT, 0 },
 };
 
+/* `qsa_page`, the pager (docs/OPS.md): cold entries of `sel` are rewritten, in place, to scratch
+ * pages that receive the block's bytes from the residency store. `store` is this layer's view
+ * (row pitch = slot bytes) and `pool` this layer's pool, both byte planes; only the scratch blocks
+ * of cold entries of `pool` are written. */
+static const RadParamSpec pQsaPage[] = {
+    { "M",           RAD_P_INT, RAD_REQUIRED },
+    { "topk",        RAD_P_INT, RAD_REQUIRED },
+    { "blocks",      RAD_P_INT, RAD_REQUIRED },
+    { "seqs",        RAD_P_INT, RAD_REQUIRED },
+    { "block_bytes", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaPage[] = {
+    { "sel",     RAD_OPD_INOUT, 0 },
+    { "store",   RAD_OPD_IN,    0 },
+    { "pool",    RAD_OPD_INOUT, 0 },
+    { "scratch", RAD_OPD_IN,    0 },
+    /* One i64 on the card the pager adds its rewritten entries to; absent, nothing is counted. */
+    { "paged",   RAD_OPD_INOUT, 1 },
+};
+
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
  * block of key history for one query.
  *
@@ -3624,6 +3644,14 @@ static const RadOpSchema kSchemas[] = {
            "blocks, never a fabricated slot, so the caller must refuse the step. The maps, the "
            "epoch, the hand and the heat counters keep state across launches, so the row is not "
            "concurrent; the miss list is the row's scratch (2 * slots i32), not an operand."),
+    SCHEMA("qsa_page", pQsaPage, oQsaPage,
+           "for each position of `sel` holding a cold entry (<= -2), the first `block_bytes` of "
+           "`store` row -2 - entry are copied into pool block scratch[m][j] and the entry becomes "
+           "that block id; resident and empty entries pass through. `store` is THIS LAYER'S view "
+           "(its offset already folded in, row pitch = slot bytes), because a device kernel may "
+           "not read the host offset table. `pool` is INOUT and only scratch blocks of cold "
+           "entries are written. A device kernel cannot refuse: an entry whose slot or scratch id "
+           "is out of range is left as it was."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "
@@ -4965,6 +4993,8 @@ static const RadConstraint cQsaWork[] = {
 static const RadConstraint cQsaTailStore[] = {
     C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "bf16"),
 };
+
+static const RadConstraint cQsaPage[] = { C_GE("topk", 1), C_GE("blocks", 1), C_GE("block_bytes", 1) };
 
 /* No dtype: every operand is f32 or i32. */
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), C_GE("ratio", 1) };
@@ -8819,6 +8849,18 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaTailStore), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
   r4d_shape_qsa_tail_store },
+
+/* One workgroup per selection position; those holding a cold entry copy one block fragment. */
+{ "qsa_page_u8", "qsa_page", "attn",
+  "rewrite each cold selection entry to a scratch page holding that block's bytes from the "
+  "residency store",
+  "any M, topk, block_bytes; a selection without a cold entry is a no-op",
+  "an i32 selection and scratch table; u8 store and pool planes, the pool and selection written "
+  "in place",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaPage), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_page, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_page },
 
 /* A four-digit radix select, one workgroup per query. Not a sort: attention is a softmax over a
  * set, and sorting 65536 scores per query per layer per step is too costly. The set is exact and

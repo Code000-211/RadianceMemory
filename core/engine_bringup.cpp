@@ -997,6 +997,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
+    bc.kv_residency = cfg_.residency_mib > 0;   /* the pager op is declared only when asked for */
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
     bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
@@ -1805,6 +1806,7 @@ int Engine::plan() {
             for (size_t i = 0; i < kg.g.size(); ++i) {
                 const int64_t w = probe.state_index_width((int32_t)i);
                 if (w > 0) kg.g[i].sidx_width = w;
+                if (const KVGroupPlan* gp = probe.plan((int32_t)i)) kg.g[i].scratch_pitch = gp->scratch_pitch;
             }
             f.staging = r->program.is_generator()       ? gen::Driver::device_bytes(r->program)
                       : r->program.is_audio_generator() ? gen::AudioDriver::device_bytes(r->program)
@@ -3487,6 +3489,101 @@ int Engine::configure_kv() {
         }
         for (auto& r : ranks_)
             r->kv.set_checkpoint_store(&ck_store_, shard_off[(size_t)(&r - &ranks_[0])]);
+    }
+
+    /* ---------------- window residency (spec §7.3) ---------------- */
+    /* A group whose consumer reads a window of its history declares it (RadKVGroupDecl::
+     * residency_window, set by arch/common/rad_qsa.h); the blocks the window does not cover can
+     * then live in a pinned store instead of VRAM. One slot is one block, so this runs after the
+     * carve, which is where a block's size exists, and under tensor parallelism the slot holds
+     * every rank's shard at its own offset. */
+    {
+        std::vector<int64_t> rank_res(ranks_.size(), 0), res_off(ranks_.size(), 0);
+        int64_t slot_bytes = 0, window_tokens = 0, n_groups = 0;
+        for (size_t i = 0; i < ranks_.size(); ++i)
+            for (const auto& p : ranks_[i]->kv.plans())
+                if (p.residency()) {
+                    rank_res[i] += p.bytes_per_block;
+                    if (i == 0) { window_tokens += p.residency_window; ++n_groups; }
+                }
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            res_off[i] = slot_bytes;
+            slot_bytes += rank_res[i];
+        }
+        if (n_groups == 0) {
+            if (cfg_.residency_mib > 0)
+                RAD_WARN("kv residency: --kv-residency-mib %lld does nothing here: no KV group "
+                         "declares a residency window, which only a sparse consumer sets "
+                         "(arch/common/rad_qsa.h, spec §7.3)", (long long)cfg_.residency_mib);
+        } else if (cfg_.residency_mib <= 0) {
+            RAD_INFO("kv residency: %lld group(s) declare a %lld-token window, and "
+                     "--kv-residency-mib 0 keeps every block of them resident",
+                     (long long)n_groups, (long long)window_tokens);
+        } else {
+            const int64_t slot = align_up(slot_bytes, 256);
+            const int64_t cap  = cfg_.residency_mib << 20;
+            const int64_t slots = slot > 0 ? cap / slot : 0;
+            if (slots <= 0) {
+                RAD_ERR("kv residency: --kv-residency-mib %lld holds no block of %s. Raise it or "
+                        "pass 0 to keep every block resident", (long long)cfg_.residency_mib,
+                        humanb(slot).c_str());
+                return RAD_E_NOMEM;
+            }
+            /* Host-mapped, because the pager reads it from the card: a host that cannot map the
+             * store refuses by flag name (HostArena::open_mapped says so) rather than opening a
+             * store nothing can page from. */
+            if (const int rc = res_store_.open_mapped(slot, slot * slots); rc == RAD_E_UNSUPPORTED)
+                return rc;
+            else if (rc != RAD_OK) {
+                RAD_ERR("kv residency: the host did not map %s for %lld blocks: %s",
+                        humanb(slot * slots).c_str(), (long long)slots, rad_dev_last_error());
+                return RAD_E_NOMEM;
+            }
+            for (auto& r : ranks_)
+                r->kv.set_residency_store(&res_store_, res_off[(size_t)(&r - &ranks_[0])]);
+            /* What the pager's scratch pages cost the card (KVGroupPlan::scratch_blocks, charged to
+             * the KV budget before the split), per rank 0's groups. */
+            int64_t scratch_bytes = 0, scratch_pages = 0;
+            for (const auto& p : ranks_[0]->kv.plans()) {
+                scratch_bytes += p.scratch_blocks * p.bytes_per_block;
+                scratch_pages += p.scratch_blocks;
+            }
+            RAD_INFO("kv residency: store %s of host-mapped memory, %lld slots of %s; scratch "
+                     "reservation %s of VRAM (%lld pages for %lld decode rows, charged to the KV "
+                     "budget); window %lld tokens", humanb(res_store_.cap_bytes()).c_str(),
+                     (long long)slots, humanb(slot).c_str(), humanb(scratch_bytes).c_str(),
+                     (long long)scratch_pages, (long long)ranks_[0]->kv.scratch_rows(),
+                     (long long)window_tokens);
+            /* The transfers (TierExec::issue_moves) on every rank, over the residency groups, and
+             * the pager's counter on each rank's card. A rank that cannot move the bytes would
+             * leave the store open and the window unenforced, which is worse than refusing the
+             * flag, so it stops the start. The scheduler's sweep and the engine's mover are
+             * installed in Engine::init once the scheduler exists (kResidencySweepBlocks). */
+            std::vector<int32_t> rg;
+            for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g)
+                if (const KVGroupPlan* p = ranks_[0]->kv.plan(g); p && p->residency()) rg.push_back(g);
+            for (auto& r : ranks_) {
+                LogRank lr(r->index);
+                RAD_TRY(rad_dev_set(r->device));
+                const int rc = r->resx.configure(&rad_tools_registry(), &r->kv, &r->tiers, rg,
+                                                 TierExec::kMoveBatch, 1, 1,
+                                                 /*leader=*/&r == &ranks_[0], r->device, 0,
+                                                 /*shared=*/r->mover.transfer_stream());
+                int64_t* paged = rc == RAD_OK ? r->resx.paged_counter() : nullptr;
+                if (rc != RAD_OK || !paged) {
+                    RAD_ERR("kv residency: rank %d cannot move blocks between the pool and the "
+                            "store (%s). Pass --kv-residency-mib 0 to keep every block resident",
+                            r->index, rc != RAD_OK ? rad_strerror(rc) : "no memory for the pager's counter");
+                    return rc != RAD_OK ? rc : RAD_E_NOMEM;
+                }
+                r->kv.set_residency_paged(paged);
+            }
+            RAD_TRY(rad_dev_set(ranks_[0]->device));
+            RAD_INFO("kv residency: window enforced -- after a decode step, blocks outside the sink "
+                     "and the %lld-token tail leave the pool for the store, %d per batch and at most "
+                     "%d per step; a prefill promotes its sequence whole first",
+                     (long long)window_tokens, TierExec::kMoveBatch, kResidencySweepBlocks);
+        }
     }
     for (auto& r : ranks_) {
         LogRank lr(r->index);

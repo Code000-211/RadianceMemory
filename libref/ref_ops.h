@@ -261,6 +261,7 @@ int ref_qsa_tail_store     (const RadArgs*, RadStream);
 int ref_qsa_work           (const RadArgs*, RadStream);
 /* the residency map between a streamed group's block ids and its ring slots (ref_kvstream.cpp) */
 int ref_kv_resolve         (const RadArgs*, RadStream);
+int ref_qsa_page           (const RadArgs*, RadStream);
 int ref_dflash_conv        (const RadArgs*, RadStream);
 
 /* ---- mixture of experts */
@@ -523,6 +524,7 @@ REF_SHAPE_FN(ref_qsa_select);
 REF_SHAPE_FN(ref_qsa_tail_store);
 REF_SHAPE_FN(ref_qsa_work);
 REF_SHAPE_FN(ref_kv_resolve);
+REF_SHAPE_FN(ref_qsa_page);
 REF_SHAPE_FN(ref_dflash_conv);
 
 REF_SHAPE_FN(ref_router_topk);

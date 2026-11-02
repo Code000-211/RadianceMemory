@@ -1720,6 +1720,23 @@ int ref_qsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("qsa_select", operand, out);
 }
 
+/* sel's draw is [0, blocks): resident ids only. A cold entry needs a store slot and a scratch page
+ * paired with it, which a random draw cannot promise, so the fixture exercises the pass-through
+ * and tests/ref_test.cpp builds the cold cases by hand. */
+int ref_qsa_page_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), topk = gi(p, n_p, "topk", 0);
+    const int64_t bb = gi(p, n_p, "block_bytes", 0), blocks = gi(p, n_p, "blocks", 0);
+    if (M <= 0 || topk <= 0 || bb <= 0 || blocks <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t pool = M * (topk + 1);                          /* one scratch page per position */
+    Opd o;
+    o.t_idx({ M, topk + 1 }, blocks, -1, 0);                      /* sel */
+    o.t_idx_dt((uint32_t)RAD_U8, { 4, 2 * bb }, 256, -1, 0);      /* store -- 4 slots, this layer's view */
+    o.t_idx_dt((uint32_t)RAD_U8, { pool + blocks, bb }, 256, -1, 0);  /* pool */
+    o.t_idx({ M, topk + 1 }, pool, -1, 0);                        /* scratch */
+    o.t_idx_dt((uint32_t)RAD_I64, { 1 }, 1, -1, 0);               /* paged: the counter, starts at 0 */
+    return o.finish("qsa_page", operand, out);
+}
+
 int ref_qsa_tail_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t ratio = gi(p, n_p, "ratio", 0), ring = gi(p, n_p, "ring", ratio);

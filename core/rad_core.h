@@ -956,6 +956,25 @@ struct Config {
      * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
 
+    /* ---- window residency (spec §7.3) ----
+     *
+     * A group whose consumer reads a window of its history (RadKVGroupDecl::residency_window,
+     * declared by arch/common/rad_qsa.h) can hold a context whose whole cache does not fit: the
+     * blocks the window does not cover leave VRAM for a pinned host store and are promoted back
+     * before a step reads them.
+     *
+     * `residency_mib` is that store's size. 0 is off, and off means the group keeps every block in
+     * VRAM, which is what a server with the room should do. `residency_sink_tokens` is how much of
+     * the *start* of a conversation stays resident: a sparse consumer's selection is not
+     * positional, but the first blocks are the attention sinks every step scores, and promoting
+     * those once a step would cost more than they save. The tail is the declared window's
+     * remainder.
+     *
+     * The store is opened only when a group declares a window; on a model without one the flags do
+     * nothing and the receipt says so (see the bringup's report line). */
+    int64_t residency_mib = 0;
+    int64_t residency_sink_tokens = 512;
+
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The
      * buffer's size depends on the workload (a prefill chunk, the largest recent shortfall), so it

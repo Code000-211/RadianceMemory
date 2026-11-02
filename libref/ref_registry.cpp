@@ -508,6 +508,14 @@ static const RadOperandSpec oKvResolve[] = { INOUT("sel"), OPD("nsel"), INOUT("r
                                              INOUT("slot_block"), INOUT("slot_state"),
                                              INOUT("ctl"), OPD("host"), INOUT("kv_cache") };
 
+/* The pager (docs/OPS.md, "`qsa_page`"): `sel` is rewritten in place. `store` and `pool` are byte
+ * planes ([slots, slot_bytes], [blocks, block_bytes]). `paged`, when given, is one i64 the op
+ * adds its count of rewritten entries to. */
+static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("blocks"), P_INT("seqs"),
+                                         P_INT("block_bytes") };
+static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
+                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+
 /* DFlash2's grouped convolution, libr4d's schema exactly. */
 static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
                                             P_INT("group_size"), P_INT("NG"), P_INT("block_size"),
@@ -1515,6 +1523,11 @@ static const RadOpSchema kSchemas[] = {
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
   "rows of the tail keep what they held." },
+{ "qsa_page", ARR(pQsaPage), ARR(oQsaPage),
+  "Rewrites each cold entry (<= -2) of the selection to its scratch page, after copying the block's "
+  "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; "
+  "resident (>= 0) and empty (-1) entries pass through. `pool` is INOUT: only the scratch blocks "
+  "of cold entries are written." },
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
@@ -2479,6 +2492,9 @@ SIMPLE("ref_qsa_select", "qsa_select", "attn",
 SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
        "QSA tail: the raw keys of open blocks into a per-sequence ring", DT_FLOAT,
        ref_qsa_tail_store),
+SIMPLE("ref_qsa_page", "qsa_page", "attn",
+       "QSA pager: cold selection entries copied from the residency store into scratch pages",
+       "i32 tables, u8 bytes", ref_qsa_page),
 SIMPLE("ref_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, ref_qsa_work),
 SIMPLE("ref_kv_resolve", "kv_resolve", "attn",

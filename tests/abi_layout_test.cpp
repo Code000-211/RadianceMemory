@@ -8,7 +8,7 @@
  *
  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
  * struct's listed fields account for its size, so the list in rad_abi_layout_rows.h is complete; and
- * the layout agrees with the table below, taken at RAD_ABI_VERSION 32 and RAD_FORMAT_VER 2. Under
+ * the layout agrees with the table below, taken at RAD_ABI_VERSION 33 and RAD_FORMAT_VER 2. Under
  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
  * headers: nothing else states the layout. When it disagrees the test prints the live table.
@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 32 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 32, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 33 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 33, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -216,6 +216,22 @@ TEST(rad_yarn_is_the_same_function_in_c_and_cpp) {
         y.factor = c[0]; y.low = c[1]; y.high = c[2]; y.magnitude = c[3];
         CHECK_EQ((int)rad_yarn_valid(y), abi_c_yarn_valid(c[0], c[1], c[2], c[3]));
     }
+}
+
+/* A paged block-table entry is a pool id (>= 0), empty (-1) or cold (-2 - slot): the three classes
+ * never overlap, slot 0 is -2 and not -1, and decode inverts encode across the slot range. */
+TEST(a_cold_table_entry_is_never_a_pool_id_or_empty_and_decodes_to_its_slot) {
+    CHECK_EQ(rad_kv_cold_entry(0), -2);
+    CHECK_EQ(rad_kv_cold_entry(7), -9);
+    CHECK(!rad_kv_entry_cold(-1));
+    CHECK(!rad_kv_entry_cold(0));
+    CHECK(!rad_kv_entry_cold(123456));
+    int bad = 0;
+    for (int32_t s : { 0, 1, 2, 255, 65535, 1 << 24, INT32_MAX - 2 }) {
+        const int32_t e = rad_kv_cold_entry(s);
+        if (!rad_kv_entry_cold(e) || rad_kv_entry_slot(e) != s || e >= -1) ++bad;
+    }
+    CHECK_EQ(bad, 0);
 }
 
 RAD_TEST_MAIN()

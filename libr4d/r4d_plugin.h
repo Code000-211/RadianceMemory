@@ -633,6 +633,7 @@ int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
 int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
 int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
+int r4d_rad_qsa_page        (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_fp8 (const RadArgs*, RadStream);
@@ -990,6 +991,7 @@ int r4d_shape_qsa_score          (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_page           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);

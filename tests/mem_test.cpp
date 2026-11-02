@@ -8073,6 +8073,1132 @@ TEST(an_entry_with_a_streamed_group_is_never_demoted) {
     f.pc.set_tiers(nullptr);
 }
 
+/* ------------------------------------------------------------------ window residency (spec §7.3) */
+
+/* QSA's shape in miniature: one group whose consumer reads a window of the history (`kv_attn`)
+ * and one whose consumer reads all of it (`kv_qsa_bkey`), both paged at 16 tokens. */
+enum : int32_t { G_RES = 1, G_KEYS = 2 };
+
+static std::vector<KVGroupInfo> residency_groups(int64_t window_tokens) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    KVGroupInfo k = paged_group("attn", RAD_KV_FULL, 2, 16, { 0, 1 });
+    k.decl.residency_window = window_tokens;
+    g.push_back(k);                                    /* page = 2048 B */
+    g.push_back(paged_group("keys", RAD_KV_FULL, 1, 16, { 2, 3 }));
+    return g;
+}
+
+/* The engine opens the store after the KV configure, because a slot is one block and the block
+ * count is only known then. The fixture does the same. */
+struct ResidencyFixture {
+    Pools pools;
+    HostArena store;
+    KVManager kv;
+    Config cfg = small_config();
+
+    int build(int64_t window_tokens, int64_t slots) {
+        int s = configure_pools(pools, cfg);
+        if (s < 0) return s;
+        s = kv.configure(residency_groups(window_tokens), cfg, pools.kv());
+        if (s < 0) return s;
+        if (kv.residency_slot_bytes() <= 0) return RAD_E_STATE;
+        s = store.open(kv.residency_slot_bytes(), kv.residency_slot_bytes() * slots);
+        if (s < 0) return s;
+        kv.set_residency_store(&store, 0);
+        return RAD_OK;
+    }
+};
+
+/* The one test that would fail if nothing ever moved: a server that keeps every block resident
+ * passes every other check here and saves no VRAM at all. */
+TEST(a_residency_window_keeps_both_ends_and_moves_only_what_lies_between_them) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(/*window_tokens=*/512, /*slots=*/256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));                 /* 40 blocks, 640 tokens */
+    const std::vector<int32_t> before = f.kv.block_table(1, G_RES);
+    CHECK_EQ((int64_t)before.size(), 40);
+
+    const int64_t free_before = f.kv.free_blocks(G_RES);
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, /*keep_head=*/2, /*keep_tail=*/8, &moves));
+    CHECK_EQ((int64_t)moves.size(), 30);
+    CHECK(f.kv.residency_stats().demoted == 30);
+    CHECK(f.kv.residency_stats().demoted_bytes == 30 * 2048);
+
+    /* The sequence's context is untouched: same positions, same token count. */
+    const std::vector<int32_t> after = f.kv.block_table(1, G_RES);
+    CHECK_EQ((int64_t)after.size(), 40);
+    CHECK_EQ(f.kv.seq_tokens(1), 640ll);
+
+    /* The sinks and the tail stayed, the middle moved, and nothing else did. */
+    for (int64_t i = 0; i < 2; ++i) CHECK_EQ(after[(size_t)i], before[(size_t)i]);
+    for (int64_t i = 2; i < 32; ++i) CHECK(f.kv.residency_cold(G_RES, after[(size_t)i]));
+    for (int64_t i = 32; i < 40; ++i) CHECK_EQ(after[(size_t)i], before[(size_t)i]);
+
+    /* The VRAM comes back only when the copy has landed: the gather still reads the blocks. */
+    CHECK_EQ(f.kv.free_blocks(G_RES), free_before);
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.free_blocks(G_RES), free_before + 30);
+    CHECK_EQ(f.kv.residency_stats().freed_blocks, 30ll);
+    CHECK_EQ(f.kv.residency_stats().freed_bytes, 30ll * 2048);
+
+    /* Every move names a distinct slot inside the store, the entry is the cold encoding of that
+     * slot, and the pointer is that block's. */
+    std::set<int32_t> slots;
+    for (size_t k = 0; k < moves.size(); ++k) {
+        const BlockMove& m = moves[k];
+        CHECK_EQ(m.group, G_RES);
+        CHECK(m.host_slot >= 0);
+        CHECK_EQ(m.block, before[2 + k]);
+        CHECK_EQ(after[2 + k], rad_kv_cold_entry(m.host_slot));
+        slots.insert(m.host_slot);
+        CHECK(f.kv.residency_ptr(G_RES, after[2 + k]) != nullptr);
+        CHECK_EQ(f.kv.residency_slot(G_RES, after[2 + k]), m.host_slot);
+    }
+    CHECK_EQ((int64_t)slots.size(), 30);
+    CHECK_EQ(f.kv.residency_host_bytes(), 30 * f.kv.residency_slot_bytes());
+
+    /* The group that reads all of its history is not part of this. */
+    CHECK_EQ((int64_t)f.kv.residency_cold_entries(1, G_KEYS).size(), 0ll);
+
+    /* A second sweep with the same window moves nothing: the state is not recomputed. */
+    std::vector<BlockMove> again;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &again));
+    CHECK(again.empty());
+    CHECK(f.kv.residency_stats().demoted == 30);
+}
+
+/* The per-session numbers /sessions reports: each sequence gets its own demoted, promoted, link
+ * bytes and freed VRAM, they move with the sweeps, and they survive the sequence's end because
+ * the session is listed after its request is gone. */
+TEST(residency_counters_are_kept_per_sequence_and_outlive_the_sequence) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    CHECK_OK(f.kv.ensure(2, 16 * 20));
+    CHECK(f.kv.residency_by_seq().empty());
+    std::vector<BlockMove> m1, m2;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m1));
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &m2));
+    f.kv.residency_demote_landed();
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote(1, G_RES, { 10, 11 }, &up));
+
+    const auto& by = f.kv.residency_by_seq();
+    CHECK_EQ(by.at(1).demoted, 30ll);
+    CHECK_EQ(by.at(2).demoted, 10ll);
+    CHECK_EQ(by.at(1).promoted, 2ll);
+    CHECK_EQ(by.at(2).promoted, 0ll);
+    CHECK_EQ(by.at(1).link_bytes, 32ll * 2048);
+    CHECK_EQ(by.at(1).freed_bytes, 30ll * 2048);
+    CHECK_EQ(by.at(2).freed_bytes, 10ll * 2048);
+    CHECK_EQ(f.kv.residency_stats().demoted_bytes + f.kv.residency_stats().promoted_bytes,
+             by.at(1).link_bytes + by.at(2).link_bytes);
+
+    f.kv.free_sequence(1);
+    CHECK_EQ(f.kv.residency_by_seq().at(1).demoted, 30ll);
+}
+
+TEST(a_promotion_returns_the_named_entries_and_charges_the_link_traffic) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));
+    CHECK_EQ((int64_t)moves.size(), 30);
+    f.kv.residency_demote_landed();
+    const std::vector<int32_t> cold_tbl = f.kv.block_table(1, G_RES);
+
+    /* What a step that selects those blocks asks for: table entries, not block ids. */
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote(1, G_RES, { 10, 11, 12 }, &up));
+    CHECK_EQ((int64_t)up.size(), 3);
+    for (size_t k = 0; k < up.size(); ++k) {
+        const BlockMove& m = up[k];
+        /* A fresh pool block is the entry now, and the slot to read is the one it replaced. */
+        CHECK_EQ(f.kv.block_table(1, G_RES)[10 + k], m.block);
+        CHECK(m.block >= 0);
+        CHECK_EQ(m.host_slot, rad_kv_entry_slot(cold_tbl[10 + k]));
+        CHECK(!f.kv.residency_cold(G_RES, m.block));
+        CHECK(f.kv.residency_ptr(G_RES, m.block) == nullptr);
+    }
+    CHECK(f.kv.residency_stats().promoted == 3);
+    CHECK(f.kv.residency_stats().promoted_misses == 3);
+    CHECK(f.kv.residency_stats().promoted_bytes == 3 * 2048);
+
+    /* Resident entries are skipped, so a caller may pass a superset of what it needs. */
+    std::vector<BlockMove> again;
+    CHECK_OK(f.kv.residency_promote(1, G_RES, { 10, 11, 12 }, &again));
+    CHECK(again.empty());
+
+    /* A demoted block promoted and then swept again moves back: the window is a state, not a
+     * one-way door. */
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &down));
+    CHECK_EQ((int64_t)down.size(), 3);
+    CHECK(f.kv.residency_cold(G_RES, f.kv.block_table(1, G_RES)[10]));
+
+    /* An index outside the table names no block of this sequence: served, it would be another
+     * conversation's context, so it is refused. */
+    std::vector<BlockMove> bad;
+    CHECK_EQ(f.kv.residency_promote(1, G_RES, { 40 }, &bad), RAD_E_INVAL);
+    CHECK_EQ(f.kv.residency_promote(1, G_RES, { -1 }, &bad), RAD_E_INVAL);
+    CHECK(bad.empty());
+}
+
+TEST(the_partial_last_block_and_a_shared_block_never_leave_vram) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    const std::vector<int32_t> before = f.kv.block_table(1, G_RES);
+
+    /* keep_tail 0 still keeps the last block: it is partial, and the next token's write would
+     * land in host memory. A moved block keeps its refcount, so its refcount is unchanged. */
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, /*keep_head=*/0, /*keep_tail=*/0, &moves));
+    CHECK_EQ((int64_t)moves.size(), 39);
+    CHECK_EQ(f.kv.block_table(1, G_RES)[39], before[39]);
+    CHECK_EQ(f.kv.block_refcount(G_RES, before[39]), 1);
+
+    /* A block the prefix cache indexes is read by whoever hits it, and this sequence cannot
+     * promote it for that reader: it stays, and the skip is counted. */
+    ResidencyFixture g2;
+    CHECK_OK(g2.build(512, 256));
+    CHECK_OK(g2.kv.add_sequence(7));
+    CHECK_OK(g2.kv.ensure(7, 16 * 40));
+    const std::vector<int32_t> b2 = g2.kv.block_table(7, G_RES);
+    CHECK_OK(g2.kv.retain_block(G_RES, b2[20]));
+    std::vector<BlockMove> m2;
+    CHECK_OK(g2.kv.residency_demote(7, G_RES, 0, 0, &m2));
+    CHECK_EQ(g2.kv.block_table(7, G_RES)[20], b2[20]);
+    CHECK(g2.kv.residency_stats().demote_skipped >= 1);
+    CHECK_EQ((int64_t)m2.size(), 38);
+}
+
+TEST(a_demoted_block_gives_its_slot_back_when_its_last_reference_goes) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));
+    CHECK_EQ(f.store.used_slots(), 30ll);
+    const int64_t total = f.kv.free_blocks(G_RES) + 40;    /* 40 held by the sequence, 30 pinned */
+
+    /* A preemption replays the sequence from zero, so its entries go -- the cold ones give their
+     * slots back and the resident ones their blocks; the 30 blocks a landing has not yet released
+     * stay pinned until it reports. */
+    CHECK_OK(f.kv.preempt(1));
+    CHECK_EQ(f.store.used_slots(), 0ll);
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.free_blocks(G_RES), total);
+
+    /* The same for a sequence freed outright. */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 16 * 40));
+    std::vector<BlockMove> m2;
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &m2));
+    CHECK_EQ(f.store.used_slots(), 30ll);
+    f.kv.residency_demote_landed();
+    f.kv.free_sequence(2);
+    CHECK_EQ(f.store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.free_blocks(G_RES), total);
+}
+
+TEST(a_full_store_leaves_the_rest_resident_and_reports_the_skips) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, /*slots=*/4));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));
+    CHECK_EQ((int64_t)moves.size(), 4);                /* the store's whole capacity */
+    CHECK(f.kv.residency_stats().demote_skipped >= 26);
+    CHECK_EQ((int64_t)f.kv.residency_cold_entries(1, G_RES).size(), 4ll);
+}
+
+TEST(a_residency_window_without_a_store_refuses_rather_than_moving_nothing) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    f.kv.set_residency_store(nullptr, 0);              /* --qsa-window-mib off */
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> moves;
+    CHECK_EQ(f.kv.residency_demote(1, G_RES, 2, 8, &moves), RAD_E_STATE);
+    CHECK(moves.empty());
+}
+
+TEST(a_residency_window_is_refused_on_a_group_that_recycles_its_blocks) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    KVGroupInfo k = paged_group("swa", RAD_KV_WINDOW, 4, 16, { 0, 1 }, /*window=*/2048);
+    k.decl.residency_window = 512;                     /* both mechanisms on one table */
+    g.push_back(k);
+    Pools pools;
+    Config c = small_config();
+    CHECK_EQ(configure_pools(pools, c), RAD_OK);
+    KVManager kv;
+    CHECK_EQ(kv.plan_groups(g, c), RAD_E_INVAL);
+}
+
+/* The window is a property of the group, so a plan that drops it drops its state too: a re-plan
+ * must not leak slots from a manager that keeps the same store. */
+TEST(a_re_plan_returns_the_slots_the_previous_one_held) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));
+    CHECK_EQ(f.store.used_slots(), 30ll);
+    CHECK_OK(f.kv.plan_groups(residency_groups(512), f.cfg));
+    CHECK_EQ(f.store.used_slots(), 0ll);
+}
+
+/* ------------------------------------------------------------------ window residency: the transfer */
+
+/* A block's bytes as the pool holds them, layer by layer: layer l of block b sits at
+ * base + l*layer_stride + b*frag, so a test that compared the whole region would pass with the
+ * layers of a block in any order. */
+static unsigned char resid_pat(int64_t layer, int32_t block, int64_t i) {
+    return (unsigned char)((layer * 131 + block * 17 + i * 7 + 3) & 0xff);
+}
+
+static void resid_fill(KVManager& kv, int32_t g) {
+    const KVGroupPlan* p = kv.plan(g);
+    auto* base = (char*)p->base;
+    const int64_t frag = p->layer_bytes_per_block();
+    for (int64_t b = 0; b < p->n_blocks; ++b)
+        for (int64_t l = 0; l < p->n_layers; ++l)
+            for (int64_t i = 0; i < frag; ++i)
+                base[l * p->layer_stride() + b * frag + i] = (char)resid_pat(l, (int32_t)b, i);
+}
+
+/* How many (layer, byte) positions of a block differ from what resid_fill wrote for `pat_block`
+ * (the block itself unless a promotion put its bytes in a different one). */
+static int64_t resid_mismatches(KVManager& kv, int32_t g, int32_t block, int32_t pat_block = -1) {
+    if (pat_block < 0) pat_block = block;
+    const KVGroupPlan* p = kv.plan(g);
+    auto* base = (char*)p->base;
+    const int64_t frag = p->layer_bytes_per_block();
+    int64_t bad = 0;
+    for (int64_t l = 0; l < p->n_layers; ++l)
+        for (int64_t i = 0; i < frag; ++i)
+            if ((unsigned char)base[l * p->layer_stride() + block * frag + i] != resid_pat(l, pat_block, i))
+                ++bad;
+    return bad;
+}
+
+static void resid_scribble(KVManager& kv, int32_t g) {
+    const KVGroupPlan* p = kv.plan(g);
+    std::memset(p->base, 0x5a, (size_t)(p->n_blocks * p->bytes_per_block));
+}
+
+/* The check the idle tiers get from scripts/tierident.sh, at the block: a demoted block comes back
+ * byte for byte after the pool has been overwritten, and nothing the promotion did not name moved.
+ * Corrupt KV reads as fluent wrong text, so a count of mismatching bytes is the only honest check. */
+TEST(a_demoted_block_comes_back_byte_for_byte_after_the_pool_is_overwritten) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+
+    ResidencyFixture f;
+    CHECK_OK(f.build(/*window_tokens=*/512, /*slots=*/64));
+    /* The tier exec wants a tier object for the entry-shaped path it also serves; this one has no
+     * host tier and is not used by a residency move. */
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    const std::vector<int32_t> groups{ G_RES };
+    CHECK_OK(x.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_fill(f.kv, G_RES);
+    const std::vector<int32_t> tbl = f.kv.block_table(1, G_RES);
+    REQUIRE_EQ((int64_t)tbl.size(), 40ll);
+
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, /*keep_head=*/2, /*keep_tail=*/8, &down));
+    REQUIRE_EQ(down.size(), 30u);
+    for (size_t i = 0; i < down.size(); i += TierExec::kMoveBatch) {
+        const std::vector<BlockMove> batch(down.begin() + (long)i,
+                                           down.begin() + (long)std::min(down.size(), i + TierExec::kMoveBatch));
+        CHECK_OK(x.issue_moves(batch, compute, /*to_host=*/true));
+        x.quiesce();
+    }
+    f.kv.residency_demote_landed();      /* the copies landed: the pool may reuse the 30 blocks */
+    CHECK_EQ(x.move_stats().out_blocks, 30ll);
+
+    /* What the pool does to VRAM once the blocks have left: another owner's bytes. */
+    resid_scribble(f.kv, G_RES);
+    /* Every byte of both layers: the pattern is unique per (layer, byte), so a mismatch count near
+     * the block size is what a scribbled block gives; a handful of coincidences (0x5a) are fine. */
+    CHECK(resid_mismatches(f.kv, G_RES, tbl[10]) > 2000);
+
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote(1, G_RES, { 10, 11, 12 }, &up));
+    REQUIRE_EQ(up.size(), 3u);
+    CHECK_OK(x.issue_moves(up, compute, /*to_host=*/false));
+    x.quiesce();
+    f.kv.residency_complete();       /* the slots the promotion held can go back */
+    CHECK_EQ(x.move_stats().in_blocks, 3ll);
+
+    /* The bytes sit in a fresh pool block, whatever id it got, and are the original block's. */
+    for (int64_t e : { 10, 11, 12 }) {
+        const int32_t now = f.kv.block_table(1, G_RES)[(size_t)e];
+        CHECK(now >= 0);
+        CHECK_EQ(resid_mismatches(f.kv, G_RES, now, tbl[(size_t)e]), 0ll);
+    }
+    /* Nothing else was brought back: a promotion that moved the whole sequence would pass the
+     * check above and hide a window that is not doing anything. */
+    CHECK(f.kv.residency_cold(G_RES, f.kv.block_table(1, G_RES)[20]));
+    CHECK_EQ(f.store.used_slots(), 27ll);
+
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+/* ------------------------------------------------------------------ window residency: cold entries */
+
+/* Demotes entries [2, 32) of a 40-block sequence and lands them, as a sweep does. */
+static void resid_go_cold(ResidencyFixture& f, uint64_t seq) {
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(seq, G_RES, 2, 8, &moves));
+    f.kv.residency_demote_landed();
+}
+
+/* The acceptance check for the whole feature: the VRAM a demotion frees is really handed to
+ * someone else, and the owner still reads its own bytes after promotion. */
+TEST(a_freed_block_id_serves_another_sequence_while_its_owner_comes_back_byte_for_byte) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 64));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    const std::vector<int32_t> groups{ G_RES };
+    CHECK_OK(x.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_fill(f.kv, G_RES);
+    const std::vector<int32_t> orig = f.kv.block_table(1, G_RES);
+
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &down));
+    REQUIRE_EQ(down.size(), 30u);
+    for (size_t i = 0; i < down.size(); i += TierExec::kMoveBatch) {
+        const std::vector<BlockMove> batch(down.begin() + (long)i,
+                                           down.begin() + (long)std::min(down.size(), i + TierExec::kMoveBatch));
+        CHECK_OK(x.issue_moves(batch, compute, /*to_host=*/true));
+        x.quiesce();
+    }
+    f.kv.residency_demote_landed();
+
+    /* Another sequence takes the pool, so it holds freed ids; it overwrites them. */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 16 * 30));
+    const std::vector<int32_t> other = f.kv.block_table(2, G_RES);
+    std::set<int32_t> freed;
+    for (size_t i = 2; i < 32; ++i) freed.insert(orig[i]);
+    int64_t reused = 0;
+    for (int32_t b : other) reused += freed.count(b);
+    CHECK(reused > 0);                                  /* a freed id really changed hands */
+    resid_scribble(f.kv, G_RES);
+
+    /* The owner promotes everything and reads what it wrote. */
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote_all(1, &up));
+    REQUIRE_EQ(up.size(), 30u);
+    for (size_t i = 0; i < up.size(); i += TierExec::kMoveBatch) {
+        const std::vector<BlockMove> batch(up.begin() + (long)i,
+                                           up.begin() + (long)std::min(up.size(), i + TierExec::kMoveBatch));
+        CHECK_OK(x.issue_moves(batch, compute, /*to_host=*/false));
+        x.quiesce();
+    }
+    f.kv.residency_complete();
+    const std::vector<int32_t> back = f.kv.block_table(1, G_RES);
+    for (size_t i = 2; i < 32; ++i) {
+        CHECK(back[i] >= 0);
+        CHECK_EQ(resid_mismatches(f.kv, G_RES, back[i], orig[i]), 0ll);
+    }
+    /* Nobody holds a block twice: the owner's fresh blocks are disjoint from the other's. */
+    for (int32_t b : back) for (int32_t o : other) CHECK(b != o);
+    CHECK_EQ(f.store.used_slots(), 0ll);
+    CHECK(f.kv.residency_cold_entries(1, G_RES).empty());
+    CHECK_EQ(f.kv.residency_stats().promoted, 30ll);
+
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+TEST(a_promotion_with_no_free_block_stops_with_full_and_loses_no_slot) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_go_cold(f, 1);
+    const int64_t used = f.store.used_slots();
+    /* Another sequence drains the pool, so the owner cannot get 30 blocks back. */
+    CHECK_OK(f.kv.add_sequence(2));
+    int64_t n = 0;
+    while (f.kv.ensure(2, 16 * (n + 1)) == RAD_OK) ++n;
+    /* ensure stops at the first group that runs out, which need not be this one; take what this
+     * group still has so it is the one that is short. */
+    std::vector<int32_t> held;
+    (void)f.kv.reserve_blocks(G_RES, f.kv.free_blocks(G_RES), &held);
+    std::vector<BlockMove> up;
+    CHECK_EQ(f.kv.residency_promote_all(1, &up), RAD_E_FULL);
+    CHECK(up.empty());                                  /* all or nothing */
+    CHECK_EQ(f.store.used_slots(), used);
+    CHECK_EQ((int64_t)f.kv.residency_cold_entries(1, G_RES).size(), 30ll);
+}
+
+TEST(rollback_frees_the_cold_entries_it_cuts_and_keeps_the_slots_of_the_rest) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_go_cold(f, 1);
+    CHECK_EQ(f.store.used_slots(), 30ll);
+    /* Back to 20 blocks: the cold entries 20..31 go, 2..19 stay cold. The cut ends on a block
+     * boundary, so the new tail is full and the next append starts a fresh block. */
+    CHECK_OK(f.kv.rollback(1, 16 * 20));
+    CHECK_EQ(f.store.used_slots(), 18ll);
+    CHECK_EQ((int64_t)f.kv.residency_cold_entries(1, G_RES).size(), 18ll);
+    /* A cut into a cold block would leave the next token's write in host memory: refused, and
+     * nothing is freed. */
+    CHECK_EQ(f.kv.rollback(1, 16 * 10 + 5), RAD_E_STATE);
+    CHECK_EQ(f.store.used_slots(), 18ll);
+    CHECK_EQ(f.kv.seq_tokens(1), 16ll * 20);
+    /* Appending past a cold entry is fine: only the partial tail is written. */
+    CHECK_OK(f.kv.ensure(1, 16 * 20 + 3));
+    f.kv.free_sequence(1);
+    CHECK_EQ(f.store.used_slots(), 0ll);
+}
+
+TEST(a_sequence_with_cold_blocks_cannot_be_forked_until_it_is_promoted) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_go_cold(f, 1);
+    CHECK_EQ(f.kv.fork(1, 2), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(2));                       /* nothing was half-built */
+    CHECK_EQ(f.store.used_slots(), 30ll);
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote_all(1, &up));
+    f.kv.residency_complete();
+    CHECK_OK(f.kv.fork(1, 2));
+    CHECK(f.kv.block_table(2, G_RES) == f.kv.block_table(1, G_RES));
+    CHECK_EQ(f.store.used_slots(), 0ll);
+}
+
+/* ------------------------------------------------------------------ window residency: the prefix cache */
+
+/* A 40-block conversation of the residency group, paged out between its sink and its window the
+ * way a decode sweep leaves it (entries [2, 32) cold), published and freed: the cache alone holds
+ * it, 30 store slots at one reference each. */
+static std::vector<int32_t> resid_publish_cold(Fixture& f, uint64_t id, int32_t base) {
+    const std::vector<int32_t> tokens = tok_run(base, 16 * 40);
+    CHECK_OK(f.kv.add_sequence(id));
+    CHECK_OK(f.kv.ensure(id, (int64_t)tokens.size()));
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(id, G_RES, 2, 8, &moves));
+    f.kv.residency_demote_landed();
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(id, g));
+    CHECK_OK(f.pc.insert(id, tokens, {}, bt, (int64_t)tokens.size()));
+    f.kv.free_sequence(id);
+    return tokens;
+}
+
+static void resid_open_store(Fixture& f, HostArena& store, int64_t slots = 256) {
+    CHECK_OK(f.build_groups(residency_groups(512)));
+    CHECK_OK(store.open(f.kv.residency_slot_bytes(), f.kv.residency_slot_bytes() * slots));
+    CHECK_OK(f.kv.set_residency_store(&store, 0));
+}
+
+/* The finding in #85: a long conversation's middle goes cold during decode, and a cache that
+ * refused cold blocks re-prefilled almost the whole context on the next turn. */
+TEST(the_prefix_cache_indexes_cold_blocks_and_a_hit_adopts_them_cold) {
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store);
+    const int64_t pool0 = f.kv.free_blocks(G_RES);
+    const std::vector<int32_t> tokens = resid_publish_cold(f, 1, 1);
+
+    CHECK_EQ(f.pc.size(), 40ll);                             /* the chain is not cut at the first cold entry */
+    CHECK_EQ(store.used_slots(), 30ll);                      /* the cache's references keep the slots */
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 10);      /* only the 10 resident entries hold blocks */
+
+    std::vector<int32_t> prompt = tokens;
+    prompt.push_back(99999);
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(prompt, {}, &hit);
+    CHECK_EQ(h.n_attn_tokens, 16 * 40);
+    REQUIRE_EQ(hit.size(), 2u);
+    int64_t cold = 0;
+    for (int32_t e : hit[0]) cold += f.kv.residency_cold(G_RES, e);
+    CHECK_EQ(cold, 30ll);
+
+    /* Adopting bumps the slots to two owners; the sequence's table is cold where the cache's is. */
+    CHECK_OK(f.kv.add_sequence(2));
+    for (size_t i = 0; i < hit.size(); ++i)
+        CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[i], hit[i], h.n_attn_tokens));
+    CHECK_EQ((int64_t)f.kv.residency_cold_entries(2, G_RES).size(), 30ll);
+    CHECK_EQ(store.used_slots(), 30ll);                      /* shared, not copied */
+    CHECK_EQ(f.kv.entry_refs(G_RES, f.kv.block_table(2, G_RES)[5]), 2);
+
+    /* The sequence going away leaves the cache's reference; the cache going away leaves nothing. */
+    f.kv.free_sequence(2);
+    CHECK_EQ(store.used_slots(), 30ll);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+    /* A cold id is a slot reference, never a pool block: the block calls refuse it. */
+    CHECK_EQ(f.kv.retain_block(G_RES, -2), RAD_E_INVAL);
+    CHECK_EQ(f.kv.retain_entry(G_RES, -1), RAD_E_INVAL);
+    CHECK_EQ(f.kv.retain_entry(G_RES, rad_kv_cold_entry(5)), RAD_E_STATE);   /* a free slot */
+}
+
+/* The acceptance check for the whole change: what the next turn promotes is what the last turn
+ * paged out. */
+TEST(a_published_cold_chain_comes_back_byte_for_byte_through_a_cache_hit) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store, 64);
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    const std::vector<int32_t> groups{ G_RES };
+    CHECK_OK(x.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+    const int64_t pool0 = f.kv.free_blocks(G_RES);
+
+    const std::vector<int32_t> tokens = tok_run(1, 16 * 40);
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, (int64_t)tokens.size()));
+    resid_fill(f.kv, G_RES);
+    const std::vector<int32_t> orig = f.kv.block_table(1, G_RES);
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &down));
+    REQUIRE_EQ(down.size(), 30u);
+    for (size_t i = 0; i < down.size(); i += TierExec::kMoveBatch) {
+        const std::vector<BlockMove> batch(down.begin() + (long)i,
+                                           down.begin() + (long)std::min(down.size(), i + TierExec::kMoveBatch));
+        CHECK_OK(x.issue_moves(batch, compute, /*to_host=*/true));
+        x.quiesce();
+    }
+    f.kv.residency_demote_landed();
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(1, g));
+    CHECK_OK(f.pc.insert(1, tokens, {}, bt, (int64_t)tokens.size()));
+    f.kv.free_sequence(1);
+    resid_scribble(f.kv, G_RES);                             /* the pool moves on to other owners */
+
+    std::vector<int32_t> prompt = tokens;
+    prompt.push_back(99999);
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(prompt, {}, &hit);
+    CHECK_EQ(h.n_attn_tokens, 16 * 40);
+    CHECK_OK(f.kv.add_sequence(2));
+    for (size_t i = 0; i < hit.size(); ++i)
+        CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[i], hit[i], h.n_attn_tokens));
+
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote_all(2, &up));
+    REQUIRE_EQ(up.size(), 30u);
+    for (size_t i = 0; i < up.size(); i += TierExec::kMoveBatch) {
+        const std::vector<BlockMove> batch(up.begin() + (long)i,
+                                           up.begin() + (long)std::min(up.size(), i + TierExec::kMoveBatch));
+        CHECK_OK(x.issue_moves(batch, compute, /*to_host=*/false));
+        x.quiesce();
+    }
+    f.kv.residency_complete();
+    for (int64_t e = 2; e < 32; ++e) {
+        const int32_t now = f.kv.block_table(2, G_RES)[(size_t)e];
+        CHECK(now >= 0);
+        CHECK_EQ(resid_mismatches(f.kv, G_RES, now, orig[(size_t)e]), 0ll);
+    }
+    CHECK_EQ(store.used_slots(), 30ll);                      /* the cache still holds every slot */
+
+    f.kv.free_sequence(2);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+/* Every way an entry leaves the cache gives its slot back, and a re-plan gives back whatever the
+ * cache still held. */
+TEST(no_store_slot_or_pool_block_outlives_a_cold_entry_however_the_cache_lets_it_go) {
+    enum { Evict, Trim, Clear, Expire, RePlan };
+    for (int how : { Evict, Trim, Clear, Expire, RePlan }) {
+        Fixture f;
+        HostArena store;
+        resid_open_store(f, store);
+        const int64_t pool0 = f.kv.free_blocks(G_RES), keys0 = f.kv.free_blocks(G_KEYS);
+        (void)resid_publish_cold(f, 1, 1);
+        CHECK_EQ(store.used_slots(), 30ll);
+        switch (how) {
+        case Evict:  CHECK_EQ(f.pc.evict_lru(1000), 40ll); break;
+        case Trim:   CHECK_EQ(f.pc.trim(1000), 40ll); break;
+        case Clear:  f.pc.clear(); break;
+        case Expire: CHECK_EQ(f.pc.expire(rad_mono_ns() + 1000000000ull, 1), 40ll); break;
+        case RePlan: CHECK_OK(f.kv.plan_groups(residency_groups(512), f.cfg)); break;
+        }
+        CHECK_EQ(store.used_slots(), 0ll);
+        if (how == RePlan) continue;                         /* the pool is re-carved with the plan */
+        CHECK_EQ(f.pc.size(), 0ll);
+        CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+        CHECK_EQ(f.kv.free_blocks(G_KEYS), keys0);
+    }
+}
+
+/* A block promoted from a slot another owner still holds, and untouched since, goes back by
+ * pointing at that slot: no bytes move and the store gains no second copy of the prefix. */
+TEST(re_demoting_an_unchanged_promoted_block_moves_no_bytes_and_a_written_one_is_copied_fresh) {
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store);
+    const int64_t pool0 = f.kv.free_blocks(G_RES);
+    const std::vector<int32_t> tokens = resid_publish_cold(f, 1, 1);
+    std::vector<int32_t> prompt = tokens;
+    prompt.push_back(99999);
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(prompt, {}, &hit);
+    CHECK_OK(f.kv.add_sequence(2));
+    for (size_t i = 0; i < hit.size(); ++i)
+        CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[i], hit[i], h.n_attn_tokens));
+    const std::vector<int32_t> slots = f.kv.block_table(2, G_RES);     /* cold ids of the cache */
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote_all(2, &up));
+    f.kv.residency_complete();
+    CHECK_EQ(store.used_slots(), 30ll);                      /* promoting copied out of the cache's slots */
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 40);
+
+    const auto before = f.kv.residency_stats();
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &down));
+    CHECK(down.empty());                                     /* nothing to copy: the bytes are in the slots */
+    const auto after = f.kv.residency_stats();
+    CHECK_EQ(after.repointed - before.repointed, 30ll);
+    CHECK_EQ(after.demoted_bytes, before.demoted_bytes);
+    CHECK_EQ(after.freed_blocks - before.freed_blocks, 30ll);
+    CHECK_EQ(store.used_slots(), 30ll);                      /* the same slots, no new copy */
+    for (int64_t e = 2; e < 32; ++e) CHECK_EQ(f.kv.block_table(2, G_RES)[(size_t)e], slots[(size_t)e]);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 10);      /* the 30 blocks are free at once */
+
+    /* Promote again, then write into one block: rolling back into entry 10 and growing past it is
+     * what a tail does. That block no longer equals its slot, so it takes a fresh one. */
+    up.clear();
+    CHECK_OK(f.kv.residency_promote_all(2, &up));
+    f.kv.residency_complete();
+    CHECK_OK(f.kv.rollback(2, 16 * 10 + 5));
+    CHECK_OK(f.kv.ensure(2, 16 * 14));
+    down.clear();
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 2, &down));
+    /* Entries 2..9 are untouched promotions; 10 was written and 11 is new: those two are copied. */
+    CHECK_EQ(down.size(), 2u);
+    const std::set<int32_t> cache_slots(slots.begin() + 2, slots.begin() + 32);
+    for (const BlockMove& m : down) CHECK(cache_slots.count(rad_kv_cold_entry(m.host_slot)) == 0);
+    CHECK_EQ(f.kv.residency_stats().repointed - before.repointed, 38ll);
+    f.kv.residency_demote_landed();
+
+    f.kv.free_sequence(2);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+}
+
+/* The tiers gather pool blocks; a cold id would index the pool out of range, and the residency
+ * group's bytes are already in host memory. */
+TEST(idle_tiers_are_never_handed_a_cache_entry_with_a_cold_component) {
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store);
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(64 * 1024, 1024)));
+    f.pc.set_tiers(&t);
+    (void)resid_publish_cold(f, 1, 1);
+    std::vector<TierJob> jobs;
+    t.plan_writeback(1 << 20, &jobs);
+    CHECK_EQ(jobs.size(), 10u);                              /* the sink and window entries only */
+    for (const TierJob& j : jobs)
+        for (int32_t b : j.blocks) CHECK(b >= 0);
+    for (TierJob& j : jobs) t.report(j, true);
+    /* Dropping what the tiers hold leaves the cold chain alone. */
+    CHECK_EQ(f.pc.drop_clean(), 10ll);
+    CHECK_EQ(store.used_slots(), 30ll);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+}
+
+TEST(a_re_plan_with_cold_entries_and_a_demote_in_flight_leaks_no_slot) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));     /* not landed */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 16 * 40));
+    resid_go_cold(f, 2);
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote(2, G_RES, { 5, 6 }, &up));   /* a promote in flight */
+    CHECK_EQ(f.store.used_slots(), 60ll);
+    /* The store cannot be swapped under cold entries... */
+    CHECK_EQ(f.kv.set_residency_store(nullptr, 0), RAD_E_STATE);
+    /* ...and a re-plan returns every slot, the landed, the in-flight and the held. */
+    CHECK_OK(f.kv.plan_groups(residency_groups(512), f.cfg));
+    CHECK_EQ(f.store.used_slots(), 0ll);
+}
+
+TEST(a_demotion_marks_the_table_changed_so_the_device_copy_is_restaged) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    (void)f.kv.take_table_changes(1, G_RES);            /* the mirror is current */
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));
+    CHECK_EQ(f.kv.take_table_changes(1, G_RES), 2ll);   /* from the first demoted entry */
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote(1, G_RES, { 10 }, &up));
+    CHECK_EQ(f.kv.take_table_changes(1, G_RES), 10ll);
+}
+
+
+/* ------------------------------------------------------------------ the pager's scratch pages */
+
+/* A host-mapped store plus the reservation the pager needs: --kv-residency-mib on, a 128-token
+ * window (8 table entries) on the 16-token group, 8 sequences. */
+struct ScratchFixture : ResidencyFixture {
+    ScratchFixture(int64_t residency_mib) {
+        cfg.vram_kv_mib = 8;
+        cfg.residency_mib = residency_mib;
+    }
+    int open_store(int64_t slots) {
+        const int s = store.open_mapped(kv.residency_slot_bytes(), kv.residency_slot_bytes() * slots);
+        if (s < 0) return s;
+        return kv.set_residency_store(&store, 0);
+    }
+    int configure() {
+        int s = configure_pools(pools, cfg);
+        return s < 0 ? s : kv.configure(residency_groups(128), cfg, pools.kv());
+    }
+};
+
+/* Reserved at carve and charged before the split: the budget resolver reads ceiling() and
+ * fixed_bytes() of an unallocated manager, so the reservation must be in both, or the resolver
+ * would over-commit the card by exactly the scratch. A row of the decode batch (max_seqs x
+ * (1 + n_spec)) needs topk + 1 pages of the window group and none of the group without a window. */
+TEST(the_pagers_scratch_pages_are_charged_to_the_vram_budget_before_the_split) {
+    Config off = small_config(), on = small_config();
+    on.residency_mib = 64;
+    KVManager a, b;
+    CHECK_OK(a.plan_groups(residency_groups(128), off));
+    CHECK_OK(b.plan_groups(residency_groups(128), on));
+
+    const int64_t pages = (128 / 16 + 1) * off.max_seqs;      /* topk + 1, per row */
+    const int64_t bytes = pages * 2048;
+    CHECK_EQ(b.plan(G_RES)->scratch_blocks, pages);
+    CHECK_EQ(b.plan(G_RES)->scratch_pitch, 128ll / 16 + 1);
+    CHECK_EQ(b.plan(G_KEYS)->scratch_blocks, 0ll);
+    CHECK_EQ(a.plan(G_RES)->scratch_blocks, 0ll);             /* a window nobody pages costs nothing */
+    CHECK_EQ(b.fixed_bytes() - a.fixed_bytes(), bytes);
+    CHECK_EQ(b.ceiling(1024) - a.ceiling(1024), bytes);
+    /* The pool a full-length sequence needs grows by at least the scratch. */
+    const int64_t ma = a.pool_mib_for_tokens(256, 64), mb = b.pool_mib_for_tokens(256, 64);
+    CHECK(ma > 0 && mb * (1 << 20) >= ma * (1 << 20) + bytes - (1 << 20));
+
+    /* And the resolver caps the cache's share at the larger ceiling. */
+    VramFacts f = big_moe_facts();
+    f.lends = true;
+    f.expert_floor = 1LL << 30;
+    f.kv_ceiling = b.ceiling(1024);
+    Config c = derive_config();
+    VramBudget bud;
+    CHECK_OK(vram_budget_resolve(c, { f }, &bud));
+    CHECK_EQ(bud.kv, f.kv_ceiling);
+    CHECK(bud.kv - [&] {
+        VramFacts g = f;
+        g.kv_ceiling = a.ceiling(1024);
+        Config c2 = derive_config();
+        VramBudget b2;
+        CHECK_OK(vram_budget_resolve(c2, { g }, &b2));
+        return b2.kv;
+    }() == bytes);
+}
+
+/* Engine-owned: ids [0, scratch) of the group, referenced for good, on no free list. A sequence
+ * that could be handed one would have the pager overwrite its keys and values mid-step. */
+TEST(scratch_pages_are_carved_but_no_sequence_is_ever_handed_one) {
+    ScratchFixture f(64);
+    CHECK_OK(f.configure());
+    const KVGroupPlan* p = f.kv.plan(G_RES);
+    const int64_t scratch = p->scratch_blocks;
+    CHECK_EQ(scratch, 9ll * 8);
+    /* Carved (pool bytes) but not countable capacity. */
+    CHECK_EQ(p->n_blocks, f.kv.total_blocks(G_RES) + scratch);
+    CHECK_EQ(f.kv.free_blocks(G_RES), f.kv.total_blocks(G_RES));
+    CHECK_EQ(f.kv.held_blocks(G_RES), scratch);
+
+    /* The table is rows x pitch, row r holding pages [r * pitch, (r + 1) * pitch). */
+    const std::vector<int32_t>& tbl = f.kv.scratch_table(G_RES);
+    CHECK_EQ((int64_t)tbl.size(), scratch);
+    CHECK_EQ(f.kv.scratch_rows(), 8ll);
+    for (int64_t i = 0; i < scratch; ++i) CHECK_EQ(tbl[(size_t)i], (int32_t)i);
+    CHECK(f.kv.scratch_table(G_KEYS).empty());
+
+    /* Drain the group: every id handed out is past the scratch and none repeats. */
+    std::set<int32_t> seen;
+    for (uint64_t id = 1; id < 1000 && f.kv.free_blocks(G_RES) > 0 && f.kv.free_blocks(G_KEYS) > 0; ++id) {
+        CHECK_OK(f.kv.add_sequence(id));
+        if (f.kv.ensure(id, 16 * 8) != RAD_OK) break;
+        for (int32_t b : f.kv.block_table(id, G_RES)) {
+            CHECK(b >= scratch);
+            CHECK(seen.insert(b).second);
+        }
+    }
+    CHECK(!seen.empty());
+    /* The pool cannot lend the top over the scratch either: nothing below a held block is lent. */
+    CHECK(f.kv.can_ever_fit(16) && !f.kv.can_ever_fit(16 * (f.kv.total_blocks(G_RES) + 1)));
+}
+
+/* The batch gets the pager's operands through the scheduler's interface: the card's address of
+ * the store, the slot size, each layer's fragment inside a slot and the scratch table. */
+TEST(the_manager_hands_the_batch_its_store_layer_offsets_and_scratch_table) {
+    ScratchFixture f(64);
+    CHECK_OK(f.configure());
+    KVBinding<KVManager> bind(&f.kv);
+    /* No store yet: nothing for the pager. */
+    CHECK(bind.pager(G_RES, 0).store == nullptr);
+    CHECK_OK(f.open_store(16));
+    CHECK(f.store.device_base() != nullptr);
+
+    const IKVManager::Pager p = bind.pager(G_RES, 0);
+    CHECK(p.store == f.store.device_base());
+    CHECK_EQ(p.slot_bytes, f.kv.residency_slot_bytes());
+    CHECK(p.scratch == f.kv.scratch_table(G_RES).data());
+    CHECK_EQ(bind.scratch_pitch(G_RES), 9ll);
+    /* Layers 0 and 1 are the group's; each fragment is one block of that layer's pool, in order. */
+    const KVGroupPlan* pl = f.kv.plan(G_RES);
+    CHECK(p.layer_off != nullptr);
+    CHECK(p.layer_off[0] >= 0);
+    CHECK_EQ(p.layer_off[1] - p.layer_off[0], pl->layer_bytes_per_block());
+    CHECK(p.layer_off[1] + pl->layer_bytes_per_block() <= f.kv.residency_slot_bytes());
+    /* A group with no window has none of it. */
+    const IKVManager::Pager none = bind.pager(G_KEYS, 0);
+    CHECK(none.store == nullptr && none.layer_off == nullptr && none.scratch == nullptr);
+    CHECK_EQ(bind.scratch_pitch(G_KEYS), 0ll);
+}
+
+/* Without the flag the store is never opened, so nothing pages and nothing is reserved. */
+TEST(no_scratch_is_reserved_when_no_residency_store_is_asked_for) {
+    ScratchFixture f(0);
+    CHECK_OK(f.configure());
+    CHECK_EQ(f.kv.plan(G_RES)->scratch_blocks, 0ll);
+    CHECK(f.kv.scratch_table(G_RES).empty());
+    KVBinding<KVManager> bind(&f.kv);
+    CHECK(bind.pager(G_RES, 0).store == nullptr);
+    CHECK_EQ(f.kv.free_blocks(G_RES), f.kv.total_blocks(G_RES));
+}
+
+/* The pager reads the store from the card, so a host whose pinned memory has no address on the
+ * card must refuse by the flag's name, and leave the arena closed. */
+TEST(a_host_without_svm_refuses_the_residency_store_and_names_the_flag) {
+    HostArena a;
+    /* The refusal is what the operator reads, so capture stderr, where the log goes. */
+    const std::string path = radtest::tmp_path("svm.log");
+    fflush(stderr);
+    const int saved = dup(2);
+    CHECK(freopen(path.c_str(), "w", stderr) != nullptr);
+    const int rc = a.open_mapped(4096, 4096 * 4, [](void*) -> void* { return nullptr; });
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    clearerr(stderr);
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(!a.enabled());
+    CHECK(a.device_base() == nullptr);
+    std::string log;
+    if (FILE* fp = fopen(path.c_str(), "r")) {
+        char buf[512];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, fp)) > 0) log.append(buf, n);
+        fclose(fp);
+    }
+    CHECK(log.find("--kv-residency-mib") != std::string::npos);
+
+    HostArena ok;
+    CHECK_OK(ok.open_mapped(4096, 4096 * 4));
+    CHECK(ok.enabled() && ok.device_base() != nullptr);
+}
+
+
+/* A server pages for every long request it serves, so the per-session counters are bounded: past
+ * kResidencySessions the oldest request ids go, and the session being counted never does. */
+TEST(the_per_session_residency_counters_keep_only_the_newest_sessions) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    const uint64_t n = KVManager::kResidencySessions + 10;
+    for (uint64_t id = 1; id <= n; ++id) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_OK(f.kv.ensure(id, 16 * 4));
+        std::vector<BlockMove> moves;
+        CHECK_OK(f.kv.residency_demote(id, G_RES, 1, 1, &moves));
+        f.kv.residency_demote_landed();
+        f.kv.free_sequence(id);
+    }
+    const auto& by = f.kv.residency_by_seq();
+    CHECK_EQ(by.size(), (size_t)KVManager::kResidencySessions);
+    CHECK(by.count(1) == 0);                    /* the oldest went */
+    CHECK(by.count(n) == 1);                    /* the newest stayed */
+    CHECK_EQ(by.begin()->first, n - KVManager::kResidencySessions + 1);
+}
+
+/* The engine's half of the sweep: it polls, never waits, for a move to land, and a follower rank
+ * carries out the list rank 0 planned though its own manager holds no record of it. Before the
+ * first move there is nothing to wait for. */
+TEST(a_move_is_polled_until_it_lands_and_a_follower_rank_runs_the_leaders_list) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 64));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    const std::vector<int32_t> groups{ G_RES };
+    TierExec lead, follower;
+    CHECK_OK(lead.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 1, 1, /*leader=*/true, 0, 0, nullptr));
+    CHECK_OK(follower.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 1, 1, /*leader=*/false, 0, 0, nullptr));
+    CHECK(lead.moves_landed());                      /* nothing issued, nothing to wait for */
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_fill(f.kv, G_RES);
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &down, /*max=*/TierExec::kMoveBatch));
+    REQUIRE_EQ(down.size(), (size_t)TierExec::kMoveBatch);
+    CHECK_OK(lead.issue_moves(down, compute, /*to_host=*/true));
+    CHECK_OK(follower.issue_moves(down, compute, /*to_host=*/true));
+    lead.quiesce();
+    for (int i = 0; i < 1000 && !lead.moves_landed(); ++i) {}
+    CHECK(lead.moves_landed());
+    CHECK(follower.moves_landed() || (follower.quiesce(), follower.moves_landed()));
+
+    /* A list the manager never handed out is the leader's to refuse; a follower has no record to
+     * check it against. */
+    std::vector<BlockMove> invented = down;
+    for (BlockMove& m : invented) m.host_slot += 40;
+    CHECK_EQ(lead.issue_moves(invented, compute, true), (int)RAD_E_STATE);
+
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+/* The pager's counter is one int64 per rank, allocated once at a fixed address (the batch carries
+ * it from the first step), zero at the start, and read back by a poll. */
+TEST(the_pagers_counter_starts_at_zero_keeps_its_address_and_reads_back_what_the_card_added) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 64));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    CHECK_OK(x.configure(&reg, &f.kv, &t, { G_RES }, TierExec::kMoveBatch, 1, 1, true, 0, 0, nullptr));
+    int64_t* c = x.paged_counter();
+    REQUIRE(c != nullptr);
+    CHECK(x.paged_counter() == c);
+    CHECK_EQ(x.paged_in(), 0ll);
+    /* The manager only carries the address to the batch. */
+    f.kv.set_residency_paged(c);
+    CHECK(f.kv.residency_paged() == c);
+
+    /* A first move creates the transfer stream the readback uses. On the host backend the card's
+     * memory is host memory, so adding to the counter stands for the kernel's atomic add. */
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    std::vector<BlockMove> down;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &down, TierExec::kMoveBatch));
+    CHECK_OK(x.issue_moves(down, compute, true));
+    x.quiesce();
+    *c += 5;
+    CHECK_EQ(x.paged_in(), 5ll);
+    *c += 7;
+    CHECK_EQ(x.paged_in(), 12ll);
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+/* What /stats reports: the binding hands the poll the card's count, and with no pager (no reader)
+ * it is zero, which is every server without --kv-residency-mib. */
+TEST(the_manager_binding_reports_the_pagers_count_only_when_a_reader_is_installed) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 64));
+    KVBinding<KVManager> bind(&f.kv);
+    CHECK_EQ(bind.residency().paged_in, 0ll);
+    int64_t counted = 41;
+    bind.paged_read = [&] { return counted; };
+    CHECK_EQ(bind.residency().paged_in, 41ll);
+    counted = 42;
+    CHECK_EQ(bind.residency().paged_in, 42ll);
+}
+
 RAD_TEST_MAIN()
 
 /* A streamed-only op exists only when the architecture's capability table says it can stream AND

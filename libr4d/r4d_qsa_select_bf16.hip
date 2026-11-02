@@ -74,15 +74,15 @@ template <bool Signed> __device__ __forceinline__ uint32_t keyof(float v, int pa
  * select, not fmaxf: fmaxf(-0.0f, 0.0f) may return -0.0f, whose sign bit would rank it above
  * every positive score. */
 template <> __device__ __forceinline__ uint32_t keyof<false>(float v, int page) {
-    if (page < 0 || !(v > -1e30f)) return 0u;
+    if (page == -1 || !(v > -1e30f)) return 0u;
     return __float_as_uint(v > 0.0f ? v : 0.0f) + 1u;
 }
 
 /* Signed order key, for indexers whose scores can be negative (GLM's head gates): the float's
- * total order over all 32 bits. Absent pages and nonfinite scores are key 0, which no finite
+ * total order over all 32 bits. Absent pages (-1) and nonfinite scores are key 0, which no finite
  * score maps to (only NaN bit patterns would); both signed zeros map to one key, so they tie. */
 template <> __device__ __forceinline__ uint32_t keyof<true>(float v, int page) {
-    if (page < 0 || !__builtin_isfinite(v)) return 0u;
+    if (page == -1 || !__builtin_isfinite(v)) return 0u;
     const uint32_t bits = v == 0 ? 0u : __float_as_uint(v);
     return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }

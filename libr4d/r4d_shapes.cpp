@@ -1944,6 +1944,30 @@ extern "C" int r4d_shape_kv_resolve(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* The QSA pager. A generated table draws resident ids only (a random draw cannot pair a cold entry
+ * with a slot and a scratch page), so this exercises the pass-through; the selftest builds the cold
+ * cases by hand. The store is four slots twice the fragment wide, so the row pitch exceeds
+ * `block_bytes`, as the plugin's per-layer view does. */
+extern "C" int r4d_shape_qsa_page(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t k  = pi(p, n_p, "topk");
+    const int64_t nb = pi(p, n_p, "blocks");
+    const int64_t bb = pi(p, n_p, "block_bytes");
+    if (k <= 0 || nb <= 0 || bb <= 0) return RAD_E_UNSUPPORTED;
+    RadOpdDesc store = opd((uint32_t)RAD_U8, 4, 2 * bb);
+    store.fill = RAD_FILL_INDEX; store.idx_max = 256;
+    RadOpdDesc pool = opd((uint32_t)RAD_U8, M * (k + 1) + nb, bb);
+    pool.fill = RAD_FILL_INDEX; pool.idx_max = 256;
+    const RadOpdDesc l[] = {
+        opd_idx(M, k + 1, nb),                /* sel: resident ids */
+        store, pool,
+        opd_idx(M, k + 1, M * (k + 1)),       /* scratch: ids inside the pool */
+        opd((uint32_t)RAD_I64, 1),            /* paged: the counter */
+    };
+    R4D_PICK(l);
+}
+
 /* The QSA block score. The block-key store's height is the KV pool's page count, which the
  * runtime decides, so `blocks` gives the widest a table entry can address: a bound, not the plan.
  * Table entries are page ids. */

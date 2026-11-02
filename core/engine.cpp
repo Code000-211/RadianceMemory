@@ -1903,7 +1903,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * whose stream it is given (spec §1). */
     RAD_TRY(rad_dev_set(ranks_[0]->device));
 
-    kv_iface_ = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
+    {
+        auto kvb = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
+        for (size_t i = 1; i < ranks_.size(); ++i) kvb->peers.push_back(&ranks_[i]->kv);
+        kv_iface_ = std::move(kvb);
+    }
     pc_iface_ = std::make_unique<PCBinding<PrefixCache>>(&ranks_[0]->prefix);
     /* The control vector's identity partitions the block cache (PCBinding::salt_id): a request
      * that runs with the projection on never adopts a block or a linear-state snapshot produced
@@ -2042,6 +2046,43 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * the card there is no such cost and every lone prefill spans. */
         sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+    }
+
+    /* Window residency (spec §7.3): the scheduler names the blocks, this runs them. Installed only
+     * when the store is open and every rank can move bytes (bring-up refuses otherwise), so a
+     * server without --kv-residency-mib never gets a mover and the scheduler demotes and promotes
+     * nothing -- the same code path as before the pager existed. */
+    static_assert(kResidencySweepBlocks == 4 * TierExec::kMoveBatch, "the sweep bound is four batches");
+    if (!gen_ && ranks_[0]->resx.enabled()) {
+        Scheduler::ResidencyMover m;
+        /* Every rank moves its own shard of the same block ids; the manager's records are rank
+         * 0's. One group a call (the scheduler cuts the list at group changes), cut here at the
+         * batch size TierExec stages. A demotion is ordered after the rank's compute stream, a
+         * promotion makes it wait: the host waits for neither. */
+        m.move = [this](const std::vector<BlockMove>& mv, bool to_host) {
+            int rc = RAD_OK;
+            for (auto& r : ranks_) {
+                if (rad_dev_set(r->device) != RAD_OK) { rc = rc ? rc : RAD_E_DEVICE; continue; }
+                for (size_t a = 0; a < mv.size(); a += TierExec::kMoveBatch) {
+                    const std::vector<BlockMove> part(
+                        mv.begin() + (std::ptrdiff_t)a,
+                        mv.begin() + (std::ptrdiff_t)std::min(mv.size(), a + TierExec::kMoveBatch));
+                    const int st = r->resx.issue_moves(part, r->ctx.stream(), to_host);
+                    if (st < 0 && rc == RAD_OK) rc = st;
+                }
+            }
+            (void)rad_dev_set(ranks_[0]->device);
+            return rc;
+        };
+        /* A poll of one event a rank: the step path never waits on the host for a transfer. */
+        m.landed = [this] {
+            for (auto& r : ranks_) if (!r->resx.moves_landed()) return false;
+            return true;
+        };
+        sched_.set_residency_mover(std::move(m), kResidencySweepBlocks);
+        /* The pager's count, read back when a statistics poll asks (rank 0's counter). */
+        static_cast<KVBinding<KVManager>*>(kv_iface_.get())->paged_read =
+            [this] { return ranks_[0]->resx.paged_in(); };
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());

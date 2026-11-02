@@ -60,6 +60,16 @@ struct QsaIndexer {
          * wider than them is one sequence (RadBuildCtx::max_mixed_tok); such a step scores and
          * selects in windows of this many rows (step()). */
         int64_t     plane_rows = 0;
+        /* Issue `qsa_page` between the selection and the attention (spec §7.3): the group
+         * declares a window (declare() always sets one) and the deployment asked for the store
+         * (RadBuildCtx::kv_residency). False declares no pager op, and the graph is the one a
+         * server that keeps every block resident runs. Also false on a rank that keeps no
+         * attention cache (Geom::attn_zero): there is no pool to page into, and nothing reads
+         * that rank's selection. */
+        bool        page       = false;
+        /* The bytes of one layer's fragment of an attention block (K and V of `ratio` tokens), the
+         * pager's `block_bytes`: what one cold block copies per layer. */
+        int64_t     page_block_bytes = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -111,7 +121,7 @@ struct QsaIndexer {
     /* Most rows `op_qprep` may be issued over (0 when not declared): `qk_fuse_rows`, a correctness
      * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
-    rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0;
+    rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0, op_page = 0;
 
     bool on() const { return op_rope != 0; }
 
@@ -140,6 +150,20 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     /* The layer's rotary width must fit inside the index head (as the checkpoint's validator also
      * requires). */
     if (c.rot < 0 || c.rot > c.head_dim || (c.rot & 1)) return RAD_E_SHAPE;
+
+    /* The residency window (spec §7.3). QSA reads `budget` tokens of a history, selected from
+     * anywhere in it, plus the tail, so the blocks the attention does not read are dead weight in
+     * VRAM: a 200K-token context's attention cache is 4.8 GiB of which a decode step reads about
+     * 48 MiB. Declaring the reach here, and not in the attention helper, is what lets the core
+     * move the rest to host memory: the helper declares a group whose consumer might read all of
+     * it, and only the indexer knows the model does not.
+     *
+     * The number is a policy hint and never a correctness bound: a selection that reaches past it
+     * is promoted in the step that reads it (KVManager::residency_promote), which costs link
+     * traffic and nothing else. The block-key group is deliberately not annotated -- the scorer
+     * reads every block key, so its pages must stay resident (3.25 of the 29.25 KiB a 4-token
+     * block costs, and the half no window can shrink). */
+    RAD_ARCH_TRY(rad_kv_set_residency_window(b, c.kv_attn, c.budget));
 
     const int64_t nw = (c.heads + 1) * c.head_dim;       /* the projection width */
 
@@ -261,6 +285,20 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
 
     /* When the attention group streams, the attention block resolves `sel` to ring slots after its
      * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
+    /* The pager rewrites `sel` in place, so it both reads and writes it; the attention, declared
+     * before this op, reads `sel` through its own liveness declaration. `M` is the decode rows,
+     * the ones that own scratch pages (RadKVGroupBatch::residency_scratch). A prefill row's
+     * history is promoted before its step instead, so it never names a cold block. */
+    if (c.page) {
+        if (c.page_block_bytes <= 0) return RAD_E_INVAL;
+        op_page = rw(b, RAD_OP(b, "qsa_page",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("topk", c.topk),
+                                     RAD_INT("blocks", c.max_blocks),
+                                     RAD_INT("seqs", g.max_seqs),
+                                     RAD_INT("block_bytes", c.page_block_bytes)),
+                          RAD_NOWEIGHTS),
+                     {w.sel}, {w.sel});
+    }
     return RAD_OK;
 }
 
@@ -410,6 +448,27 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 brows(w.nc, S), praw(batch->positions, RAD_I32, T),
                 praw(batch->cu_seqlens, RAD_I32, S + 1),
                 brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+
+    /* The pager, on the decode rows (they come first, RadBatch::n_seq_decode, and own the scratch
+     * pages). Only with the store open this step: the declare asked for the op, the batch says
+     * whether a store exists, and a step with none has no cold entry to rewrite. A step with no
+     * decode row has no scratch and nothing to page. A windowed prefill (above) never gets here:
+     * its history was promoted before the step. */
+    if (op_page && atb->residency_store && atb->residency_slots > 0 && atb->residency_layer_off &&
+        atb->residency_scratch &&
+        batch->n_tok_decode > 0)
+        RAD_ISSUE_N(c_, op_page, batch->n_tok_decode,
+                    brows(w.sel, batch->n_tok_decode),
+                    /* The store as this layer's fragments see it: the offset is folded in here, on the
+                     * host, because the offset table is host memory a device kernel cannot read.
+                     * Slot s of this layer starts at store + s * slot_bytes (the operand's extent). */
+                    praw2((char*)atb->residency_store + atb->residency_layer_off[layer], RAD_U8,
+                          atb->residency_slots, atb->residency_slot_bytes),
+                    kv_cache(c.kv_attn, layer),
+                    praw2(atb->residency_scratch, RAD_I32, batch->n_tok_decode,
+                          atb->residency_scratch_pitch),
+                    /* The optional counter (null: not counted; a null operand is an absent one). */
+                    praw(atb->residency_paged, RAD_I64, 1));
 
     /* RADIANCE_DEBUG_QSA: prints the first few selections (nc, nsel, sequ, leading sel and score
      * entries) to tell a divergence from intended dropping (`nc` above `topk`). Synchronises the

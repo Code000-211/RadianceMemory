@@ -24490,6 +24490,129 @@ static void sam_attn_case(const Plugin& pl) {
        "bad=" + std::to_string(bad_total) + "/" + std::to_string(checked));
 }
 
+/* qsa_page, against libref's ref_qsa_page, byte for byte.
+ *
+ * The pager rewrites each cold entry (-2 - slot) of a selection to a scratch page after copying the
+ * block's fragment out of the layer's view of the residency store; resident and empty entries pass
+ * through. Two geometries: a 16-byte-aligned fragment (the wide copy) and an odd-length one on a
+ * store whose base is one byte off alignment with an odd pitch (the byte copy). The pool holds a
+ * poison pattern, so a write outside a scratch block, or past the fragment into its row padding,
+ * changes the compared bytes. Row 2 holds no cold entry and must pass through whole; row 4 is all
+ * cold. The selection and the pool are both compared whole, not just the rewritten positions.
+ */
+static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t slot_pitch,
+                         int64_t pool_pitch, int64_t store_skew, bool kv_shaped = false) {
+    const RadKernelInfo* r = find(pl, "qsa_page_u8");
+    if (!r || !g_plugin) { ok(what, false, "row or plugin path absent"); return; }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what, false, "reference plugin unavailable"); return; }
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "qsa_page")) { oracle = at(i); break; }
+    if (!oracle) { ok(what, false, "reference operation unavailable"); dlclose(ref); return; }
+
+    const int64_t M = 5, topk = 7, w = topk + 1, slots = 6, blocks = 40, pages = 24;
+    std::vector<int32_t> sel((size_t)(M * w)), scr((size_t)(M * w));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t j = 0; j < w; ++j) {
+            const size_t i = (size_t)(m * w + j);
+            scr[i] = (int32_t)pages;                                        /* made distinct for cold ones below */
+            sel[i] = (int32_t)((m * 5 + j * 3) % pages);              /* resident */
+            if (m == 2) continue;                                     /* no cold entry */
+            if (m == 4 || (j + m) % 3 == 0) sel[i] = (int32_t)(-2 - (m * 2 + j) % slots);
+            else if ((j + m) % 4 == 1) sel[i] = -1;
+        }
+    /* Distinct scratch ids for the cold positions, from the top of the pool; the reference refuses
+     * a repeat. */
+    {
+        int32_t next = (int32_t)pages;
+        for (size_t i = 0; i < sel.size(); ++i)
+            if (sel[i] <= -2) scr[i] = next++;
+        if (next > blocks) { ok(what, false, "fixture: too many cold entries for the pool"); dlclose(ref); return; }
+    }
+    std::vector<uint8_t> store((size_t)(slots * slot_pitch + store_skew)), pool((size_t)(blocks * pool_pitch), 0xA5);
+    for (size_t i = 0; i < store.size(); ++i) store[i] = (uint8_t)(st_mix32((uint32_t)i) >> 7);
+
+    auto mk = [&](void* ds, void* dst, void* dp, void* dc, std::vector<RadTensor>& ts) {
+        RadTensor tst = T(dst, RAD_U8, { slots, bb });
+        tst.stride[0] = slot_pitch;
+        /* The pool as the core binds a KV operand: the layer's own shape and dtype, not a byte
+         * plane -- here bf16 [blocks, 1 head, 2 tokens, bb / 4] with the same byte pitch. */
+        RadTensor tp = kv_shaped ? T(dp, RAD_BF16, { blocks, 1, 2, bb / 4 }) : T(dp, RAD_U8, { blocks, bb });
+        tp.stride[0] = kv_shaped ? pool_pitch / 2 : pool_pitch;
+        ts = { T(ds, RAD_I32, { M, w }), tst, tp, T(dc, RAD_I32, { M, w }) };
+    };
+    /* The optional counter operand, seeded non-zero: the op adds, it does not store. */
+    auto with_count = [&](void* dcount, std::vector<RadTensor>& ts) { ts.push_back(T(dcount, RAD_I64, { 1 })); };
+    std::vector<RadParam> ps = { PI("M", M), PI("topk", topk), PI("blocks", blocks), PI("seqs", M),
+                                 PI("block_bytes", bb) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.p = ps.data(); a.n_p = (int)ps.size();
+
+    /* The reference, on host copies. */
+    std::vector<int32_t> wsel = sel;
+    std::vector<uint8_t> wpool = pool;
+    std::vector<RadTensor> hts;
+    mk(wsel.data(), store.data() + store_skew, wpool.data(), scr.data(), hts);
+    int64_t want_count = 1000;
+    with_count(&want_count, hts);
+    a.t = hts.data(); a.n_t = (int)hts.size();
+    const int rr = oracle->launch(&a, nullptr);
+    if (rr != RAD_OK) { ok(what, false, "reference rc=" + std::to_string(rr)); dlclose(ref); return; }
+
+    /* The kernel. */
+    void* d_se = dalloc(sel.size() * 4);
+    void* d_sc = dalloc(scr.size() * 4);
+    void* d_st = dalloc(store.size());
+    void* d_pl = dalloc(pool.size());
+    st_memcpy(d_se, sel.data(), sel.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_sc, scr.data(), scr.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_st, store.data(), store.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_pl, pool.data(), pool.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> dts;
+    mk(d_se, (uint8_t*)d_st + store_skew, d_pl, d_sc, dts);
+    int64_t* d_ct = (int64_t*)dalloc(sizeof(int64_t));
+    const int64_t seed = 1000;
+    st_memcpy(d_ct, &seed, sizeof seed, hipMemcpyHostToDevice);
+    with_count(d_ct, dts);
+    a.t = dts.data(); a.n_t = (int)dts.size();
+    const int rc = r->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc)); dlclose(ref); return; }
+    std::vector<int32_t> gsel(sel.size());
+    std::vector<uint8_t> gpool(pool.size());
+    st_memcpy(gsel.data(), d_se, gsel.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(gpool.data(), d_pl, gpool.size(), hipMemcpyDeviceToHost);
+    int64_t got_count = 0;
+    st_memcpy(&got_count, d_ct, sizeof got_count, hipMemcpyDeviceToHost);
+    size_t cold = 0;
+    for (int32_t e : sel) cold += e <= -2;
+    const bool sel_ok = gsel == wsel, pool_ok = gpool == wpool, moved = wpool != pool && cold > 0;
+    /* Both added the cold entries to 1000: the card's count is the reference's, and is the number
+     * of cold positions, not the width of the grid. */
+    const bool cnt_ok = got_count == want_count && got_count == 1000 + (int64_t)cold;
+    ok(what, sel_ok && pool_ok && moved && cnt_ok,
+       std::string("sel=") + (sel_ok ? "1" : "0") + " pool=" + (pool_ok ? "1" : "0") +
+       " count=" + std::to_string(got_count) + "/" + std::to_string(1000 + (int64_t)cold) +
+       " cold=" + std::to_string(cold) + " reference_wrote=" + (moved ? "1" : "0"));
+    dlclose(ref);
+}
+
+static void qsa_page_case(const Plugin& pl) {
+    qsa_page_one(pl, "qsa_page vs libref byte for byte, a 16-byte-aligned fragment (wide copy)",
+                 96, 128, 112, 0);
+    qsa_page_one(pl, "qsa_page vs libref byte for byte, an odd fragment on a skewed store (byte copy)",
+                 37, 51, 45, 1);
+    qsa_page_one(pl, "qsa_page vs libref byte for byte, the pool in its KV shape (bf16, rank 4)",
+                 96, 128, 112, 0, /*kv_shaped=*/true);
+}
+
 /* qsa_select, against a host sort of the same scores.
  *
  * Focused on ties and the tail. Block scores (sums of relus over a shared grid) tie often, so the
@@ -24501,9 +24624,16 @@ static void sam_attn_case(const Plugin& pl) {
  *   the partial page is last, so the attention's causal bound masks inside it only;
  *   a page id of -1 inside the scored range is never selected, whatever its score;
  *   two runs give byte-identical tables (atomic placement would not).
+ *
+ * `cold` turns every fifth block's entry into the pager's cold encoding (-2 - slot, any value
+ * below -1): a paged-out block is a live candidate, so the oracle ranks it exactly as it would a
+ * resident one with the same score and the table carries the encoded value through. Only -1 is
+ * dead.
  */
-static void qsa_select_case(const Plugin& pl, int signed_scores = 0) {
-    const char* what = "qsa_select vs a host sort, with ties, a tail and a dead page";
+static void qsa_select_case(const Plugin& pl, int signed_scores = 0, bool cold = false) {
+    const std::string what_s = std::string("qsa_select vs a host sort, with ties, a tail and a dead page") +
+        (cold ? ", cold entries ranked as live" : "");
+    const char* what = what_s.c_str();
     const RadKernelInfo* r = find(pl, "qsa_select_i32");
     if (!r) { ok(what, false, "row absent"); return; }
 
@@ -24523,6 +24653,7 @@ static void qsa_select_case(const Plugin& pl, int signed_scores = 0) {
                 sc[i] = (float)((b * 17 + m * 7) % 40) * 0.25f;
                 if (signed_scores) sc[i] -= signed_scores == 1 ? 5.0f : 20.0f;
                 bt[i] = (int32_t)((b * 31 + m * 11) % pages);
+                if (cold && b % 5 == 2) bt[i] = (int32_t)(-2 - ((b * 13 + m) % 1000));
                 /* A dead page with a winning score, inside the scored range. */
                 if (b == live / 3) { sc[i] = 1e6f; bt[i] = -1; }
             } else if (b == live) {
@@ -24539,7 +24670,7 @@ static void qsa_select_case(const Plugin& pl, int signed_scores = 0) {
         const int64_t live = nc[(size_t)m];
         std::vector<std::pair<float, int64_t>> v;
         for (int64_t b = 0; b < live; ++b)
-            if (bt[(size_t)(m * nb + b)] >= 0) v.push_back({ sc[(size_t)(m * nb + b)], b });
+            if (bt[(size_t)(m * nb + b)] != -1) v.push_back({ sc[(size_t)(m * nb + b)], b });
         std::stable_sort(v.begin(), v.end(), [](const std::pair<float, int64_t>& a,
                                                 const std::pair<float, int64_t>& b) {
             return a.first > b.first;                       /* stable => index ascending on ties */
@@ -24619,7 +24750,7 @@ static void qsa_select_case(const Plugin& pl, int signed_scores = 0) {
         if (want_tail[(size_t)m] >= 0 && (ns == 0 || mine.back() != want_tail[(size_t)m]))
             tail_ok = false;
         if (want_tail[(size_t)m] >= 0) mine.pop_back();
-        for (int32_t v : mine) if (v < 0) dead_ok = false;
+        for (int32_t v : mine) if (v == -1) dead_ok = false;
         std::vector<int32_t> ref = want[(size_t)m];
         std::sort(mine.begin(), mine.end());
         std::sort(ref.begin(), ref.end());
@@ -31755,11 +31886,18 @@ static void device_phase(const Plugin& pl) {
         qsa_tail_store_case(pl);
     }
 
+    if (sel("qsa_page_u8")) {
+        if (!g_case) std::printf("\nthe QSA pager, against libref's reference\n");
+        qsa_page_case(pl);
+    }
+
     if (sel("qsa_select_i32")) {
         if (!g_case) std::printf("\nthe QSA selection, against a host sort\n");
         qsa_select_case(pl);
         qsa_select_case(pl, 1);
         qsa_select_case(pl, 2);
+        qsa_select_case(pl, 0, true);
+        qsa_select_case(pl, 1, true);
         qsa_select_prefill_case(pl);
         qsa_select_wide_case(pl);
         qsa_select_split_one(pl, "qsa_select split across chunks vs the same launch unsplit",

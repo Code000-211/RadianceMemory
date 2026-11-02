@@ -120,6 +120,40 @@ public:
      * off-device or already has work outstanding. */
     bool plan_promote(const BlockHash& key, TierJob* out);           /* leader only */
 
+    /* ---------------- window residency (spec §7.3) ----------------
+     *
+     * Moves one group's blocks between the pool and the manager's pinned store. `to_host` packs them
+     * out of the pool with gather_rows and writes their slots; the reverse copies the slots in and
+     * scatters them back, then makes `compute` wait -- the step that follows reads them.
+     *
+     * One group a call, up to kMoveBatch blocks. Both directions run on the transfer stream, so a
+     * promotion always sees what the demotion before it wrote. The caller owns the order: a demote
+     * belongs after the step that wrote the blocks, a promote before the step that reads them.
+     *
+     * A block the manager has no slot for is refused rather than half-moved: a promotion into a
+     * block the sequence no longer holds would serve another sequence's bytes. */
+    static constexpr int kMoveBatch = 16;
+    int  issue_moves(const std::vector<BlockMove>& moves, RadStream compute, bool to_host);
+    struct MoveStats { int64_t out_blocks = 0, in_blocks = 0, out_bytes = 0, in_bytes = 0; };
+    const MoveStats& move_stats() const { return mv_; }
+    /* Whether every move issued so far has landed: a poll of one event, no host sync. True when
+     * nothing was issued. A failed query counts as landed, so a broken card cannot hold pool
+     * blocks and store slots for ever (the failure itself was reported by the move). */
+    bool moves_landed() const;
+    /* Only the leader's manager holds the move records (rank 0 hands out slot ids and blocks); a
+     * follower carries out the same list into its own shard and has nothing to check it against. */
+
+    /* ---------------- the pager's counter ----------------
+     *
+     * One int64 on this rank's card that `qsa_page` adds the cold entries it rewrote to
+     * (RadKVGroupBatch::residency_paged). Allocated by the first call, zeroed, and never moved, so
+     * the batch can carry its address from the start. null when the card has no memory for it.
+     * paged_in() reads it back with one small copy on the transfer stream and waits for that copy
+     * only -- never for the step -- so it belongs on a statistics poll, not on the step path. */
+    int64_t* paged_counter();
+    int64_t  paged_in();
+
+
     /* ---------------- RADIANCE_DEBUG_TIER_VERIFY, the replicated window ----------------
      *
      * A replicated group's bytes are the plugin's claim. Under the variable a follower gathers the
@@ -170,8 +204,12 @@ private:
      * checked here, where the job can still be refused. */
     bool blocks_backed(const std::vector<int32_t>& blocks, const char* what);
     void warn_once(const char* what, int st);
+    /* One launch per (group, layer). `pitch` is the staging stride between consecutive jobs:
+     * one cache entry for the idle tiers, one block for a residency move. `stage_off` is where
+     * this group's bytes start inside a job's staging slot. */
     int  run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int64_t layer,
-                  void* stage_base, const int32_t* d_idx, int64_t n_jobs);
+                  void* stage_base, const int32_t* d_idx, int64_t n_jobs,
+                  int64_t pitch, int64_t stage_off);
     /* One strided copy per window per run of consecutive arena slots, `n` entries starting at job
      * `first` of `order`. To host when `out` (the replicated window from the leader only), from
      * host otherwise. */
@@ -227,6 +265,10 @@ private:
     RadEvent  ev_compute_ = nullptr;  /* the compute stream, as a copy out found it */
     RadEvent  ev_copy_ = nullptr;     /* the last copy out, landed */
     RadEvent  ev_restore_ = nullptr;  /* the last restore, landed */
+    RadEvent  ev_move_ = nullptr;     /* the last residency move, either direction, landed */
+    bool      moved_ = false;         /* a move was recorded on ev_move_ */
+    int64_t*  paged_dev_ = nullptr;   /* paged_counter(), device */
+    int64_t*  paged_host_ = nullptr;  /* its readback target, pinned */
     bool      copy_out_ = false;
     /* Transfer stream. Each stream costs a hardware queue, and a fourth queue costs this card 65% of
      * its decode step, so the tier borrows the expert mover's maintenance stream
@@ -244,6 +286,14 @@ private:
      * window, above. A copy out is hashed once landed (first seen by copy_state). */
     bool      verify_ = false;
     bool      verify_rep_ = false;    /* a follower gathering the replicated groups to verify */
+    /* Residency staging (issue_moves): one batch of one group's blocks, both directions, plus the
+     * block indices it gathers with. Allocated with the rest of the device state and only when some
+     * group declares a residency window, so a server that never moves a block pays nothing. */
+    void*     move_stage_ = nullptr;
+    int32_t*  move_idx_host_ = nullptr;
+    int32_t*  move_idx_dev_ = nullptr;
+    int64_t   move_bytes_ = 0;      /* bytes one block of the widest residency group takes */
+    MoveStats mv_;
     std::unordered_map<BlockHash, uint64_t, BlockHashHash> out_sum_;
     std::unordered_map<BlockHash, uint64_t, BlockHashHash> rep_sum_;   /* follower */
     struct VerifyNote { BlockHash key; int32_t host_slot = -1; int64_t ord = -1; };

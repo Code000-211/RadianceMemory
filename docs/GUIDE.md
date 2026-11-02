@@ -1659,6 +1659,42 @@ window per rank.
 
 Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
 
+**Window residency, for a model that does not read all of its history.** The tiers above move a
+conversation that has *finished*. A sparse-attention model needs something else: while a turn is
+running, its attention reads a selected part of the history (QSA reads the best 512 blocks plus the
+tail, `docs/QSA.md`), so most of its cache is VRAM nothing touches. A KV group declares that reach
+(`RadKVGroupDecl::residency_window`, set by `arch/common/rad_qsa.h` on the attention group and never
+on the block-key group, which the scorer reads whole), and `--kv-residency-mib N` opens a host-mapped
+store (the card reads it; a host without SVM refuses the flag, and the scratch pages the pager
+needs are reserved out of the KV budget and logged at startup) for the blocks the reach does not cover: one block a slot, up to N MiB. A demoted block's
+copy lands in its slot, then its pool block goes back to the free list -- that is the VRAM the
+window saves -- and its table entry becomes a cold entry naming the slot (`-2 - slot`, spec §7.3).
+The sequence's context is the same table; only where one entry's bytes live has changed.
+
+```sh
+radiance --model flashnext.rad --kv-residency-mib 2048 --kv-residency-sink-tokens 512
+```
+
+- `--kv-residency-mib N` (default 0, off): the store's size. Off is what a server with the VRAM
+  should do; on, blocks between the sink region and the tail leave the card.
+- `--kv-residency-sink-tokens N` (default 512): how much of the *start* of a conversation stays
+  resident. A sparse selection is not positional, so a positional window is the wrong shape, but
+  the first blocks are the attention sinks every step scores: demoting them would promote them
+  again every step.
+- A sweep skips a block the prefix cache indexes, a forked child's block, and the last (partial)
+  block an append writes into; `/stats` `kv_residency.skipped` counts those.
+
+**Status.** Live. With the store open the engine installs the scheduler's mover: after each decode
+step a sweep of at most 64 blocks (between all sequences) leaves the pool for the store, a prefill
+promotes its sequence whole first, and `qsa_page` pages a cold block the selection names into a
+scratch page between the selection and the attention. Startup says `kv residency: window enforced`.
+`/stats` `kv_residency.freed_bytes` is the VRAM given back; `paged_in` is how many cold entries the
+pager rewrote (summed over QSA layers and decode rows, from a counter on the card, rank 0), and is
+the number that tells you the window is doing something. A model that declares no window warns that
+the flag does nothing and moves nothing. Not yet measured on a card: see `docs/qsa-residency-bench.md`.
+Under tensor parallelism every rank moves its own shard, but that path has only been tested through
+the host-side seam.
+
 On a hybrid model the recurrent state matters as much as the attention blocks: restoring the blocks
 alone re-runs every linear layer over the whole transcript, which hit-rate counters still report as a
 hit. Snapshots never take VRAM: each is copied to host memory after the step that produced it and
@@ -2084,6 +2120,8 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory, up to N MiB (§4.8) |
 | `--prefix-cache-ttl S` | 3600 | seconds an unused conversation is kept, in VRAM or host memory; `0` never expires |
+| `--kv-residency-mib N` | 0 (off) | pinned host store for the KV blocks a sparse consumer's window does not cover (§4.8, spec §7.3) |
+| `--kv-residency-sink-tokens N` | 512 | tokens at the start of a conversation kept resident when `--kv-residency-mib` is on |
 
 **Placement and state**
 

@@ -68,6 +68,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
         const int64_t w = kv->state_index_width((int32_t)i);
         if (w > 0) kvgeom_.g[i].sidx_width = w;
+        kvgeom_.g[i].scratch_pitch = kv->scratch_pitch((int32_t)i);
     }
     has_linear_state_ = false;
     for (const auto& g : kvgeom_.g) if (!g.paged) has_linear_state_ = true;
@@ -1597,8 +1598,82 @@ bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
 }
 
 /* ------------------------------------------------------------------ the step */
+/* ------------------------------------------------------------------ window residency */
+void Scheduler::set_residency_mover(ResidencyMover m, int64_t sweep_blocks) {
+    std::lock_guard<std::mutex> lk(mu_);
+    res_mover_ = std::move(m);
+    res_sweep_blocks_ = sweep_blocks;
+}
+
+/* The mover takes one group per call (TierExec::issue_moves), so the list is cut at group changes.
+ * A failed batch is an error to report, not a state to repair: the manager already encoded the
+ * entries, so the moves it named must still be accounted as in flight. */
+int Scheduler::res_issue(bool to_host) {
+    int rc = RAD_OK;
+    for (size_t a = 0; a < res_moves_.size(); ) {
+        size_t z = a;
+        while (z < res_moves_.size() && res_moves_[z].group == res_moves_[a].group) ++z;
+        const std::vector<BlockMove> part(res_moves_.begin() + (std::ptrdiff_t)a,
+                                          res_moves_.begin() + (std::ptrdiff_t)z);
+        const int st = res_mover_.move(part, to_host);
+        if (st < 0) {
+            RAD_ERR("kv residency: %s of %zu block(s) failed: %s", to_host ? "demote" : "promote",
+                    part.size(), rad_strerror(st));
+            if (rc == RAD_OK) rc = st;
+        }
+        a = z;
+    }
+    if (!res_moves_.empty()) res_inflight_ = true;
+    res_moves_.clear();
+    return rc;
+}
+
+void Scheduler::res_reap() {
+    if (!res_inflight_ || !res_mover_.landed || !res_mover_.landed()) return;
+    kv_->residency_demote_landed();
+    kv_->residency_complete();
+    res_inflight_ = false;
+}
+
+void Scheduler::res_sweep() {
+    if (!res_mover_.move || res_sweep_blocks_ <= 0) return;
+    /* One sweep in flight at a time. Landing is a poll of the newest transfer, so a sweep issued
+     * every step would keep that transfer always pending and the blocks of every earlier one held:
+     * on the card the store filled while not one byte of VRAM came back. Waiting for the last batch
+     * to be reaped (at the start of a step) bounds what is held to one batch, at half the rate. */
+    if (res_inflight_) return;
+    int64_t left = res_sweep_blocks_;
+    const int32_t ng = kv_->n_groups();
+    for (int32_t slot : running_) {
+        if (left <= 0) break;
+        const SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running || s.req->state != ReqState::Running) continue;
+        /* No skip for a step issued ahead or a drafter's rows: they read the device table staged
+         * when they were built, whose pool ids stay valid. A demoted block is freed only once its
+         * copy has landed, the copy waits on the compute stream as it stood at the sweep, and a new
+         * owner writes the block only in a later step on that same in-order stream, after every
+         * earlier reader. The next build uploads the changed entries, and the pager serves them.
+         * Skipping such sequences, as the first version did, swept nothing at all under step-ahead
+         * issue and MTP, which hold every decoding sequence on every step. */
+        for (int32_t g = 0; g < ng && left > 0; ++g) {
+            const int64_t win = kv_->residency_window(g), bt = kv_->block_tokens(g);
+            if (win <= 0 || bt <= 0) continue;
+            /* Whole blocks, rounded up: a partly covered block is still read. */
+            const int64_t head = (cfg_.residency_sink_tokens + bt - 1) / bt;
+            const int64_t tail = (win + bt - 1) / bt;
+            const size_t before = res_moves_.size();
+            const int st = kv_->residency_demote(s.req->id, g, head, tail, left, &res_moves_);
+            if (st < 0) RAD_WARN("kv residency: sweep of request %llu: %s",
+                                 (unsigned long long)s.req->id, rad_strerror(st));
+            left -= (int64_t)(res_moves_.size() - before);
+        }
+    }
+    if (!res_moves_.empty()) (void)res_issue(/*to_host=*/true);
+}
+
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
+    res_reap();
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
@@ -2179,8 +2254,52 @@ const RadBatch* Scheduler::step() {
         lost_restore = true;
     }
 
+    /* A prefill or mixed step reads its sequences' tables densely, and a cold entry is a store slot,
+     * not a block: every sequence in it is promoted first, and the compute stream waits on the
+     * copy (the mover). A pool too full to take them all abandons the step like a failed staging,
+     * and the next one asks again once the sweep or a finish has freed room. */
+    bool promote_failed = false;
+    if (res_mover_.move && plan_.phase != RAD_PHASE_DECODE) {
+        uint64_t full_seq = 0;
+        bool full = false;
+        for (const StepEntry& e : plan_.e) {
+            int st = kv_->residency_promote_all(e.seq, &res_moves_);
+            /* Room first from the prefix cache, as growth takes it (bounded the same way). */
+            for (int round = 0; st == RAD_E_FULL && round < kEvictRounds && pc_ &&
+                                cfg_.prefix_cache && pc_->evict(kEvictBlocks) > 0; ++round)
+                st = kv_->residency_promote_all(e.seq, &res_moves_);
+            if (st == RAD_E_FULL && !full) { full = true; full_seq = e.seq; }
+            if (st < 0) {
+                RAD_WARN("kv residency: request %llu could not be made dense: %s",
+                         (unsigned long long)e.seq, rad_strerror(st));
+                promote_failed = true;
+            }
+        }
+        if (res_issue(/*to_host=*/false) < 0) promote_failed = true;
+        /* Still full: the sequence that could not be promoted gives its blocks up, by recompute.
+         * Without this a pool that stays full replans the same dense step forever -- the sweep
+         * that would free room runs only after decode steps. It must be that sequence and not the
+         * back of the running set: the back is usually the prompt that made the step mixed, which
+         * would be readmitted at once into the same failing step while the cold sequence never
+         * decodes. Recompute is dear for a long context, but such a sequence cannot run densely
+         * in this pool at all; re-prefilled, it holds no cold entry. */
+        if (full) {
+            for (size_t i = 0; i < running_.size(); ++i) {
+                const SchedReq& r = *reqs_[(size_t)running_[i]];
+                if (r.req && r.req->id == full_seq) {
+                    /* preempt_back takes the back; move this one there, the rest keep order. */
+                    std::rotate(running_.begin() + (std::ptrdiff_t)i,
+                                running_.begin() + (std::ptrdiff_t)i + 1, running_.end());
+                    preempt_back();
+                    break;
+                }
+            }
+        }
+    }
+
     step_start_ = std::chrono::steady_clock::now();
-    const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
+    const RadBatch* b = (lost_restore || promote_failed) ? nullptr
+                                                          : builder_.build(plan_, *kv_, step_);
     if (!b) {
         /* Staging failed. Nothing was computed, so nothing is committed and n_computed did not
          * advance: the next step re-schedules the same chunks on the KV already allocated. The
@@ -2692,6 +2811,13 @@ int Scheduler::commit(StepResult& res) {
      * issued before this step's readback, and the engine waits for the drafter's passes behind it
      * before issuing anything that could reuse what is released here. */
     sweep_deferred();
+    /* After the release above, so a block it returned is not the sweep's to see; decode only,
+     * since a prefill chunk has not placed the sequence's history yet. */
+    /* Reap first: under step-ahead issue the engine calls step_next() and rarely step(), so a
+     * reap at step() alone left the first batch held for the whole decode -- on the card, one
+     * sweep went out, never landed in the scheduler's view, and VRAM never came back. The poll is
+     * a query of one event a rank; it never waits. */
+    if (plan_.phase == RAD_PHASE_DECODE) { res_reap(); res_sweep(); }
     res.n_prefill_done = (int)last_prefill_ids_.size();
     res.n_finished     = step_finished_;
     return RAD_OK;
@@ -3378,6 +3504,16 @@ SchedMetrics Scheduler::metrics_locked() const {
                m.prefix_released = pc_->released();
                m.prefix_ckpt_released = pc_->ckpt_released();
                m.prefix_held_tokens = pc_->held_tokens(); }
+    if (kv_) {
+        const IKVManager::Residency r = kv_->residency();
+        m.res_demoted = r.demoted;   m.res_promoted = r.promoted;
+        m.res_skipped = r.skipped;   m.res_misses   = r.misses;
+        m.res_host_bytes = r.host_bytes; m.res_cap_bytes = r.cap_bytes;
+        m.res_freed_bytes = r.freed_bytes;
+        m.res_link_bytes = r.link_bytes; m.res_scratch_bytes = r.scratch_bytes;
+        m.res_paged_in = r.paged_in;
+        m.res_seqs = kv_->residency_seqs();
+    }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.linear_hit_rate = m.prompt_tokens

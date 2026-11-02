@@ -371,6 +371,43 @@ int Builder::bind_layer_kv(int layer, rad_kvgroup g) {
     return RAD_OK;
 }
 
+/* The sparse consumer's reach. Declared by the plugin that owns the sparse read, after the group
+ * and before the build finishes: the attention helper declares the group without knowing whether
+ * the model reads all of its history, and only the plugin does.
+ *
+ * A zero is an explicit "the whole history is read" and is accepted, so a plugin can pass a number
+ * it computed from a checkpoint field that is missing. A different non-zero number on a second call
+ * is refused rather than overwritten: two plugins disagreeing about one group's reach would leave
+ * the residency policy sized for whichever ran last. */
+int Builder::set_residency_window(rad_kvgroup g, int64_t tokens) {
+    if (g == 0 || g >= prog_.kv_groups.size()) {
+        err(RAD_E_INVAL, "set_residency_window: kv group handle %u is not one this builder handed "
+                         "out", g);
+        return RAD_E_INVAL;
+    }
+    if (tokens < 0) {
+        err(RAD_E_INVAL, "set_residency_window: %lld tokens", (long long)tokens);
+        return RAD_E_INVAL;
+    }
+    KVGroupInfo& gi = prog_.kv_groups[g];
+    const int kind = gi.decl.kind;
+    if (kind != RAD_KV_FULL) {
+        err(RAD_E_INVAL, "kv group '%s': a residency window on kind %d. Only a RAD_KV_FULL group "
+                         "can hold blocks the consumer skips: a windowed group recycles them and a "
+                         "stateful one is not paged",
+            gi.name.c_str(), kind);
+        return RAD_E_INVAL;
+    }
+    if (gi.decl.residency_window > 0 && tokens > 0 && gi.decl.residency_window != tokens) {
+        err(RAD_E_STATE, "kv group '%s': residency window already %lld tokens, and %lld was asked "
+                         "for. Two readers of one group must agree on its reach",
+            gi.name.c_str(), (long long)gi.decl.residency_window, (long long)tokens);
+        return RAD_E_STATE;
+    }
+    gi.decl.residency_window = tokens;
+    return RAD_OK;
+}
+
 /* Which op reads this group. The ABI does not link an op to a KV group, so declaration order is
  * the binding, as documented: "declare the group, declare the op, then ask rad_kv_block_size()"
  * (docs/OPS.md, spec §7.2). The consumer is the first unclaimed op after the group that carries a
@@ -2598,6 +2635,11 @@ int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->bind_layer_kv(layer, g);
+}
+
+int rad_kv_set_residency_window(RadBuilder* b, rad_kvgroup g, int64_t tokens) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->set_residency_window(g, tokens);
 }
 
 rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_params,

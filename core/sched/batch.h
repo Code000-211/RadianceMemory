@@ -175,6 +175,11 @@ private:
         int32_t*    h_used = nullptr;  int32_t* d_used = nullptr;
         int32_t*    h_sidx = nullptr;  int32_t* d_sidx = nullptr;
         int64_t     sidx_pitch = 1;    /* columns per sequence in h_sidx/d_sidx */
+        /* The pager's scratch pages (RadKVGroupBatch::residency_scratch): scratch_rows x
+         * scratch_pitch pool ids, copied from the manager every build; null/0 for a group with no
+         * window. */
+        int64_t     scratch_pitch = 0;
+        int32_t*    h_scr = nullptr;   int32_t* d_scr = nullptr;
     };
 
     /* Layout of a build: every array at the same offset on the card and in host staging, so one

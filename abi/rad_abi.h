@@ -18,8 +18,14 @@ extern "C" {
  * the number. Every kind of plugin reports it, and a plugin that does not report exactly this
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
- * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 32u
+ * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default.
+ *
+ * 33: window residency (spec §7.3, docs/OPS.md `qsa_page`), an alternative to KV streaming for
+ * the same sparse attention group: RadKVGroupDecl gained residency_window; RadKVGroupBatch the
+ * residency store (device base, slot size and count, per-layer offsets), the pager's per-row
+ * scratch pages and its counter; RadBuildCtx gained kv_residency; and a paged block-table entry
+ * a third meaning, cold (-2 - slot; rad_kv_cold_entry in rad_runtime.h). */
+#define RAD_ABI_VERSION 33u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

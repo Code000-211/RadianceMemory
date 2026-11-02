@@ -686,6 +686,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
         fd.head_dim = g.head_dim * row16 / 32;
         m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
+        /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
+         * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
+        m.qsacfg.page = ctx->kv_residency != 0 && !g.attn_zero;
+        m.qsacfg.page_block_bytes = rad_dtype_bytes(fd.dtype, 2 * m.qsacfg.ratio * fd.n_head_kv *
+                                                              fd.head_dim);
         g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
         if (kvq_name)
             rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a "

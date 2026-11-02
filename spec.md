@@ -1175,6 +1175,125 @@ slower), so the snapshot check is a counter of prompt tokens covered with restor
 
 `/sessions` reports what is stored, where, and what the tiers have done, failures included.
 
+### Window residency
+
+The idle tiers move a *finished conversation*. They cannot help a conversation that is still
+running and does not read all of its own history, and block-sparse attention is exactly that: QSA
+scores 4-token blocks of the key history with a small indexer and its attention reads the best 512
+of them plus the tail (`docs/QSA.md`), so a 200K-token context's attention cache is 4.8 GiB of
+which a decode step reads about 48 MiB. The rest is VRAM nobody touches.
+
+A KV group declares how much of the history its consumer reads (`RadKVGroupDecl::residency_window`,
+tokens counted back from the tail, 0 for all of it). `arch/common/rad_qsa.h` sets it on the
+attention group with the indexer's budget, and never on the block-key group: the scorer reads
+every block key, so those pages stay resident (3.25 of the 29.25 KiB a 4-token block costs at
+bf16). An attention helper cannot declare it, because only the plugin of a sparse model knows the
+model is sparse.
+
+A block outside the window leaves VRAM for a host-mapped store (`--kv-residency-mib`, one block a
+slot; the card reads it directly, so a host with no SVM mapping refuses the flag by name) **and
+gives its pool block back**. The pager's scratch pages (`residency_blocks + 1` per decode row,
+`max_seqs x (1 + n_spec)` rows) are pool blocks `[0, n)` of the group, charged to the KV budget
+before the split (`KVManager::fixed_bytes`), never on a free list, and reported with the store
+size and window at startup; `RadKVGroupBatch::residency_*` carries them every step. Demotion copies the block to its slot, encodes the table entry
+cold (`rad_kv_cold_entry(slot)`, `-2 - slot`, see the block-table contract in `rad_runtime.h`) and
+returns the block id to the free list only once the copy has landed
+(`KVManager::residency_demote_landed`), so the pool never hands out a block the gather still
+reads. The sequence's context is the same table of the same positions and token count, but a cold
+entry is no pool block: it has no block refcount and is never shared by a fork (a cached or shared
+block is not demoted; `fork` refuses a parent with cold entries). The *slot* is reference-counted
+instead: a cold entry may sit in several sequence tables and in prefix-cache entries at once
+(`KVManager::retain_entry`/`release_entry`, which the cache uses for everything it holds), and the
+slot goes back to the store when its last reference does -- a table entry's on free, preempt or
+rollback, a promotion's when its copy has landed. A publish therefore indexes cold entries, a hit
+adopts them cold, and the next dense step promotes them (a host-to-VRAM copy) instead of the
+prompt recomputing them; that is what keeps a paged conversation reusable across turns. A block
+promoted from a slot that another owner still holds remembers that slot while it is unwritten (a
+prefix block is immutable; a write into the partial tail ends it), and its next demotion points the
+entry back at the slot with no transfer, so the store does not gain a copy of the prefix per turn.
+The idle tiers skip a cache entry with a cold component: they gather pool blocks, and the residency
+group's bytes are already in host memory. `rollback` into a cold block
+(the next append would write host memory) and an append onto one are refused with `RAD_E_STATE`.
+`residency_promote` takes a fresh pool block per named entry, and `residency_promote_all` does so for
+every cold entry of a sequence, all or nothing on room, for the dense steps that read the table
+whole. Counters: demoted, promoted, `freed_bytes` (VRAM given back by landed demotions).
+
+**Two ends stay, not one.** A sparse selection is not positional -- the top-k comes from anywhere
+in the history -- so a positional window would be the wrong shape. But two regions are read every
+step: the first blocks (the attention sinks the indexer always scores) and the last (the tail the
+attention always attends). A sweep therefore keeps `--kv-residency-sink-tokens` of the start and
+the tail the declared window leaves, and moves what lies between them. Demoting the sinks would
+promote them again every step, which costs more than it saves.
+
+**What a sweep skips.** A block the prefix cache indexes, or a forked child holds, stays: another
+sequence's step may read it and this one cannot promote it for that reader. So does the last block,
+which is partial and the one an append writes into. Both are counted (`skipped`), as is a sweep
+that found the store full.
+
+**The read set is device data, so the fetch happens on the card.** `qsa_select` writes the
+selection as the attention's block table, on the card; nothing on the host knows which blocks a
+decode step will read before it runs. A cold entry the selection names is therefore paged in by the
+`qsa_page` op between the selection and the attention ("The pager contract" below). The host
+promotes only for dense steps, which read the whole table and whose cold set it knows
+(`KVManager::residency_promote_all`, run through `TierExec::issue_moves` with the compute stream
+made to wait). With the store open the engine installs the scheduler's mover (below), so the sweep
+demotes and the pager pages: startup says "window enforced". A model that declares no window warns
+that the flag does nothing and installs nothing.
+
+**The engine's mover.** `Scheduler::set_residency_mover` is given two calls when the store is open.
+`move` runs a group's list on every rank through that rank's own `TierExec` (`Rank::resx`, apart
+from the idle tiers' `tierx`, since either can run without the other), cut at `TierExec::kMoveBatch`
+(16) blocks a call; a follower rank carries out the list rank 0's manager planned, which is the only
+place the records live. `landed` polls one event a rank (`TierExec::moves_landed`), recorded after
+each batch on the transfer stream; held pool blocks and slots go back at the first step after it
+says yes, and the host never waits on a transfer. The sweep bound is `Engine::kResidencySweepBlocks`
+= 64 blocks a step between all sequences (four batches, about 1.8 MiB over the link for a 4-token
+block): steady decode retires about one block per sequence per 4 tokens, so the bound clears it and
+drains the backlog a long prefill leaves in a few thousand steps. It is a constant, not a flag,
+until a measurement asks for a knob.
+
+**The pager's counter.** The card cannot say which blocks a step read, so `qsa_page` counts what it
+rewrote: one int64 a rank (`RadKVGroupBatch::residency_paged`, ABI 30), added to by the kernel and
+read back by `/stats` with one small copy on the transfer stream (`TierExec::paged_in`), never on
+the step path. `kv_residency.paged_in` is rank 0's count, in cold entries summed over QSA layers and
+decode rows (a block paged for 12 layers counts 12), and is not per session: the card cannot
+attribute a row. It is the proof that paging happened; an identity run whose count is zero proved
+nothing.
+
+What a first sweep would show, and why the feature is worth the fetch path: at 200K tokens a
+sequence holds 50K attention blocks; keeping 2048 of them (a 512-token sink plus a 1536-token
+tail) plus the block keys is 51 MiB against 4.80 GiB. The cost is the promotions a step's selection
+reaches outside the window for: 26 KiB a block over the link, which is 1-3% of a decode step if the
+selection is as stable step to step as the published SSA measurements suggest, and much more if it
+is not. That ratio is the measurement, and it needs a GPU.
+
+**Testing.** `mem_test` covers the state machine on the host: two ends kept and the middle moved,
+the table and the reference counts unchanged, promotion of named entries, a refusal for an entry
+outside the sequence's table, the skips, the slot returned when a block's last reference goes, a
+full store, and a plan that drops the window. `arch_test` asserts that a QSA layer annotates its
+attention group and leaves the block-key group alone. Neither can show what a promotion costs on a
+card, and the byte-exact check `scripts/tierident.sh` performs for the idle tiers is the shape that
+check should take: one prompt with the window fully resident, one with it forced small so blocks
+were fetched mid-decode, and the same output bytes, failing when `kv_residency.paged_in` is zero.
+The seam the engine plugs into is held on the host: `mem_test` covers a move's landing poll, a
+follower rank running the leader's list and the counter's readback; `sched_test` the sweep and the
+batch carrying the counter; `ref_test` the op's count; `r4d_selftest` the kernel's, against the
+reference. No tiny checkpoint is sparse, so `engine_e2e_test` holds the other half -- a flag on a
+model without a window changes no token and moves nothing.
+
+**The pager contract (ABI 28).** Releasing a cold block's VRAM means its table entry can no longer
+name a pool block, so a paged block-table entry is one of three things: a pool block id (`>= 0`),
+empty (`-1`), or cold (`-2 - slot`), `slot` indexing the residency store. Only a group declaring a
+residency window ever holds a cold entry; `rad_kv_cold_entry` and its inverses in `rad_runtime.h`
+are the one encoding. `RadKVGroupBatch` carries what a pager needs per step: the store's
+device-visible base and slot size, the per-layer offset of a layer's fragment in a slot (host array
+by layer), and a per-row list of `topk + 1` scratch pages, ordinary pool blocks the engine owns and
+valid for one step. The op `qsa_page` (`docs/OPS.md`) sits between `qsa_select` and the attention
+and rewrites each cold entry of the selection to a scratch page it has filled from the store, one
+writer per position and no atomics; the attention is unchanged. Dense steps (prefill, mixed) promote
+a sequence's cold blocks from the host before they run, because only the host knows the cold set.
+ABI 30 adds `residency_paged`, the card-side counter above.
+
 ---
 
 ## 8. The step batch

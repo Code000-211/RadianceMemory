@@ -515,6 +515,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
+        { "--kv-residency-mib", { "256" } }, { "--kv-residency-sink-tokens", { "512" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
@@ -1525,6 +1526,19 @@ TEST(usage_names_every_flag_it_documents) {
 
 /* --rope-scaling is validated at the command line: a typo is refused rather than serving the
  * trained rotary at a length it cannot reach. */
+/* KV streaming and window residency both own a sparse attention group's placement, so a server
+ * runs one of them: either flag alone parses, the two together are refused by name. */
+TEST(kv_streaming_and_window_residency_are_refused_together) {
+    Config a, b, c;
+    CHECK_EQ(parse({ "--kv-resident", "65536" }, &a), RAD_OK);
+    CHECK_EQ(parse({ "--kv-residency-mib", "4096" }, &b), RAD_OK);
+    std::string log;
+    int st = RAD_OK;
+    log = stderr_of([&] { st = parse({ "--kv-resident", "65536", "--kv-residency-mib", "4096" }, &c); });
+    CHECK_EQ(st, (int)RAD_E_INVAL);
+    CHECK(has(log, "--kv-resident") && has(log, "--kv-residency-mib"));
+}
+
 TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     for (const char* ok : { "yarn:4", "yarn:2.5", "yarn:4:262144", "none" }) {
         Config c;

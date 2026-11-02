@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 32 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 33 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -97,7 +97,7 @@
 { "RadBufDecl", "domain", 60, 4 },
 { "RadBufDecl", "derive", 64, 8 },
 { "RadBufDecl", "kv", 72, 4 },
-{ "RadBuildCtx", "", 0, 200 },
+{ "RadBuildCtx", "", 0, 208 },
 { "RadBuildCtx", "rank", 0, 4 },
 { "RadBuildCtx", "world_size", 4, 4 },
 { "RadBuildCtx", "max_tok", 8, 8 },
@@ -130,6 +130,7 @@
 { "RadBuildCtx", "calib_tokens", 176, 8 },
 { "RadBuildCtx", "gen_max_pixels", 184, 8 },
 { "RadBuildCtx", "gen_max_refs", 192, 8 },
+{ "RadBuildCtx", "kv_residency", 200, 4 },
 { "RadAudioGenBatch", "", 0, 344 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },
@@ -485,7 +486,7 @@
 { "RadGeneratorDecl", "chunk_bos", 364, 4 },
 { "RadGeneratorDecl", "chunk_eos", 368, 4 },
 { "RadGeneratorDecl", "cond_opts", 372, 4 },
-{ "RadKVGroupBatch", "", 0, 80 },
+{ "RadKVGroupBatch", "", 0, 136 },
 { "RadKVGroupBatch", "group", 0, 4 },
 { "RadKVGroupBatch", "slot_mapping", 8, 8 },
 { "RadKVGroupBatch", "block_table", 16, 8 },
@@ -496,7 +497,14 @@
 { "RadKVGroupBatch", "block_size", 56, 8 },
 { "RadKVGroupBatch", "max_blocks", 64, 8 },
 { "RadKVGroupBatch", "stream", 72, 8 },
-{ "RadKVGroupDecl", "", 0, 56 },
+{ "RadKVGroupBatch", "residency_store", 80, 8 },
+{ "RadKVGroupBatch", "residency_slot_bytes", 88, 8 },
+{ "RadKVGroupBatch", "residency_layer_off", 96, 8 },
+{ "RadKVGroupBatch", "residency_scratch", 104, 8 },
+{ "RadKVGroupBatch", "residency_scratch_pitch", 112, 8 },
+{ "RadKVGroupBatch", "residency_paged", 120, 8 },
+{ "RadKVGroupBatch", "residency_slots", 128, 8 },
+{ "RadKVGroupDecl", "", 0, 64 },
 { "RadKVGroupDecl", "kind", 0, 4 },
 { "RadKVGroupDecl", "dtype", 4, 4 },
 { "RadKVGroupDecl", "window", 8, 8 },
@@ -504,6 +512,7 @@
 { "RadKVGroupDecl", "head_dim", 24, 8 },
 { "RadKVGroupDecl", "state_dim", 32, 16 },
 { "RadKVGroupDecl", "conv_width", 48, 8 },
+{ "RadKVGroupDecl", "residency_window", 56, 8 },
 { "RadKVStream", "", 0, 72 },
 { "RadKVStream", "host", 0, 8 },
 { "RadKVStream", "res", 8, 8 },

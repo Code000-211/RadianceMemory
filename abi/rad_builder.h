@@ -295,6 +295,17 @@ typedef struct RadBuildCtx {
      * fixed buffers ignores them, and the core says so at startup. */
     int64_t  gen_max_pixels;
     int64_t  gen_max_refs;
+
+    /* ---- appended in ABI 33 (the pager) */
+    /* Nonzero: the engine was asked for a window-residency store (--kv-residency-mib), so a
+     * sparse consumer's selection may name cold blocks (spec §7.3, docs/OPS.md `qsa_page`) and
+     * the plugin should issue the pager between its selection and its attention. Zero, the
+     * default, is a graph with no pager op: a server that keeps every block resident pays
+     * nothing. This is the request, not the outcome -- whether a step finds the store open is
+     * RadKVGroupBatch::residency_store, and a plugin issues the op only when that is non-null.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      kv_residency;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */
@@ -474,6 +485,19 @@ typedef struct RadKVGroupDecl {
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
     int64_t  conv_width;      /* RAD_KV_CONV */
+    /* RAD_KV_FULL only: the tokens of a sequence's history the consumer of this group reads,
+     * counted back from the tail (spec §7.3, "window residency"). A block below that window may
+     * leave VRAM for host memory and is promoted back before a step reads it, so a sparse
+     * consumer -- one that reads a selected part of the history rather than all of it -- can hold
+     * a context whose whole cache it has no room for. 0 keeps the whole history resident, which
+     * is what a dense consumer needs.
+     *
+     * Declared by the plugin that owns the sparse read (arch/common/rad_qsa.h), not by the
+     * attention helper: the window is the consumer's reach, and only the plugin knows it. An
+     * over-estimate costs VRAM and nothing else; an under-estimate costs a promotion in the step
+     * that reads past it, which is correct but slower, so the number is a performance knob and
+     * never a correctness one. */
+    int64_t  residency_window;
     /* Block size is not declared. It is taken from the resolved attention kernel's constraints at
      * declare, so the core needs no edit when a kernel changes (spec §7.2). Read it back with
      * rad_kv_block_size() after declaring the attention op that consumes this group. */
@@ -487,6 +511,18 @@ int64_t     rad_kv_block_size(RadBuilder* b, rad_kvgroup g);
  * mirror row's. 0 for a group that is not paged, or before the block size is known. Additive
  * export. */
 int64_t     rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g);
+/* The sparse consumer's reach, in tokens, for a RAD_KV_FULL group: the history this group's
+ * consumer reads, counted from the tail (spec §7.3, "window residency"). A block outside it may
+ * leave VRAM for host memory and is promoted back before a step reads it, so a model whose
+ * attention reads a selected part of its history holds a context whose whole cache it has no room
+ * for. 0 (the default) keeps every block resident.
+ *
+ * Called by the plugin that owns the sparse read, after the group is declared -- the attention
+ * helper cannot know this. It is a hint for eviction and never a correctness bound: the engine
+ * promotes on the step that reads past it, so an under-estimate costs link traffic and an
+ * over-estimate costs VRAM. Adding this export does not by itself move RAD_ABI_VERSION, but
+ * RadKVGroupDecl gained the field, which does (ABI 33). */
+int         rad_kv_set_residency_window(RadBuilder* b, rad_kvgroup g, int64_t tokens);
 
 /* Bind a layer to a group, so the block manager knows how many state instances a sequence owns. */
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g);

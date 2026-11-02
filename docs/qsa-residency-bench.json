@@ -1,0 +1,17 @@
+{
+  "_comment": "Window residency (spec §7.3), CPU-only smoke. Two runs of the same configuration, one with the residency store open and one without, so the only difference the benchmark sees is whether the server holds cold blocks in host memory. Decode-only and one pass a category: this is a smoke that the flags are accepted and the counters exist, not a performance measurement. A real run needs a model that declares a residency window (Qwen3.8-Flash-Next, arch/common/rad_qsa.h) on a card, and prefill depths past the QSA bound of 2051 tokens.",
+  "warmup": 1,
+  "runs_per_category": 1,
+  "unique_nonce": true,
+  "run_single_stream": true,
+  "concurrency_levels": [1],
+  "concurrency_requests": 1,
+  "run_concurrency": false,
+  "run_prefill": false,
+  "prefill_depths": [],
+  "prefill_runs": 0,
+  "prefill_warmup": 0,
+  "prefill_max_tokens": 16,
+  "max_model_len": 8192,
+  "timeout_s": 600.0
+}

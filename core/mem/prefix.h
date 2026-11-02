@@ -496,7 +496,10 @@ private:
     bool shared_with_live(const Entry& e) const;
     /* Whether `e` holds the block_size_ token ids at `src`, so a hash collision is a miss. */
     bool same_tokens(const Entry& e, const int32_t* src) const;
-    /* Gives the entry's blocks in every group back to the KV manager. */
+    /* The entry names a cold id in some group (KVManager window residency): its bytes are in the
+     * residency store, and the idle tiers (which gather pool blocks) must not be handed it. */
+    bool cold_entry(const Entry& e) const;
+    /* Gives the entry's block in every group back to the KV manager. */
     void release_blocks(const Entry& e);
     /* Takes the cache's reference on the blocks of entry `b` of a sequence's tables `bt` (one per
      * cached group) into `out`, entry_groups_ order; on a refusal releases exactly what it took

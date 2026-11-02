@@ -4965,6 +4965,289 @@ TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
     bb.fini();
 }
 
+/* The pager reads its operands from the batch (RadKVGroupBatch::residency_*), and a stale or unset
+ * one would have it copy from the wrong slot or into a page another row owns. They must be filled
+ * every build -- the staging is re-carved each step -- for the group that has a window, and stay
+ * zero for the one that has not, because a non-null store is also what makes the core issue the
+ * pager op at all. */
+TEST(a_residency_group_s_batch_carries_the_store_its_layer_offsets_and_scratch_pages) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;                 /* rows = max_seqs x (1 + n_spec), copied into the builder */
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    const int64_t pitch = 5, rows = f.cfg.max_seqs * (1 + f.cfg.n_spec);
+    static const int64_t off[] = { -1, 4096, 6144 };
+    std::vector<int32_t> scratch((size_t)(rows * pitch));
+    for (size_t i = 0; i < scratch.size(); ++i) scratch[i] = (int32_t)(100 + i);
+    f.kv.pager_group = 0;
+    f.kv.pager_pitch = pitch;
+    f.kv.pager_view.store = reinterpret_cast<void*>(uintptr_t(0x7f0000000000));
+    f.kv.pager_view.slot_bytes = 8192;
+    f.kv.pager_view.layer_off = off;
+    f.kv.pager_view.scratch = scratch.data();
+    int64_t counter = 0;
+    f.kv.pager_view.paged = &counter;
+
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+        kvg.g[i].scratch_pitch = f.kv.scratch_pitch((int32_t)i);
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 32));
+    StepPlan p;
+    for (int round = 0; round < 2; ++round) {      /* the second build re-carves the staging */
+        p.reset();
+        StepEntry e;
+        e.seq = 1;
+        e.card = 0;
+        e.n_tokens = 1;
+        e.ctx_len = 31;
+        p.e.push_back(e);
+        p.n_tok = 1;
+        const RadBatch* b = bb.build(p, f.kv, round);
+        CHECK(b != nullptr);
+        if (!b) break;
+        const RadKVGroupBatch& g = b->kv[0];
+        CHECK(g.residency_store == f.kv.pager_view.store);
+        CHECK_EQ(g.residency_slot_bytes, (int64_t)8192);
+        CHECK(g.residency_layer_off == off);
+        /* The pager's counter rides in the batch, for the group that has the pager and no other. */
+        CHECK(g.residency_paged == &counter);
+        CHECK_EQ(g.residency_scratch_pitch, pitch);
+        CHECK(g.residency_scratch != nullptr);
+        if (!g.residency_scratch) break;
+        for (int64_t i = 0; i < rows * pitch; ++i) CHECK_EQ(g.residency_scratch[i], (int32_t)(100 + i));
+        /* A group with no window is all zero, so no pager op is issued for it. */
+        const RadKVGroupBatch& none = b->kv[1];
+        CHECK(none.residency_store == nullptr);
+        CHECK_EQ(none.residency_slot_bytes, (int64_t)0);
+        CHECK(none.residency_layer_off == nullptr);
+        CHECK(none.residency_scratch == nullptr);
+        CHECK(none.residency_paged == nullptr);
+        CHECK_EQ(none.residency_scratch_pitch, (int64_t)0);
+    }
+    bb.fini();
+}
+
+/* ------------------------------------------------------------------ window residency */
+namespace {
+/* The engine's half of the sweep, recorded: what the scheduler asked to move in which direction,
+ * and whether the copies have "landed" yet (a test flips it). */
+struct Rig {
+    std::vector<std::pair<bool, std::vector<BlockMove>>> runs;
+    bool landed = false;
+    int64_t moved(bool to_host) const {
+        int64_t n = 0;
+        for (const auto& r : runs) if (r.first == to_host) n += (int64_t)r.second.size();
+        return n;
+    }
+    void arm(Fixture& f, int64_t sweep, int64_t window = 64, int64_t sink = 32) {
+        f.kv.res_group = 0;
+        f.kv.res_window = window;
+        f.kv.res_open = true;
+        f.cfg.residency_sink_tokens = sink;
+        Scheduler::ResidencyMover m;
+        m.move = [this](const std::vector<BlockMove>& mv, bool to_host) {
+            runs.push_back({ to_host, mv });
+            return RAD_OK;
+        };
+        m.landed = [this] { return landed; };
+        f.sch.set_residency_mover(std::move(m), sweep);
+    }
+};
+
+/* Steps until the planned step is a decode step, committing the prefill chunks on the way. */
+void run_to_decode(Fixture& f) {
+    for (int i = 0; i < 64; ++i) {
+        const RadBatch* b = f.sch.step();
+        CHECK(b != nullptr);
+        if (!b || f.sch.plan().phase == RAD_PHASE_DECODE) return;
+        f.commit_plain();
+    }
+}
+}  /* namespace */
+
+/* The sweep is what bounds the copy a step pays and what keeps the blocks every step reads where
+ * they are: at most `sweep_blocks` leave per committed decode step across all sequences, and the
+ * sink blocks at the start and the window at the end are never among them, nor is the partial last
+ * block. The VRAM comes back only once the copies are reported landed. */
+TEST(the_sweep_after_a_decode_step_respects_its_bound_and_never_demotes_the_sink_or_the_tail) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/5, /*window=*/64, /*sink=*/32);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);       /* 20 blocks of 16, a 21st once it decodes */
+    run_to_decode(f);
+    CHECK_EQ(rig.moved(true), (int64_t)0);      /* a prefill chunk sweeps nothing */
+    const int64_t free_before = f.kv.free_blocks(0);
+
+    /* One sweep is issued and, until its copies land, no other: what is held is one batch. */
+    f.commit_plain();
+    const int64_t first = rig.moved(true);
+    CHECK(first > 0 && first <= 5);
+    for (int step = 0; step < 3; ++step) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK_EQ(rig.moved(true), first);
+    }
+    CHECK_EQ(f.kv.free_blocks(0), free_before);  /* held, not freed, until the copies land */
+
+    /* Landing at once from here: every step reaps the last batch and sweeps at most 5 more. */
+    rig.landed = true;
+    int64_t last = first;
+    for (int step = 0; step < 12; ++step) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK(rig.moved(true) - last <= 5);
+        last = rig.moved(true);
+    }
+    /* The sequence grows as it decodes, so its tail slides and a block leaves the window now
+     * and then; a step with no new cold block, after a landed one, is the steady state. */
+    for (int step = 0; step < 4; ++step) { CHECK(f.sch.step() != nullptr); f.commit_plain(); }
+    CHECK(f.sch.step() != nullptr);             /* reaps the final batch */
+    const std::vector<int32_t>& t = f.kv.block_table(a, 0);
+    const int64_t n = (int64_t)t.size();
+    /* sink 32 tokens = 2 blocks, window 64 tokens = 4 blocks, and the last entry partial. */
+    int64_t cold = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const bool inside = i < 2 || i >= n - 4;
+        if (t[(size_t)i] <= -2) { ++cold; CHECK(!inside); }
+        else if (!inside) CHECK(false);         /* everything between must have gone cold */
+    }
+    CHECK_EQ(cold, n - 2 - 4);
+    CHECK_EQ(cold, rig.moved(true));
+    /* Every landed batch gave its blocks back. The decode steps grew the sequence by a few
+     * tokens, which may have taken a block of their own. */
+    CHECK(f.kv.free_blocks(0) + 2 >= free_before + cold);
+}
+
+/* A prefill or mixed step reads tables densely, so a cold entry in one would be a store slot
+ * dereferenced as a pool block. Every sequence in such a step is promoted before the batch is
+ * built, and the batch's own table holds pool ids only. */
+TEST(a_dense_step_after_demotion_sees_only_pool_blocks_in_its_tables) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);
+    run_to_decode(f);
+    f.commit_plain();                            /* sweeps every middle block of `a` */
+    const int64_t demoted = rig.moved(true);
+    CHECK(demoted > 0);
+    rig.landed = true;
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                            /* reaps; a is cold in the middle */
+    int64_t cold = 0;
+    for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
+    CHECK(cold > 0);
+
+    f.submit(48, 8);                             /* a new prompt beside a decoding row: mixed */
+    const RadBatch* b = f.sch.step();
+    CHECK(b != nullptr);
+    if (!b) return;
+    CHECK_EQ((int)f.sch.plan().phase, (int)RAD_PHASE_MIXED);
+    CHECK_EQ(rig.moved(false), cold);            /* each cold entry was promoted by the host */
+    CHECK_EQ(f.kv.res_cold, (int64_t)0);
+    const RadKVGroupBatch& g = b->kv[0];
+    for (int32_t i = 0; i < b->n_seq; ++i) {
+        const std::vector<int32_t>& t = f.kv.block_table(f.sch.plan().e[(size_t)i].seq, 0);
+        for (size_t k = 0; k < t.size(); ++k)
+            CHECK(g.block_table[i * g.block_table_pitch + (int64_t)k] >= 0);
+    }
+}
+
+/* A conversation paged out and published is still a cache hit: the chain's cold entries are
+ * adopted as they are, the step's one promotion brings them back, and the prefill that follows
+ * reads pool ids only -- the prompt skips the recompute of a context whose bytes sit in host
+ * memory. */
+TEST(a_prompt_that_hits_a_cached_chain_with_cold_entries_prefills_on_pool_ids_after_one_promotion) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed_cold(256, /*first=*/2, /*n=*/10);     /* 16 blocks, entries 2..11 cold */
+    f.pc.lin = 256;
+    f.pc.src = 3;
+
+    const uint64_t a = f.submit(600, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_cached, 256);         /* the whole chain counted as a hit */
+    CHECK_EQ(rig.moved(false), (int64_t)10);        /* one promotion, every cold entry in it */
+    CHECK_EQ(rig.moved(true), (int64_t)0);
+    CHECK_EQ(f.kv.res_cold, (int64_t)0);
+    const RadKVGroupBatch& g = b->kv[0];
+    const std::vector<int32_t>& t = f.kv.block_table(a, 0);
+    CHECK(t.size() >= 16);
+    for (size_t k = 0; k < t.size(); ++k) {
+        CHECK(t[k] >= 0);
+        CHECK(g.block_table[k] >= 0);
+    }
+}
+
+/* A dense step whose sequence cannot be promoted because the pool is full must not be planned and
+ * abandoned forever: the sweep that would free room runs only after decode steps. The scheduler
+ * preempts the back of the running set by recompute, as it does when a sequence cannot grow, so
+ * every failed attempt costs one request and the server keeps stepping. */
+TEST(a_dense_step_the_pool_cannot_promote_preempts_instead_of_retrying_forever) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);
+    run_to_decode(f);
+    f.commit_plain();                            /* sweeps the middle of `a` */
+    rig.landed = true;
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                            /* reaps: the freed blocks are back */
+    int64_t cold = 0;
+    for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
+    REQUIRE(cold > 0);
+    /* Room for the newcomer's 48 tokens (3 blocks) and its first decode token, not for `a`'s
+     * promotion: admission succeeds, the mixed step's promotion cannot. */
+    REQUIRE(cold > 4);
+    std::vector<int32_t> taken;
+    auto& fl = f.kv.freelist[0];
+    while (fl.size() > 4) { taken.push_back(fl.back()); fl.pop_back(); }
+
+    const int64_t pre0 = f.sch.metrics().preemptions;
+    f.submit(48, 8);                             /* beside a decoding row: a mixed step */
+    int stepped = 0;
+    for (int i = 0; i < 20; ++i)
+        if (f.sch.step() != nullptr) { ++stepped; f.commit_plain(); }
+    CHECK(f.sch.metrics().preemptions > pre0);   /* something gave its blocks up */
+    CHECK(stepped > 0);                          /* and the server kept stepping */
+    for (int32_t b : taken) f.kv.freelist[0].push_back(b);
+}
+
+/* --kv-residency-mib 0 gives the scheduler no mover, and then nothing moves even when the manager
+ * would take a demotion: the sweep and the promotion are both behind it. */
+TEST(without_a_residency_mover_the_scheduler_demotes_and_promotes_nothing) {
+    Fixture f;
+    f.build();
+    f.kv.res_group = 0;
+    f.kv.res_window = 64;
+    f.kv.res_open = true;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);
+    run_to_decode(f);
+    for (int i = 0; i < 4; ++i) { f.commit_plain(); CHECK(f.sch.step() != nullptr); }
+    CHECK_EQ(f.kv.res_cold, (int64_t)0);
+    for (int32_t e : f.kv.block_table(a, 0)) CHECK(e >= 0);
+}
+
 /* Two conv groups, each derivation reading its own window. With one shared slot array and window,
  * only the last-declared RAD_KV_CONV group would be filled and the other's row would stay -1.
  * (Today only `conv_state_index` reads these, and no architecture calls it; conv kernels use the

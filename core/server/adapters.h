@@ -97,6 +97,13 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
      * in. */
     o.prefix_hit_rate = m.attn_hit_rate;
     o.prefix_evictions = m.prefix_evictions;
+    /* Window residency (spec §7.3): what moved, and what the pager paged back for a step. */
+    o.res_demoted = m.res_demoted;   o.res_promoted = m.res_promoted;
+    o.res_skipped = m.res_skipped;   o.res_misses = m.res_misses;
+    o.res_host_bytes = m.res_host_bytes; o.res_cap_bytes = m.res_cap_bytes;
+    o.res_freed_bytes = m.res_freed_bytes;
+    o.res_link_bytes = m.res_link_bytes; o.res_scratch_bytes = m.res_scratch_bytes;
+    o.res_paged_in = m.res_paged_in;
     /* What only the cache holds (SchedMetrics::prefix_held_tokens), clamped to the pool's
      * used figure: the two are counted at different moments in a step, and cached > used
      * would show a negative live share. */
@@ -260,6 +267,8 @@ public:
         }
         const uint64_t now = rad_mono_ns();
         out->reserve(v.size());
+        std::unordered_map<uint64_t, SeqResidency> res;
+        for (const SeqResidency& r : s_->observed_metrics().res_seqs) res[r.id] = r;
         for (const IdleTiers::SessionInfo& s : v) {
             SessionStat o;
             o.id        = s.id;
@@ -275,6 +284,11 @@ public:
             o.snapshots   = s.snapshots;
             o.snap_bytes  = s.snap_bytes;
             o.resume_tokens = s.resume_tokens;
+            if (const auto r = res.find(s.id); r != res.end()) {
+                o.res_demoted = r->second.demoted;   o.res_promoted = r->second.promoted;
+                o.res_skipped = r->second.skipped;
+                o.res_link_bytes = r->second.link_bytes; o.res_freed_bytes = r->second.freed_bytes;
+            }
             out->push_back(std::move(o));
         }
         return (int)out->size();

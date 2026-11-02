@@ -130,6 +130,8 @@ void BatchBuilder::carve(Set& s, char* h) {
         pair(&g.h_slot, &g.d_slot, T);
         pair(&g.h_used, &g.d_used, S);
         pair(&g.h_sidx, &g.d_sidx, S * g.sidx_pitch);
+        /* One row per decode row the step can carry, as O above counts them for the logits. */
+        pair(&g.h_scr, &g.d_scr, g.scratch_pitch * S * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0)));
     }
     /* Rotary planes and encoder-row targets, only for a program with an encoder; nothing else
      * moves a rotary position off the token index. */
@@ -190,6 +192,7 @@ void BatchBuilder::size_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         }
         s.groups[gi].max_blocks = mb;
         s.groups[gi].sidx_pitch = e.sidx_width > 0 ? e.sidx_width : 1;
+        s.groups[gi].scratch_pitch = e.scratch_pitch > 0 ? e.scratch_pitch : 0;
     }
     carve(s, nullptr);
 }
@@ -836,6 +839,15 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             a.tlen_off    = (const char*)s.d_tlen - d0;
         }
 
+        /* Every build, not once: the slab's staging is re-carved from the ring each build and the
+         * whole prefix is uploaded with it, so a table written once would not be on the card. */
+        if (g.scratch_pitch > 0) {
+            const IKVManager::Pager pg = kv.pager(g.g, 0);
+            const int64_t n = g.scratch_pitch * max_seqs_ * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0));
+            if (pg.scratch) std::memcpy(g.h_scr, pg.scratch, (size_t)n * sizeof(int32_t));
+            else std::fill(g.h_scr, g.h_scr + n, -1);
+        }
+
         /* Each rank's own view of the group's ring and mirror (kvstream_step_view). */
         const RadKVStream* sv = kv.stream_view((int32_t)gi);
         for (size_t r = 0; r < ranks_.size(); ++r) {
@@ -855,6 +867,26 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                                           ranks_[r].kv_streams != nullptr,
                                           ranks_[0].kv_base, ranks_[r].kv_base);
 
+            /* The pager's operands, from this rank's manager: all zero when the group has no
+             * window or its store is closed, which is also what gates the pager op. */
+            const IKVManager::Pager pg = kv.pager(g.g, (int)r);
+            if (pg.store && g.scratch_pitch > 0) {
+                b.residency_store         = pg.store;
+                b.residency_slot_bytes    = pg.slot_bytes;
+                b.residency_layer_off     = pg.layer_off;
+                b.residency_scratch       = on_rank(base, s.dev[0], g.d_scr);
+                b.residency_scratch_pitch = g.scratch_pitch;
+                b.residency_paged         = pg.paged;
+                b.residency_slots         = pg.slots;
+            } else {
+                b.residency_store = nullptr;
+                b.residency_slot_bytes = 0;
+                b.residency_layer_off = nullptr;
+                b.residency_scratch = nullptr;
+                b.residency_scratch_pitch = 0;
+                b.residency_paged = nullptr;
+                b.residency_slots = 0;
+            }
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }
     }

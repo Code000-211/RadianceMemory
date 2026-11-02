@@ -2930,6 +2930,11 @@ order, not a slow one.
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
+| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout? |
+
+`qsa_page` is the sixth op of the family and runs only when the attention group declares a
+residency window and the store is open (see "`qsa_page`" below).
+
 Five ops decompose one indexer, which scores blocks of key history against the query and hands
 `attn_paged` a shorter block table. `docs/QSA.md` describes the decomposition and
 `arch/common/rad_qsa.h` issues all five. libref implements all five (the oracle for libr4d's
@@ -3013,6 +3018,44 @@ score[m][b] = ( sum over heads h of relu( q[m][h] . bk[bt[seq(m)][b]] ) ) / sqrt
   and the top-k of the output is already the table the attention reads.
 - **A negative table entry scores `-inf`, not zero.** A table is padded to its declared width and a
   real score can be zero (every head vetoed the block), so zero would let padding outrank it.
+
+### `qsa_page`
+
+Between `qsa_select` and the attention, for each QSA layer of a group with a residency window:
+rewrites every *cold* entry of the selection to a scratch page holding that block's bytes.
+libref implements it (`ref_qsa_page`), and libr4d's `qsa_page_u8` is held to it byte for byte by
+`r4d_selftest`. The device kernel cannot refuse: an entry whose slot or scratch id is out of range
+is left as it was, so a bad table never writes out of bounds -- the reference's refusals are the
+check that such a table is never built.
+`arch/common/rad_qsa.h` declares it when `RadBuildCtx::kv_residency` is set (and the rank keeps an
+attention cache) and issues it on the decode rows (`M` = `n_tok_decode`) when the step's batch has
+the store open. `pool` is inout (only the scratch blocks of cold entries are written); `store` and
+`pool` are byte planes. The reference refuses with `RAD_E_INVAL`, before any write, a slot outside
+the store, a scratch id outside the pool, or two cold positions sharing a scratch page.
+
+- **Block-table encoding** (`RadKVGroupBatch`, `rad_kv_cold_entry` in `rad_runtime.h`): an entry is a
+  pool block id (`>= 0`), empty (`-1`), or cold (`-2 - slot`, `slot` indexing the residency store).
+  Only a group declaring a residency window holds cold entries. `qsa_select` passes a cold entry
+  through like any live one (its liveness test is "page != -1"); the attention must never see one.
+- **Params:** `M` the selection's rows, `topk` the selection width less the partial page (a row is
+  `topk + 1` wide, as `qsa_select`'s `sel`), `blocks` unused by the rewrite but kept equal to the
+  select's for shape checks, `seqs`, `block_bytes` the bytes of one layer's fragment of a block.
+- **Inputs:** `sel` `[M, topk + 1]` i32 (in place; the output), `store` the residency store as this
+  layer sees it -- `residency_store + residency_layer_off[layer]`, folded on the host because the
+  offset table is host memory no device kernel may read; `[slots, >= block_bytes]` with a row pitch
+  of `residency_slot_bytes`, so row `s` starts this layer's fragment of slot `s` -- `pool` this
+  layer's pool `[blocks, block_bytes]`, `scratch` `[M, topk + 1]` i32 the row's scratch page ids
+  (`residency_scratch`, row pitch `residency_scratch_pitch`). `paged` (optional) is one i64 on the
+  card (`RadKVGroupBatch::residency_paged`): the op adds the number of cold entries it rewrote to it,
+  so a run reads how much it paged with one copy at the end. It is an add, not a store, the launch
+  adds nothing when it is refused or finds no cold entry, and absent means not counted. libr4d's
+  kernel adds with one atomic per rewritten entry (a sum, so scheduling does not change it).
+- **Output:** for each position `j` of row `m` with `sel[m, j] <= -2`, the first `block_bytes` of
+  `store` row `slot` are copied into pool block `scratch[m, j]`, and `sel[m, j]` becomes
+  `scratch[m, j]`. A resident entry (`>= 0`) and an empty one (`-1`) pass through unchanged, so a
+  row with no cold entry is a no-op. Scratch pages are valid for the step that wrote them only.
+- **Determinism:** each `(m, j)` position, and so each scratch page, has exactly one writer; no
+  atomics, no two threads write one byte, and the result does not depend on scheduling.
 
 ### `qsa_select`
 

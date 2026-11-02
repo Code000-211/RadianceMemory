@@ -34,7 +34,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 
 ## Rows nothing ran
 
-132 of 514 declared row(s) were reached by a case in this pass.
+132 of 516 declared row(s) were reached by a case in this pass.
 
 `libavx`: 58 row(s) not reached:
 
@@ -99,7 +99,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `avx_silu` | `silu` |
 | `avx_softmax` | `softmax` |
 
-`libr4d`: 243 row(s) not reached:
+`libr4d`: 244 row(s) not reached:
 
 | kernel | op |
 |---|---|
@@ -319,6 +319,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `qk_norm_rope_gate_kv_store_streamed_bf16` | `qk_norm_rope_gate_kv_store_streamed` |
 | `qkv_norm_rope_bf16` | `qkv_norm_rope` |
 | `qsa_block_key_bf16` | `qsa_block_key` |
+| `qsa_page_u8` | `qsa_page` |
 | `qsa_score_bf16` | `qsa_score` |
 | `qsa_select_i32` | `qsa_select` |
 | `qsa_tail_store_bf16` | `qsa_tail_store` |
@@ -347,7 +348,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `timestep_embed_bf16` | `timestep_embed` |
 | `to_rgba8_bf16` | `to_rgba8` |
 
-`libref`: 81 row(s) not reached:
+`libref`: 82 row(s) not reached:
 
 | kernel | op |
 |---|---|
@@ -408,6 +409,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `ref_pool_rows` | `pool_rows` |
 | `ref_qk_norm_rope` | `qk_norm_rope` |
 | `ref_qsa_block_key` | `qsa_block_key` |
+| `ref_qsa_page` | `qsa_page` |
 | `ref_qsa_score` | `qsa_score` |
 | `ref_qsa_select` | `qsa_select` |
 | `ref_qsa_tail_store` | `qsa_tail_store` |
@@ -542,6 +544,7 @@ on a marked row is a hole this model falls into.
 | `qk_norm_rope_gate_kv_store_streamed` |   | - | device | - |
 | `qkv_norm_rope` |   | - | device | - |
 | `qsa_block_key` |   | host | device | host |
+| `qsa_page` |   | - | device | host |
 | `qsa_score` |   | - | device | host |
 | `qsa_select` |   | - | device | host |
 | `qsa_tail_store` |   | - | device | host |

@@ -135,6 +135,16 @@ static const Flag g_flags[] = {
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
+    { "--kv-residency-mib",   "N",      "host memory, up to N MiB, for the KV blocks a sparse\n"
+    "                                    consumer's window does not cover (spec §7.3). A model\n"
+    "                                    whose attention reads a selected part of its history\n"
+    "                                    declares that window, and the rest of its cache then costs\n"
+    "                                    link traffic instead of VRAM. 0 is off: every block stays"
+    "                                    resident" },
+    { "--kv-residency-sink-tokens", "N", "tokens at the start of a conversation kept resident\n"
+    "                                    when --kv-residency-mib is on (default 512): a sparse\n"
+    "                                    consumer scores them every step, so they are cheaper in\n"
+    "                                    VRAM than in the store" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -671,6 +681,10 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
+        else if (S("--kv-residency-mib"))     { if (!num(0, INT32_MAX, &c->residency_mib)) return RAD_E_INVAL; }
+        else if (S("--kv-residency-sink-tokens")) {
+            if (!num(0, INT32_MAX, &c->residency_sink_tokens)) return RAD_E_INVAL;
+        }
         else if (S("--lora")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             const char* eq = std::strchr(v, '=');
@@ -1258,6 +1272,18 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* Two answers to one question: KV streaming (--kv-resident, docs/KV-STREAMING.md) keeps the
+     * sparse attention group in host memory with a ring on the card, window residency
+     * (--kv-residency-mib, spec §7.3) keeps it on the card and demotes what the window does not
+     * cover. Both rewrite the same group's selection and own its blocks' placement, so one server
+     * runs one of them. */
+    if (c->kv_resident > 0 && c->residency_mib > 0) {
+        RAD_ERR("--kv-resident and --kv-residency-mib are two ways to keep a sparse attention "
+                "group's KV off the card -- streaming from host memory with a ring on the card, or "
+                "the cache on the card with its unread middle demoted -- and a server runs one of "
+                "them. Pass only one");
+        return RAD_E_INVAL;
+    }
 
     return RAD_OK;
 }
@@ -1347,6 +1373,9 @@ const ShowRow kShow[] = {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
+    { "--kv-residency-mib",   [](const Config& c) {
+          return c.residency_mib ? num(c.residency_mib) : std::string("0 (off)"); } },
+    { "--kv-residency-sink-tokens", [](const Config& c) { return num(c.residency_sink_tokens); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

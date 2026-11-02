@@ -24,6 +24,15 @@ class HostArena {
 public:
     ~HostArena();
     int  open(int64_t slot_bytes, int64_t cap_bytes);
+    /* open() for a store the card reads directly (the window-residency store, spec §7.3): host
+     * memory the card can address, and `dev_view` (rad_dev_device_ptr) must name it. A host with no
+     * such mapping -- no SVM, so a pinned range has no address on the card -- refuses with
+     * RAD_E_UNSUPPORTED and a message naming --kv-residency-mib, instead of opening a store the
+     * pager cannot read. `dev_view` is a seam for the test of that refusal. */
+    int  open_mapped(int64_t slot_bytes, int64_t cap_bytes,
+                     void* (*dev_view)(void*) = nullptr);
+    /* The base as the card addresses it; null for a store that is closed or not card-readable. */
+    void* device_base() const { return dev_base_; }
     void close();
     bool enabled() const { return base_ != nullptr; }
 
@@ -47,8 +56,11 @@ public:
     void*   at(int32_t slot) const;
 
 private:
+    int  open_kind(int64_t slot_bytes, int64_t cap_bytes);
     bool    is_used(int64_t s) const { return (bits_[(size_t)(s >> 6)] >> (s & 63)) & 1ull; }
     void*   base_ = nullptr;
+    void*   dev_base_ = nullptr;
+    int     kind_ = 1;   /* RAD_MEM_HOST_PINNED; open_mapped() uses RAD_MEM_HOST_MAPPED */
     int64_t slot_bytes_ = 0;
     int64_t used_ = 0;
     int64_t cap_slots_ = 0;

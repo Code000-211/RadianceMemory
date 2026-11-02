@@ -946,7 +946,7 @@ int Ctx::lane_join(int from, int to) {
  * (below). */
 static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 408,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 136,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
@@ -988,6 +988,11 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
         /* A streamed group's view by the memory it names, never its address (kvstream_view_key). */
         mix(kvstream_view_key(k.stream));
+        /* The pager's operands: the op is issued only when the store is open, and its pointers are
+         * what it reads. The per-layer offsets are host data fixed for the engine's life. */
+        ptr(k.residency_store); mix((uint64_t)k.residency_slot_bytes); ptr(k.residency_layer_off);
+        ptr(k.residency_scratch); mix((uint64_t)k.residency_scratch_pitch); ptr(k.residency_paged);
+        mix((uint64_t)k.residency_slots);
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);

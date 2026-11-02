@@ -9805,6 +9805,94 @@ TEST(flashnext_steps_lint_clean_at_one_two_and_four_ranks) {
         }
 }
 
+/* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked
+ * for the residency store: a window is declared on every QSA attention group, so the store is the
+ * gate. Off, the declaration holds no `qsa_page` and is the one a server keeping every block
+ * resident runs; on, each full-attention rank with a cache declares one per QSA layer (two trunk
+ * layers and the MTP head's), and a rank with no attention cache none. */
+TEST(flashnext_declares_qsa_page_only_when_the_residency_store_is_asked_for) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int store = 0; store < 2; ++store)
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.kv_residency = store;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                int pages = 0;
+                for (const auto& o : b.ops) pages += o.op == "qsa_page";
+                const bool has_cache = !b.kv_groups[0].zero;
+                CHECK_EQ(pages, store && has_cache ? 3 : 0);
+                if (!pages) continue;
+                const RecOp* sel = find_op(b, "qsa_select");
+                const RecOp* pg = find_op(b, "qsa_page");
+                REQUIRE(sel != nullptr);
+                CHECK_EQ(pint(pg, "topk"), pint(sel, "topk"));
+                CHECK_EQ(pint(pg, "blocks"), pint(sel, "blocks"));
+                /* K and V of a four-token page, one layer: bf16, 2 * 4 * n_head_kv * head_dim. */
+                const RadKVGroupDecl& kd = b.kv_groups[0].d;
+                CHECK_EQ(pint(pg, "block_bytes"), 2 * 4 * kd.n_head_kv * kd.head_dim * 2);
+            }
+}
+
+/* With the store open the pager is issued between the select and the attention, on the decode rows
+ * only (they own the scratch pages), with the batch's store, this layer's fragment offset, the
+ * layer's pool and the scratch table; a step whose batch has no store, or no decode row, issues
+ * none. And every step still lints clean at one, two and four ranks with the op in the graph. */
+TEST(flashnext_steps_with_qsa_page_issue_it_between_select_and_attention_and_lint_clean) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    static char store[4096];
+    static const int64_t layer_off[64] = {};
+    static const int32_t scratch[64 * 513] = {};
+    static int64_t paged_counter = 0;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            ctx.kv_residency = 1;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            const bool has_cache = !b.kv_groups[0].zero;
+            for (int open = 0; open < 2; ++open)
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000),
+                                       kit(b, { 1, 4 }, { 6 }, 300) }) {
+                    for (auto& gb : k->kv) if (open) {
+                        gb.residency_store = store;
+                        gb.residency_slot_bytes = (int64_t)sizeof store;
+                        gb.residency_slots = 1;
+                        gb.residency_layer_off = layer_off;
+                        gb.residency_scratch = scratch;
+                        gb.residency_scratch_pitch = 513;
+                        gb.residency_paged = &paged_counter;
+                    }
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    const auto pg = issues_of(b, *v[0], "qsa_page");
+                    const bool want = open && has_cache && k->b.n_tok_decode > 0;
+                    CHECK_EQ(pg.size(), (size_t)(want ? 2 : 0));
+                    if (!want) continue;
+                    for (const RecIssue* i : pg) {
+                        CHECK_EQ(i->n, k->b.n_tok_decode);
+                        CHECK_EQ(i->opd[0].rows, k->b.n_tok_decode);
+                        CHECK(i->opd[1].raw == (void*)store);
+                        /* The card's counter of rewritten entries rides as the fifth operand. */
+                        CHECK(i->opd.size() > 4 && i->opd[4].raw == (void*)&paged_counter);
+                    }
+                    /* Between: each page follows a select and precedes the next layer's. */
+                    int sel_seen = 0;
+                    for (const auto& i : v[0]->issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o) continue;
+                        if (o->op == "qsa_select") ++sel_seen;
+                        if (o->op == "qsa_page") CHECK(sel_seen > 0);
+                    }
+                }
+        }
+}
+
 /* Sparse attention issues one row per query, chunked by the split-KV scratch it declared, never
  * by `max_seqs`: with four sequences allowed, a 1024-token chunk after a long history is one
  * launch of the gated form, or four of 256 rows where only the plain form resolves. Rows of four
@@ -9834,6 +9922,32 @@ TEST(flashnext_sparse_attention_chunks_by_its_scratch_not_by_max_seqs) {
 /* The indexer's unfinished block is state, not scratch: each QSA layer stores it in the linear
  * `kv_qsa_tail` group at its own layer, so two layers never share one tail and a slot survives
  * across steps. */
+/* Window residency (spec §7.3): the indexer knows how much of the history one query reads, and the
+ * attention helper does not, so rad_qsa.h annotates the group the attention reads and leaves the
+ * block-key group alone. The block keys are what the scorer gathers over the *whole* history, so a
+ * window on them would have the scorer read host memory for every step, which is the opposite of
+ * the saving. */
+TEST(flashnext_qsa_declares_a_window_on_its_attention_group_and_none_on_its_block_keys) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadBuilder b;
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    rad_kvgroup attn = 0, keys = 0;
+    for (size_t g = 0; g < b.kv_groups.size(); ++g) {
+        if (b.kv_groups[g].name == "kv_attn") attn = (rad_kvgroup)(g + 1);
+        if (b.kv_groups[g].name == "kv_qsa_bkey") keys = (rad_kvgroup)(g + 1);
+    }
+    REQUIRE(attn != 0);
+    REQUIRE(keys != 0);
+    CHECK_EQ((int)b.kv_groups[attn - 1].d.kind, (int)RAD_KV_FULL);
+    /* indexer_budget, from the checkpoint: the history one query scores, 512 four-token blocks. */
+    CHECK_EQ(b.kv_groups[attn - 1].d.residency_window, 2048ll);
+    CHECK_EQ(b.kv_groups[keys - 1].d.residency_window, 0ll);
+    /* And the store is a per-block one: every residency group holds blocks of its own size. */
+    CHECK_EQ(b.kv_groups[attn - 1].d.n_head_kv, 2);
+}
+
 TEST(flashnext_qsa_tail_is_per_layer_state) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();

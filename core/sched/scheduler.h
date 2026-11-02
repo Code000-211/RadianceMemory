@@ -474,6 +474,27 @@ public:
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
      * saves (Engine::serve). */
     void    set_span_min(int64_t tokens);
+
+    /* Window residency (spec §7.3), the scheduler's half. The manager names which blocks move; the
+     * engine owns the streams, so it supplies the two calls below. Without a mover nothing is ever
+     * demoted or promoted, which is every server that does not pass --kv-residency-mib.
+     *
+     *   move    runs `moves` (all one group) -- VRAM -> host when `to_host`, else host -> VRAM --
+     *           and returns RAD_OK once they are issued. A demotion is ordered after the step that
+     *           wrote the blocks; a promotion is a dependency of the compute stream, so the step
+     *           that reads the blocks waits (TierExec::issue_moves).
+     *   landed  whether every move issued so far has landed. Polled, never waited on: held pool
+     *           blocks and store slots are given back at the first step after it says yes.
+     *
+     * After a committed decode step the sequences outside sink + tail window lose at most
+     * `sweep_blocks` blocks between them (the copy a step pays is bounded); before a prefill or
+     * mixed step every sequence in it is promoted whole, so dense attention never reads a cold
+     * entry. */
+    struct ResidencyMover {
+        std::function<int(const std::vector<BlockMove>&, bool to_host)> move;
+        std::function<bool()> landed;
+    };
+    void    set_residency_mover(ResidencyMover m, int64_t sweep_blocks);
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
@@ -501,6 +522,17 @@ private:
     int64_t       stage_rows_ = 0;
     /* set_span_min: the shortest prefill a span is taken for, 0 for any. */
     int64_t       span_min_ = 0;
+    /* set_residency_mover, and whether moves it ran have not been reported landed yet. */
+    ResidencyMover res_mover_;
+    int64_t        res_sweep_blocks_ = 0;
+    bool           res_inflight_ = false;
+    std::vector<BlockMove> res_moves_;
+    /* Runs res_moves_ through the mover one group at a time, then clears it. */
+    int res_issue(bool to_host);
+    /* Gives back the blocks and slots of moves that have landed. */
+    void res_reap();
+    /* After a committed decode step: demote what falls outside sink + tail, within the bound. */
+    void res_sweep();
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
