@@ -2,6 +2,7 @@
 """Host unit tests for the DSpark QoS harness's evidence checks (no server/GPU)."""
 import importlib.util
 import io
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -51,6 +52,38 @@ class HarnessChecks(unittest.TestCase):
         with patch.object(qos, "fetch", return_value=io.BytesIO(reasoning)):
             r = qos.stream_request("", "", "test", api_key=None, timeout=1)
         self.assertIsNotNone(r["first_text_s"])
+
+    def test_draft_token_total_reports_observed_trials(self):
+        self.assertEqual(qos.observed_draft_token_total([{"draft_tokens": 168}, {"draft_tokens": 189}]), 357)
+        self.assertEqual(qos.observed_draft_token_total([]), 0)
+
+    def test_seeded_repeat_requires_nonempty_matching_content_and_usage(self):
+        sample = {"content": "A bright comet crosses the sky.", "finish_reason": "stop",
+                  "completion_tokens": 7}
+        self.assertTrue(qos.seeded_sample_reproduced(sample, dict(sample)))
+        for first, repeat in (
+            ({**sample, "content": ""}, {**sample, "content": ""}),
+            ({**sample, "content": "   "}, {**sample, "content": "   "}),
+            (sample, {**sample, "content": "A different comet."}),
+            (sample, {**sample, "finish_reason": "length"}),
+            (sample, {**sample, "completion_tokens": 8}),
+            (sample, {**sample, "completion_tokens": 7.0}),
+            (sample, {**sample, "completion_tokens": None}),
+            ({**sample, "completion_tokens": 1}, {**sample, "completion_tokens": True}),
+            ({**sample, "finish_reason": None}, {**sample, "finish_reason": None}),
+        ):
+            with self.subTest(first=first, repeat=repeat):
+                self.assertFalse(qos.seeded_sample_reproduced(first, repeat))
+
+    def test_chat_request_forwards_reasoning_effort(self):
+        payload = {"choices": [{"finish_reason": "stop", "message": {"content": "OK"}}],
+                   "usage": {"completion_tokens": 1}}
+        with patch.object(qos, "fetch", return_value=io.BytesIO(json.dumps(payload).encode())) as fetch:
+            result = qos.chat_request("http://localhost", "spark", [{"role": "user", "content": "test"}],
+                                      api_key=None, timeout=1, reasoning_effort="none")
+        self.assertEqual(result["content"], "OK")
+        sent = json.loads(fetch.call_args.kwargs["data"])
+        self.assertEqual(sent["reasoning_effort"], "none")
 
     def test_stop_requires_control_and_exact_prefix(self):
         marker = "STOP"

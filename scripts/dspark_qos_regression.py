@@ -252,6 +252,23 @@ def stop_sequence_observed(unstopped: dict[str, Any], stopped: dict[str, Any], m
     return bool(found) and stopped["finish_reason"] == "stop" and stopped["content"] == before_marker
 
 
+def observed_draft_token_total(trials: list[dict[str, Any]]) -> int:
+    return sum(int(trial["draft_tokens"]) for trial in trials)
+
+
+def seeded_sample_reproduced(first: dict[str, Any], repeat: dict[str, Any]) -> bool:
+    """Equal empty responses do not establish seeded sampling reproducibility."""
+    content = first.get("content")
+    count = first.get("completion_tokens")
+    repeat_count = repeat.get("completion_tokens")
+    finish = first.get("finish_reason")
+    return (isinstance(content, str) and bool(content.strip()) and
+            content == repeat.get("content") and
+            finish in ("stop", "length") and finish == repeat.get("finish_reason") and
+            type(count) is int and count > 0 and
+            type(repeat_count) is int and count == repeat_count)
+
+
 def calibrated_rollover_prompt(base: str, model: str, api_key: str | None,
                                timeout: float, target: int = 480) -> tuple[str, int]:
     """Find a repeated prompt below the 512 boundary using response usage (no tokenizer guess)."""
@@ -392,14 +409,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     eos = chat_request(on_url, args.model,
                        [{"role": "user", "content": "Reply with exactly OK and then end the turn."}],
                        api_key=args.api_key, timeout=args.timeout, temperature=0, seed=61,
-                       max_tokens=24)
+                       max_tokens=24, reasoning_effort="none")
     stop_prompt = [{"role": "user", "content": "Write exactly DS_STOP_6f41 and nothing after it."}]
     unstopped = chat_request(on_url, args.model, stop_prompt,
                              api_key=args.api_key, timeout=args.timeout, temperature=0, seed=67,
-                             max_tokens=24)
+                             max_tokens=24, reasoning_effort="none")
     stopped = chat_request(on_url, args.model, stop_prompt,
                            api_key=args.api_key, timeout=args.timeout, temperature=0, seed=67,
-                           max_tokens=24, stop=["DS_STOP_6f41"])
+                           max_tokens=24, stop=["DS_STOP_6f41"], reasoning_effort="none")
     result["scenarios"]["eos_and_stop"] = {"eos": eos, "without_stop": unstopped, "stop": stopped}
     require(result, "natural_end_of_turn", eos["finish_reason"] == "stop",
             f"finish_reason={eos['finish_reason']}")
@@ -425,13 +442,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     seeded_body = [{"role": "user", "content": "Write a short, varied sentence about a comet."}]
     seeded_a = chat_request(on_url, args.model, seeded_body, api_key=args.api_key, timeout=args.timeout,
-                            temperature=0.75, seed=99173, max_tokens=32)
+                            temperature=0.75, seed=99173, max_tokens=32, reasoning_effort="none")
     seeded_b = chat_request(on_url, args.model, seeded_body, api_key=args.api_key, timeout=args.timeout,
-                            temperature=0.75, seed=99173, max_tokens=32)
+                            temperature=0.75, seed=99173, max_tokens=32, reasoning_effort="none")
     same = seeded_a["content"] == seeded_b["content"]
-    result["scenarios"]["seeded_sampling"] = {"first": seeded_a, "repeat": seeded_b, "identical": same}
-    require(result, "seed_reproduces_sample", same,
-            f"first={seeded_a['content']!r}, repeat={seeded_b['content']!r}")
+    reproduced = seeded_sample_reproduced(seeded_a, seeded_b)
+    result["scenarios"]["seeded_sampling"] = {"first": seeded_a, "repeat": seeded_b,
+                                               "identical": same, "valid_reproduction": reproduced}
+    require(result, "seed_reproduces_sample", reproduced,
+            f"first={seeded_a['content']!r}, repeat={seeded_b['content']!r}, "
+            f"finish={seeded_a['finish_reason']!r}/{seeded_b['finish_reason']!r}, "
+            f"completion_tokens={seeded_a['completion_tokens']!r}/{seeded_b['completion_tokens']!r}")
 
     # Exercise concurrent batching, then look for unaccepted proposals. Aggregate per-request
     # counters cannot establish whether any single verify was partially accepted.
@@ -467,9 +488,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                  "draft_accepted": accepted, "unaccepted_proposals": rejected})
     result["scenarios"]["unaccepted_proposals"] = {"trials": rejection_trials,
                                                       "observed": any_rejection}
-    require(result, "draft_proposals_are_observed",
-            any(t["draft_tokens"] > 0 for t in rejection_trials),
-            "no draft_tokens_total increase; confirm DSpark is enabled on this server")
+    draft_tokens_observed = observed_draft_token_total(rejection_trials)
+    require(result, "draft_proposals_are_observed", draft_tokens_observed > 0,
+            f"draft_tokens_total delta={draft_tokens_observed}")
     if not args.allow_unobserved_rejection:
         require(result, "unaccepted_proposals_are_observed", any_rejection,
                 f"trials={len(rejection_trials)}; per-trial deltas are recorded")

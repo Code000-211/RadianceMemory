@@ -44,7 +44,216 @@
 #include <thread>
 #include <unistd.h>
 
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+#include <string>
+#endif
+
 namespace rad {
+
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+namespace {
+struct KVRollbackTestEvidence {
+    bool waiting_for_greedy = false;
+    std::string report_path;
+    uint64_t seq = 0;
+    int step = -1;
+    int proposals = 0;
+    int accepted = -1;
+    int32_t group = -1;
+    int64_t prefix_before = 0;
+    int64_t rollback_tokens_before = 0;
+    int64_t rollback_to_tokens = 0;
+    int64_t prefix_after_rollback = -1;
+    int64_t first_block_pos = 0;
+    int64_t block_size = 0;
+    int64_t n_layers = 0;
+    int64_t bytes_per_layer = 0;
+    std::vector<int32_t> logical_blocks;
+    std::vector<int32_t> physical_slots;
+    std::vector<uint8_t> before;
+    uint64_t after_hash = 0;
+    bool bytes_equal = false;
+    bool mapping_equal = false;
+    bool negative_control_detected = false;
+};
+
+uint64_t kv_test_hash(const std::vector<uint8_t>& bytes) {
+    uint64_t h = 14695981039346656037ull;
+    for (uint8_t b : bytes) h = (h ^ b) * 1099511628211ull;
+    return h;
+}
+
+bool kv_test_bytes_equal(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+template<class RankT>
+bool kv_test_snapshot(RankT& rank, uint64_t seq, int32_t group, int64_t prefix_tokens,
+                      int64_t* first_block_pos, std::vector<int32_t>* logical,
+                      std::vector<int32_t>* physical, std::vector<uint8_t>* bytes) {
+    const KVGroupPlan* p = rank.kv.plan(group);
+    if (!p || p->zero || !p->paged() || p->kind != RAD_KV_FULL || p->streamed() ||
+        p->n_layers <= 0 || p->block_size <= 0 || !p->base) return false;
+    const auto& table = rank.kv.block_table(seq, group);
+    const int64_t first_pos = rank.kv.first_block_pos(seq, group);
+    if (first_pos < 0 || prefix_tokens < first_pos) return false;
+    const int64_t complete = (prefix_tokens - first_pos) / p->block_size;
+    if (complete <= 0 || complete > (int64_t)table.size()) return false;
+    if (first_block_pos) *first_block_pos = first_pos;
+    /* Snapshot every complete block in the retained pre-verify prefix. The trailing partial
+     * block is omitted because accepted verify tokens may legitimately fill its unused slots. */
+    const int64_t nblocks = complete;
+    const int64_t layer_bytes = p->layer_bytes_per_block();
+    const int64_t block_bytes = p->n_layers * layer_bytes;
+    if (nblocks <= 0 || layer_bytes <= 0 || p->bytes_per_block != block_bytes) return false;
+    if (rad_dev_set(rank.device) < 0 || rad_stream_sync(rank.ctx.stream()) < 0) return false;
+    logical->clear();
+    physical->clear();
+    logical->reserve((size_t)nblocks);
+    physical->reserve((size_t)nblocks);
+    bytes->resize((size_t)nblocks * (size_t)block_bytes);
+    for (int64_t b = 0; b < nblocks; ++b) {
+        const int32_t id = table[(size_t)b];
+        if (id < 0 || id >= p->pool_blocks()) return false;
+        logical->push_back((int32_t)(first_pos / p->block_size + b));
+        physical->push_back(id);
+        for (int64_t layer = 0; layer < p->n_layers; ++layer) {
+            const auto* src = static_cast<const uint8_t*>(p->base) +
+                              layer * p->layer_stride() + (int64_t)id * layer_bytes;
+            auto* dst = bytes->data() + b * block_bytes + layer * layer_bytes;
+            if (rad_memcpy_async(dst, src, layer_bytes, rank.ctx.stream()) < 0) return false;
+        }
+    }
+    return rad_stream_sync(rank.ctx.stream()) >= 0;
+}
+
+void kv_test_write_report(const KVRollbackTestEvidence& e, bool greedy, int greedy_token,
+                          int64_t tokens_at_greedy) {
+    if (e.report_path.empty()) return;
+    std::ofstream f(e.report_path, std::ios::trunc);
+    if (!f) return;
+    f << "{\"partial_rejection_observed\":true,\"step\":" << e.step
+      << ",\"sequence\":" << e.seq << ",\"proposals\":" << e.proposals
+      << ",\"accepted\":" << e.accepted << ",\"group\":" << e.group
+      << ",\"prefix_tokens_before_verify\":" << e.prefix_before
+      << ",\"rollback_tokens_before\":" << e.rollback_tokens_before
+      << ",\"rollback_to_tokens\":" << e.rollback_to_tokens
+      << ",\"prefix_tokens_after\":" << e.prefix_after_rollback
+      << ",\"first_block_pos\":" << e.first_block_pos
+      << ",\"block_size\":" << e.block_size << ",\"layers\":" << e.n_layers
+      << ",\"bytes_per_layer\":" << e.bytes_per_layer << ",\"logical_blocks\":[";
+    for (size_t i = 0; i < e.logical_blocks.size(); ++i) f << (i ? "," : "") << e.logical_blocks[i];
+    f << "],\"physical_slots\":[";
+    for (size_t i = 0; i < e.physical_slots.size(); ++i) f << (i ? "," : "") << e.physical_slots[i];
+    f << "],\"committed_prefix_bytes\":" << e.before.size()
+      << ",\"before_hash\":" << kv_test_hash(e.before)
+      << ",\"after_hash\":" << e.after_hash
+      << ",\"bytes_equal\":" << (e.bytes_equal ? "true" : "false")
+      << ",\"mapping_equal\":" << (e.mapping_equal ? "true" : "false")
+      << ",\"negative_control_detected\":" << (e.negative_control_detected ? "true" : "false")
+      << ",\"next_greedy_decode_observed\":" << (greedy ? "true" : "false")
+      << ",\"tokens_at_next_greedy_decode\":" << (greedy ? tokens_at_greedy : -1)
+      << ",\"next_greedy_token\":" << (greedy ? greedy_token : -1) << "}\n";
+}
+
+KVRollbackTestEvidence& kv_test_evidence() {
+    static KVRollbackTestEvidence e;
+    return e;
+}
+
+template<class Output, class Ranks>
+void kv_test_before_commit(const StepPlan& plan, const Output& so, int step, Ranks& ranks) {
+    auto& e = kv_test_evidence();
+    if (!e.waiting_for_greedy && !e.report_path.empty() && e.accepted < 0) {
+        for (size_t i = 0; i < plan.e.size(); ++i) {
+            const StepEntry& entry = plan.e[i];
+            if (entry.seq == e.seq && step == e.step && entry.n_spec == e.proposals &&
+                (so.accepted[i] <= 0 || so.accepted[i] >= e.proposals)) {
+                e = KVRollbackTestEvidence{};
+                return;
+            }
+        }
+    }
+    if (!e.waiting_for_greedy) return;
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        const StepEntry& entry = plan.e[i];
+        if (entry.seq == e.seq && entry.req && entry.req->sp.greedy() &&
+            so.first_row[i] >= 0) {
+            kv_test_write_report(e, true, so.token[i], ranks[0]->kv.seq_tokens(e.seq));
+            e.waiting_for_greedy = false;
+            break;
+        }
+    }
+}
+
+template<class Ranks>
+void kv_test_prepare(const StepPlan& plan, int step, Ranks& ranks) {
+    auto& e = kv_test_evidence();
+    if (!e.report_path.empty() || e.waiting_for_greedy) return;
+    const char* path = std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT");
+    if (!path || !*path) return;
+    for (const StepEntry& entry : plan.e) {
+        if (!entry.req || entry.n_spec != 7) continue;
+        const int64_t prefix = entry.ctx_len;
+        for (int32_t g = 0; g < ranks[0]->kv.n_groups(); ++g) {
+            const KVGroupPlan* p = ranks[0]->kv.plan(g);
+            if (!p || p->kind != RAD_KV_FULL || p->zero || p->streamed() ||
+                prefix < p->block_size) continue;
+            KVRollbackTestEvidence candidate;
+            candidate.report_path = path;
+            candidate.seq = entry.seq;
+            candidate.step = step;
+            candidate.proposals = entry.n_spec;
+            candidate.group = g;
+            candidate.prefix_before = prefix;
+            candidate.block_size = p->block_size;
+            candidate.n_layers = p->n_layers;
+            candidate.bytes_per_layer = p->layer_bytes_per_block();
+            if (!kv_test_snapshot(*ranks[0], entry.seq, g, prefix, &candidate.first_block_pos,
+                                  &candidate.logical_blocks, &candidate.physical_slots,
+                                  &candidate.before)) continue;
+            e = std::move(candidate);
+            return;
+        }
+    }
+}
+
+template<class RankT>
+void kv_test_rollback(uint64_t seq, int proposals, int accepted, int64_t valid,
+                      bool before, RankT& rank) {
+    auto& e = kv_test_evidence();
+    if (e.report_path.empty() || e.waiting_for_greedy || seq != e.seq ||
+        proposals != e.proposals || proposals != 7 || accepted <= 0 || accepted >= proposals)
+        return;
+    if (before) {
+        e.accepted = accepted;
+        e.rollback_tokens_before = rank.kv.seq_tokens(seq);
+        e.rollback_to_tokens = valid;
+        return;
+    }
+    std::vector<int32_t> logical, physical;
+    std::vector<uint8_t> after;
+    int64_t first_block_pos = -1;
+    const bool copied = kv_test_snapshot(rank, seq, e.group, std::min(e.prefix_before, valid),
+                                         &first_block_pos, &logical, &physical, &after);
+    bool mapping_equal = copied && first_block_pos == e.first_block_pos &&
+                         logical == e.logical_blocks && physical == e.physical_slots;
+    const bool bytes_equal = copied && kv_test_bytes_equal(after, e.before);
+    e.after_hash = copied ? kv_test_hash(after) : 0;
+    e.bytes_equal = bytes_equal;
+    std::vector<uint8_t> mutated = e.before;
+    if (!mutated.empty()) mutated[0] ^= 1;
+    e.negative_control_detected = !mutated.empty() && !kv_test_bytes_equal(e.before, mutated);
+    const int64_t after_tokens = rank.kv.seq_tokens(seq);
+    mapping_equal = mapping_equal && after_tokens == e.rollback_to_tokens;
+    e.mapping_equal = mapping_equal;
+    e.prefix_after_rollback = after_tokens;
+    kv_test_write_report(e, false, -1, -1);
+    e.waiting_for_greedy = true;
+    (void)valid;  // rollback's requested length is emitted by the manager as after_tokens
+}
+} // namespace
+#endif
 
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
@@ -507,6 +716,9 @@ int Engine::issue_ahead(const RadBatch** out) {
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    kv_test_prepare(sched_.plan(), nb->step, ranks_);
+#endif
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
@@ -568,6 +780,15 @@ int Engine::step_loop() {
         return fail_loop(RAD_E_UNSUPPORTED);
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    if (std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT")) {
+        sched_.set_kv_rollback_test_hook([this](uint64_t seq, int proposals, int accepted,
+                                                int64_t valid, bool before) {
+            if (!ranks_.empty()) kv_test_rollback(seq, proposals, accepted, valid, before,
+                                                   *ranks_[0]);
+        });
+    }
+#endif
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
@@ -621,6 +842,9 @@ int Engine::step_loop() {
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+        kv_test_prepare(plan, b->step, ranks_);
+#endif
         /* One entry per request; Sampler::build_step expands each into 1 + n_draft rows itself
          * (giving each position its RNG coordinate), so one push per row would stage (1+n)^2 rows.
          * `first_row` indexes sampled tokens, so it counts rows. */
@@ -884,6 +1108,9 @@ int Engine::step_loop() {
             res.first_row = so.first_row.data();
         }
         res.path = so.path.empty() ? nullptr : so.path.data();
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+        kv_test_before_commit(plan, so, b->step, ranks_);
+#endif
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }

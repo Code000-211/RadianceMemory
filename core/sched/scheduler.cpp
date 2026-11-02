@@ -2571,7 +2571,14 @@ int Scheduler::commit(StepResult& res) {
             /* Not while a step issued ahead writes past `valid`; that step's commit rolls back to
              * the end it reaches. */
             if (a < e.n_spec && !(next_open_ && s.entry_next >= 0)) {
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+                if (kv_rollback_test_hook_) kv_rollback_test_hook_(r.id, e.n_spec, a, valid, true);
+#endif
                 int st = kv_->rollback(r.id, valid);
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+                if (st >= 0 && kv_rollback_test_hook_)
+                    kv_rollback_test_hook_(r.id, e.n_spec, a, valid, false);
+#endif
                 if (st < 0) RAD_WARN("kv rollback for request %llu: %s",
                                      (unsigned long long)r.id, rad_strerror(st));
             }

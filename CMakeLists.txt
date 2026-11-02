@@ -20,6 +20,7 @@ set(RAD_WITH_FFMPEG "AUTO" CACHE STRING
     "ON | OFF | AUTO -- decode image, video and audio parts with libavformat/libavcodec/libswscale/libswresample")
 set_property(CACHE RAD_WITH_FFMPEG PROPERTY STRINGS ON OFF AUTO)
 option(RAD_BUILD_TESTS "Build the test suite"                            ON)
+option(RAD_ENABLE_KV_ROLLBACK_TEST_HOOK "Compile the test-only device KV rollback observer" OFF)
 option(RAD_ASAN        "Build host code with AddressSanitizer and UBSan"  OFF)
 option(RAD_TSAN        "Build host code with ThreadSanitizer"             OFF)
 # LLVM 24's VOPD pairing is not repeatable unless patched (docker/llvm-vopd-pairing.patch); when
