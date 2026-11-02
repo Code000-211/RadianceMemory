@@ -3527,16 +3527,23 @@ int Engine::configure_kv() {
      * residency_window, set by arch/common/rad_qsa.h); the blocks the window does not cover can
      * then live in a pinned store instead of VRAM. One slot is one block, so this runs after the
      * carve, which is where a block's size exists, and under tensor parallelism the slot holds
-     * every rank's shard at its own offset. */
+     * every rank's shard at its own offset. A slot holds one block of one group, so a rank's
+     * shard is its widest residency group's block (KVManager::residency_shard_bytes): under a
+     * per-layer recipe the groups are layouts of different widths, all with one window. */
     {
         std::vector<int64_t> rank_res(ranks_.size(), 0), res_off(ranks_.size(), 0);
         int64_t slot_bytes = 0, window_tokens = 0, n_groups = 0;
+        std::string per_group;   /* each group's block, for the store's line */
         for (size_t i = 0; i < ranks_.size(); ++i)
-            for (const auto& p : ranks_[i]->kv.plans())
-                if (p.residency()) {
-                    rank_res[i] += p.bytes_per_block;
-                    if (i == 0) { window_tokens += p.residency_window; ++n_groups; }
-                }
+            rank_res[i] = ranks_[i]->kv.residency_shard_bytes();
+        for (const auto& p : ranks_[0]->kv.plans())
+            if (p.residency()) {
+                window_tokens = std::max(window_tokens, p.residency_window);
+                ++n_groups;
+                per_group += (per_group.empty() ? "" : ", ") + p.name + " " +
+                             humanb(p.bytes_per_block) + " (" + std::to_string(p.n_layers) +
+                             " layers of " + humanb(p.layer_bytes_per_block()) + ")";
+            }
         for (size_t i = 0; i < ranks_.size(); ++i) {
             res_off[i] = slot_bytes;
             slot_bytes += rank_res[i];
@@ -3571,7 +3578,7 @@ int Engine::configure_kv() {
                 return RAD_E_NOMEM;
             }
             for (auto& r : ranks_)
-                r->kv.set_residency_store(&res_store_, res_off[(size_t)(&r - &ranks_[0])]);
+                RAD_TRY(r->kv.set_residency_store(&res_store_, res_off[(size_t)(&r - &ranks_[0])]));
             /* What the pager's scratch pages cost the card (KVGroupPlan::scratch_blocks, charged to
              * the KV budget before the split), per rank 0's groups. */
             int64_t scratch_bytes = 0, scratch_pages = 0;
@@ -3579,10 +3586,11 @@ int Engine::configure_kv() {
                 scratch_bytes += p.scratch_blocks * p.bytes_per_block;
                 scratch_pages += p.scratch_blocks;
             }
-            RAD_INFO("kv residency: store %s of host-mapped memory, %lld slots of %s; scratch "
-                     "reservation %s of VRAM (%lld pages for %lld decode rows, charged to the KV "
-                     "budget); window %lld tokens", humanb(res_store_.cap_bytes()).c_str(),
-                     (long long)slots, humanb(slot).c_str(), humanb(scratch_bytes).c_str(),
+            RAD_INFO("kv residency: store %s of host-mapped memory, %lld slots of %s, a slot one "
+                     "block of one group, rank 0's: %s; scratch reservation %s of VRAM (%lld pages "
+                     "for %lld decode rows, charged to the KV budget); window %lld tokens",
+                     humanb(res_store_.cap_bytes()).c_str(), (long long)slots,
+                     humanb(slot).c_str(), per_group.c_str(), humanb(scratch_bytes).c_str(),
                      (long long)scratch_pages, (long long)ranks_[0]->kv.scratch_rows(),
                      (long long)window_tokens);
             /* The transfers (TierExec::issue_moves) on every rank, over the residency groups, and

@@ -273,16 +273,21 @@ public:
      * snapshot store, one slot per cold block. Under tensor parallelism a slot holds every rank's
      * shard at its own offset (set_residency_store's rank_off), and rank 0 hands out slot ids. */
     /* RAD_E_STATE if this manager still holds cold entries (or in-flight transfers) in the store
-     * it has: their slots would name bytes in a store that is gone. */
+     * it has: their slots would name bytes in a store that is gone. RAD_E_INVAL for a store whose
+     * slot cannot hold this rank's part past `rank_off`. */
     int    set_residency_store(HostArena* store, int64_t rank_off);
     bool   residency_enabled() const { return res_arena_ != nullptr; }
     /* The pager's counter on this rank's card (RadKVGroupBatch::residency_paged), owned by the
      * engine (TierExec::paged_counter); the manager only carries the address to the batch. */
     void     set_residency_paged(int64_t* dev) { res_paged_ = dev; }
     int64_t* residency_paged() const { return res_paged_; }
-    /* Bytes one block of `group` occupies in its slot, and the slot's whole size (the widest
-     * residency group, since one arena serves them all). */
+    /* Bytes one block of `group` occupies in its slot, this rank's part of a slot (the widest
+     * residency group's block: a slot holds one block of one group, since a demotion takes a fresh
+     * slot per group and entry, and one arena serves them all), and the slot's whole size (every
+     * rank's part, the open store's slot once one is set). Under a per-layer recipe (--kv-recipe)
+     * the groups are layouts, so a block's bytes, and its layers' fragments, are its layout's. */
     int64_t residency_block_bytes(int32_t group) const;
+    int64_t residency_shard_bytes() const;
     int64_t residency_slot_bytes() const { return res_slot_bytes_; }
     /* The store as the card addresses it, null when none is open (HostArena::open_mapped). */
     void*   residency_device_base() const { return res_arena_ ? res_arena_->device_base() : nullptr; }

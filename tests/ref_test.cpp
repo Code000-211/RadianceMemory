@@ -9227,6 +9227,50 @@ TEST(qsa_page_adds_the_cold_entries_it_rewrote_to_its_counter) {
     CHECK_EQ(paged.iat(0), 44LL);
 }
 
+/* qsa_page over a packed per-layer layout (--kv-recipe): the core binds such a layer's cache as
+ * E4M3 columns at its row's bytes over two -- [blocks, kv_heads, block_size, 2 * head_dim * row16 /
+ * 32], 25 a 16-byte unit for fp8_v4, 22 for k6_v4 -- and its store fragment is one block of that,
+ * so the pager's block_bytes is the layout's and not the fp8 one's. Packed K, V and f16 scales are
+ * opaque bytes to it: each cold entry's fragment of the asked layer arrives whole, at the layout's
+ * width, from a slot whose layers sit one after another at that width; the neighbouring layers and
+ * blocks are not touched. Two geometries: fp8_v4 at head_dim 32 (a 50-column row, 1600 bytes a
+ * block of 16 tokens and 2 heads) and k6_v4 at Flash-Next's head_dim 256 (352 columns, 1408 bytes a
+ * 4-token block of one head). */
+TEST(qsa_page_moves_a_packed_layouts_fragment_at_its_own_width) {
+    struct Geo { const char* name; int64_t heads, bs, cols; };
+    for (const Geo& g : { Geo{ "fp8_v4", 2, 16, 2 * 32 * 25 / 32 },
+                          Geo{ "k6_v4", 1, 4, 2 * 256 * 22 / 32 } }) {
+        const int64_t frag = g.heads * g.bs * g.cols, layers = 3, slots = 4, blocks = 10;
+        CHECK_EQ(frag, std::strcmp(g.name, "k6_v4") == 0 ? 1408ll : 1600ll);
+        T store(RAD_U8, {slots, layers * frag});
+        for (int64_t i = 0; i < slots * layers * frag; ++i)
+            store.mem[(size_t)i] = (uint8_t)((i * 37 + i / 251 + 11) & 0xff);
+        for (int64_t layer : { 1, 2 }) {
+            T sel(RAD_I32, {2, 3}), scratch(RAD_I32, {2, 3});
+            sel.n({ rad_kv_cold_entry(3), 4, rad_kv_cold_entry(0),  -1, rad_kv_cold_entry(2), 5 });
+            scratch.n({ 6, 0, 7,  0, 8, 0 });
+            T pool(RAD_F8E4M3, {blocks, g.heads, g.bs, g.cols});
+            std::fill(pool.mem.begin(), pool.mem.end(), (uint8_t)0xEE);
+            T view = store;                     /* this layer's view, as rad_qsa.h folds it in */
+            view.t.data = store.mem.data() + layer * frag;
+            view.t.shape[1] = frag;
+            A a; a.t(sel).t(view).t(pool).t(scratch);
+            a.i("M", 2).i("topk", 2).i("blocks", blocks).i("seqs", 1).i("block_bytes", frag);
+            CHECK_OK(run("qsa_page", a));
+            const std::vector<int64_t> want = { 6, 4, 7,  -1, 8, 5 };
+            for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(sel.iat((int64_t)i), want[i]);
+            auto holds = [&](int64_t b, int64_t slot) {
+                return std::memcmp(pool.mem.data() + b * frag,
+                                   store.mem.data() + (slot * layers + layer) * frag, (size_t)frag) == 0;
+            };
+            CHECK(holds(6, 3)); CHECK(holds(7, 0)); CHECK(holds(8, 2));
+            for (int64_t b : { 0, 1, 2, 3, 4, 5, 9 })
+                for (int64_t i = 0; i < frag; ++i)
+                    if (pool.mem[(size_t)(b * frag + i)] != 0xEE) { CHECK(false); break; }
+        }
+    }
+}
+
 /* dflash_conv: tap 0 always, tap 1 only past a block's first row; each tap's coefficient is base
  * plus its group's delta, read from the first taps * NG columns of a twice-as-wide row. */
 TEST(dflash_conv_resets_its_taps_at_each_block) {

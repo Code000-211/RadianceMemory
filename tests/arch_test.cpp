@@ -10184,6 +10184,10 @@ TEST(a_mixed_kv_recipe_on_flashnext_declares_each_layers_cache_in_its_own_layout
             CHECK_EQ(b.kv_groups[0].d.head_dim, 200);
             CHECK_EQ(b.kv_groups[1].d.head_dim, 176);
             CHECK_EQ(b.kv_groups[0].zero, b.kv_groups[1].zero);
+            /* Each layout's group carries the indexer's residency window, the same one, so both
+             * page out and the store's slot follows the widest layout's block. */
+            CHECK(b.kv_groups[0].d.residency_window > 0);
+            CHECK_EQ(b.kv_groups[0].d.residency_window, b.kv_groups[1].d.residency_window);
             const bool has_cache = !b.kv_groups[0].zero;
 
             std::map<int, rad_kvgroup> bound;

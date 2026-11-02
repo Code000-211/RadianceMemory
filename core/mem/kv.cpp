@@ -1405,17 +1405,20 @@ void KVManager::size_residency() {
     res_off_.assign(plans_.size(), 0);
     if (res_origin_.size() != plans_.size()) res_origin_.resize(plans_.size());
     /* Under tensor parallelism every rank takes the same slot id for the same block, so the slot is
-     * the sum of the ranks' shards and each rank writes only its own window (`rank_off` plus the
-     * groups before it). */
-    int64_t bytes = res_rank_off_;
-    for (size_t i = 0; i < plans_.size(); ++i) {
-        const auto& p = plans_[i];
-        if (!p.residency()) continue;
-        res_off_[i] = bytes;
-        bytes += p.bytes_per_block;
-    }
+     * the sum of the ranks' shards and each rank writes only its own window, at `rank_off`. A slot
+     * holds one block of one group (residency_demote takes a fresh slot per group and entry), so
+     * every group's block starts there and the window is as wide as the widest group's block, not
+     * their sum: under a per-layer recipe of two layouts a sum would leave every slot partly empty.
+     * The pitch is the open store's slot, which is every rank's window; without a store, what this
+     * rank would need (the engine sizes the store from residency_shard_bytes() instead).
+     * shortcut: one arena for every group, so a narrower layout's block leaves the rest of its slot
+     * unused; one arena per group if a mixed recipe's store ever needs those host bytes. */
+    for (size_t i = 0; i < plans_.size(); ++i)
+        if (plans_[i].residency()) res_off_[i] = res_rank_off_;
     constexpr int64_t unit = 256;
-    res_slot_bytes_ = ceil_div(bytes, unit) * unit;
+    res_slot_bytes_ = res_arena_ && res_arena_->enabled()
+                          ? res_arena_->slot_bytes()
+                          : ceil_div(res_rank_off_ + residency_shard_bytes(), unit) * unit;
 
     /* The pager's per-layer view of the same layout: a group's bytes in a slot are its layers'
      * fragments in the order they were bound (residency_ptr / TierExec::issue_moves), each one
@@ -1451,6 +1454,14 @@ int KVManager::set_residency_store(HostArena* store, int64_t rank_off) {
                 (long long)res_cold_, res_pending_.size() + res_demoting_.size());
         return RAD_E_STATE;
     }
+    /* A slot too small for this rank's window would put its blocks in the next slot's bytes. */
+    if (store && store->enabled() &&
+        (rank_off > 0 ? rank_off : 0) + residency_shard_bytes() > store->slot_bytes()) {
+        RAD_ERR("KV residency: a store slot of %s cannot hold this rank's %s at offset %lld",
+                humanb(store->slot_bytes()).c_str(), humanb(residency_shard_bytes()).c_str(),
+                (long long)rank_off);
+        return RAD_E_INVAL;
+    }
     res_arena_ = store;
     res_rank_off_ = rank_off > 0 ? rank_off : 0;
     /* The slot size is derived from the plans at carve, so a store set before configure() needs no
@@ -1476,6 +1487,13 @@ void KVManager::release_residency() {
 int64_t KVManager::residency_block_bytes(int32_t g) const {
     if (g < 0 || g >= (int32_t)plans_.size()) return 0;
     return plans_[(size_t)g].residency() ? plans_[(size_t)g].bytes_per_block : 0;
+}
+
+int64_t KVManager::residency_shard_bytes() const {
+    int64_t b = 0;
+    for (const KVGroupPlan& p : plans_)
+        if (p.residency()) b = std::max(b, p.bytes_per_block);
+    return b;
 }
 
 int32_t KVManager::residency_slot(int32_t, int32_t entry) const {

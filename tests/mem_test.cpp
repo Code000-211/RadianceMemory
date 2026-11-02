@@ -8135,9 +8135,12 @@ struct ResidencyFixture {
     Config cfg = small_config();
 
     int build(int64_t window_tokens, int64_t slots) {
+        return build_groups(residency_groups(window_tokens), slots);
+    }
+    int build_groups(const std::vector<KVGroupInfo>& groups, int64_t slots) {
         int s = configure_pools(pools, cfg);
         if (s < 0) return s;
-        s = kv.configure(residency_groups(window_tokens), cfg, pools.kv());
+        s = kv.configure(groups, cfg, pools.kv());
         if (s < 0) return s;
         if (kv.residency_slot_bytes() <= 0) return RAD_E_STATE;
         s = store.open(kv.residency_slot_bytes(), kv.residency_slot_bytes() * slots);
@@ -8407,19 +8410,21 @@ static unsigned char resid_pat(int64_t layer, int32_t block, int64_t i) {
     return (unsigned char)((layer * 131 + block * 17 + i * 7 + 3) & 0xff);
 }
 
-static void resid_fill(KVManager& kv, int32_t g) {
+static void resid_fill(KVManager& kv, int32_t g, int64_t salt = 0) {
     const KVGroupPlan* p = kv.plan(g);
     auto* base = (char*)p->base;
     const int64_t frag = p->layer_bytes_per_block();
     for (int64_t b = 0; b < p->n_blocks; ++b)
         for (int64_t l = 0; l < p->n_layers; ++l)
             for (int64_t i = 0; i < frag; ++i)
-                base[l * p->layer_stride() + b * frag + i] = (char)resid_pat(l, (int32_t)b, i);
+                base[l * p->layer_stride() + b * frag + i] = (char)resid_pat(l + salt, (int32_t)b, i);
 }
 
 /* How many (layer, byte) positions of a block differ from what resid_fill wrote for `pat_block`
- * (the block itself unless a promotion put its bytes in a different one). */
-static int64_t resid_mismatches(KVManager& kv, int32_t g, int32_t block, int32_t pat_block = -1) {
+ * (the block itself unless a promotion put its bytes in a different one), under the same `salt`
+ * (a per-group one tells two groups' blocks apart). */
+static int64_t resid_mismatches(KVManager& kv, int32_t g, int32_t block, int32_t pat_block = -1,
+                                int64_t salt = 0) {
     if (pat_block < 0) pat_block = block;
     const KVGroupPlan* p = kv.plan(g);
     auto* base = (char*)p->base;
@@ -8427,7 +8432,8 @@ static int64_t resid_mismatches(KVManager& kv, int32_t g, int32_t block, int32_t
     int64_t bad = 0;
     for (int64_t l = 0; l < p->n_layers; ++l)
         for (int64_t i = 0; i < frag; ++i)
-            if ((unsigned char)base[l * p->layer_stride() + block * frag + i] != resid_pat(l, pat_block, i))
+            if ((unsigned char)base[l * p->layer_stride() + block * frag + i] !=
+                resid_pat(l + salt, pat_block, i))
                 ++bad;
     return bad;
 }
@@ -8589,6 +8595,166 @@ TEST(a_freed_block_id_serves_another_sequence_while_its_owner_comes_back_byte_fo
     CHECK_EQ(f.store.used_slots(), 0ll);
     CHECK(f.kv.residency_cold_entries(1, G_RES).empty());
     CHECK_EQ(f.kv.residency_stats().promoted, 30ll);
+
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+/* ------------------------------------------------------------------ window residency: a per-layer recipe */
+
+/* Flash-Next under a mixed --kv-recipe, in miniature: the trunk's attention layers in one group per
+ * layout, each declared at its row's bytes over two as E4M3 columns (32 at fp8, 22 at k6_v4 for
+ * head_dim 32), both carrying the indexer's window, beside the block keys. One fp8 layer is 2048
+ * bytes a block, each k6_v4 layer 1408. */
+enum : int32_t { G_MIX_F8 = 1, G_MIX_K6 = 2, G_MIX_KEYS = 3 };
+
+static std::vector<KVGroupInfo> mixed_residency_groups() {
+    auto attn = [](const char* name, int64_t head_dim, std::vector<int32_t> layers) {
+        KVGroupInfo k = paged_group(name, RAD_KV_FULL, 2, 16, std::move(layers));
+        k.decl.dtype = RAD_F8E4M3;
+        k.decl.head_dim = head_dim;
+        k.decl.residency_window = 512;
+        return k;
+    };
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    g.push_back(attn("kv_attn_fp8", 32, { 3 }));               /* 2048 B a block */
+    g.push_back(attn("kv_attn_k6_v4", 22, { 7, 11, 15 }));     /* 3 x 1408 = 4224 B */
+    g.push_back(paged_group("kv_qsa_bkey", RAD_KV_FULL, 1, 16, { 3, 7, 11, 15 }));
+    return g;
+}
+
+/* A slot holds one block of one group -- a demotion takes a fresh slot for each group's entry --
+ * so its size is the widest layout's block, not the sum of every layout's: the sum would leave
+ * every slot of a two-layout recipe partly empty and the store holding fewer blocks than its
+ * bytes buy. Each group's block starts at the rank's offset in the slot, its layers' fragments
+ * one after the other at that layer's own width, which is what the pager's layer offsets name.
+ * Under tensor parallelism the pitch the pager walks is the shared slot, every rank's window, and
+ * not the part one rank would need alone. */
+TEST(a_mixed_recipes_store_slot_is_its_widest_layouts_block_and_each_layer_its_own_fragment) {
+    ResidencyFixture f;
+    CHECK_OK(f.build_groups(mixed_residency_groups(), /*slots=*/16));
+    const KVGroupPlan* f8 = f.kv.plan(G_MIX_F8);
+    const KVGroupPlan* k6 = f.kv.plan(G_MIX_K6);
+    REQUIRE(f8 && k6 && f8->residency() && k6->residency());
+    CHECK_EQ(f8->bytes_per_block, 2048ll);
+    CHECK_EQ(k6->bytes_per_block, 3 * 1408ll);
+    CHECK_EQ(f.kv.residency_block_bytes(G_MIX_F8), 2048ll);
+    CHECK_EQ(f.kv.residency_block_bytes(G_MIX_K6), 4224ll);
+    CHECK_EQ(f.kv.residency_block_bytes(G_MIX_KEYS), 0ll);     /* no window: never in the store */
+    CHECK_EQ(f.kv.residency_shard_bytes(), 4224ll);
+    CHECK_EQ(f.kv.residency_slot_bytes(), 4352ll);             /* 4224 up to the 256-byte unit */
+    CHECK_EQ(f.store.slot_bytes(), 4352ll);
+
+    const std::vector<int64_t>& o8 = f.kv.residency_layer_off(G_MIX_F8);
+    const std::vector<int64_t>& o6 = f.kv.residency_layer_off(G_MIX_K6);
+    REQUIRE_EQ(o8.size(), (size_t)4);
+    REQUIRE_EQ(o6.size(), (size_t)16);
+    CHECK_EQ(o8[3], 0ll);
+    CHECK_EQ(o8[0], -1ll); CHECK_EQ(o8[1], -1ll); CHECK_EQ(o8[2], -1ll);
+    CHECK_EQ(o6[7], 0ll); CHECK_EQ(o6[11], 1408ll); CHECK_EQ(o6[15], 2816ll);
+    CHECK_EQ(o6[3], -1ll);                                     /* layer 3 is the fp8 group's */
+    CHECK(o6[15] + k6->layer_bytes_per_block() <= f.kv.residency_slot_bytes());
+
+    /* Two ranks, the engine's way: the slot is the sum of the ranks' widest blocks, rank 1's window
+     * starts after rank 0's, and both walk the store at the shared slot's pitch. */
+    Pools p1;
+    Config c1 = small_config();
+    REQUIRE_EQ(configure_pools(p1, c1), RAD_OK);
+    KVManager r1;
+    REQUIRE_EQ(r1.configure(mixed_residency_groups(), c1, p1.kv()), RAD_OK);
+    const int64_t shard = f.kv.residency_shard_bytes();
+    HostArena shared;
+    CHECK_OK(shared.open(2 * shard, 2 * shard * 8));
+    CHECK_OK(f.kv.set_residency_store(&shared, 0));
+    /* A store whose slot cannot hold a rank's window past its offset is refused, not overrun. */
+    CHECK_EQ(r1.set_residency_store(&shared, shard + 1), (int)RAD_E_INVAL);
+    CHECK(!r1.residency_enabled());
+    CHECK_OK(r1.set_residency_store(&shared, shard));
+    CHECK_EQ(f.kv.residency_slot_bytes(), 2 * shard);
+    CHECK_EQ(r1.residency_slot_bytes(), 2 * shard);
+    CHECK_EQ(r1.residency_layer_off(G_MIX_F8)[3], shard);
+    CHECK_EQ(r1.residency_layer_off(G_MIX_K6)[15], shard + 2816);
+    CHECK_OK(f.kv.set_residency_store(nullptr, 0));   /* `shared` goes before the managers do */
+    CHECK_OK(r1.set_residency_store(nullptr, 0));
+}
+
+/* Demote, overwrite, promote with two layouts in one model: each group's blocks leave at their own
+ * width, the pool is overwritten, and promotion brings every layer of every block back byte for
+ * byte into fresh blocks, from slots that never alias across groups. Nothing about the movement
+ * is layout specific -- the bytes are packed K, V and scales, moved as bytes -- so the check is
+ * that the per-layer widths and offsets are honoured end to end. */
+TEST(blocks_of_mixed_kv_layouts_demote_and_come_back_byte_for_byte_after_the_pool_is_overwritten) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    ResidencyFixture f;
+    CHECK_OK(f.build_groups(mixed_residency_groups(), /*slots=*/64));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    const std::vector<int32_t> groups{ G_MIX_F8, G_MIX_K6 };
+    CHECK_OK(x.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 20));
+    std::vector<int32_t> orig[3];
+    /* Salted by group: a slot that aliased across groups would bring back the other layout's
+     * bytes, which the same block id in the other pool would otherwise match. */
+    for (int32_t g : groups) {
+        resid_fill(f.kv, g, 10 * g);
+        orig[g] = f.kv.block_table(1, g);
+        REQUIRE_EQ((int64_t)orig[g].size(), 20ll);
+    }
+
+    /* The sweep's order: every residency group of the sequence, the mover one group a call. */
+    auto run = [&](std::vector<BlockMove>& mv, bool to_host) {
+        for (size_t a = 0; a < mv.size();) {
+            size_t z = a;
+            while (z < mv.size() && z - a < (size_t)TierExec::kMoveBatch &&
+                   mv[z].group == mv[a].group) ++z;
+            const std::vector<BlockMove> part(mv.begin() + (long)a, mv.begin() + (long)z);
+            CHECK_OK(x.issue_moves(part, compute, to_host));
+            x.quiesce();
+            a = z;
+        }
+    };
+    std::vector<BlockMove> down;
+    for (int32_t g : groups)
+        CHECK_OK(f.kv.residency_demote(1, g, /*keep_head=*/2, /*keep_tail=*/4, &down));
+    REQUIRE_EQ(down.size(), 28u);                      /* entries [2, 16) of both groups */
+    run(down, /*to_host=*/true);
+    f.kv.residency_demote_landed();
+    CHECK_EQ(x.move_stats().out_blocks, 28ll);
+    CHECK_EQ(x.move_stats().out_bytes, 14 * 2048ll + 14 * 4224ll);
+    CHECK_EQ(f.store.used_slots(), 28ll);              /* one slot per group and entry */
+
+    for (int32_t g : groups) resid_scribble(f.kv, g);
+    CHECK(resid_mismatches(f.kv, G_MIX_K6, orig[G_MIX_K6][5], -1, 10 * G_MIX_K6) > 4000);
+
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote_all(1, &up));
+    REQUIRE_EQ(up.size(), 28u);
+    run(up, /*to_host=*/false);
+    f.kv.residency_complete();
+    CHECK_EQ(x.move_stats().in_bytes, 14 * 2048ll + 14 * 4224ll);
+    for (int32_t g : groups) {
+        const std::vector<int32_t> back = f.kv.block_table(1, g);
+        for (size_t i = 2; i < 16; ++i) {
+            CHECK(back[i] >= 0);
+            CHECK_EQ(resid_mismatches(f.kv, g, back[i], orig[g][i], 10 * g), 0ll);
+        }
+        CHECK(f.kv.residency_cold_entries(1, g).empty());
+    }
+    CHECK_EQ(f.store.used_slots(), 0ll);
 
     CHECK_OK(rad_stream_sync(compute));
     rad_stream_destroy(compute);
