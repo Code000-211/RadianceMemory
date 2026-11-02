@@ -295,6 +295,12 @@ typedef struct RadBuildCtx {
      * fixed buffers ignores them, and the core says so at startup. */
     int64_t  gen_max_pixels;
     int64_t  gen_max_refs;
+
+    /* ---- appended in ABI 37 (where a routed expert may live) */
+    /* --weights-disk-tier: nonzero when weights may stay in the container. An expert read from the
+     * drive has to be stored whole, so a plugin that can lay its routed experts out either way
+     * keeps them whole for this; 0 leaves it free to split them across the ranks by width. */
+    int      expert_file_tier;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */

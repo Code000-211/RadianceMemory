@@ -50,6 +50,11 @@ struct Model {
      * form declares none of the row form's full-width weights (1.29 GiB a card at eight ranks);
      * the row form is opt-in because it is not bit-identical to it (docs/ARCHITECTURES.md). */
     GlmMla::Form form = GlmMla::Form::heads;
+    /* Routed experts whole on their rank (288/world of them) instead of split by width across
+     * every rank. Whole experts can be read from the drive, which two cards need; at four and
+     * eight the width split is the shape the MXFP4 kernels are tuned for (prefill runs about three
+     * times faster), so it stays unless --weights-disk-tier asks for the drive. */
+    bool whole_experts = false;
     std::vector<Layer> layers;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
@@ -252,10 +257,10 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { T * 8 });
     mw.inv = decl_b(b, nm.f("expert_inverse"), RAD_I32, { T * 8 });
-    // FE: the routed experts' WHOLE intermediate (2048). Under expert parallelism a rank owns
-    // whole experts, so the routed arm's buffers are full-width at every world size; the SHARED
-    // expert stays width-sharded (F). The two coincide at world 1.
-    const int64_t FE = 2048;
+    // FE: the routed experts' intermediate. Under expert parallelism a rank owns whole experts,
+    // so the routed arm's buffers are full-width (2048); split by width they are F. The SHARED
+    // expert stays width-sharded (F) either way. The two coincide at world 1.
+    const int64_t FE = m.whole_experts ? 2048 : F;
     mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * FE });
     mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, FE });
     RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", FE, T * 8));
@@ -380,14 +385,19 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
         s.cfg.n_expert_all = 288;
         s.cfg.top_k = 8;
-        s.cfg.n_expert = 288 / g.world;
-        // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
-        // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
-        const int ep_rank = g.rank < g.world ? g.rank : 0;
-        s.cfg.expert_base = ep_rank * (288 / g.world);
-        s.cfg.probed_expert = s.cfg.expert_base;      // probe this rank's first owned expert
-        s.cfg.n_ff_exp = 2048;                        // whole: whole experts' intermediate
-        s.cfg.n_ff_shared = 2048 / g.world;
+        s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
+        if (m.whole_experts) {
+            s.cfg.n_expert = 288 / g.world;
+            // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
+            // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
+            const int ep_rank = g.rank < g.world ? g.rank : 0;
+            s.cfg.expert_base = ep_rank * (288 / g.world);
+            s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
+            s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
+        } else {
+            s.cfg.n_expert = 288;
+            s.cfg.n_ff_exp = GlmTp::expert_width(g.world);
+        }
         s.cfg.rows = g.max_tok;
         s.cfg.sigmoid_router = 1;
         s.cfg.route_scale = 2.5;
@@ -396,12 +406,12 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.cfg.router_fuse = 1;
         s.cfg.swiglu_quant = 1;
         // At world 1 the width-slice declaration IS the whole model: keep the spans so the
-        // graph stays the pinned one. At world > 1 expert parallelism is in force and whole
-        // experts need no width spans (split && ep is refused by the helper).
-        if (g.world == 1) {
+        // graph stays the pinned one. Whole experts need no width spans (split && ep is refused
+        // by the helper).
+        if (!m.whole_experts) {
             for (int q = 0; q < 2; ++q) {
-                s.cfg.ff_lo[q] = g.rank * (2048 / g.world);
-                s.cfg.ff_hi[q] = (g.rank + 1) * (2048 / g.world);
+                s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
+                s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
             }
         }
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
@@ -494,6 +504,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& nm = m.nm;
     m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
+    m.whole_experts = world == 2 || (world > 2 && ctx->expert_file_tier);
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
     RAD_ARCH_TRY(mla_buffers(b, m));

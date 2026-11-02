@@ -1788,6 +1788,7 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         int world;
         uint64_t graph, steps;
         bool heads_only = false;   /* the default: the graph before the row form */
+        bool file_tier = false;    /* --weights-disk-tier: whole experts at four ranks and up */
     };
     /* Pins from this test's own `pin:` printout: the head form (heads_only, which declares the
      * streamed ops) and the row form, at one and eight ranks. Re-recorded after every graph
@@ -1795,10 +1796,15 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
      * expert ops, and the graphs again when the routing counts became RAD_BUF_PERSIST (the
      * steps did not change). */
     const Case cases[] = { { 1, 0xce4368c09bfdbbeeull, 0x19679d4fcc0321ebull },
-                           /* World 8 is this branch's expert-parallel graph (288/world whole
-                            * experts, file-direct), so its pins differ from main's. */
-                           { 8, 0x553f81a93cec76bfull, 0x17f0a90d3bed9713ull },
-                           { 8, 0x9685be82c8d55813ull, 0x75e775f0568636b5ull, true } };
+                           /* Two ranks keep whole experts; four and eight split them by width. */
+                           { 2, 0xab04b95724840abeull, 0x76865603b1390635ull },
+                           { 4, 0xfdee91cd1c985b0aull, 0xde7ebe5b604c3cd2ull },
+                           { 8, 0x59112e7ad7d77fdeull, 0xb9c29d30003a6df7ull },
+                           { 8, 0xf1bb904ab21d8813ull, 0xfb28d3dcd8ec5ae1ull, true },
+                           /* The file tier's whole experts, file-direct, at four and eight. */
+                           { 4, 0x1918906f91fad4e7ull, 0x07d518b9a0f32986ull, false, true },
+                           { 8, 0x553f81a93cec76bfull, 0x17f0a90d3bed9713ull, false, true },
+                           { 8, 0x9685be82c8d55813ull, 0x75e775f0568636b5ull, true, true } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
@@ -1815,11 +1821,12 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         ctx.max_seqs = 8;
         ctx.max_ctx = 200000;
         ctx.tp_attn_rows = cs.heads_only ? 0 : 1;
+        ctx.expert_file_tier = cs.file_tier;
         REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
         const uint64_t g = graph_hash(b);
         const uint64_t s = pinned_steps(b, glm5next::step, 0, cs.world);
-        fprintf(stderr, "    pin: glm5next world %d%s: graph 0x%016llxull, steps 0x%016llxull\n",
-                cs.world, cs.heads_only ? " heads only" : "",
+        fprintf(stderr, "    pin: glm5next world %d%s%s: graph 0x%016llxull, steps 0x%016llxull\n",
+                cs.world, cs.heads_only ? " heads only" : "", cs.file_tier ? " file tier" : "",
                 (unsigned long long)g, (unsigned long long)s);
         CHECK_EQ(g, cs.graph);
         CHECK_EQ(s, cs.steps);
