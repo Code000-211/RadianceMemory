@@ -56,7 +56,8 @@ recomputes block keys inside the per-query loop; the engine computes each once, 
 
 12 QSA layers x 64 B = 768 B per token, about 3% of the main KV cache's 24 KiB per token
 (2 heads x 256 x 2 (K and V) x 2 bytes x 12 at bf16): 192 MiB per sequence at 262144 tokens,
-24 MiB at 32768.
+24 MiB at 32768. In int8 (`--qsa-bkey-dtype i8`, below) a block key is 136 bytes, 34 a token a
+layer.
 
 ## Exactness bound
 
@@ -112,6 +113,29 @@ A `RAD_KV_FULL` group stores `[pages, kv_heads, block_size, 2*head_dim]`. With `
 one block key of `n` values (`2 * head_dim * ratio == n` is asserted). A group's page size comes
 from the first later-declared op with a `block_size` (`Builder::find_kv_consumer`), so the group is
 declared immediately before `qsa_block_key`, whose `block_size` sizes it.
+
+**In int8** (`--qsa-bkey-dtype i8`, RadBuildCtx::qsa_bkey_dtype RAD_I8) a page holds the key's `n`
+int8 codes, one f16 scale and zero padding: `n + 2` bytes rounded up to the `2 * ratio` a page of
+this geometry comes in, so the group is declared RAD_I8 with `head_dim = ceil((n + 2) / (2 * ratio))`,
+136 bytes at `n` 128 and `ratio` 4 (8.5 bits a value, 6 bytes of padding). Everything that sizes a
+page from the declaration -- the pool, the prefix cache, the residency store -- follows unchanged;
+every QSA layer and the MTP head share the group, so all store int8 together. `qsa_block_key` and
+`qsa_score` take `key_dtype` i8 (docs/OPS.md), only then, so the bf16 program is the one before the
+flag existed, parameter for parameter.
+
+- **The scale rule** is i8h's for a head: `scale = f16(fmin(amax / 127, 512))` over the key as the
+  bf16 store would hold it, codes `clamp(rint(x / scale), -127, 127)`, 0 at a zero scale; a NaN is
+  dropped from the max and stored as -127, an all-NaN key takes the cap. One scale a key, not a
+  32-group: g32 bought 0.0008 of top-512 overlap for 0.37 more bits (prep/aq/m8/bkey/decision.md).
+- **The score folds the scale out of the dot**: `relu(scale * (q . codes))` per head. A bf16 query
+  times a code is exact in f32, so the products are the bf16 path's kind and the scale is one
+  multiply a block and head; the matrix form widens codes to bf16 (exact) for the same WMMA.
+- **Measured** on two R9700s (Flash-Next `--tp 2`, a 30 210-token prefill, layer 47's own
+  selection, ovl.sh): top-512 overlap 0.932 mean against bf16 keys, the same as an fp8 attention
+  cache's against bf16 (0.928); block keys rebuilt in isolation keep 0.996 (the rest is the drift
+  of the earlier layers). KL against the bf16-cache reference, 4 long documents: fp8 0.0262 ->
+  0.0256, i8h 0.0236 -> 0.0243, both differences inside their 95% paired bootstrap interval;
+  window residency byte-identical off against on.
 
 ## The tail
 

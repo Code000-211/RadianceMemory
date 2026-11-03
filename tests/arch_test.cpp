@@ -11191,6 +11191,80 @@ TEST(flashnext_qsa_tail_is_per_layer_state) {
     CHECK(layers == (std::set<int64_t>{ 3, 7 }));
 }
 
+/* --qsa-bkey-dtype i8 (RadBuildCtx::qsa_bkey_dtype RAD_I8) at one and two ranks: the block-key
+ * group is declared RAD_I8 at head_dim 17, a 136-byte page for the 128 codes and their f16 scale
+ * (34 bytes a token a layer against bf16's 64), and every qsa_block_key and qsa_score -- the two
+ * trunk QSA layers' and the MTP head's -- takes key_dtype i8 and differs from the bf16 program in
+ * that parameter only. The default declares today's group (bf16, head_dim 16) and no key_dtype
+ * anywhere, so the bf16 program is unchanged. The probe says the plugin serves int8, a dtype it
+ * does not know is refused, and the int8 steps lint clean (decode, prefill, verify and the head). */
+TEST(flashnext_int8_block_keys_shrink_the_block_key_page_and_change_nothing_else) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.qsa_bkey_i8_ok, 1);
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &ctx), RAD_OK);
+            ctx.qsa_bkey_dtype = RAD_I8;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            auto keys = [](const RadBuilder& x) -> const RecKV* {
+                for (const RecKV& g : x.kv_groups) if (g.name == "kv_qsa_bkey") return &g;
+                return nullptr;
+            };
+            const RecKV *ka = keys(a), *kb = keys(b);
+            REQUIRE(ka != nullptr);
+            REQUIRE(kb != nullptr);
+            CHECK_EQ(ka->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(ka->d.head_dim, 16);
+            CHECK_EQ(kb->d.dtype, (uint32_t)RAD_I8);
+            CHECK_EQ(kb->d.head_dim, 17);
+            CHECK_EQ(rad_dtype_bytes(kb->d.dtype, 2 * 4 * kb->d.head_dim), 136);
+            CHECK_EQ(kb->d.n_head_kv, ka->d.n_head_kv);
+            CHECK_EQ(kb->d.residency_window, 0ll);
+            REQUIRE_EQ(a.ops.size(), b.ops.size());
+            int keyed = 0;
+            for (size_t i = 0; i < a.ops.size(); ++i) {
+                const RecOp &x = a.ops[i], &y = b.ops[i];
+                REQUIRE_EQ(x.op, y.op);
+                CHECK_EQ(pstr(&x, "key_dtype"), std::string("<absent>"));
+                if (x.op != "qsa_block_key" && x.op != "qsa_score") {
+                    CHECK_EQ(y.p.size(), x.p.size());
+                    continue;
+                }
+                ++keyed;
+                CHECK_EQ(pstr(&y, "key_dtype"), std::string("i8"));
+                REQUIRE_EQ(y.p.size(), x.p.size() + 1);
+                for (size_t j = 0; j < x.p.size(); ++j) {
+                    CHECK_EQ(y.p[j].key, x.p[j].key);
+                    CHECK_EQ(y.p[j].ival, x.p[j].ival);
+                    CHECK_EQ(y.p[j].sval, x.p[j].sval);
+                }
+            }
+            CHECK_EQ(keyed, 6);   /* layers 3 and 7 and the MTP head, a store and a score each */
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+        }
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    ctx.qsa_bkey_dtype = RAD_F8E4M3;
+    RadBuilder c;
+    c.encs = { { "draft_head", u2_head() } };
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&c, &meta, &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(err.find("block keys") != std::string::npos);
+}
+
 /* The rope table has a row for every position a step can name: a verify and the draft rounds run
  * up to max_spec past max_ctx, so a table ending at max_ctx would rotate them by unwritten rows.
  * Every draft pass fills its own rows before anything reads them, since a round's positions are

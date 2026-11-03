@@ -15,6 +15,12 @@
 //
 // An absent entry scores -inf, not zero: tables are padded, and a real score can be zero.
 //
+// With `key_dtype` i8 a page is qsa_block_key's int8 page (n codes, then the key's f16 scale): a
+// head's dot is taken over the codes and multiplied by the scale before the relu,
+// relu(scale * (q . codes)), libref's order. A bf16 query times a code is exact in f32 (8 and 7
+// significant bits), so both forms sum the same products as over bf16 keys; the matrix form feeds
+// the codes to the bf16 WMMA as bf16, which holds every code exactly.
+//
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
@@ -28,8 +34,18 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
+
+/* An int8 page's f16 scale, two bytes after the codes (2-byte aligned only by the page pitch). */
+__device__ __forceinline__ float qs_scale(const uint8_t* p) {
+    return (float)__builtin_bit_cast(__fp16, (uint16_t)(p[0] | (p[1] << 8)));
+}
+/* bf16 bits of an int8 code, exact (a code has at most 7 significant bits). */
+__device__ __forceinline__ uint32_t qs_code_bf16(uint32_t byte) {
+    return __float_as_uint((float)(int8_t)(uint8_t)byte) >> 16;
+}
 
 constexpr int kWave    = 32;
 constexpr int kThreads = 256;
@@ -63,7 +79,7 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
     const __hip_bfloat16* __restrict__ q, const __hip_bfloat16* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int n, int heads, int nb, int nseq, int q_ld, int bk_ld, int bt_ld, int out_ld) {
+    int n, int heads, int nb, int nseq, int q_ld, int bk_ld, int bt_ld, int out_ld, int i8) {
 
     __shared__ int sh_seq;
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
@@ -126,6 +142,7 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
          * present) and is skipped below. */
         int   pg[kBPW];
         float kvs[kBPW][VPL];
+        float ksc[kBPW];                 /* int8: each block's scale */
 #pragma unroll
         for (int i = 0; i < kBPW; ++i) {
             const int b = b0 + wave + i * kWaves;
@@ -134,6 +151,15 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
 #pragma unroll
         for (int i = 0; i < kBPW; ++i) {
             float* kv = kvs[i];
+            if (i8) {
+                /* `bk_ld` is the page's pitch in bytes; codes widen exactly. */
+                const int8_t* cp = (const int8_t*)bk + (size_t)(pg[i] >= 0 ? pg[i] : 0) * bk_ld;
+#pragma unroll
+                for (int j = 0; j < VPL; ++j) kv[j] = (float)cp[lane * VPL + j];
+                ksc[i] = qs_scale((const uint8_t*)cp + n);
+                continue;
+            }
+            ksc[i] = 1.0f;
             /* One vector load per lane instead of VPL two-byte loads, each of which would touch
              * the wave's whole 256-byte row (about 145 GB/s on a 621 GB/s part). Same bytes and
              * registers, so the sum is bit-identical. */
@@ -201,7 +227,7 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
                 /* Every lane holds the full reduction; lane 0 stores. */
                 float s = 0.0f;
 #pragma unroll
-                for (int h = 0; h < HEADS; ++h) s += fmaxf(dv[h], 0.0f);
+                for (int h = 0; h < HEADS; ++h) s += fmaxf(i8 ? dv[h] * ksc[i] : dv[h], 0.0f);
                 if (lane == 0) out[(size_t)(m + mi) * out_ld + b] = s * inv;
             }
         }
@@ -246,7 +272,7 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec, int i8) {
 
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
     const int half = lane >> 4, col = lane & 15;
@@ -292,10 +318,29 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
              * 0's key (always present) and is masked or skipped at the store. */
             const int b  = b0 + col;
             const int pg = pg_next;
-            const unsigned short* kp = bk + (size_t)(pg >= 0 ? pg : 0) * bk_ld + 4 * half;
             v8bf kf[kMxKS];
+            float ksc = 1.0f;
+            if (i8) {
+                /* The same fragment from int8 codes: k indices 16 ks + 4 half + {0..3, 8..11},
+                 * two dwords of codes, each widened exactly to bf16. `bk_ld` is in bytes. */
+                const uint8_t* cp = (const uint8_t*)bk + (size_t)(pg >= 0 ? pg : 0) * bk_ld;
 #pragma unroll
-            for (int ks = 0; ks < kMxKS; ++ks) kf[ks] = fragP(kp + ks * 16);
+                for (int ks = 0; ks < kMxKS; ++ks) {
+                    const uint32_t w0 = *(const uint32_t*)(cp + ks * 16 + 4 * half);
+                    const uint32_t w1 = *(const uint32_t*)(cp + ks * 16 + 4 * half + 8);
+                    union { uint32_t d[4]; v8bf f; } u;
+                    u.d[0] = qs_code_bf16(w0)       | qs_code_bf16(w0 >> 8)  << 16;
+                    u.d[1] = qs_code_bf16(w0 >> 16) | qs_code_bf16(w0 >> 24) << 16;
+                    u.d[2] = qs_code_bf16(w1)       | qs_code_bf16(w1 >> 8)  << 16;
+                    u.d[3] = qs_code_bf16(w1 >> 16) | qs_code_bf16(w1 >> 24) << 16;
+                    kf[ks] = u.f;
+                }
+                ksc = qs_scale(cp + kMxKS * 16);
+            } else {
+                const unsigned short* kp = bk + (size_t)(pg >= 0 ? pg : 0) * bk_ld + 4 * half;
+#pragma unroll
+                for (int ks = 0; ks < kMxKS; ++ks) kf[ks] = fragP(kp + ks * 16);
+            }
             pg_next = b + 16 < bend ? tab[b + 16] : -1;
             /* Which of the tile's sixteen blocks have no page: lanes 0-15 each read one. */
             const unsigned absent = (unsigned)__ballot(pg < 0) & 0xFFFFu;
@@ -310,14 +355,21 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
 #pragma unroll
                 for (int h = 0; h < HEADS; ++h) acc[h] = mma(kf[ks], qf[h][ks], acc[h]);
 
-            /* D[block][query]: this lane holds query `col` against blocks b0 + 8*half + e. */
+            /* D[block][query]: this lane holds query `col` against blocks b0 + 8*half + e, whose
+             * scales lanes 8*half + e read (wave-uniform branch: every lane shuffles). */
+            float bsc[8];
+            if (i8) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) bsc[e] = __shfl(ksc, 8 * half + e, kWave);
+            }
             if (!live) continue;
             float v[8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 float s = 0.0f;
 #pragma unroll
-                for (int h = 0; h < HEADS; ++h) s += fmaxf(acc[h][e], 0.0f);
+                for (int h = 0; h < HEADS; ++h)
+                    s += fmaxf(i8 ? acc[h][e] * bsc[e] : acc[h][e], 0.0f);
                 v[e] = ((absent >> (8 * half + e)) & 1u) ? -INFINITY : s * inv;
             }
             float* op = out + (size_t)row * out_ld + b0 + 8 * half;
@@ -350,7 +402,8 @@ extern "C" void r4d_qsa_score_pin_form(int form) { g_qsa_form = form; }
 //   out  [M][nb]         f32, `out_ld` elements a row (0 = nb)
 static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, long out,
                                   int M, int n, int heads, int nb, int nseq,
-                                  int q_ld, int bk_ld, int bt_ld, int out_ld, RadStream stream) {
+                                  int q_ld, int bk_ld, int bt_ld, int out_ld, int i8,
+                                  RadStream stream) {
     int emit_rc = RAD_OK;
     if (!q || !bk || !bt || !cu || !nc || !out) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n <= 0 || heads <= 0 || nb <= 0 || nseq <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -378,7 +431,8 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
                            dim3(kMxWaves * kWave), 0, (const unsigned short*)q,                   \
                            (const unsigned short*)bk,                                             \
                            (const int32_t*)bt, (const int32_t*)cu, (const int32_t*)nc,            \
-                           (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec)
+                           (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec, \
+                           i8)
         switch (heads) {
             case 1: RAD_QSA_MX(1); break;
             case 2: RAD_QSA_MX(2); break;
@@ -398,7 +452,7 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
     emit_rc = R4D_EMIT(stream, (qsa_score_kernel<V, H>), dim3(nbg, nmg), dim3(kThreads), 0,      \
                        (const __hip_bfloat16*)q, (const __hip_bfloat16*)bk, (const int32_t*)bt, \
                        (const int32_t*)cu, (const int32_t*)nc,                                  \
-                       (float*)out, n, heads, nb, nseq, q_ld, bk_ld, bt_ld, out_ld)
+                       (float*)out, n, heads, nb, nseq, q_ld, bk_ld, bt_ld, out_ld, i8)
 #define RAD_QSA_HEADS(V)                                        \
     switch (heads) {                                            \
         case 1: RAD_QSA_GO(V, 1); break;                        \
@@ -456,14 +510,22 @@ extern "C" int r4d_rad_qsa_score(const RadArgs* a, RadStream stream) {
     if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const long long nseq = cu->shape[0] - 1;
     if (bt->shape[0] < nseq || r4d_numel(nc) < nseq) return R4D_NO(RAD_E_SHAPE);
-    if (bk->shape[0] < 1 || r4d_numel(bk) / bk->shape[0] != n) return R4D_NO(RAD_E_SHAPE);
+    /* `key_dtype` i8: byte pages of at least the n codes and the f16 scale, whose pitch the
+     * matrix form reads as dwords. */
+    const char* kd = r4d_gets(a, "key_dtype");
+    if (kd && std::strcmp(kd, "i8")) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (bk->shape[0] < 1 ||
+        (kd ? r4d_numel(bk) / bk->shape[0] < n + 2 || rad_dtype_bits(bk->dtype) != 8
+            : r4d_numel(bk) / bk->shape[0] != n))
+        return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(q) < M * heads * n) return R4D_NO(RAD_E_SHAPE);
     const long long qp = r4d_row_pitch(q), kp = r4d_row_pitch(bk);
     const long long tp = r4d_row_pitch(bt), op = r4d_row_pitch(o);
     if (qp < 0 || kp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    if (kd && ((kp & 3) || (r4d_addr(bk) & 3))) return R4D_NO(RAD_E_STRIDE);
     return r4d_qsa_score_bf16_emit(r4d_addr(q), r4d_addr(bk), r4d_addr(bt), r4d_addr(cu),
                                    r4d_addr(nc), r4d_addr(o),
                                    (int)M, (int)n, (int)heads, (int)nb, (int)nseq,
-                                   (int)qp, (int)kp, (int)tp, (int)op, stream);
+                                   (int)qp, (int)kp, (int)tp, (int)op, kd ? 1 : 0, stream);
 }
 

@@ -398,7 +398,8 @@ static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("rati
                                              P_F64O("scale"), P_F64O("wadd"), P_STR("dtype"),
                                              P_STRO("mode"), P_STRO("sections"),
                                              P_F64O("yarn_factor"), P_F64O("yarn_low"),
-                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                             P_STRO("key_dtype") };
 static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page"), OPD_O("pos"),
                                                OUT("out") };
 
@@ -406,7 +407,7 @@ static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page")
  * tokens (tail store, work list); `seqs` is the declared height of `cu`'s sequences, whose count is
  * cu's length less one. `work` bounds the blocks that can complete. */
 static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
-                                          P_INT("seqs"), P_STR("dtype") };
+                                          P_INT("seqs"), P_STR("dtype"), P_STRO("key_dtype") };
 static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD("cu"), OPD("nc"),
                                             OUT("score") };
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
@@ -1138,11 +1139,13 @@ static const RadOpSchema kSchemas[] = {
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
-  "arithmetic with the angles from one table a block." },
+  "arithmetic with the angles from one table a block. `key_dtype` i8: libref's int8 page (codes, "
+  "f16 scale, zero padding)." },
 { "qsa_score", ARR(pQsaScore), ARR(oQsaScore),
   "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[seq(m)][b]])) / sqrt(n) for the sequence's "
   "first min(nc, width) blocks, a negative page id scoring -inf; the dots in vector order, the "
-  "heads summed in order. Columns past the bound are not written." },
+  "heads summed in order. Columns past the bound are not written. `key_dtype` i8: the dots over "
+  "the codes, times the block's scale before the relu." },
 { "qsa_select", ARR(pQsaSelect), ARR(oQsaSelect),
   "the topk highest-scoring complete blocks as page ids, libref's order exactly: the blocks above "
   "the threshold in block order, then its ties in block order, then the partial page, then -1 to "

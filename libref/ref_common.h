@@ -551,6 +551,17 @@ static inline void fwht(float* v, int64_t g) {
 
 static inline bool pow2(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
 
+/* Whether the trailing dimensions after the first are dense, so a row of a paged store is
+ * `numel / shape[0]` contiguous values from `row * stride[0]`. */
+static inline bool rows_dense(const RadTensor* t) {
+    int64_t acc = 1;
+    for (int i = (int)t->rank - 1; i >= 1; --i) {
+        if (t->shape[i] != 1 && t->stride[i] != acc) return false;
+        acc *= t->shape[i];
+    }
+    return true;
+}
+
 /* 1/sqrt(g) for a power of two g, the normalisation of `had_rotate`, formed so that every
  * implementation forms the same float: a power of two, times 1/sqrt(2) rounded to f32 when log2(g)
  * is odd. Both factors are exact or rounded once, and a product with a power of two is exact, so

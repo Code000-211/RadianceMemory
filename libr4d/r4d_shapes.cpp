@@ -1999,9 +1999,12 @@ extern "C" int r4d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadO
     const int64_t s  = pi(p, n_p, "seqs", 1);
     if (n <= 0 || h <= 0 || nb <= 0 || s <= 0) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
+    /* In int8 a page is the codes, the f16 scale and padding to 8 bytes (ratio 4). */
+    const bool i8 = r4d_pgets(p, n_p, "key_dtype") != nullptr;
     const RadOpdDesc l[] = {
         opd(D, M, h * n),
-        opd(D, nb, n),                 /* the store, bounded by the blocks one query can address */
+        /* the store, bounded by the blocks one query can address */
+        i8 ? opd((uint32_t)RAD_I8, nb, (n + 2 + 7) / 8 * 8) : opd(D, nb, n),
         /* Page ids, which must index the store: the ABI default (the previous operand) fits. */
         opd_idx(s, nb, 0),
         opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
@@ -2024,7 +2027,10 @@ extern "C" int r4d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, 
         opd((uint32_t)RAD_F32, n),
         opd_idx(M, 1, M),          /* page ids; a synthesised one addresses the store below */
         opd_idx(M, 1, M * r),      /* each block's first-token position */
-        opd(D, M, n),
+        /* in int8 a byte page: the codes, the f16 scale, padding to 2 * ratio bytes */
+        r4d_pgets(p, n_p, "key_dtype")
+            ? opd((uint32_t)RAD_I8, M, (n + 2 + 2 * r - 1) / (2 * r) * (2 * r))
+            : opd(D, M, n),
     };
     R4D_PICK(l);
 }

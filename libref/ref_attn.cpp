@@ -1457,7 +1457,17 @@ int ref_rope_table(const RadArgs* a, RadStream) {
  * block's position is `pos[b]` (a [>= M, 1 or 3] list holds a block's components side by side,
  * read under `mode` mrope/imrope and `sections`), or `pos0 + b*ratio` without one. `page[b]`, when
  * given, is the output row; a negative entry writes nothing. The rotary is `rope`'s ladder, with
- * YaRN's blend and magnitude when its coefficients are given. */
+ * YaRN's blend and magnitude when its coefficients are given.
+ *
+ * `key_dtype` i8 (RadBuildCtx::qsa_bkey_dtype RAD_I8, docs/QSA.md "Block-key storage") stores a
+ * block key as an int8 page: `out` is a byte-wide store whose row of P >= n + 2 bytes holds
+ *     [0, n)      the codes, dim d in byte d
+ *     [n, n + 2)  one f16 scale for the whole key
+ *     [n + 2, P)  zero
+ * The codes quantise the value the activation-dtype store would hold (out rounded to k's dtype),
+ * by i8h's rule for a head (the file header): scale f16(fmin(amax / 127, 512)), codes
+ * clamp(rint(x / scale), -127, 127), 0 at a zero scale; a NaN is dropped from the max and stored as
+ * -127. A read is code * scale. */
 int ref_qsa_block_key(const RadArgs* a, RadStream) {
     const RadTensor* k = t_in(a, 0);
     const RadTensor* w = t_in(a, 1);
@@ -1471,8 +1481,13 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
     if (rot < 0 || rot > n || (rot & 1)) return RAD_E_SHAPE;
     if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
     if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
+    const char* kd = p_str(a, "key_dtype", nullptr);
+    if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;
+    const bool i8 = kd != nullptr;
     const int64_t M = page ? numel(page) : out->shape[0];
-    if (M < 1 || numel(out) / out->shape[0] != n) return RAD_E_SHAPE;
+    const int64_t ow = numel(out) / out->shape[0];   /* a page: values, or bytes in int8 */
+    if (M < 1 || (i8 ? ow < n + 2 : ow != n)) return RAD_E_SHAPE;
+    if (i8 && (rad_dtype_bits(out->dtype) != 8 || !rows_dense(out))) return RAD_E_SHAPE;
     if (k->shape[0] != M * ratio || k->shape[1] != n || numel(w) < n) return RAD_E_SHAPE;
     const bool pos2 = pos && pos->rank == 2;
     if (pos && (pos2 ? pos->shape[0] < M : numel(pos) < M)) return RAD_E_SHAPE;
@@ -1524,6 +1539,13 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
             const float x0 = y[i], x1 = y[half + i];
             y[i] = x0 * c - x1 * s;
             y[half + i] = x0 * s + x1 * c;
+        }
+        if (i8) {
+            uint8_t* row = (uint8_t*)out->data + orow * out->stride[0];
+            for (int64_t t = 0; t < n; ++t) y[t] = round_dt(k->dtype, y[t]);
+            i8h_head(y, n, row, row + n);
+            std::memset(row + n + 2, 0, (size_t)(ow - n - 2));
+            continue;
         }
         for (int64_t t = 0; t < n; ++t) stt(out, offlin(out, orow * n + t), y[t]);
     }

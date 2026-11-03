@@ -3019,13 +3019,13 @@ order, not a slow one.
 
 | op | params | operands |
 |---|---|---|
-| `qsa_block_key` | `M`(range) `n` `ratio` `rotary_dim` `pos0`/opt `block_size`/opt `eps`:f64 `theta`:f64 `scale`:f64/opt `wadd`:f64/opt `dtype` `mode`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `k`, `w`w, `page`?, `pos`? → `out` |
+| `qsa_block_key` | `M`(range) `n` `ratio` `rotary_dim` `pos0`/opt `block_size`/opt `eps`:f64 `theta`:f64 `scale`:f64/opt `wadd`:f64/opt `dtype` `mode`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `key_dtype`/opt | `k`, `w`w, `page`?, `pos`? → `out` |
 | `dsa_pool` | `M`(range) `n` `ratio` `dtype` `block_size`/opt | `kg`, `ape`w → `q`, `scale`; `page`?, `cache`:inout? |
 | `dsa_query` | `M`(range) `n` `dtype` | `x` → `q`, `scale` |
 | `dsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `row_part`/opt | `q`, `q_scale`, `gate`, `k`, `k_scale`?, `bt`, `cu`, `nc` → `score`, `cu_part`? |
 | `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `kv`, `bt`, `length` → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
-| `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
+| `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `key_dtype`/opt | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
 | `kv_resolve` | `M`(range) `blocks` `slots` `sel_pitch` `block_bytes` | `sel`:inout, `nsel`, `res`:inout, `slot_block`:inout, `slot_state`:inout, `ctl`:inout, `host`, `kv_cache`:inout |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
@@ -3085,10 +3085,19 @@ YaRN, `scale` must be 1.
   the step carries. `qsa_block_key` with `mode` (`mrope`, `imrope`) and `sections` then reads the
   component each frequency's section names, as `rope` does.
 
+- **`key_dtype` i8 stores the key as an int8 page** (`--qsa-bkey-dtype i8`): `out` is a byte-wide
+  store whose row of `P >= n + 2` bytes holds the `n` codes (dim `d` in byte `d`), one f16 scale
+  for the whole key and zero padding to `P`. The codes quantise the value the activation-dtype
+  store would hold (`out` rounded to `k`'s dtype) by i8h's rule for a head: scale
+  `f16(fmin(amax / 127, 512))`, codes `clamp(rint(x / scale), -127, 127)`, 0 at a zero scale, a
+  NaN dropped from the max and stored as -127. A read is `code * scale`. libr4d's page is libref's
+  quantiser applied to its own bf16 key, byte for byte. Absent, the key is stored at the
+  activation dtype, the program and bytes as before the parameter existed.
+
 A block key is query-independent and permanent once its `ratio` tokens exist. The reference
 recomputes it inside its per-query loop; the engine computes it when the block's last token arrives
-and caches it, so the indexer costs 64 bytes a token a layer instead of a pass over the whole
-history every step.
+and caches it, so the indexer costs 64 bytes a token a layer (34 in int8, the page rounded up to
+136 bytes) instead of a pass over the whole history every step.
 
 ### `qsa_score`
 
@@ -3119,6 +3128,10 @@ score[m][b] = ( sum over heads h of relu( q[m][h] . bk[bt[seq(m)][b]] ) ) / sqrt
   and the top-k of the output is already the table the attention reads.
 - **A negative table entry scores `-inf`, not zero.** A table is padded to its declared width and a
   real score can be zero (every head vetoed the block), so zero would let padding outrank it.
+- **`key_dtype` i8 reads `qsa_block_key`'s int8 pages**, folding the scale out of the dot:
+  `relu(scale * (q[m][h] . codes))`. A bf16 query times a code is exact in f32, so the products are
+  the bf16 path's kind and the scale costs one multiply a block and head; libr4d's matrix form
+  widens the codes to bf16 (exact) for the same WMMA.
 
 ### `qsa_page`
 

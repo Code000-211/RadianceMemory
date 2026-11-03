@@ -389,6 +389,16 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     const struct RadKvVMean* kv_vmean;
+
+    /* ---- appended in ABI 40 (int8 block keys) */
+    /* --qsa-bkey-dtype: the dtype a sparse indexer stores its block keys at. 0, the default, is the
+     * plugin's own (bf16 on Qwen3.8-Flash-Next: the program and every byte as before ABI 40);
+     * RAD_I8 is int8 codes with one f16 scale a block key (docs/QSA.md, "Block-key storage"). The
+     * engine sets it only for a plugin whose probe has RadArchProbe::qsa_bkey_i8_ok and refuses
+     * the flag otherwise; a plugin refuses a value it does not know.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int32_t  qsa_bkey_dtype;
 } RadBuildCtx;
 
 /* ================================================================== a static V mean per layer */
@@ -1755,6 +1765,12 @@ typedef struct RadArchProbe {
      * --kv-recipe is refused at startup with the plugin named when this is 0: a plugin that
      * ignored the recipe would store every layer as plain E4M3. */
     int32_t kv_recipe_ok;
+
+    /* ---- appended in ABI 40 (int8 block keys) */
+    /* Nonzero when the plugin stores its indexer's block keys in int8 under
+     * RadBuildCtx::qsa_bkey_dtype RAD_I8. --qsa-bkey-dtype i8 is refused at startup with the
+     * plugin named when this is 0. 64-bit so it starts past the older struct's tail padding. */
+    int64_t qsa_bkey_i8_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

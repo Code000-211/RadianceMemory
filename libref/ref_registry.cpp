@@ -478,7 +478,8 @@ static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("rati
                                              P_F64O("scale"), P_F64O("wadd"), P_STR("dtype"),
                                              P_STRO("mode"), P_STRO("sections"),
                                              P_F64O("yarn_factor"), P_F64O("yarn_low"),
-                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                             P_STRO("key_dtype") };
 static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page"), OPD_O("pos"),
                                                OUT("out") };
 
@@ -486,7 +487,7 @@ static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page")
  * rows (score, select) or tokens (tail store, work list); `cu` maps a row to its sequence, whose
  * count is cu's length less one (`seqs` is the declared height). */
 static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
-                                          P_INT("seqs"), P_STR("dtype") };
+                                          P_INT("seqs"), P_STR("dtype"), P_STRO("key_dtype") };
 static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD("cu"), OPD("nc"),
                                             OUT("score") };
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
@@ -1520,11 +1521,13 @@ static const RadOpSchema kSchemas[] = {
   "rounded to k's dtype, RMS-normed with gain (wadd + w), then NeoX-rotated over `rotary_dim` at "
   "the block's position -- `pos[b]` (with `mode` mrope/imrope and `sections`, a [>= M, 3] list's "
   "three components) or `pos0 + b*ratio` -- with YaRN's blend and magnitude when given. `page[b]`, "
-  "when given, is the output row; a negative entry writes nothing." },
+  "when given, is the output row; a negative entry writes nothing. `key_dtype` i8 stores the key, "
+  "rounded to k's dtype, as an int8 page: n codes, an f16 scale (absmax / 127) and zero padding." },
 { "qsa_score", ARR(pQsaScore), ARR(oQsaScore),
   "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[seq(m)][b]])) / sqrt(n) for the sequence's "
   "first min(nc, width) blocks; the relu is per (block, head) and the sum over heads, and a negative "
-  "page id scores -inf. Columns past the bound are not written." },
+  "page id scores -inf. Columns past the bound are not written. `key_dtype` i8 reads qsa_block_key's "
+  "int8 pages as relu(scale * (q . codes))." },
 { "qsa_select", ARR(pQsaSelect), ARR(oQsaSelect),
   "The topk highest-scoring complete blocks a query has passed, as page ids: ties to the lower block "
   "index, the blocks above the threshold first and the tied ones after, then the partial page when "

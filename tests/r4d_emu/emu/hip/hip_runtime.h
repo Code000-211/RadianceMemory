@@ -80,6 +80,7 @@ unsigned emu_ballot(bool p);
 /* HIP's __ballot: the wave32 mask, zero-extended */
 inline unsigned long long __ballot(int p) { return emu_ballot(p != 0); }
 inline int __popcll(unsigned long long v) { return __builtin_popcountll(v); }
+inline int __ffsll(long long v) { return __builtin_ffsll(v); }
 /* v_readfirstlane_b32: a cross-lane op is a wave barrier here, so every lane is active, lane 0 first */
 #define __builtin_amdgcn_readfirstlane(v) emu_readlane((v), 0)
 /* DPP16 row_shl, row_shr and row_xmask with every row and bank written; a source outside the row

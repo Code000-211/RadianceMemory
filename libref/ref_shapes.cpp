@@ -1700,7 +1700,12 @@ int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     /* page: absent, so the write is contiguous; a drawn page list could repeat and race. */
     o.skip();
     o.t_idx({ M }, M * r, -1, 0);                    /* pos -- each block's first-token position */
-    o.t(D, { M, n });                                /* out */
+    /* out; in int8 a byte page of the codes, the f16 scale and the padding to 2 * ratio bytes,
+     * as the block-key group declares it (arch/common/rad_qsa.h) */
+    if (const char* kd = gs(p, n_p, "key_dtype"); kd && !std::strcmp(kd, "i8"))
+        o.t((uint32_t)RAD_I8, { M, (n + 2 + 2 * r - 1) / (2 * r) * (2 * r) });
+    else
+        o.t(D, { M, n });
     return o.finish("qsa_block_key", operand, out);
 }
 
@@ -1723,7 +1728,12 @@ int ref_qsa_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     const int64_t S = qsa_seqs(p, n_p, M), pages = S * blocks;
     Opd o;
     o.t(D, { M, heads * n });                                     /* q */
-    o.t(D, { pages, n });                                         /* bk -- one block key a page */
+    /* bk -- one block key a page; in int8 a byte page (codes, f16 scale, padding) at ratio 4,
+     * drawn as codes, so a scale's two bytes are any f16 including NaN and infinities */
+    if (const char* kd = gs(p, n_p, "key_dtype"); kd && !std::strcmp(kd, "i8"))
+        o.t((uint32_t)RAD_I8, { pages, (n + 2 + 7) / 8 * 8 });
+    else
+        o.t(D, { pages, n });
     o.t_idx({ S, blocks }, pages, -1, 0);                         /* bt -- page ids */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
     o.t_idx({ S }, blocks + 1, -1, 0);                            /* nc -- 0 .. blocks */

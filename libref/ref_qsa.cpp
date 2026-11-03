@@ -38,24 +38,18 @@ int64_t col0(const RadTensor* t, int64_t i) {
 
 int64_t ldi(const RadTensor* t, int64_t off) { return ld_int(t->dtype, t->data, off); }
 
-/* Whether the trailing dimensions after the first are dense, so a row of a paged store is
- * `numel / shape[0]` contiguous values from `row * stride[0]`. */
-bool rows_dense(const RadTensor* t) {
-    int64_t acc = 1;
-    for (int i = (int)t->rank - 1; i >= 1; --i) {
-        if (t->shape[i] != 1 && t->stride[i] != acc) return false;
-        acc *= t->shape[i];
-    }
-    return true;
-}
-
 }  /* namespace */
 
 /* ------------------------------------------------------------------ qsa_score */
 /* score[m][b] = (sum over heads h of relu(q[m][h] . bk[bt[seq(m)][b]])) / sqrt(n), for b below
  * min(nc[seq], the table's width, the score plane's width); a negative page id scores -inf. Each
  * dot is an f32 sum over the n lanes in order, the relus are summed over the heads in order.
- * Columns past the bound, and rows no sequence of `cu` holds, are not written. */
+ * Columns past the bound, and rows no sequence of `cu` holds, are not written.
+ *
+ * `key_dtype` i8 reads qsa_block_key's int8 pages (a byte-wide store, rows of >= n + 2 bytes): the
+ * scale is folded out of the dot, relu(scale * (q . codes)), so each product q * code is exact in
+ * f32 (a bf16 query has 8 significant bits and a code 7) and the scale costs one multiply a
+ * block and head. */
 int ref_qsa_score(const RadArgs* a, RadStream) {
     if (!have(a, 6)) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *bk = &a->t[1], *bt = &a->t[2], *cu = &a->t[3];
@@ -67,7 +61,11 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
     const int64_t n_seq = numel(cu) - 1, pages = bk->shape[0];
     if (M <= 0 || nb <= 0 || n_seq <= 0 || pages <= 0) return RAD_E_SHAPE;
     if (bt->shape[0] < n_seq || numel(nc) < n_seq || rows_of(q, heads * n) < M) return RAD_E_SHAPE;
-    if (numel(bk) / pages != n) return RAD_E_SHAPE;
+    const char* kd = p_str(a, "key_dtype", nullptr);
+    if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;
+    const bool i8 = kd != nullptr;
+    if (i8 ? numel(bk) / pages < n + 2 || rad_dtype_bits(bk->dtype) != 8 : numel(bk) / pages != n)
+        return RAD_E_SHAPE;
     if (!rows_dense(bk)) return RAD_E_STRIDE;
     const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
     /* Every page id the loop will read must name a page of `bk`. */
@@ -88,6 +86,20 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
             const int64_t pg = ldi(bt, s * bt_rs + b * bt_cs);
             if (pg < 0) { stt(o, m * o_rs + b * o_cs, -INFINITY); continue; }
             float sum = 0.0f;
+            if (i8) {
+                const uint8_t* row = (const uint8_t*)bk->data + pg * pg_rs;
+                uint16_t s16;
+                std::memcpy(&s16, row + n, 2);
+                const float sc = f16_to_f32(s16);
+                for (int64_t h = 0; h < heads; ++h) {
+                    float d = 0.0f;
+                    for (int64_t i = 0; i < n; ++i)
+                        d += ldt(q, m * q_rs + (h * n + i) * q_cs) * (float)(int8_t)row[i];
+                    sum += std::fmax(d * sc, 0.0f);
+                }
+                stt(o, m * o_rs + b * o_cs, sum / rn);
+                continue;
+            }
             for (int64_t h = 0; h < heads; ++h) {
                 float d = 0.0f;
                 for (int64_t i = 0; i < n; ++i)

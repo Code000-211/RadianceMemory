@@ -9229,6 +9229,123 @@ TEST(qsa_score_sums_per_head_relus_and_marks_absent_pages) {
     for (int i = 4; i < 8; ++i) CHECK_EQ(sc.at(i), 99.0f);   /* row 1 is in no sequence */
 }
 
+/* qsa_block_key at key_dtype i8, worked by hand: one block of one token, n 4, no rotation, eps 0,
+ * gain 0 + w. k = (1, -1, 1, -1) has unit RMS, so the key is k * w = (1, 0.5, 0.25, -0.75):
+ * amax 1, scale f16(1/127) = 1.0078125 * 2^-7 (bits 0x2008), codes rint(x / scale) = 127,
+ * 64 (63.504), 32 (31.752), -95 (-95.256), then the scale's two bytes and two zero bytes of
+ * padding. The page goes
+ * to row 1 of a two-page store; row 0 keeps its bytes. A block of NaN keys stores the cap, f16
+ * 512 (0x6000), and -127 throughout, as i8h does. */
+TEST(qsa_block_key_in_int8_stores_codes_an_f16_scale_and_zero_padding) {
+    T k(RAD_F32, {1, 4}); k.f({ 1, -1, 1, -1 });
+    T w(RAD_F32, {4}); w.f({ 1.0f, -0.5f, 0.25f, 0.75f });
+    T page(RAD_I32, {1}); page.n({ 1 });
+    T out(RAD_I8, {2, 8}); out.raw(std::vector<uint8_t>(16, 0xEE));
+    A a; a.t(k).t(w).t(page).tnull().t(out).i("M", 1).i("n", 4).i("ratio", 1)
+        .i("rotary_dim", 0).i("pos0", 0).d("eps", 0).d("theta", 1e7).d("wadd", 0)
+        .s("dtype", "f32").s("key_dtype", "i8");
+    CHECK_OK(run("qsa_block_key", a));
+    const std::vector<uint8_t> want = { 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE,
+                                        0x7F, 0x40, 0x20, 0xA1, 0x08, 0x20, 0x00, 0x00 };
+    for (size_t i = 0; i < want.size(); ++i) CHECK_EQ((int)out.mem[i], (int)want[i]);
+
+    T kn(RAD_F32, {1, 4}); kn.f({ NAN, NAN, NAN, NAN });
+    T on(RAD_I8, {1, 8}); on.raw(std::vector<uint8_t>(8, 0xEE));
+    A an; an.t(kn).t(w).tnull().tnull().t(on).i("M", 1).i("n", 4).i("ratio", 1)
+        .i("rotary_dim", 0).i("pos0", 0).d("eps", 0).d("theta", 1e7).d("wadd", 0)
+        .s("dtype", "f32").s("key_dtype", "i8");
+    CHECK_OK(run("qsa_block_key", an));
+    const std::vector<uint8_t> nan_page = { 0x81, 0x81, 0x81, 0x81, 0x00, 0x60, 0x00, 0x00 };
+    for (size_t i = 0; i < nan_page.size(); ++i) CHECK_EQ((int)on.mem[i], (int)nan_page[i]);
+}
+
+/* At Flash-Next's geometry (n 128, ratio 4, 64-wide rotary, bf16 keys) the int8 page is the bf16
+ * store's key quantised, byte for byte: the same block keys stored both ways, and each int8 page
+ * held to i8h's rule restated over the bf16 key. A -1 page entry writes neither. The refusals: a
+ * `key_dtype` other than i8, a page too narrow for the codes and the scale, a page whose elements
+ * are not bytes. */
+TEST(qsa_block_key_in_int8_is_the_bf16_key_quantised_byte_for_byte) {
+    const int64_t M = 6, n = 128, ratio = 4, rot = 64, W = 136;
+    std::vector<float> kv((size_t)(M * ratio * n));
+    for (size_t i = 0; i < kv.size(); ++i)
+        kv[i] = (float)(((int64_t)i * 37 % 97) - 48) / 53.0f * (i % 31 == 0 ? 6.0f : 1.0f);
+    T k(RAD_BF16, {M * ratio, n}); k.f(kv);
+    std::vector<float> wv((size_t)n);
+    for (int64_t d = 0; d < n; ++d) wv[(size_t)d] = 0.1f + (float)((d * 7) % 13) / 40.0f;
+    T w(RAD_F32, {n}); w.f(wv);
+    T page(RAD_I32, {M}); page.n({ 4, 0, -1, 7, 2, 5 });
+    T bf(RAD_BF16, {8, n});
+    T q8(RAD_I8, {8, 1, ratio, W / ratio}); q8.raw(std::vector<uint8_t>((size_t)(8 * W), 0xEE));
+    /* Fills `a` in place: A's string parameters point into its own storage. */
+    auto args = [&](A& a, T& out, const char* kd) {
+        a.t(k).t(w).t(page).tnull().t(out).i("M", M).i("n", n).i("ratio", ratio)
+            .i("rotary_dim", rot).i("pos0", 40).i("block_size", ratio).d("eps", 1e-6)
+            .d("theta", 1e7).d("scale", 1).d("wadd", 1).s("dtype", "bf16");
+        if (kd) a.s("key_dtype", kd);
+    };
+    A ab, a8;
+    args(ab, bf, nullptr);
+    args(a8, q8, "i8");
+    CHECK_OK(run("qsa_block_key", ab));
+    CHECK_OK(run("qsa_block_key", a8));
+    for (int64_t p = 0; p < 8; ++p) {
+        const uint8_t* g = q8.mem.data() + p * W;
+        if (p == 1 || p == 3 || p == 6) {
+            for (int64_t i = 0; i < W; ++i) CHECK_EQ((int)g[i], 0xEE);
+            continue;
+        }
+        float amax = 0.0f;
+        for (int64_t i = 0; i < n; ++i) amax = std::fmax(amax, std::fabs(bf.at(p * n + i)));
+        const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 127.0f, 512.0f));
+        const float sc = rad_f16_to_f32(s16);
+        CHECK(sc > 0.0f);
+        for (int64_t i = 0; i < n; ++i) {
+            const float r = std::fmin(std::fmax(std::rint(bf.at(p * n + i) / sc), -127.0f), 127.0f);
+            CHECK_EQ((int)(int8_t)g[i], (int)r);
+        }
+        CHECK_EQ((int)g[n], (int)(s16 & 0xFF));
+        CHECK_EQ((int)g[n + 1], (int)(s16 >> 8));
+        for (int64_t i = n + 2; i < W; ++i) CHECK_EQ((int)g[i], 0);
+    }
+    A bad, an, aw;
+    args(bad, q8, "fp8");
+    CHECK_EQ(run("qsa_block_key", bad), RAD_E_UNSUPPORTED);
+    T narrow(RAD_I8, {8, n + 1});
+    args(an, narrow, "i8");
+    CHECK_EQ(run("qsa_block_key", an), RAD_E_SHAPE);
+    T wide(RAD_BF16, {8, W});
+    args(aw, wide, "i8");
+    CHECK_EQ(run("qsa_block_key", aw), RAD_E_SHAPE);
+}
+
+/* qsa_score over int8 pages: relu(scale * (q . codes)) per head, summed, over sqrt(n). Page 0 is
+ * codes (1, 1) at scale 0.5: both heads 0.5, score 1 / sqrt 2. Page 1 is (-1, 2) at scale 2: head 0
+ * dots to -2 and is vetoed, head 1 to 4, score 4 / sqrt 2. Every product is exact, so these are
+ * the bits of 1/sqrt(2) and 4/sqrt(2). A -1 entry still scores -inf; past nc nothing is written. */
+TEST(qsa_score_over_int8_pages_sums_the_relus_of_the_scaled_code_dots) {
+    const int64_t n = 2, heads = 2;
+    T q(RAD_BF16, {1, heads * n}); q.f({ 1, 0, 0, 1 });
+    T bk(RAD_I8, {2, 8});
+    const uint16_t half = rad_f32_to_f16(0.5f), two = rad_f32_to_f16(2.0f);
+    bk.raw({ 1, 1, (uint8_t)(half & 0xFF), (uint8_t)(half >> 8), 0, 0, 0, 0,
+             0xFF, 2, (uint8_t)(two & 0xFF), (uint8_t)(two >> 8), 0, 0, 0, 0 });
+    T bt(RAD_I32, {1, 4}); bt.n({ 0, 1, -1, 0 });
+    T cu(RAD_I32, {2}); cu.n({ 0, 1 });
+    T nc(RAD_I32, {1}); nc.n({ 3 });
+    T sc(RAD_F32, {1, 4}); sc.f({ 99, 99, 99, 99 });
+    A a; a.t(q).t(bk).t(bt).t(cu).t(nc).t(sc).i("M", 1).i("n", n).i("heads", heads)
+          .i("blocks", 4).i("seqs", 1).s("dtype", "bf16").s("key_dtype", "i8");
+    CHECK_OK(run("qsa_score", a));
+    CHECK_EQ(sc.at(0), 1.0f / std::sqrt(2.0f));
+    CHECK_EQ(sc.at(1), 4.0f / std::sqrt(2.0f));
+    CHECK(std::isinf(sc.at(2)) && sc.at(2) < 0);
+    CHECK_EQ(sc.at(3), 99.0f);
+    T narrow(RAD_I8, {2, 3});
+    A an; an.t(q).t(narrow).t(bt).t(cu).t(nc).t(sc).i("M", 1).i("n", n).i("heads", heads)
+           .i("blocks", 4).i("seqs", 1).s("dtype", "bf16").s("key_dtype", "i8");
+    CHECK_EQ(run("qsa_score", an), RAD_E_SHAPE);
+}
+
 namespace {
 /* One qsa_select call over a single sequence: returns sel (topk + 1), nsel and seqused per row. */
 struct Sel { std::vector<int64_t> sel, nsel, su; };

@@ -766,7 +766,8 @@ it) by the context you serve and by the sessions you want live at once, and comp
 the receipt reports. The cache already has everything the experts can spare; a larger
 `--host-pool-mib` (RAM permitting) or `--kv-cache-dtype fp8` gives it more. For example, on
 Qwen3.8-Flash-Next two paged groups share one token axis, `kv_attn` at 26.00 KiB and `kv_qsa_bkey` at
-3.25 KiB per 4-token block, so a token costs 7.32 KiB and a 200K-token sequence 1.43 GiB. A
+3.25 KiB per 4-token block (1.73 KiB with `--qsa-bkey-dtype i8`), so a token costs 7.32 KiB and a
+200K-token sequence 1.43 GiB. A
 prefix-cached session occupies about 1.8x its context in pool tokens, so two live 184K sessions need
 ~662K pool tokens.
 
@@ -960,6 +961,11 @@ attention layer the file leaves out, naming the layer. The MTP head is not a rec
 shares the last attention layer's cache and layout, and a drafter's own cache stays fp8. On
 Qwen3.8-Flash-Next only the attention cache takes a recipe; the QSA indexer's block keys keep
 their own cache, and each layer's pager (`--kv-residency-mib`) moves its own layout's fragment.
+`--qsa-bkey-dtype i8` stores the block keys in int8 (one f16 scale a key, `kv_qsa_bkey` at a
+1.73 KiB page instead of 3.25), for every QSA layer and the MTP head at once; startup says so, and
+an architecture that does not serve it is refused by name. Measured against the bf16-cache
+reference, it leaves the KL of an fp8 or i8h cache within noise (docs/QSA.md, "Block-key
+storage").
 
 Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`,
 `kv_attn_k4h_v4`, `kv_attn_k4h_v2h`, `kv_attn_i8h`), and the
@@ -2292,6 +2298,7 @@ by 0.002-0.003 nats.
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
+| `--qsa-bkey-dtype T` | bf16 | `bf16` or `i8`: the QSA indexer's block keys; i8 is int8 with one f16 scale a key, 1.73 instead of 3.25 KiB a 4-token block on Qwen3.8-Flash-Next (the part window residency never demotes), and moves the selection about as much as an fp8 attention cache does; `qwen4exp_fp8` only (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins and `qwen4exp_fp8` (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |

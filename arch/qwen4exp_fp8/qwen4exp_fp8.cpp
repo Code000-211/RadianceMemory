@@ -856,6 +856,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
          * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
         m.qsacfg.page = ctx->kv_residency != 0 && !g.attn_zero;
+        /* --qsa-bkey-dtype: int8 block keys for every QSA layer and the MTP head (one group). */
+        if (ctx->qsa_bkey_dtype != 0 && ctx->qsa_bkey_dtype != RAD_I8) {
+            fprintf(stderr, "radiance: QSA block keys at dtype %d; the indexer stores bf16 or "
+                            "i8\n", (int)ctx->qsa_bkey_dtype);
+            return RAD_E_UNSUPPORTED;
+        }
+        m.qsacfg.bkey_i8 = ctx->qsa_bkey_dtype == RAD_I8;
         m.qsacfg.page_block_bytes = m.kv_page_bytes[last_q];
         /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
         g.kv_dtype = m.kv_dt[last_q];
@@ -1909,6 +1916,9 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->kv_recipe_ok = 1;
     /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
     out->state_f16_ok = 1;
+    /* --qsa-bkey-dtype i8: libr4d's qsa_block_key and qsa_score take `key_dtype` i8 at the
+     * indexer's geometry (n a multiple of 32 to 256). */
+    out->qsa_bkey_i8_ok = 1;
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;
     return RAD_OK;

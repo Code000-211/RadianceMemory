@@ -70,6 +70,10 @@ struct QsaIndexer {
         /* The bytes of one layer's fragment of an attention block (K and V of `ratio` tokens), the
          * pager's `block_bytes`: what one cold block copies per layer. */
         int64_t     page_block_bytes = 0;
+        /* Block keys in int8 (RadBuildCtx::qsa_bkey_dtype RAD_I8): a page holds the `head_dim`
+         * codes and their f16 scale (docs/QSA.md, "Block-key storage"), and `qsa_block_key` and
+         * `qsa_score` take `key_dtype` i8. False is today's bf16 page and the same program. */
+        bool        bkey_i8 = false;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -162,7 +166,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * is promoted in the step that reads it (KVManager::residency_promote), which costs link
      * traffic and nothing else. The block-key group is deliberately not annotated -- the scorer
      * reads every block key, so its pages must stay resident (3.25 of the 29.25 KiB a 4-token
-     * block costs, and the half no window can shrink). */
+     * block costs at bf16, 1.73 in int8, and the part no window can shrink). */
     RAD_ARCH_TRY(rad_kv_set_residency_window(b, c.kv_attn, c.budget));
 
     const int64_t nw = (c.heads + 1) * c.head_dim;       /* the projection width */
@@ -230,14 +234,22 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
 
     /* The block-key group, declared immediately before its consumer (see the declaration). One KV
      * head, `block_size` = ratio and `head_dim` = n / (2 * ratio) make a page hold exactly one
-     * block key of `n` values, one page per `ratio` tokens. */
+     * block key of `n` values, one page per `ratio` tokens.
+     *
+     * In int8 a page is `n` codes and an f16 scale, n + 2 bytes, which a page of `2 * ratio *
+     * head_dim` bytes holds only rounded up: the group is declared RAD_I8 with head_dim
+     * ceil((n + 2) / (2 * ratio)), 136 bytes at n 128 and ratio 4 (6 of them zero padding), so
+     * the pool, the prefix cache and the residency store size the page from the declaration as
+     * they do any other. Every QSA layer and the MTP head share the group, so all take the same
+     * dtype (one Config). */
     if (*bk == 0) {
         if ((c.head_dim % (2 * c.ratio)) != 0) return RAD_E_SHAPE;
         RadKVGroupDecl d{};
         d.kind      = RAD_KV_FULL;
-        d.dtype     = RAD_BF16;
+        d.dtype     = c.bkey_i8 ? RAD_I8 : RAD_BF16;
         d.n_head_kv = 1;
-        d.head_dim  = c.head_dim / (2 * c.ratio);
+        d.head_dim  = c.bkey_i8 ? (c.head_dim + 2 + 2 * c.ratio - 1) / (2 * c.ratio)
+                                : c.head_dim / (2 * c.ratio);
         *bk = rad_decl_kv_group(b, nm.f("kv_qsa_bkey"), &d);
         if (!*bk) return RAD_E_INVAL;
         /* qsa_score reads every complete block of the history each step, so this group stays resident
@@ -254,9 +266,17 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                 RAD_F64("eps", g.eps), RAD_F64("theta", g.theta),
                                 RAD_F64("scale", g.rope_scale), RAD_F64("wadd", g.wadd_qk),
                                 RAD_STR("dtype", g.dtype), RAD_STR("mode", g.rope_mode),
-                                RAD_STR("sections", g.rope_sections) };
-        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (g.rope_mc ? 0 : 2);
-        op_bkey = rw(b, decl_rotary(b, g, "qsa_block_key", ps, n_ps, &w_kn, 1),
+                                RAD_STR("sections", g.rope_sections),
+                                RAD_STR("key_dtype", "i8") };
+        /* `key_dtype` only in int8 (here and on `qsa_score`), so the bf16 program is today's
+         * parameter for parameter; `mode` and `sections` only under M-RoPE. */
+        RadParam pk[sizeof ps / sizeof ps[0]];
+        int n_ps = 0;
+        for (const RadParam& p : ps)
+            if ((g.rope_mc || (std::strcmp(p.key, "mode") && std::strcmp(p.key, "sections"))) &&
+                (c.bkey_i8 || std::strcmp(p.key, "key_dtype")))
+                pk[n_ps++] = p;
+        op_bkey = rw(b, decl_rotary(b, g, "qsa_block_key", pk, n_ps, &w_kn, 1),
                      {w.stage, w.page, w.bpos}, {});
     }
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv_bk));
@@ -270,12 +290,15 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                 {w.qk}, {});
 
     /* M is queries for both, up to a whole prefill chunk: the selection is per query. */
-    op_score = rw(b, RAD_OP(b, "qsa_score",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
+    {
+        const RadParam ps[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
                                 RAD_INT("heads", c.heads), RAD_INT("blocks", c.max_blocks),
-                                RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.q, w.nc}, {w.score});
+                                RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype),
+                                RAD_STR("key_dtype", "i8") };
+        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (c.bkey_i8 ? 0 : 1);
+        op_score = rw(b, rad_decl_op(b, "qsa_score", ps, n_ps, RAD_NOWEIGHTS), {w.q, w.nc},
+                      {w.score});
+    }
     op_select = rw(b, RAD_OP(b, "qsa_select",
                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                  RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),

@@ -27020,6 +27020,255 @@ static void qsa_block_key_case(const Plugin& pl) {
     ok(what, pass, "rel " + std::to_string(r_ok) + ", control " + std::to_string(r_shift));
 }
 
+/* ------------------------------------------------------------------ int8 block keys
+ *
+ * `key_dtype` i8 on qsa_block_key and qsa_score (--qsa-bkey-dtype i8, docs/QSA.md "Block-key
+ * storage"): a page is the bf16 key's int8 codes, one f16 scale and zero padding to the group's
+ * 136 bytes. */
+
+/* libref's quantiser for a block key (ref_qsa_block_key at key_dtype i8, i8h's rule for a head),
+ * restated over a bf16 key: the page's first n + 2 bytes, padding zero. */
+static void bkey_i8_page(const uint16_t* key, int64_t n, int64_t width, uint8_t* page) {
+    float amax = std::fabs(h_bf16(key[0]));
+    for (int64_t i = 1; i < n; ++i) amax = std::fmax(amax, std::fabs(h_bf16(key[i])));
+    const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 127.0f, 512.0f));
+    const float sc = rad_f16_to_f32(s16);
+    for (int64_t i = 0; i < n; ++i) {
+        const float r = sc > 0.0f ? std::rint(h_bf16(key[i]) / sc) : 0.0f;
+        page[i] = (uint8_t)(int8_t)(int)std::fmin(std::fmax(r, -127.0f), 127.0f);
+    }
+    std::memcpy(page + n, &s16, 2);
+    std::memset(page + n + 2, 0, (size_t)(width - n - 2));
+}
+
+/* qsa_block_key at key_dtype i8 into a paged store shaped as the group declares it ([pages, 1, 4,
+ * 34] bytes): each listed block's page equals the quantiser above applied to the same kernel's
+ * bf16 key for that block, byte for byte, padding included; the -1 entry and every unlisted page
+ * keep the sentinel. Against libref's own i8 store on host copies, the decoded keys agree to the
+ * bf16 key's last bit (rel_l2 < 2e-3) and the count of byte-identical pages is reported. */
+static void qsa_block_key_i8_case(const Plugin& pl) {
+    const char* what = "qsa_block_key key_dtype i8: the bf16 key's codes and scale, byte for byte";
+    const RadKernelInfo* r = find(pl, "qsa_block_key_bf16");
+    const RadLaunchFn ref = libref_row("ref_qsa_block_key");
+    if (!r || !ref) { ok(what, false, "row or libref's qsa_block_key absent"); return; }
+
+    const int64_t M = 17, n = 128, ratio = 4, rot = 64, pos0 = 36, pages = 40, W = 136;
+    std::vector<uint16_t> kh((size_t)(M * ratio * n));
+    std::vector<float>    wh((size_t)n);
+    for (int64_t i = 0; i < M * ratio; ++i)
+        for (int64_t d = 0; d < n; ++d) {
+            float v = (float)(((i * 37 + d * 11) % 97) - 48) / 53.0f;
+            if (d % 31 == 0) v *= 5.0f;
+            kh[(size_t)(i * n + d)] = h_to_bf16(v);
+        }
+    for (int64_t d = 0; d < n; ++d) wh[(size_t)d] = 0.1f + (float)((d * 7) % 13) / 40.0f;
+    std::vector<int32_t> pg((size_t)M);
+    for (int64_t b = 0; b < M; ++b) pg[(size_t)b] = b == 5 ? -1 : (int32_t)((b * 7 + 3) % pages);
+
+    void* d_k = dalloc(kh.size() * 2);
+    void* d_w = dalloc(wh.size() * 4);
+    void* d_pg = dalloc(pg.size() * 4);
+    void* d_bf = dalloc((size_t)(pages * n) * 2);
+    void* d_i8 = dalloc((size_t)(pages * W));
+    st_memcpy(d_k, kh.data(), kh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wh.data(), wh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_pg, pg.data(), pg.size() * 4, hipMemcpyHostToDevice);
+    std::vector<uint8_t> sent((size_t)(pages * W), 0xA5);
+    st_memcpy(d_i8, sent.data(), sent.size(), hipMemcpyHostToDevice);
+
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("ratio", ratio), PI("rotary_dim", rot), PI("pos0", pos0),
+        PI("block_size", ratio), PF("eps", 1e-6), PF("theta", 10000000.0), PF("scale", 1.0),
+        PF("wadd", 1.0), PS("dtype", "bf16"),
+    };
+    std::vector<RadParam> ps8 = ps;
+    ps8.push_back(PS("key_dtype", "i8"));
+    auto launch = [&](void* out, bool i8, RadLaunchFn fn, void* k, void* w, void* p) {
+        std::vector<RadTensor> ts = {
+            T(k, RAD_BF16, { M * ratio, n }), T(w, RAD_F32, { n }), T(p, RAD_I32, { M }),
+            T(nullptr, RAD_I32, { M }),
+            i8 ? T(out, RAD_I8, { pages, 1, ratio, W / ratio })
+               : T(out, RAD_BF16, { pages, n }),
+        };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = i8 ? ps8.data() : ps.data(); a.n_p = (int)(i8 ? ps8.size() : ps.size());
+        return fn(&a, nullptr);
+    };
+    const int rb = launch(d_bf, false, r->launch, d_k, d_w, d_pg);
+    const int r8 = launch(d_i8, true, r->launch, d_k, d_w, d_pg);
+    st_stream_sync(nullptr);
+    if (rb != RAD_OK || r8 != RAD_OK) {
+        ok(what, false, fmt("launch rc %d / %d", rb, r8));
+        return;
+    }
+    std::vector<uint16_t> bf((size_t)(pages * n));
+    std::vector<uint8_t> got((size_t)(pages * W));
+    st_memcpy(bf.data(), d_bf, bf.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(got.data(), d_i8, got.size(), hipMemcpyDeviceToHost);
+
+    std::vector<char> listed((size_t)pages, 0);
+    for (int32_t p : pg) if (p >= 0) listed[(size_t)p] = 1;
+    long bad = 0, kept = 0, unlisted = 0;
+    std::vector<uint8_t> want((size_t)W);
+    for (int64_t p = 0; p < pages; ++p) {
+        const uint8_t* g = got.data() + p * W;
+        if (!listed[(size_t)p]) {
+            ++unlisted;
+            kept += std::all_of(g, g + W, [](uint8_t v) { return v == 0xA5; });
+            continue;
+        }
+        bkey_i8_page(bf.data() + p * n, n, W, want.data());
+        bad += std::memcmp(g, want.data(), (size_t)W) != 0;
+    }
+    std::printf("        %ld listed pages differ from the quantised bf16 key; %ld of %ld unlisted "
+                "pages untouched\n", bad, kept, unlisted);
+    ok(what, bad == 0 && kept == unlisted && unlisted > 0,
+       fmt("%ld pages differ, %ld/%ld untouched", bad, kept, unlisted));
+
+    /* libref on host copies of the same operands. */
+    std::vector<uint8_t> rout = sent;
+    const int rr = launch(rout.data(), true, ref, kh.data(), wh.data(), pg.data());
+    double num = 0.0, den = 0.0;
+    long same = 0, live = 0;
+    for (int64_t p = 0; p < pages && rr == RAD_OK; ++p) {
+        if (!listed[(size_t)p]) continue;
+        ++live;
+        const uint8_t *g = got.data() + p * W, *w = rout.data() + p * W;
+        same += std::memcmp(g, w, (size_t)W) == 0;
+        uint16_t sg, sw;
+        std::memcpy(&sg, g + n, 2);
+        std::memcpy(&sw, w + n, 2);
+        for (int64_t i = 0; i < n; ++i) {
+            const double a = (double)(int8_t)g[i] * rad_f16_to_f32(sg);
+            const double b = (double)(int8_t)w[i] * rad_f16_to_f32(sw);
+            num += (a - b) * (a - b);
+            den += b * b;
+        }
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : -1.0;
+    std::printf("        against libref's i8 store: %ld of %ld pages byte-identical, decoded "
+                "rel_l2 %.3e\n", same, live, rel);
+    ok("qsa_block_key key_dtype i8 against libref's i8 store", rr == RAD_OK && rel >= 0.0 &&
+       rel < 2e-3, fmt("rc %d, rel %.3e, %ld/%ld pages identical", rr, rel, same, live));
+}
+
+/* qsa_score at key_dtype i8 against an f64 evaluation of relu(scale * (q . codes)) summed over
+ * the heads, and against libref's i8 score on host copies; two sequences of 7 and 13 rows (a
+ * straddled tile in both forms), scattered pages at the group's 136-byte pitch, padding. The
+ * control drops the scale (every block at scale 1), which keeps the ranking within a block's
+ * heads but not across blocks. */
+static void qsa_score_i8_case(const Plugin& pl) {
+    const char* what = "qsa_score key_dtype i8 vs relu(scale * (q . codes)) in f64";
+    const RadKernelInfo* r = find(pl, "qsa_score_bf16");
+    const RadLaunchFn ref = libref_row("ref_qsa_score");
+    if (!r || !ref) { ok(what, false, "row or libref's qsa_score absent"); return; }
+
+    const int64_t S = 2, n = 128, heads = 4, nb = 45, pages = 80, W = 136;
+    const int64_t rows[S] = { 7, 13 };
+    std::vector<int32_t> cuh((size_t)(S + 1), 0), nch((size_t)S);
+    for (int64_t i = 0; i < S; ++i) cuh[(size_t)(i + 1)] = cuh[(size_t)i] + (int32_t)rows[i];
+    const int64_t M = cuh[(size_t)S];
+    std::vector<uint16_t> qh((size_t)(M * heads * n));
+    for (int64_t i = 0; i < M * heads * n; ++i)
+        qh[(size_t)i] = h_to_bf16((float)(((i * 31 + 5) % 89) - 44) / 43.0f);
+    std::vector<uint8_t> bk((size_t)(pages * W), 0);
+    std::vector<float> scl((size_t)pages);
+    for (int64_t p = 0; p < pages; ++p) {
+        for (int64_t i = 0; i < n; ++i)
+            bk[(size_t)(p * W + i)] = (uint8_t)(int8_t)(((p * 43 + i * 11) % 255) - 127);
+        const uint16_t s16 = rad_f32_to_f16(0.002f + 0.03f * (float)((p * 7) % 17));
+        std::memcpy(&bk[(size_t)(p * W + n)], &s16, 2);
+        scl[(size_t)p] = rad_f16_to_f32(s16);
+    }
+    std::vector<int32_t> bth((size_t)(S * nb));
+    for (int64_t sq = 0; sq < S; ++sq) {
+        const int64_t live = nb - 2 - sq * 9;
+        nch[(size_t)sq] = (int32_t)(live - 1);
+        for (int64_t b = 0; b < nb; ++b)
+            bth[(size_t)(sq * nb + b)] =
+                b < live && (b % 11) != 4 ? (int32_t)((b * 17 + sq * 7) % pages) : -1;
+    }
+    auto score = [&](int64_t m, int64_t sq, int64_t b, bool scaled) {
+        const int32_t p = bth[(size_t)(sq * nb + b)];
+        if (p < 0) return -1e30;
+        double s = 0.0;
+        for (int64_t h = 0; h < heads; ++h) {
+            double d = 0.0;
+            for (int64_t j = 0; j < n; ++j)
+                d += (double)h_bf16(qh[(size_t)((m * heads + h) * n + j)]) *
+                     (double)(int8_t)bk[(size_t)(p * W + j)];
+            if (scaled) d *= scl[(size_t)p];
+            s += d > 0.0 ? d : 0.0;
+        }
+        return s / std::sqrt((double)n);
+    };
+
+    void* d_q  = dalloc(qh.size() * 2);
+    void* d_bk = dalloc(bk.size());
+    void* d_bt = dalloc(bth.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_nc = dalloc(nch.size() * 4);
+    void* d_o  = dalloc((size_t)(M * nb) * 4);
+    st_memcpy(d_q,  qh.data(),  qh.size() * 2,  hipMemcpyHostToDevice);
+    st_memcpy(d_bk, bk.data(),  bk.size(),      hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nch.data(), nch.size() * 4, hipMemcpyHostToDevice);
+    std::vector<float> sentinel((size_t)(M * nb), 12345.0f);
+    st_memcpy(d_o, sentinel.data(), sentinel.size() * 4, hipMemcpyHostToDevice);
+
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("heads", heads), PI("blocks", nb),
+                                 PI("seqs", S), PS("dtype", "bf16"), PS("key_dtype", "i8") };
+    auto launch = [&](RadLaunchFn fn, void* q, void* k, void* bt, void* cu, void* nc, void* o) {
+        std::vector<RadTensor> ts = {
+            T(q, RAD_BF16, { M, heads * n }), T(k, RAD_I8, { pages, 1, 4, W / 4 }),
+            T(bt, RAD_I32, { S, nb }), T(cu, RAD_I32, { S + 1 }), T(nc, RAD_I32, { S }),
+            T(o, RAD_F32, { M, nb }),
+        };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        return fn(&a, nullptr);
+    };
+    const int rc = launch(r->launch, d_q, d_bk, d_bt, d_cu, d_nc, d_o);
+    st_stream_sync(nullptr);
+    if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc)); return; }
+    std::vector<float> got((size_t)(M * nb));
+    st_memcpy(got.data(), d_o, got.size() * 4, hipMemcpyDeviceToHost);
+    std::vector<float> rout = sentinel;
+    const int rr = launch(ref, qh.data(), bk.data(), bth.data(), cuh.data(), nch.data(),
+                          rout.data());
+
+    double num = 0.0, den = 0.0, cnum = 0.0, rnum = 0.0;
+    long pad = 0, pad_ninf = 0, past = 0, past_kept = 0;
+    for (int64_t sq = 0; sq < S; ++sq)
+        for (int64_t m = cuh[(size_t)sq]; m < cuh[(size_t)(sq + 1)]; ++m)
+            for (int64_t b = 0; b < nb; ++b) {
+                const float g = got[(size_t)(m * nb + b)];
+                if (b >= nch[(size_t)sq]) { ++past; past_kept += g == 12345.0f; continue; }
+                const double w = score(m, sq, b, true);
+                if (w <= -1e29) { ++pad; pad_ninf += g < -1e30f; continue; }
+                const double c = score(m, sq, b, false), lr = rout[(size_t)(m * nb + b)];
+                num += ((double)g - w) * ((double)g - w);
+                rnum += ((double)g - lr) * ((double)g - lr);
+                cnum += (c - w) * (c - w);
+                den += w * w;
+            }
+    const double r_ok = den > 0.0 ? std::sqrt(num / den) : -1.0;
+    const double r_ref = den > 0.0 ? std::sqrt(rnum / den) : -1.0;
+    const double r_ctl = den > 0.0 ? std::sqrt(cnum / den) : -1.0;
+    const bool pass = rr == RAD_OK && r_ok >= 0.0 && r_ok < 1e-5 && r_ref < 1e-5 &&
+                      r_ctl > 100.0 * r_ok && pad > 0 && pad_ninf == pad && past > 0 &&
+                      past_kept == past;
+    std::printf("        rel_l2 vs f64: %.3e, vs libref %.3e; unscaled codes %.3e; %ld padded "
+                "entries, %ld at -inf; %ld past the live count, %ld untouched\n",
+                r_ok, r_ref, r_ctl, pad, pad_ninf, past, past_kept);
+    ok(what, pass, fmt("rel %.3e, libref %.3e, control %.3e", r_ok, r_ref, r_ctl));
+}
+
 /* qsa_block_key with YaRN, against yarn_ref. Identical unit keys make the block mean exactly one,
  * and unit gain with eps 0 makes the norm one too, so what is left is the rotation of the
  * compressed key at each block's position: c - s in the first half of the rotary, s + c in the
@@ -32841,6 +33090,7 @@ static void device_phase(const Plugin& pl) {
             }
             qsa_score_case(pl);
             qsa_score_rows_case(pl);
+            qsa_score_i8_case(pl);
         }
         if (pl.pin_qsa) pl.pin_qsa(0);
     }
@@ -32849,6 +33099,7 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\nthe QSA compressed key, against the formula it implements\n");
         qsa_block_key_case(pl);
         qsa_block_key_yarn_case(pl);
+        qsa_block_key_i8_case(pl);
     }
 
     if (sel("logit_softcap_bf16")) {

@@ -1284,6 +1284,9 @@ static const RadParamSpec pQsaBlockKey[] = {
     { "yarn_low", RAD_P_F64, RAD_OPTIONAL },
     { "yarn_high", RAD_P_F64, RAD_OPTIONAL },
     { "yarn_magnitude", RAD_P_F64, RAD_OPTIONAL },
+    /* Absent, the key is stored at the activation dtype; `i8`, as an int8 page of the n codes,
+     * one f16 scale (absmax / 127) and zero padding (docs/QSA.md, "Block-key storage"). */
+    { "key_dtype",  RAD_P_STR, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaBlockKey[] = {
     { "k",    RAD_OPD_IN,     0 },
@@ -1450,6 +1453,8 @@ static const RadParamSpec pQsaScore[] = {
     { "blocks", RAD_P_INT, RAD_REQUIRED },
     { "seqs",   RAD_P_INT, RAD_REQUIRED },
     { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    /* `i8` reads qsa_block_key's int8 pages; absent, keys at the activation dtype. */
+    { "key_dtype", RAD_P_STR, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaScore[] = {
     { "q",     RAD_OPD_IN,  0 },
@@ -9190,8 +9195,9 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "qsa_score_bf16", "qsa_score", "attn",
   "the QSA indexer's block score: relu per (block, head), summed over heads, over 1/sqrt(n)",
   "n a multiple of 32 up to 256, at most 8 heads, any block count and any M",
-  "bf16 queries and block keys, an i32 page-id table, f32 scores; a negative table entry scores "
-  "-inf and not zero",
+  "bf16 queries and block keys (or `key_dtype` i8 pages: the dot over the codes, times the "
+  "page's f16 scale before the relu), an i32 page-id table, f32 scores; a negative table entry "
+  "scores -inf and not zero",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQsaScore), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_score, nullptr, nullptr, nullptr,
@@ -9204,8 +9210,9 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "block's first position",
   "n a multiple of 32 up to 256 (a block reduction over one LDS row), an even rotary width no "
   "wider than the head, any `ratio` and any `M`",
-  "bf16 keys in with an f32 gain; bf16 out, one row a BLOCK. The mean is rounded to bf16 before "
-  "the norm, which is the reference's order and not the convenient one",
+  "bf16 keys in with an f32 gain; bf16 out, one row a BLOCK, or with `key_dtype` i8 a byte page "
+  "of the bf16 key's int8 codes, its f16 scale and zero padding. The mean is rounded to bf16 "
+  "before the norm, which is the reference's order and not the convenient one",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQsaBlockKey), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_block_key, nullptr, nullptr, nullptr,

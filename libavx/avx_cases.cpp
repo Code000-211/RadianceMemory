@@ -562,6 +562,16 @@ std::vector<Case> build_cases() {
                        HS("dtype", "f32") });
     add("qsa_score", { HI("M", 1), HI("n", 128), HI("heads", 4), HI("blocks", 1), HI("seqs", 1),
                        HS("dtype", "bf16") });
+    /* Int8 block keys (`key_dtype` i8): the store's page at both activation dtypes, and the score
+     * over drawn codes and scales (any f16, NaN and infinities included), one sequence and three. */
+    for (const char* dt : { "f32", "bf16" })
+        add("qsa_block_key", { HI("M", 12), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                               HF("eps", 1e-6), HF("theta", 1e7), HF("scale", 1), HF("wadd", 1),
+                               HS("dtype", dt), HS("key_dtype", "i8") });
+    add("qsa_score", { HI("M", 4), HI("n", 128), HI("heads", 4), HI("blocks", 300), HI("seqs", 1),
+                       HS("dtype", "bf16"), HS("key_dtype", "i8") });
+    add("qsa_score", { HI("M", 7), HI("n", 128), HI("heads", 4), HI("blocks", 37), HI("seqs", 3),
+                       HS("dtype", "bf16"), HS("key_dtype", "i8") });
     add("qsa_select", { HI("M", 4), HI("blocks", 300), HI("topk", 32), HI("ratio", 4),
                         HI("seqs", 1) });
     add("qsa_select", { HI("M", 4), HI("blocks", 300), HI("topk", 200), HI("ratio", 4),

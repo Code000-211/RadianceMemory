@@ -42,17 +42,6 @@ int64_t col0(const RadTensor* t, int64_t i) {
     return t->rank >= 2 ? i * t->stride[0] : offlin(t, i);
 }
 
-/* Whether the dimensions after the first are dense, so a row of a paged store is
- * `numel / shape[0]` contiguous values from `row * stride[0]`. */
-bool rows_dense(const RadTensor* t) {
-    int64_t acc = 1;
-    for (int i = (int)t->rank - 1; i >= 1; --i) {
-        if (t->shape[i] != 1 && t->stride[i] != acc) return false;
-        acc *= t->shape[i];
-    }
-    return true;
-}
-
 /* seq[m] for every m < M: the first sequence whose cu span holds row m, or `none` (libref's
  * seq_holding), filled from the spans instead of scanning every span for every row. */
 void seq_rows(const RadTensor* cu, int64_t n_seq, int64_t M, int64_t none, int64_t* seq) {
@@ -159,6 +148,7 @@ struct ScoreJob {
     int64_t q_rs, q_cs, pg_rs, bt_rs, bt_cs, o_rs, o_cs;
     int64_t esz;          /* bytes an element of bk, 0 for a packed dtype */
     float rn;
+    bool i8;              /* `key_dtype` i8: codes widened, the page's f16 scale after them */
 };
 
 /* Scores blocks [b0, b1) of one tile. */
@@ -202,10 +192,23 @@ static void score_unit(const ScoreJob& j, const ScoreTile& t, int64_t b0, int64_
             if (p >= 0) widen(j.bk, p * j.pg_rs, 1, n, d);
             else        std::fill(d, d + n, 0.0f);
         }
+        /* In int8, lane L's dot is block L's over its codes, scaled before the relu as libref's
+         * relu(scale * (q . codes)); a NaN product is dropped by vf_max(x, 0) as by fmax. */
+        alignas(64) float scl[VF_N];
+        if (j.i8)
+            for (int L = 0; L < VF_N; ++L) {
+                uint16_t s16 = 0;
+                if (pg[L] >= 0) std::memcpy(&s16, bkb + pg[L] * j.pg_rs + n, 2);
+                scl[L] = rad_f16_to_f32(s16);
+            }
+        const vf vsc = j.i8 ? vf_load(scl) : vf_zero();
         for (int64_t qi = 0; qi < t.rows; ++qi) {
             vf s = vf_zero();
-            for (int64_t h = 0; h < j.heads; ++h)
-                s = vf_add(s, vf_max(dot_group(qf + (qi * j.heads + h) * np, kf, np), vf_zero()));
+            for (int64_t h = 0; h < j.heads; ++h) {
+                vf d = dot_group(qf + (qi * j.heads + h) * np, kf, np);
+                if (j.i8) d = vf_mul(d, vsc);
+                s = vf_add(s, vf_max(d, vf_zero()));
+            }
             vf_store(lanes, vf_div(s, vf_set1(j.rn)));
             const int64_t ob = (t.m0 + qi) * j.o_rs + g * j.o_cs;
             if (f32_out) {
@@ -236,7 +239,11 @@ AVX_KERNEL(qsa_score) {
     const int64_t n_seq = numel(cu) - 1, pages = bk->shape[0];
     if (M <= 0 || nb <= 0 || n_seq <= 0 || pages <= 0) return RAD_E_SHAPE;
     if (bt->shape[0] < n_seq || numel(nc) < n_seq || rows_of(q, heads * n) < M) return RAD_E_SHAPE;
-    if (numel(bk) / pages != n) return RAD_E_SHAPE;
+    const char* kd = p_str(a, "key_dtype", nullptr);
+    if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;
+    const bool i8 = kd != nullptr;
+    if (i8 ? numel(bk) / pages < n + 2 || rad_dtype_bits(bk->dtype) != 8 : numel(bk) / pages != n)
+        return RAD_E_SHAPE;
     if (!rows_dense(bk)) return RAD_E_STRIDE;
     const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
     /* Every page id the launch will read must name a page of `bk`. */
@@ -254,6 +261,7 @@ AVX_KERNEL(qsa_score) {
     j.o_rs = o->stride[0]; j.o_cs = o->stride[1];
     j.esz = rad_dtype_bits(bk->dtype) / 8;
     j.rn = std::sqrt((float)n);
+    j.i8 = i8;
 
     /* Tiles: runs of up to kQT consecutive rows of one sequence. One allocation, as a second
      * scratch_raw call could move the first. */

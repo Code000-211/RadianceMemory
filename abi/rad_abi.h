@@ -44,8 +44,12 @@ extern "C" {
  *
  * 39: a sixth layout, RAD_KVQ_I8H (i8h: rotated int8 K and V, one f16 scale a token and head;
  * rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built at 38 would read an i8h
- * layer as a layout it does not know. */
-#define RAD_ABI_VERSION 39u
+ * layer as a layout it does not know.
+ *
+ * 40: the QSA indexer's block keys in int8 (--qsa-bkey-dtype i8): RadBuildCtx gained
+ * qsa_bkey_dtype and RadArchProbe qsa_bkey_i8_ok (rad_builder.h). A plugin built at 39 would keep
+ * bf16 block keys under a flag that promised half their memory. */
+#define RAD_ABI_VERSION 40u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

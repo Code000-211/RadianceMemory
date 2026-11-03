@@ -102,6 +102,9 @@ static const Flag g_flags[] = {
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
                                         "and is lossy; the qwen35 plugins serve it" },
+    { "--qsa-bkey-dtype",     "T",      "bf16 (default) | i8 -- the QSA indexer's block keys: i8\n"
+                                        "halves them (int8, an f16 scale a block; Flash-Next)\n"
+                                        "and moves the indexer's selection slightly" },
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
@@ -999,6 +1002,14 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->state_cache_dtype = v;
         }
+        else if (S("--qsa-bkey-dtype")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "bf16") && std::strcmp(v, "i8")) {
+                RAD_ERR("--qsa-bkey-dtype takes bf16 or i8, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->qsa_bkey_dtype = v;
+        }
         else if (S("--attn-prefill-fp8")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off"))  c->attn_prefill_fp8 = 0;
@@ -1743,6 +1754,7 @@ const ShowRow kShow[] = {
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
     { "--kv-recipe",          [](const Config& c) { return or_none(c.kv_recipe_path, "none"); } },
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
+    { "--qsa-bkey-dtype",     [](const Config& c) { return c.qsa_bkey_dtype; } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--kv-resident",        [](const Config& c) {

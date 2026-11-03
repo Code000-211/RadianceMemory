@@ -12,3 +12,6 @@ struct __hip_bfloat16 {
     }
     operator float() const { uint32_t u = (uint32_t)data << 16; float f; std::memcpy(&f, &u, 4); return f; }
 };
+/* The conversions HIP spells as functions, through the struct's own (ROCm's rounding). */
+inline float __bfloat162float(__hip_bfloat16 h) { return (float)h; }
+inline __hip_bfloat16 __float2bfloat16(float f) { return __hip_bfloat16(f); }

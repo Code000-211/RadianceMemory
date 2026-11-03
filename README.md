@@ -102,7 +102,10 @@ The model plugin declares how much of the history its consumer reads. In `arch/c
 attention group `kv_attn` declares the indexer's budget, 2 048 tokens, through
 `rad_kv_set_residency_window`. The block-key group `kv_qsa_bkey` declares **nothing**: the indexer
 scores every block key on every step, so those pages must stay resident. At bf16 they are 3.25 of the
-29.25 KiB a 4-token block costs, and no window can shrink them.
+29.25 KiB a 4-token block costs, and no window can shrink them. `--qsa-bkey-dtype i8` stores them as
+int8 with one f16 scale a key, 1.73 KiB a block (the page 136 bytes a layer), so the resident floor
+under residency drops from 832 to 442 bytes a token a card ([`docs/QSA.md`](docs/QSA.md),
+"Block-key storage").
 
 Only a group that declares a window is ever demoted. For that group a sequence keeps two ends:
 
@@ -303,7 +306,10 @@ flowchart TB
 | per-block bookkeeping | 4 bytes a block (the table entry already holds the slot) | none worth counting |
 
 At 200 K tokens a sequence holds 50 K attention blocks. With a 512-token sink and a 2 048-token tail
-resident, it needs about **51 MiB instead of 4.80 GiB** on the card, before the shared scratch.
+resident, it needs about **51 MiB instead of 4.80 GiB** on the card, before the shared scratch. Its
+block keys stay resident beside that: 159 MiB at bf16, 84 MiB with `--qsa-bkey-dtype i8`. The block-key
+group's page is whatever its declaration says, so the pool, the prefix cache and the residency store
+size it from there unchanged.
 
 ---
 

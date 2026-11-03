@@ -1686,8 +1686,15 @@ AVX_KERNEL(qsa_block_key) {
     if (rot < 0 || rot > n || (rot & 1) || rot / 2 > AVX_HD_MAX / 2) return RAD_E_SHAPE;
     if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
     if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
+    /* `key_dtype` i8: libref's int8 page, n codes, an f16 scale and zero padding (libref's
+     * ref_qsa_block_key states the rule). */
+    const char* kd = p_str(a, "key_dtype", nullptr);
+    if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;
+    const bool i8 = kd != nullptr;
     const int64_t M = page ? numel(page) : out->shape[0];
-    if (M < 1 || numel(out) / out->shape[0] != n) return RAD_E_SHAPE;
+    const int64_t ow = numel(out) / out->shape[0];
+    if (M < 1 || (i8 ? ow < n + 2 : ow != n)) return RAD_E_SHAPE;
+    if (i8 && (rad_dtype_bits(out->dtype) != 8 || !rows_dense(out))) return RAD_E_SHAPE;
     if (k->shape[0] != M * ratio || k->shape[1] != n || numel(w) < n) return RAD_E_SHAPE;
     const bool pos2 = pos && pos->rank == 2;
     if (pos && (pos2 ? pos->shape[0] < M : numel(pos) < M)) return RAD_E_SHAPE;
@@ -1764,6 +1771,26 @@ AVX_KERNEL(qsa_block_key) {
             const float x0 = y[i], x1 = y[half + i];
             y[i] = x0 * c - x1 * sn;
             y[half + i] = x0 * sn + x1 * c;
+        }
+        if (i8) {
+            /* Rounded to k's dtype as the activation store would hold it, then i8h's rule. */
+            uint8_t* row = (uint8_t*)out->data + orow * out->stride[0];
+            float amax = 0.0f;
+            for (int64_t t = 0; t < n; ++t) {
+                uint64_t tmp = 0;
+                st_elem(&tmp, k->dtype, 0, y[t]);
+                y[t] = ld_elem(&tmp, k->dtype, 0);
+                amax = t ? std::fmax(amax, std::fabs(y[t])) : std::fabs(y[t]);
+            }
+            const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 127.0f, 512.0f));
+            const float sc = rad_f16_to_f32(s16);
+            for (int64_t t = 0; t < n; ++t) {
+                const float r = sc > 0.0f ? std::rint(y[t] / sc) : 0.0f;
+                row[t] = (uint8_t)(int8_t)(int)std::fmin(std::fmax(r, -127.0f), 127.0f);
+            }
+            std::memcpy(row + n, &s16, 2);
+            std::memset(row + n + 2, 0, (size_t)(ow - n - 2));
+            continue;
         }
         for (int64_t t = 0; t < n; ++t) stt(out, offlin(out, orow * n + t), y[t]);
     }
