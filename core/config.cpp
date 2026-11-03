@@ -525,7 +525,9 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
 /* The layouts a recipe can name, widest first: the name in the file, the RAD_KVQ_* the plugin
  * declares, and what one group of 32 K elements and 32 V elements costs in bits, scales included
  * (the unit rad-autoquant's bit budget is counted in). A row added here is a recipe word and a
- * calibration candidate at once. */
+ * calibration candidate at once: rad-autoquant's variants are each row as kv_recipe_parse reads it
+ * plain, `rotated` and `vmean` (kv_autoquant_variants), so a new layout's rules (rotation implied,
+ * no V mean) belong in the parser below and nowhere else. */
 struct KvLayout { const char* name; int kvq; int group_bits; };
 static const KvLayout kKvLayouts[] = {
     /* K and V int8, stored rotated, one f16 scale a token and head for each: at head_dim 256 a

@@ -1104,15 +1104,23 @@ output a tenth less than `fp8` for 0.8 % more bytes (paired by position, a boots
 bits, does not at eight (+0.0008, -0.0002 to +0.0017: no gain this corpus can see). Speed is not
 measured.
 
-**A measured recipe.** `rad-autoquant` writes the recipe from the KL mode: it measures each layer
-in each layout against a bf16-cache reference over long documents and picks, per layer, the
-layouts of least total KL within an average bit budget (`--bits 6`: between `k4h_v2h`'s 3.5 and
-`fp8`'s 8). Its candidates are every recipe layout no wider than `fp8`, `k4h_v4` and `k4h_v2h`
-included (`i8h` is not: its cost above the `fp8` base would read as none); on a model
-whose plugin does not serve them (`qwen35_fp8`), pass `--layouts fp8_v4,k6_v4` or the first
-`k4h_v4` run stops the calibration. A reference whose documents are shorter than 32768 tokens is refused unless the bound
-is lowered. The flags, the cost of the runs and what the prediction assumes are in
-[TOOLS.md](TOOLS.md#rad-autoquant).
+**A measured recipe.** `rad-autoquant` writes the recipe from the KL mode, against a bf16-cache
+reference over long documents. `--max-kl 0.035` asks for the fewest bits whose *measured* mean KL
+stays within 0.035 (`--min-top1` adds a floor on top-1 agreement, `--strict` checks both at the
+95 % bound from the per-position rows, each document a stratum). Every layout above is a
+candidate, plain, `rotated` and, given the `--vmean` file, `vmean`: 16 variants on
+`qwen4exp_fp8`. It measures each variant on every layer, takes the most accurate (`i8h` today) as
+the base, measures each layer alone in each variant not beaten outright by one of no more bits,
+solves for the fewest bits from those costs, and measures what it solved, tightening while the
+mixed recipe measures over the limit (the costs do not add up exactly). It writes the cheapest
+recipe measured within the limit, uniform ones included, so it is never worse than the best
+uniform layout: C + L (K - 1) runs plus at most six solved ones for C variants, K kept and L
+layers, 64 to 70 on Flash-Next. `--bits 6` instead picks the least predicted KL within an average
+budget, unmeasured. On a model whose plugin does not serve `i8h`, the `k4h` layouts or the V mean
+(`qwen35_fp8`), pass `--layouts fp8,fp8_v4,k6_v4` or the first such run stops the calibration. A
+reference whose documents are shorter than 32768 tokens is refused unless the bound is lowered.
+The flags, the cost of the runs, the noise and what is not yet searched (global knobs, a demoted
+layout) are in [TOOLS.md](TOOLS.md#rad-autoquant).
 
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities

@@ -6,29 +6,33 @@
  *   rad-autoquant --kld-ref REF --layers 3,7,... --max-kl 0.035 -o model.kvrecipe -- <flags>
  *
  * REF is a KL-mode reference (`radiance --kld-record`) recorded by the same model with an
- * unquantised (bf16) cache, so a run's KL is what its cache costs and nothing else. The driver runs
- * the engine's KL mode (`--kld-ref`) once with every listed layer in fp8, the base, and once for
- * each layer and each narrower layout with that layer alone narrowed. A layer's cost in a layout
- * is the run's mean KL above the base's; a run under it is measurement noise and counts as no
- * cost. With the costs taken as adding up across layers, kv_autoquant_solve (core/kv_autoquant.h)
- * picks the assignment of least summed cost within the budget, and the recipe is written with
- * the measurements in its comments. The candidate set is every layout a recipe can name that is
- * no wider than the fp8 base (core/config.cpp, kKvLayouts), so a narrower layout added there is
- * calibrated without a change here. A wider one (i8h) is left out: a cost is measured above the
- * base and clamped at zero, so a layout that beats fp8 would only ever read as free.
+ * unquantised (bf16) cache, so a run's KL is what its cache costs and nothing else.
  *
- * --max-kl asks the converse: the fewest bits whose mean KL stays within a limit. The per-layer
- * costs do not add up exactly when layouts are mixed (an assignment predicted within the limit can
- * measure above it), so in this mode every solved assignment is measured before it is written.
- * One that measures above the limit tightens the predicted limit by how far the prediction fell
- * short, and the solver is asked again, at most --verify times. Every layout uniform across the
- * layers is measured too, so a uniform layout that is smaller at the limit than any mixed one is
- * what gets written. The recipe written is the smallest whose own run measured within the limit;
- * every layer fp8, the base, always is (the tool refuses a limit under it).
+ * The candidates are the variants (kv_autoquant_variants): every layout of the recipe table
+ * (core/config.cpp, kKvLayouts), each plain, `rotated` and, with --vmean FILE, `vmean`, as far as
+ * the recipe parser takes the words. So a layout or recipe word added there is calibrated with no
+ * change here. --layouts and --variants restrict the set.
+ *
+ *   1. Every variant uniform, one run each. The base is the one of least mean KL (today i8h): a
+ *      layer's cost in another variant is measured above it, so nothing reads as better than the
+ *      base and the clamp at zero below only absorbs noise.
+ *   2. Screening: a variant another of no more bits beats uniformly gets no per-layer runs
+ *      (--keep-dominated measures it anyway). Its uniform recipe still competes in --max-kl.
+ *   3. Each layer alone in each kept variant, the rest at the base. A layer's cost is the run's
+ *      mean KL above the base's; a run under it is noise and costs nothing.
+ *   4. --bits: with the costs taken as adding up, kv_autoquant_solve picks the assignment of least
+ *      summed cost within the budget, written with its prediction, unmeasured.
+ *      --max-kl: they do not add up exactly when layouts are mixed, so kv_autoquant_fit measures
+ *      each solved assignment and tightens the predicted room by how far the prediction fell
+ *      short, at most --verify times. The recipe written is the fewest bits of every recipe
+ *      measured within the limits (uniform, single-layer or solved), so it is never worse than the
+ *      best uniform variant. --min-top1 adds a floor on top-1 agreement; --strict checks both at
+ *      the 95 % bound from each run's .rows, the documents as strata (kv_autoquant_interval).
  *
  * Every run is a child `radiance` with the flags after `--`, plus the cache and KL flags this tool
- * sets; its recipe, report and log stay in the work directory, so a surprising number can be
- * looked at afterwards.
+ * sets; its recipe, report, .rows and log stay in the work directory, so a surprising number can
+ * be looked at afterwards, and --reuse reads a run back where its recipe and command line are
+ * unchanged.
  *
  * Long context is the point: a narrowed layer's error is paid where attention reaches far back,
  * which a short document never asks for, so a reference whose documents are shorter than
@@ -44,6 +48,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -52,6 +57,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <deque>
 #include <iterator>
 #include <set>
 #include <sstream>
@@ -71,7 +77,7 @@ constexpr int kVerify = 6;
 
 void usage() {
     std::printf(
-        "rad-autoquant -- each attention layer's KV layout from measured KL under a bit budget\n"
+        "rad-autoquant -- each attention layer's KV layout from measured KL\n"
         "\n"
         "usage: rad-autoquant --kld-ref DIR --layers N,N,... (--bits B | --max-kl K) -o FILE\n"
         "                     [options] -- <radiance flags: --model and the serve flags>\n"
@@ -79,17 +85,24 @@ void usage() {
         "  --kld-ref DIR       a KL reference recorded by this model with a bf16 cache\n"
         "  --layers N,N,...    the model's attention layers, as the checkpoint numbers them\n"
         "  --bits B            the average bits a cached K or V element may cost, scales\n"
-        "                      included (fp8 8, fp8_v4 6.25, k6_v4 5.5, k4h_v4 4.5,\n"
-        "                      k4h_v2h 3.5): the least KL within them\n"
+        "                      included (i8h 8.06, fp8 8, fp8_v4 6.25, k6_v4 5.5, k4h_v4 4.5,\n"
+        "                      k4h_v2h 3.5): the least KL within them, predicted\n"
         "  --max-kl K          the mean KL against the reference a recipe may measure: the\n"
-        "                      fewest bits within it, each solved recipe measured\n"
+        "                      fewest bits measured within it\n"
         "  -o FILE             the recipe to write (--kv-recipe FILE)\n"
+        "  --min-top1 P        with --max-kl, the top-1 agreement (0..1) it must keep too\n"
+        "  --strict            with --max-kl, check the 95%% bounds from the runs' .rows (KL's\n"
+        "                      upper, top-1's lower), not the means\n"
         "  --verify N          with --max-kl, the solved recipes to measure at most (default\n"
         "                      %d)\n"
+        "  --vmean FILE        a V mean file (radiance --calib-dir): the variants that\n"
+        "                      subtract it join the candidates\n"
+        "  --layouts L,L,...   only these layouts' variants (default every recipe layout)\n"
+        "  --variants V,V,...  only these variants, a variant's words joined by '+'\n"
+        "                      (k6_v4+rotated+vmean)\n"
+        "  --keep-dominated    per-layer runs for the variants screening would drop too\n"
         "  --reuse             take a run's KL from the work dir where its recipe and flags\n"
         "                      are the same as before, instead of running it again\n"
-        "  --layouts L,L,...   the layouts to choose from (default every one no wider than\n"
-        "                      fp8); fp8, the base, is always among them\n"
         "  --work DIR          each run's recipe, report and log (default FILE.work)\n"
         "  --min-context N     refuse a reference with a document under N tokens (default\n"
         "                      %lld); 0 measures any\n"
@@ -148,42 +161,85 @@ std::string self_dir() {
 const char* const kReserved[] = { "--kv-cache-dtype", "--kv-recipe", "--kld-ref", "--kld-out",
                                   "--kld-record", "--kld-corpus", "--kld-top" };
 
-/* The mean KL a KL-mode report states, or a negative number where it states none. */
-double report_mean(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return -1;
-    const json rep = json::parse(f, nullptr, false);
-    if (!rep.is_object() || !rep.contains("all") || !rep["all"].is_object() ||
-        !rep["all"].contains("kld") || !rep["all"]["kld"].is_object() ||
-        !rep["all"]["kld"].contains("mean") || !rep["all"]["kld"]["mean"].is_number())
-        return -1;
-    const double m = rep["all"]["kld"]["mean"].get<double>();
-    return std::isfinite(m) && m >= 0 ? m : -1;
-}
-
 std::string read_file(const std::string& path, bool* ok) {
     std::ifstream f(path, std::ios::binary);
     *ok = (bool)f;
     return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
+/* FNV-1a, 64 bits, in hex: a solved recipe's run name and the V mean file's identity in --reuse. */
+std::string fnv_hex(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) h = (h ^ c) * 1099511628211ull;
+    char b[17];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
+/* A variant's words as one token, for run names and --variants: "k6_v4+rotated+vmean". */
+std::string tag(const KvVariant& v) {
+    std::string t = v.words;
+    std::replace(t.begin(), t.end(), ' ', '+');
+    return t;
+}
+
+/* One measured recipe: what the KL mode reported, and the 95 % intervals from its .rows (half
+ * NaN without usable rows; top1 NaN where the report has none). */
+struct Meas {
+    std::string label;          /* "every layer fp8", "layer 3 k6_v4", "verify 1" */
+    std::vector<int32_t> kvq;   /* per --layers entry */
+    int64_t bits = 0;           /* summed over the layers, a group of 32 K and 32 V each */
+    double kl = 0, top1 = NAN;
+    KvInterval kl_ci, top1_ci;
+};
+
+/* The limits a --max-kl recipe is checked against: the means, or under --strict the 95 % bound
+ * on the bad side. A missing number fails the check it takes part in. */
+struct Limits {
+    double max_kl = 0;
+    double min_top1 = NAN;   /* none */
+    bool strict = false;
+    double kl(const Meas& m) const { return strict ? m.kl + m.kl_ci.half : m.kl; }
+    double top1(const Meas& m) const { return strict ? m.top1 - m.top1_ci.half : m.top1; }
+    bool within(const Meas& m) const {
+        return kl(m) <= max_kl && (std::isnan(min_top1) || top1(m) >= min_top1);
+    }
+};
+
 struct Run {
-    std::string radiance, ref, work;
+    std::string radiance, ref, work, vmean, vmean_id;   /* vmean absolute, or empty */
     std::vector<std::string> engine;
     std::vector<int> layers;
+    std::vector<KvVariant> all;        /* every variant, for the words of a RAD_KVQ_* */
+    std::vector<int64_t> doc_rows;     /* the reference's scored positions a document */
     bool reuse = false;
 
-    /* The mean KL of the engine with layer layers[i] in layout[i], or a negative number, the
-     * refusal printed, when the run did not report one. With `reuse`, a run whose recipe and
-     * command line in the work dir are this one's, and whose report states a mean, is not run
-     * again: its command line is written beside it (NAME.args) only once it has succeeded. */
-    double mean_kl(const std::string& name, const std::vector<int>& layout) const {
+    const KvVariant* variant(int32_t kvq) const {
+        for (const KvVariant& v : all)
+            if (v.kvq == kvq) return &v;
+        return nullptr;
+    }
+    /* The recipe a run is given: the mean file first where a layer subtracts it. */
+    std::string text(const std::vector<int32_t>& kvq) const {
+        std::string s;
+        if (std::any_of(kvq.begin(), kvq.end(), [](int32_t q) { return q & RAD_KVQ_VMEAN; }))
+            s += "vmean " + vmean + "\n";
+        for (size_t i = 0; i < kvq.size(); ++i)
+            s += "layer " + std::to_string(layers[i]) + " " + variant(kvq[i])->words + "\n";
+        return s;
+    }
+
+    /* The engine with layer layers[i] in variant kvq[i], into `m`; false, the refusal printed,
+     * when the run did not report a mean KL. With `reuse`, a run whose recipe and command line in
+     * the work dir are this one's, and whose report states a mean, is not run again: its command
+     * line (and the V mean file's hash where the recipe reads it) is written beside it
+     * (NAME.args) only once it has succeeded. */
+    bool measure(const std::string& name, const std::string& label,
+                 const std::vector<int32_t>& kvq, Meas* m) const {
         const std::string base = work + "/" + name;
         const std::string recipe = base + ".kvrecipe", out = base + ".json", log = base + ".log",
-                          args = base + ".args";
-        std::string text;
-        for (size_t i = 0; i < layers.size(); ++i)
-            text += "layer " + std::to_string(layers[i]) + " " + kv_layout_name(layout[i]) + "\n";
+                          args = base + ".args", rows = out + ".rows";
+        const std::string text = this->text(kvq);
         std::vector<std::string> a = { radiance };
         a.insert(a.end(), engine.begin(), engine.end());
         for (const char* s : { "--kv-cache-dtype", "fp8", "--kv-recipe" }) a.push_back(s);
@@ -194,61 +250,123 @@ struct Run {
         a.push_back(out);
         std::string cmd;
         for (const std::string& s : a) cmd += s + "\n";
+        if (text.rfind("vmean ", 0) == 0) cmd += "# vmean " + vmean_id + "\n";
+        m->label = label;
+        m->kvq = kvq;
+        m->bits = 0;
+        for (int32_t q : kvq) m->bits += variant(q)->bits;
+        bool reused = false;
         if (reuse) {
             bool ok_r = false, ok_a = false;
-            const double m = report_mean(out);
-            if (m >= 0 && read_file(recipe, &ok_r) == text && ok_r &&
-                read_file(args, &ok_a) == cmd && ok_a) {
-                std::printf("rad-autoquant: %s: reused from %s\n", name.c_str(), out.c_str());
-                return m;
+            reused = read_file(recipe, &ok_r) == text && ok_r && read_file(args, &ok_a) == cmd &&
+                     ok_a && report(out, rows, m);
+            if (reused) std::printf("rad-autoquant: %s: reused from %s\n", name.c_str(), out.c_str());
+        }
+        if (!reused) {
+            std::remove(args.c_str());
+            {
+                std::ofstream f(recipe, std::ios::binary);
+                f << text;
+                if (!f) { fail("cannot write %s", recipe.c_str()); return false; }
             }
-        }
-        std::remove(args.c_str());
-        {
-            std::ofstream f(recipe, std::ios::binary);
-            f << text;
-            if (!f) { fail("cannot write %s", recipe.c_str()); return -1; }
-        }
-        std::remove(out.c_str());
-        std::vector<char*> av;
-        for (std::string& s : a) av.push_back(s.data());
-        av.push_back(nullptr);
+            std::remove(out.c_str());
+            std::remove(rows.c_str());
+            std::vector<char*> av;
+            for (std::string& s : a) av.push_back(s.data());
+            av.push_back(nullptr);
 
-        const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd < 0) { fail("cannot write %s: %s", log.c_str(), std::strerror(errno)); return -1; }
-        std::fflush(nullptr);
-        const pid_t pid = ::fork();
-        if (pid == 0) {
-            ::dup2(fd, 1);
-            ::dup2(fd, 2);
-            ::execv(av[0], av.data());
-            std::fprintf(stderr, "rad-autoquant: cannot run %s: %s\n", av[0], std::strerror(errno));
-            ::_exit(127);
+            const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0) { fail("cannot write %s: %s", log.c_str(), std::strerror(errno)); return false; }
+            std::fflush(nullptr);
+            const pid_t pid = ::fork();
+            if (pid == 0) {
+                ::dup2(fd, 1);
+                ::dup2(fd, 2);
+                ::execv(av[0], av.data());
+                std::fprintf(stderr, "rad-autoquant: cannot run %s: %s\n", av[0], std::strerror(errno));
+                ::_exit(127);
+            }
+            ::close(fd);
+            if (pid < 0) { fail("fork: %s", std::strerror(errno)); return false; }
+            int st = 0;
+            while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+            const bool ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+            if (!ok || !report(out, rows, m)) {
+                fail("run %s %s; its log, %s, ends:\n%s", name.c_str(),
+                     ok ? "reported no mean KL" : "failed", log.c_str(), tail(log, 15).c_str());
+                return false;
+            }
+            std::ofstream f(args, std::ios::binary);
+            f << cmd;
         }
-        ::close(fd);
-        if (pid < 0) { fail("fork: %s", std::strerror(errno)); return -1; }
-        int st = 0;
-        while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-        const bool ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        std::printf("rad-autoquant: %s: %s\n", label.c_str(), describe(*m).c_str());
+        std::fflush(stdout);
+        return true;
+    }
 
-        const double m = ok ? report_mean(out) : -1;
-        if (m < 0) {
-            fail("run %s %s; its log, %s, ends:\n%s", name.c_str(),
-                 ok ? "reported no mean KL" : "failed", log.c_str(), tail(log, 15).c_str());
-            return -1;
+    /* A KL-mode report's mean KL and top-1 agreement into `m`, and the intervals from its .rows
+     * ([positions, 4] f32: KL, the two NLLs, top-1 agreement) where they are the reference's
+     * positions; false where it states no mean. */
+    bool report(const std::string& out, const std::string& rows, Meas* m) const {
+        std::ifstream f(out);
+        if (!f) return false;
+        const json rep = json::parse(f, nullptr, false);
+        if (!rep.is_object() || !rep.contains("all") || !rep["all"].is_object()) return false;
+        const json& a = rep["all"];
+        if (!a.contains("kld") || !a["kld"].is_object() || !a["kld"].contains("mean") ||
+            !a["kld"]["mean"].is_number())
+            return false;
+        m->kl = a["kld"]["mean"].get<double>();
+        if (!std::isfinite(m->kl) || m->kl < 0) return false;
+        m->top1 = a.contains("top1_agreement") && a["top1_agreement"].is_number()
+                      ? a["top1_agreement"].get<double>() : NAN;
+        m->kl_ci = m->top1_ci = KvInterval{};
+        m->kl_ci.half = m->top1_ci.half = NAN;
+        bool ok = false;
+        const std::string raw = read_file(rows, &ok);
+        int64_t n = 0;
+        for (int64_t d : doc_rows) n += d;
+        if (!ok || raw.empty() || raw.size() % 16 || (n && (int64_t)raw.size() != n * 16)) return true;
+        std::vector<float> v(raw.size() / 4);
+        std::memcpy(v.data(), raw.data(), raw.size());
+        std::vector<double> kl, t1;
+        for (size_t i = 0; i < v.size(); i += 4) { kl.push_back(v[i]); t1.push_back(v[i + 3]); }
+        KvInterval a1, a2;
+        if (kv_autoquant_interval(kl, doc_rows, &a1) == RAD_OK &&
+            kv_autoquant_interval(t1, doc_rows, &a2) == RAD_OK) {
+            m->kl_ci = a1;
+            m->top1_ci = a2;
         }
-        std::ofstream f(args, std::ios::binary);
-        f << cmd;
-        return m;
+        return true;
+    }
+
+    /* "5.5000 bits, mean KL 0.034429 +- 0.003400, top-1 0.9412 +- 0.0021"; without the bits,
+     * from "mean KL". */
+    std::string describe(const Meas& m, bool bits = true) const {
+        char b[200];
+        int at = bits ? std::snprintf(b, sizeof b, "%.4f bits, ", per_element(m.bits)) : 0;
+        at += std::snprintf(b + at, sizeof b - (size_t)at, "mean KL %.6f", m.kl);
+        if (!std::isnan(m.kl_ci.half))
+            at += std::snprintf(b + at, sizeof b - (size_t)at, " +- %.6f", m.kl_ci.half);
+        if (!std::isnan(m.top1)) {
+            at += std::snprintf(b + at, sizeof b - (size_t)at, ", top-1 %.4f", m.top1);
+            if (!std::isnan(m.top1_ci.half))
+                std::snprintf(b + at, sizeof b - (size_t)at, " +- %.4f", m.top1_ci.half);
+        }
+        return b;
+    }
+    double per_element(int64_t bits) const {
+        return (double)bits / kGroupElems / (double)layers.size();
     }
 };
 
 }  /* namespace */
 
 int main(int argc, char** argv) {
-    std::string ref, out, work, radiance, layers_arg, layouts_arg, bits_arg, max_kl_arg;
+    std::string ref, out, work, radiance, layers_arg, layouts_arg, variants_arg, bits_arg,
+        max_kl_arg, min_top1_arg, vmean_arg;
     int64_t min_context = kMinContext, verify = kVerify;
-    bool reuse = false;
+    bool reuse = false, strict = false, keep_dominated = false, have_verify = false;
     std::vector<std::string> engine;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -266,12 +384,18 @@ int main(int argc, char** argv) {
         if (a == "--radiance" && val(&radiance)) continue;
         if (a == "--layers" && val(&layers_arg)) continue;
         if (a == "--layouts" && val(&layouts_arg)) continue;
+        if (a == "--variants" && val(&variants_arg)) continue;
+        if (a == "--vmean" && val(&vmean_arg)) continue;
         if (a == "--bits" && val(&bits_arg)) continue;
         if (a == "--max-kl" && val(&max_kl_arg)) continue;
+        if (a == "--min-top1" && val(&min_top1_arg)) continue;
         if (a == "--reuse") { reuse = true; continue; }
+        if (a == "--strict") { strict = true; continue; }
+        if (a == "--keep-dominated") { keep_dominated = true; continue; }
         if (a == "--verify" && val(&v)) {
             if (!parse_int(v, 1, 1000, &verify))
                 return fail("--verify '%s' is not a number of runs from 1 to 1000", v.c_str());
+            have_verify = true;
             continue;
         }
         if (a == "--min-context" && val(&v)) {
@@ -290,6 +414,9 @@ int main(int argc, char** argv) {
     if (!bits_arg.empty() && !max_kl_arg.empty())
         return fail("--bits and --max-kl ask opposite questions; give one");
     const bool by_kl = !max_kl_arg.empty();
+    if (!by_kl && (!min_top1_arg.empty() || strict || have_verify))
+        return fail("--min-top1, --strict and --verify go with --max-kl; --bits measures nothing "
+                    "it writes");
     if (engine.empty()) return fail("no engine flags after --; the runs need at least --model");
     for (const std::string& e : engine)
         for (const char* r : kReserved)
@@ -309,47 +436,88 @@ int main(int argc, char** argv) {
         if (!seen.insert(l).second) return fail("--layers names layer %lld twice", (long long)l);
         layers.push_back((int)l);
     }
-    /* The candidates, widest first so that a tie keeps the wider layout; fp8 is the base. */
-    std::vector<int> layouts;
-    std::set<int> want = { RAD_KVQ_NONE };
-    if (layouts_arg.empty()) {
-        for (int q : kv_layouts())
-            if (kv_layout_group_bits(q) <= kv_layout_group_bits(RAD_KVQ_NONE)) want.insert(q);
-    } else {
+    const size_t L = layers.size();
+
+    /* The V mean file: absolute, as the recipes in the work dir and the one written name it, and
+     * its content's hash, so --reuse runs again after it is recalibrated. */
+    std::string vmean, vmean_id;
+    if (!vmean_arg.empty()) {
+        char buf[PATH_MAX];
+        if (!::realpath(vmean_arg.c_str(), buf))
+            return fail("--vmean %s: %s", vmean_arg.c_str(), std::strerror(errno));
+        vmean = buf;
+        bool ok = false;
+        const std::string vt = read_file(vmean, &ok);
+        KvVMean vm;
+        if (!ok || kv_vmean_parse(vt, vmean.c_str(), &vm) != RAD_OK)
+            return fail("--vmean %s is not a V mean file (radiance --calib-dir writes one)",
+                        vmean.c_str());
+        vmean_id = fnv_hex(vt);
+    }
+
+    /* The candidates: the variants, widest first so that a tie keeps the wider one, restricted by
+     * --layouts and --variants. */
+    const std::vector<KvVariant> every = kv_autoquant_variants(true);
+    std::vector<KvVariant> variants = kv_autoquant_variants(!vmean.empty());
+    if (!layouts_arg.empty()) {
+        std::set<int> want;
         for (const std::string& s : split(layouts_arg, ',')) {
             const int q = kv_layout_of(s.c_str());
             if (q < 0) return fail("--layouts: '%s' is not a KV layout", s.c_str());
-            if (kv_layout_group_bits(q) > kv_layout_group_bits(RAD_KVQ_NONE))
-                return fail("--layouts: %s is wider than the fp8 base, and a cost is measured "
-                            "above the base", s.c_str());
             want.insert(q);
         }
+        std::erase_if(variants, [&](const KvVariant& v) { return !want.count(v.kvq & RAD_KVQ_LAYOUT); });
     }
-    for (int q : kv_layouts())
-        if (want.count(q)) layouts.push_back(q);
+    if (!variants_arg.empty()) {
+        std::set<int32_t> want;
+        for (const std::string& s : split(variants_arg, ',')) {
+            const KvVariant* hit = nullptr;
+            for (const KvVariant& v : every)
+                if (tag(v) == s) hit = &v;
+            if (!hit) {
+                std::string names;
+                for (const KvVariant& v : every) names += (names.empty() ? "" : ", ") + tag(v);
+                return fail("--variants: '%s' is not a variant; they are %s", s.c_str(), names.c_str());
+            }
+            if ((hit->kvq & RAD_KVQ_VMEAN) && vmean.empty())
+                return fail("--variants: %s subtracts a V mean, and no --vmean FILE names one",
+                            s.c_str());
+            want.insert(hit->kvq);
+        }
+        std::erase_if(variants, [&](const KvVariant& v) { return !want.count(v.kvq); });
+    }
+    if (variants.empty()) return fail("--layouts and --variants leave no variant to choose from");
+    const size_t C = variants.size();
 
     int64_t budget = 0;
-    double max_kl = 0;
+    Limits lim;
+    lim.strict = strict;
     if (!by_kl) {
         char* end = nullptr;
         const double bits = std::strtod(bits_arg.c_str(), &end);
         if (!end || *end || !(bits > 0) || !std::isfinite(bits))
             return fail("--bits '%s' is not a number of bits", bits_arg.c_str());
         /* The budget in bits a layer's group, summed; the epsilon keeps 6.25 * 64 at 400. */
-        budget = (int64_t)std::floor(bits * kGroupElems * (double)layers.size() + 1e-6);
+        budget = (int64_t)std::floor(bits * kGroupElems * (double)L + 1e-6);
         int narrowest = INT_MAX;
-        for (int q : layouts) narrowest = std::min(narrowest, kv_layout_group_bits(q));
-        if (budget < (int64_t)narrowest * (int64_t)layers.size())
+        for (const KvVariant& v : variants) narrowest = std::min(narrowest, v.bits);
+        if (budget < (int64_t)narrowest * (int64_t)L)
             return fail("--bits %s is under the narrowest layout's %.2f", bits_arg.c_str(),
                         (double)narrowest / kGroupElems);
     } else {
         char* end = nullptr;
-        max_kl = std::strtod(max_kl_arg.c_str(), &end);
-        if (!end || *end || !(max_kl > 0) || !std::isfinite(max_kl))
+        lim.max_kl = std::strtod(max_kl_arg.c_str(), &end);
+        if (!end || *end || !(lim.max_kl > 0) || !std::isfinite(lim.max_kl))
             return fail("--max-kl '%s' is not a positive mean KL", max_kl_arg.c_str());
+        if (!min_top1_arg.empty()) {
+            lim.min_top1 = std::strtod(min_top1_arg.c_str(), &end);
+            if (!end || *end || !(lim.min_top1 >= 0 && lim.min_top1 <= 1))
+                return fail("--min-top1 '%s' is not an agreement from 0 to 1", min_top1_arg.c_str());
+        }
     }
 
-    /* The reference's documents, against the long-context bound. */
+    /* The reference's documents, against the long-context bound, and each one's scored
+     * positions (`[score_from, n - 1)`, core/kld.h): the strata of a run's interval. */
     json manifest;
     {
         std::ifstream f(ref + "/kld.json");
@@ -362,11 +530,16 @@ int main(int argc, char** argv) {
         return fail("--kld-ref %s/kld.json lists no documents", ref.c_str());
     int64_t shortest = INT64_MAX;
     size_t shortest_at = 0;
+    std::vector<int64_t> doc_rows;
     for (size_t d = 0; d < manifest["docs"].size(); ++d) {
         const json& j = manifest["docs"][d];
         if (!j.is_object() || !j.contains("tokens") || !j["tokens"].is_number_integer())
             return fail("--kld-ref %s/kld.json: document %zu has no token count", ref.c_str(), d);
-        if (j["tokens"].get<int64_t>() < shortest) { shortest = j["tokens"]; shortest_at = d; }
+        const int64_t n = j["tokens"].get<int64_t>();
+        if (n < shortest) { shortest = n; shortest_at = d; }
+        const int64_t from = j.contains("score_from") && j["score_from"].is_number_integer()
+                                 ? j["score_from"].get<int64_t>() : 0;
+        doc_rows.push_back(std::max<int64_t>(0, n - 1 - from));
     }
     if (shortest < min_context)
         return fail("--kld-ref %s: document %zu holds %lld tokens, under --min-context %lld. A "
@@ -379,187 +552,251 @@ int main(int argc, char** argv) {
 
     if (::mkdir(work.c_str(), 0755) != 0 && errno != EEXIST)
         return fail("cannot create %s: %s", work.c_str(), std::strerror(errno));
-    const Run run{ radiance, ref, work, engine, layers, reuse };
-    const size_t n_runs = 1 + layers.size() * (layouts.size() - 1);
-    if (by_kl)
-        std::printf("rad-autoquant: %zu layers, %zu layouts, %zu runs, %zu uniform and up to %lld "
-                    "to verify, over %zu documents (shortest %lld tokens); work in %s\n",
-                    layers.size(), layouts.size(), n_runs, layouts.size() - 1, (long long)verify,
-                    manifest["docs"].size(), (long long)shortest, work.c_str());
-    else
-        std::printf("rad-autoquant: %zu layers, %zu layouts, %zu runs over %zu documents (shortest "
-                    "%lld tokens); work in %s\n", layers.size(), layouts.size(), n_runs,
-                    manifest["docs"].size(), (long long)shortest, work.c_str());
+    const Run run{ radiance, ref, work, vmean, vmean_id, engine, layers, every, doc_rows, reuse };
+    std::printf("rad-autoquant: %zu layers, %zu variants, over %zu documents (shortest %lld "
+                "tokens); work in %s\n", L, C, manifest["docs"].size(), (long long)shortest,
+                work.c_str());
+    std::printf("rad-autoquant: runs: %zu uniform, then at most %zu per-layer, L (C - 1), fewer "
+                "for the variants screening drops", C, L * (C - 1));
+    if (by_kl) std::printf(", and up to %lld to verify", (long long)verify);
+    std::printf("\n");
     std::fflush(stdout);
 
-    const double base = run.mean_kl("base", std::vector<int>(layers.size(), RAD_KVQ_NONE));
-    if (base < 0) return 1;
-    std::printf("rad-autoquant: every layer fp8: mean KL %.6f\n", base);
+    /* Every measured recipe; a deque, so what points into it stays put. */
+    std::deque<Meas> runs;
+    auto find = [&](const std::vector<int32_t>& kvq) -> const Meas* {
+        for (const Meas& m : runs)
+            if (m.kvq == kvq) return &m;
+        return nullptr;
+    };
+    /* What a limit needs of a run, where the run lacks it. */
+    auto unusable = [&](const Meas& m) -> const char* {
+        if (!std::isnan(lim.min_top1) && std::isnan(m.top1))
+            return "reported no top-1 agreement, which --min-top1 needs";
+        if (lim.strict && std::isnan(m.kl_ci.half))
+            return "left no .rows of the reference's positions, which --strict needs";
+        return nullptr;
+    };
+
+    /* 1. Every variant uniform; the base is the least mean KL, of equal ones the fewer bits. */
+    std::vector<const Meas*> uni;
+    size_t b0 = 0;
+    for (size_t c = 0; c < C; ++c) {
+        Meas m;
+        if (!run.measure("uniform_" + tag(variants[c]), "every layer " + variants[c].words,
+                         std::vector<int32_t>(L, variants[c].kvq), &m))
+            return 1;
+        if (by_kl)
+            if (const char* why = unusable(m))
+                return fail("run uniform_%s %s", tag(variants[c]).c_str(), why);
+        runs.push_back(m);
+        uni.push_back(&runs.back());
+        if (m.kl < uni[b0]->kl || (m.kl == uni[b0]->kl && variants[c].bits < variants[b0].bits))
+            b0 = c;
+    }
+    const Meas& base = *uni[b0];
+    std::printf("rad-autoquant: the base, the most accurate: every layer %s\n",
+                variants[b0].words.c_str());
+
+    /* 2. Screening: a variant that one of no more bits beats on the uniform recipe gets no
+     * per-layer runs; at equal bits the lower KL stays, an exact tie keeps the earlier. A
+     * heuristic, as a layer can differ from the model's average; the base is never dropped. */
+    std::vector<size_t> kept;
+    std::vector<std::string> dropped;
+    for (size_t i = 0; i < C; ++i) {
+        size_t by = SIZE_MAX;
+        for (size_t j = 0; j < C && by == SIZE_MAX && !keep_dominated && i != b0; ++j) {
+            if (j == i) continue;
+            const int bi = variants[i].bits, bj = variants[j].bits;
+            const double ki = uni[i]->kl, kj = uni[j]->kl;
+            if ((bj < bi && kj <= ki) || (bj == bi && (kj < ki || (kj == ki && j < i)))) by = j;
+        }
+        if (by == SIZE_MAX) { kept.push_back(i); continue; }
+        char b[256];
+        std::snprintf(b, sizeof b, "%s (%.6f at %.2f bits; %s: %.6f at %.2f)",
+                      variants[i].words.c_str(), uni[i]->kl, (double)variants[i].bits / kGroupElems,
+                      variants[by].words.c_str(), uni[by]->kl, (double)variants[by].bits / kGroupElems);
+        dropped.push_back(b);
+        std::printf("rad-autoquant: screening drops %s\n", b);
+    }
+    /* Under --max-kl a base over the limits leaves the costs nothing to give: only the uniform
+     * recipes compete. */
+    const bool search = !by_kl || lim.within(base);
+    std::printf("rad-autoquant: %zu per-layer runs, %zu layers x %zu variants\n",
+                search ? L * (kept.size() - 1) : 0, L, kept.size() - 1);
     std::fflush(stdout);
-    if (by_kl && base > max_kl)
-        return fail("every layer fp8 already measures a mean KL of %.6f, above --max-kl %s, and "
-                    "no recipe layout is wider than fp8: raise the limit, or serve a bf16 cache",
-                    base, max_kl_arg.c_str());
-    /* cost[i][c]: layer layers[i] alone in layouts[c], above the base. */
-    std::vector<std::vector<KvCandidate>> cand(layers.size());
-    for (size_t i = 0; i < layers.size(); ++i)
-        for (int q : layouts) {
+
+    /* 3. cand[i][k]: layer layers[i] alone in variants[kept[k]], the rest at the base. */
+    std::vector<std::vector<KvCandidate>> cand(L);
+    for (size_t i = 0; i < L && search; ++i)
+        for (size_t k : kept) {
             double d = 0;
-            if (q != RAD_KVQ_NONE) {
-                std::vector<int> lay(layers.size(), RAD_KVQ_NONE);
-                lay[i] = q;
-                const double kl = run.mean_kl("layer" + std::to_string(layers[i]) + "_" +
-                                              kv_layout_name(q), lay);
-                if (kl < 0) return 1;
-                d = std::max(0.0, kl - base);
-                std::printf("rad-autoquant: layer %d %s: mean KL %.6f (+%.3e)\n", layers[i],
-                            kv_layout_name(q), kl, d);
-                std::fflush(stdout);
+            if (k != b0) {
+                std::vector<int32_t> kvq(L, variants[b0].kvq);
+                kvq[i] = variants[k].kvq;
+                Meas m;
+                if (!run.measure("layer" + std::to_string(layers[i]) + "_" + tag(variants[k]),
+                                 "layer " + std::to_string(layers[i]) + " " + variants[k].words,
+                                 kvq, &m))
+                    return 1;
+                d = std::max(0.0, m.kl - base.kl);
+                if (by_kl && !unusable(m) && !find(kvq)) runs.push_back(m);
             }
-            cand[i].push_back({ q, kv_layout_group_bits(q), d });
+            cand[i].push_back({ variants[k].kvq, variants[k].bits, d });
         }
 
-    /* The layouts, bits and predicted mean KL of an assignment, from the per-layer costs. */
-    auto layouts_of = [&](const KvAssignment& a) {
-        std::vector<int> lay;
-        for (size_t i = 0; i < layers.size(); ++i) lay.push_back(cand[i][(size_t)a.pick[i]].kvq);
-        return lay;
+    /* The variants of an assignment. */
+    auto kvq_of = [&](const KvAssignment& a) {
+        std::vector<int32_t> q;
+        for (size_t i = 0; i < L; ++i) q.push_back(cand[i][(size_t)a.pick[i]].kvq);
+        return q;
     };
-    auto bits_of = [&](const std::vector<int>& lay) {
-        int64_t b = 0;
-        for (int q : lay) b += kv_layout_group_bits(q);
-        return b;
-    };
-    auto predicted_of = [&](const std::vector<int>& lay) {
-        double p = base;
-        for (size_t i = 0; i < layers.size(); ++i)
-            for (const KvCandidate& c : cand[i])
-                if (c.kvq == lay[i]) p += c.kl;
-        return p;
-    };
-    auto per_element = [&](int64_t b) { return (double)b / kGroupElems / (double)layers.size(); };
 
-    /* What is written: a layout per layer, and the comment lines that say why. */
-    std::vector<int> chosen;
+    /* What is written: a variant per layer, and the comment lines that say why. */
+    std::vector<int32_t> chosen;
     std::ostringstream why;
-    char line[256];
+    char line[512];
     double avg = 0, reported = 0;
+    std::string chosen_desc;
     if (!by_kl) {
         KvAssignment pick;
         if (kv_autoquant_solve(cand, budget, &pick) != RAD_OK)
             return fail("no assignment fits %s bits", bits_arg.c_str());
-        chosen = layouts_of(pick);
-        avg = per_element(pick.bits);
-        reported = base + pick.kl;
+        chosen = kvq_of(pick);
+        avg = run.per_element(pick.bits);
+        reported = base.kl + pick.kl;
         std::snprintf(line, sizeof line,
                       "# chosen: %.4f bits an element, predicted mean KL %.6f (the layers' costs "
                       "summed onto the base)\n", avg, reported);
         why << line;
     } else {
-        /* Every recipe measured: the base, each layout uniform, and the solver's answers. */
-        struct Measured {
-            std::string name;
-            std::vector<int> lay;
-            double kl;
+        /* The fewest bits measured within the limits, the least KL of those. */
+        auto best = [&]() -> const Meas* {
+            const Meas* w = nullptr;
+            for (const Meas& m : runs)
+                if (lim.within(m) && (!w || m.bits < w->bits ||
+                                      (m.bits == w->bits && lim.kl(m) < lim.kl(*w))))
+                    w = &m;
+            return w;
         };
-        std::vector<Measured> runs = { { "base", std::vector<int>(layers.size(), RAD_KVQ_NONE),
-                                         base } };
-        auto measured = [&](const std::vector<int>& lay) -> const Measured* {
-            for (const Measured& m : runs)
-                if (m.lay == lay) return &m;
-            return nullptr;
-        };
-        for (int q : layouts) {
-            if (q == RAD_KVQ_NONE) continue;
-            const std::vector<int> lay(layers.size(), q);
-            const double kl = run.mean_kl(std::string("uniform_") + kv_layout_name(q), lay);
-            if (kl < 0) return 1;
-            runs.push_back({ std::string("uniform ") + kv_layout_name(q), lay, kl });
-            std::printf("rad-autoquant: every layer %s: mean KL %.6f\n", kv_layout_name(q), kl);
-            std::fflush(stdout);
-        }
-        /* The cost above the base the solver may predict. A solved recipe that measures above
-         * the limit scales it by how far that prediction fell short of its measurement, and
-         * keeps it under that recipe's prediction, so the next answer is a different one. */
-        const double room = max_kl - base;
-        double allowed = room;
-        for (int64_t v = 1; v <= verify; ++v) {
-            KvAssignment a;
-            if (kv_autoquant_solve_kl(cand, allowed, &a) != RAD_OK) break;
-            const std::vector<int> lay = layouts_of(a);
-            const Measured* m = measured(lay);
-            double kl = m ? m->kl : -1;
-            if (!m) {
-                kl = run.mean_kl("verify" + std::to_string(v), lay);
-                if (kl < 0) return 1;
-                runs.push_back({ "verify " + std::to_string(v), lay, kl });
+        /* 4. Solve, measure, tighten. */
+        std::vector<KvRound> trail;
+        std::string capped;
+        if (search) {
+            int round = 0;
+            const KvMeasure measure = [&](const KvAssignment& a, std::vector<KvCheck>* ch) {
+                const std::vector<int32_t> kvq = kvq_of(a);
+                const Meas* m = find(kvq);
+                ++round;
+                if (!m) {
+                    Meas n;
+                    if (!run.measure("verify_" + fnv_hex(run.text(kvq)).substr(0, 12),
+                                     "verify " + std::to_string(round), kvq, &n))
+                        return (int)RAD_E_IO;
+                    if (const char* w = unusable(n)) { fail("verify %d %s", round, w); return (int)RAD_E_IO; }
+                    runs.push_back(n);
+                    m = &runs.back();
+                }
+                std::printf("rad-autoquant: solved %d: %.4f bits an element, predicted mean KL "
+                            "%.6f, measured %.6f (%s), %s\n", round, run.per_element(a.bits),
+                            base.kl + a.kl, m->kl, m->label.c_str(),
+                            lim.within(*m) ? "within the limit" : "above the limit");
+                std::fflush(stdout);
+                ch->push_back({ lim.kl(*m) - lim.kl(base), lim.max_kl - lim.kl(base) });
+                if (!std::isnan(lim.min_top1))
+                    ch->push_back({ lim.top1(base) - lim.top1(*m), lim.top1(base) - lim.min_top1 });
+                return (int)RAD_OK;
+            };
+            /* A solution of no fewer bits than a recipe already measured within cannot be the
+             * answer, so it is not measured. */
+            const Meas* had = best();
+            const int rc = kv_autoquant_fit(cand, lim.max_kl - lim.kl(base), (int)verify, measure,
+                                            &trail, had ? had->bits : INT64_MAX);
+            if (rc == RAD_E_IO) return 1;
+            if (rc != RAD_OK) return fail("the solver refused the per-layer costs; this is a bug");
+            if (had && (trail.empty() || (!trail.back().within && (int64_t)trail.size() < verify &&
+                                          trail.back().pick.kl > 0))) {
+                capped = "the next solution has no fewer bits than " + had->label +
+                         ", measured within the limits, and is not measured";
+                std::printf("rad-autoquant: %s\n", capped.c_str());
             }
-            std::printf("rad-autoquant: solved %lld: %.4f bits an element, predicted mean KL %.6f, "
-                        "measured %.6f%s, %s\n", (long long)v, per_element(a.bits), base + a.kl,
-                        kl, m ? (" (as " + m->name + ")").c_str() : "",
-                        kl <= max_kl ? "within the limit" : "above the limit");
-            std::fflush(stdout);
-            if (kl <= max_kl) break;
-            const double actual = kl - base;
-            double next = a.kl > 0 && actual > 0 ? room * (a.kl / actual) : 0;
-            next = std::min(next, a.kl - std::max(1e-12, 1e-9 * a.kl));
-            if (next < 0) break;
-            allowed = next;
         }
-        /* The fewest bits among the recipes measured within the limit, the least KL of those. */
-        const Measured* best = nullptr;
-        for (const Measured& m : runs) {
-            if (m.kl > max_kl) continue;
-            if (!best || bits_of(m.lay) < bits_of(best->lay) ||
-                (bits_of(m.lay) == bits_of(best->lay) && m.kl < best->kl))
-                best = &m;
+        const Meas* w = best();
+        if (!w) {
+            std::string t;
+            if (!std::isnan(lim.min_top1)) {
+                std::snprintf(line, sizeof line, " and top-1 %.4f", lim.top1(base));
+                t = line;
+            }
+            return fail("no recipe measured is within the limits: the most accurate, every layer "
+                        "%s, measures a mean KL of %.6f%s%s, above --max-kl %s%s%s",
+                        variants[b0].words.c_str(), base.kl, t.c_str(),
+                        lim.strict ? " at the 95% bounds" : "", max_kl_arg.c_str(),
+                        std::isnan(lim.min_top1) ? "" : " or under --min-top1 ",
+                        min_top1_arg.c_str());
         }
-        /* The base is among them: a limit under it was refused before anything else ran. */
-        chosen = best->lay;
-        avg = per_element(bits_of(chosen));
-        reported = best->kl;
-        why << "# recipes measured, mean KL predicted (the layers' costs summed onto the base) "
-               "and measured\n";
-        for (const Measured& m : runs) {
-            std::snprintf(line, sizeof line, "#   %-17s %7.4f bits  predicted %.6f  measured %.6f%s\n",
-                          m.name.c_str(), per_element(bits_of(m.lay)), predicted_of(m.lay), m.kl,
-                          m.kl <= max_kl ? "" : "  above the limit");
+        chosen = w->kvq;
+        avg = run.per_element(w->bits);
+        reported = w->kl;
+        /* Each solved recipe: the room it was solved within, its prediction and its run. */
+        for (size_t k = 0; k < trail.size(); ++k) {
+            const Meas& m = *find(kvq_of(trail[k].pick));
+            std::snprintf(line, sizeof line,
+                          "# solved %zu: room %.6f above the base, predicted mean KL %.6f, measured "
+                          "%s (%s)%s\n", k + 1, trail[k].allowed, base.kl + trail[k].pick.kl,
+                          run.describe(m).c_str(), m.label.c_str(),
+                          trail[k].within ? "" : ", above the limit");
             why << line;
         }
-        std::snprintf(line, sizeof line,
-                      "# chosen: %.4f bits an element, measured mean KL %.6f (%s), the fewest bits "
-                      "measured within %s\n", avg, reported, best->name.c_str(), max_kl_arg.c_str());
-        why << line;
+        if (!capped.empty()) why << "# " << capped << "\n";
+        std::snprintf(line, sizeof line, "# chosen: %s (%s), the fewest bits measured within %s%s",
+                      run.describe(*w).c_str(), w->label.c_str(), max_kl_arg.c_str(),
+                      std::isnan(lim.min_top1) ? "" : (" and top-1 " + min_top1_arg).c_str());
+        why << line << (lim.strict ? " at the 95% bounds\n" : "\n");
+        why << "# (+- the 95% half-width from the run's .rows, each document a stratum)\n";
+        chosen_desc = run.describe(*w);
     }
 
     std::ostringstream r;
-    if (by_kl)
+    if (by_kl) {
         r << "# rad-autoquant: a KV layout per attention layer, the fewest bits measured within a "
-             "mean KL of " << max_kl_arg << "\n";
-    else
+             "mean KL of " << max_kl_arg;
+        if (!std::isnan(lim.min_top1)) r << " and a top-1 agreement of " << min_top1_arg;
+        r << (strict ? " (95% bounds)\n" : "\n");
+    } else {
         r << "# rad-autoquant: a KV layout per attention layer within " << bits_arg
           << " bits an element\n";
+    }
     r << "# reference " << ref << ", " << manifest["docs"].size()
       << " documents, the shortest " << shortest << " tokens\n";
-    std::snprintf(line, sizeof line, "# every layer fp8: mean KL %.6f\n", base);
-    r << line;
-    r << "# each layer alone narrowed, the rest fp8: mean KL above that\n#   layer";
-    for (int q : layouts)
-        if (q != RAD_KVQ_NONE) { std::snprintf(line, sizeof line, " %12s", kv_layout_name(q)); r << line; }
-    r << "\n";
-    for (size_t i = 0; i < layers.size(); ++i) {
-        std::snprintf(line, sizeof line, "#   %5d", layers[i]);
-        r << line;
-        for (size_t c = 0; c < layouts.size(); ++c)
-            if (layouts[c] != RAD_KVQ_NONE) {
-                std::snprintf(line, sizeof line, " %12.3e", cand[i][c].kl);
+    for (size_t c = 0; c < C; ++c)
+        r << "# every layer " << variants[c].words << ": " << run.describe(*uni[c], false)
+          << (c == b0 ? " (the base)" : "") << "\n";
+    for (const std::string& d : dropped) r << "# no per-layer runs: " << d << "\n";
+    if (search && kept.size() > 1) {
+        r << "# each layer alone in a variant, the rest the base: mean KL above that\n#   layer";
+        for (size_t k : kept)
+            if (k != b0) {
+                std::snprintf(line, sizeof line, " %*s",
+                              (int)std::max<size_t>(12, tag(variants[k]).size()), tag(variants[k]).c_str());
                 r << line;
             }
         r << "\n";
+        for (size_t i = 0; i < L; ++i) {
+            std::snprintf(line, sizeof line, "#   %5d", layers[i]);
+            r << line;
+            for (size_t c = 0; c < kept.size(); ++c)
+                if (kept[c] != b0) {
+                    std::snprintf(line, sizeof line, " %*.3e",
+                                  (int)std::max<size_t>(12, tag(variants[kept[c]]).size()),
+                                  cand[i][c].kl);
+                    r << line;
+                }
+            r << "\n";
+        }
     }
     r << why.str();
-    for (size_t i = 0; i < layers.size(); ++i)
-        r << "layer " << layers[i] << " " << kv_layout_name(chosen[i]) << "\n";
+    r << run.text(chosen);
 
     /* What the server reads: refused here rather than at its startup. */
     std::vector<int32_t> check;
@@ -573,7 +810,8 @@ int main(int argc, char** argv) {
     }
     if (std::rename(tmp.c_str(), out.c_str()) != 0)
         return fail("cannot write %s: %s", out.c_str(), std::strerror(errno));
-    std::printf("rad-autoquant: %s: %.4f bits an element, %s mean KL %.6f\n", out.c_str(), avg,
-                by_kl ? "measured" : "predicted", reported);
+    std::printf("rad-autoquant: %s: %.4f bits an element, %s mean KL %.6f%s\n", out.c_str(), avg,
+                by_kl ? "measured" : "predicted", reported,
+                by_kl ? (" (" + chosen_desc + ")").c_str() : "");
     return 0;
 }

@@ -3,10 +3,13 @@
 #include "kv_autoquant.h"
 
 #include "rad_core.h"
+#include "rad_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <set>
 
 namespace rad {
 
@@ -110,6 +113,120 @@ int kv_autoquant_solve_kl(const std::vector<std::vector<KvCandidate>>& layers, d
             return RAD_OK;
         }
     return RAD_E_NOTFOUND;
+}
+
+std::vector<KvVariant> kv_autoquant_variants(bool vmean) {
+    std::vector<KvVariant> v;
+    std::set<int32_t> seen;
+    /* The parser's refusals are the answer here, not errors to print. */
+    const Log was = log_level();
+    log_set_level((Log)-1);
+    for (int q : kv_layouts())
+        for (bool rot : { false, true })
+            for (bool vm : { false, true }) {
+                if (vm && !vmean) continue;
+                const std::string words = std::string(kv_layout_name(q)) +
+                                          (rot ? " rotated" : "") + (vm ? " vmean" : "");
+                std::vector<int32_t> r;
+                if (kv_recipe_parse((vm ? "vmean m\n" : "") + std::string("layer 0 ") + words,
+                                    "variant", &r) != RAD_OK || r.size() != 1)
+                    continue;
+                if (seen.insert(r[0]).second) v.push_back({ r[0], kv_layout_group_bits(q), words });
+            }
+    log_set_level(was);
+    return v;
+}
+
+int kv_autoquant_fit(const std::vector<std::vector<KvCandidate>>& layers, double room, int rounds,
+                     const KvMeasure& measure, std::vector<KvRound>* trail, int64_t bits_cap) {
+    trail->clear();
+    if (rounds < 1) return RAD_E_INVAL;
+    double allowed = room;
+    for (int r = 0; r < rounds; ++r) {
+        KvRound k;
+        k.allowed = allowed;
+        if (kv_autoquant_solve_kl(layers, allowed, &k.pick) != RAD_OK) return RAD_E_INVAL;
+        if (k.pick.bits >= bits_cap) break;
+        if (const int rc = measure(k.pick, &k.checks); rc != RAD_OK) return rc;
+        /* The tightest failing check scales the room: allowed / excess < 1 there. One that is not
+         * a number, or measured nothing above the base and still failed, leaves nothing. */
+        double f = 1;
+        k.within = true;
+        for (const KvCheck& c : k.checks)
+            if (!(c.excess <= c.allowed)) {
+                k.within = false;
+                f = std::min(f, c.excess > 0 && c.allowed > 0 && std::isfinite(c.excess)
+                                    ? c.allowed / c.excess : 0.0);
+            }
+        trail->push_back(k);
+        if (k.within) break;
+        /* Under the rejected prediction, so the solver cannot answer it again. */
+        const double next = std::min(k.pick.kl * f, k.pick.kl - std::max(1e-12, 1e-9 * k.pick.kl));
+        if (next < 0) break;
+        allowed = next;
+    }
+    return RAD_OK;
+}
+
+double kv_autoquant_t975(int64_t df) {
+    static const double kSmall[] = { 12.706, 4.303, 3.182, 2.776, 2.571,
+                                     2.447,  2.365, 2.306, 2.262, 2.228 };
+    if (df < 1) return kNone;
+    if (df <= 10) return kSmall[df - 1];
+    /* Cornish-Fisher in 1/df around the normal quantile (Abramowitz & Stegun 26.7.5). */
+    const double z = 1.959963984540054, n = (double)df, z2 = z * z;
+    const double g1 = (z2 + 1) * z / 4;
+    const double g2 = ((5 * z2 + 16) * z2 + 3) * z / 96;
+    const double g3 = (((3 * z2 + 19) * z2 + 17) * z2 - 15) * z / 384;
+    const double g4 = ((((79 * z2 + 776) * z2 + 1482) * z2 - 1920) * z2 - 945) * z / 92160;
+    return z + g1 / n + g2 / (n * n) + g3 / (n * n * n) + g4 / (n * n * n * n);
+}
+
+int kv_autoquant_interval(const std::vector<double>& x, const std::vector<int64_t>& doc_rows,
+                          KvInterval* out) {
+    *out = KvInterval{};
+    std::vector<int64_t> docs = doc_rows;
+    if (docs.empty()) docs.push_back((int64_t)x.size());
+    int64_t n = 0;
+    for (int64_t d : docs) {
+        if (d < 0) return RAD_E_INVAL;
+        n += d;
+    }
+    if (n != (int64_t)x.size() || n == 0) return RAD_E_INVAL;
+    double sum = 0;
+    for (double v : x) {
+        if (!std::isfinite(v)) return RAD_E_INVAL;
+        sum += v;
+    }
+    const int64_t b = std::max<int64_t>(2, (32 + (int64_t)docs.size() - 1) / (int64_t)docs.size());
+    double var = 0;
+    int64_t df = 0, at = 0;
+    for (int64_t nd : docs) {
+        /* A document too short for b batches takes one a position; one of a single position adds
+         * its weight to the mean and nothing to what is known of the spread. */
+        const int64_t bd = std::min(b, nd);
+        if (bd >= 2) {
+            std::vector<double> m((size_t)bd, 0.0);
+            for (int64_t k = 0; k < bd; ++k) {
+                const int64_t lo = at + k * nd / bd, hi = at + (k + 1) * nd / bd;
+                for (int64_t i = lo; i < hi; ++i) m[(size_t)k] += x[(size_t)i];
+                m[(size_t)k] /= (double)(hi - lo);
+            }
+            const double mm = std::accumulate(m.begin(), m.end(), 0.0) / (double)bd;
+            double s2 = 0;
+            for (double v : m) s2 += (v - mm) * (v - mm);
+            s2 /= (double)(bd - 1);
+            const double w = (double)nd / (double)n;
+            var += w * w * s2 / (double)bd;
+            df += bd - 1;
+        }
+        at += nd;
+    }
+    if (df < 1) return RAD_E_INVAL;
+    out->mean = sum / (double)n;
+    out->half = kv_autoquant_t975(df) * std::sqrt(var);
+    out->df = df;
+    return RAD_OK;
 }
 
 }  /* namespace rad */

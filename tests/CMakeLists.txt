@@ -357,9 +357,11 @@ if(TARGET laya_decision_test)
 endif()
 
 # kv_autoquant_test runs rad-autoquant, the per-layer KV calibration driver, against a stand-in for
-# the engine that it writes itself, so it needs the tool and nothing the engine loads.
+# the engine that it writes itself, so it needs the tool and nothing the engine loads; its solver
+# cases read the per-layer costs measured on the card (tests/data/autoquant).
 if(TARGET kv_autoquant_test)
-  target_compile_definitions(kv_autoquant_test PRIVATE RAD_AUTOQUANT="$<TARGET_FILE:rad-autoquant>")
+  target_compile_definitions(kv_autoquant_test PRIVATE RAD_AUTOQUANT="$<TARGET_FILE:rad-autoquant>"
+                             RAD_AUTOQUANT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/autoquant")
   add_dependencies(kv_autoquant_test rad-autoquant)
 endif()
 

@@ -908,50 +908,109 @@ over long documents with a bf16 cache, and not over the documents the KL mode wi
 
 ```
 radiance --model M.rad <serve flags> --kv-cache-dtype bf16 --kld-record REF --kld-corpus LONG.jsonl
+rad-autoquant --kld-ref REF --layers 3,7,...,47 --max-kl 0.035 [--vmean M.kvmean] -o M.kvrecipe -- --model M.rad <serve flags>
 rad-autoquant --kld-ref REF --layers 3,7,...,63 --bits 6 -o M.kvrecipe -- --model M.rad <serve flags>
-rad-autoquant --kld-ref REF --layers 3,7,...,47 --max-kl 0.035 -o M.kvrecipe -- --model M.rad <serve flags>
 
   --kld-ref DIR       the reference: this model with a bf16 cache, over long documents
   --layers N,N,...    the model's attention layers, numbered as the checkpoint numbers them
-  --bits B            the average bits a cached K or V element may cost, scales included
-  --max-kl K          instead of --bits: the mean KL against the reference a recipe may measure
+  --max-kl K          the mean KL against the reference a recipe may measure: the fewest bits
+                      measured within it
+  --bits B            instead of --max-kl: the average bits a cached K or V element may cost,
+                      scales included: the least KL predicted within them
   -o FILE             the recipe (GUIDE.md §4.4, --kv-recipe)
+  --min-top1 P        with --max-kl, the top-1 agreement (0 to 1) the recipe must keep as well
+  --strict            with --max-kl, check both limits at the 95 % bound on the bad side (KL's
+                      upper, top-1's lower) from each run's .rows, not at the means
   --verify N          with --max-kl, the solved recipes measured at most (default 6)
+  --vmean FILE        a V mean file (radiance --calib-dir, kv_vmean.txt): the variants that
+                      subtract it join the candidates
+  --layouts L,L,...   only these layouts' variants (default every layout a recipe names)
+  --variants V,V,...  only these variants, a variant's words joined by '+' (k6_v4+vmean,
+                      fp8_v4+rotated+vmean)
+  --keep-dominated    per-layer runs for the variants screening would drop as well
   --reuse             take a run's KL from the work dir when its recipe and command line match
-  --layouts L,L,...   the layouts to choose from; default every one a recipe names, and fp8,
-                      the base, is always among them
-  --work DIR          each run's recipe, KL report and log (default FILE.work)
+  --work DIR          each run's recipe, KL report, .rows and log (default FILE.work)
   --min-context N     refuse a reference with a document shorter than N tokens (default 32768);
                       0 measures any
   --radiance PATH     the engine (default: radiance beside the tool)
 ```
 
-Chooses each trunk attention layer's KV layout for a `--kv-recipe` (GUIDE.md §4.4). It runs the
-KL mode (`--kld-ref`) once with every listed layer `fp8`, the base, and once for every layer and
-every narrower layout with that layer alone narrowed, so a model of L attention layers and C
-layouts costs 1 + L (C - 1) prefills of the corpus (33 for Qwen3.8-27B's 16 layers). A layer's
-cost in a layout is its run's mean KL above the base's; a run that lands under the base is noise
-and costs nothing. Taking the costs as adding up across layers, it then picks the assignment of
-least summed cost whose bits fit the budget, exactly (a knapsack solved over the bits spent,
-`core/kv_autoquant.h`), and writes the recipe with the measurements and the predicted mean KL in
-its comments. Where a narrower layout measures no cost the wider one is kept. Every layout a
-recipe names that is no wider than `fp8` is a candidate, so a narrower layout added to the recipe
-set is calibrated with no change to the tool. `i8h` (8.06 bits) is wider than the base, whose KL
-every cost is measured above and clamped at, so it would only ever read as free: it is left out of
-the default set, and `--layouts i8h` is refused.
+Chooses each trunk attention layer's KV layout for a `--kv-recipe` (GUIDE.md §4.4) from the
+engine's KL mode (`--kld-ref`). The reference must be the same model, flags and corpus with a bf16
+cache, so that a run's KL is what its cache costs and nothing of the weights' quantisation. The
+flags after `--` go to every run unchanged; the cache and KL flags are the tool's
+(`--kv-cache-dtype`, `--kv-recipe`, `--kld-*` there are refused). Each run's recipe, `--kld-out`
+report with its `.rows`, and log stay in the work directory, and a failed run stops the tool with
+its log's last lines and no recipe written. Bits count a group of 32 K and 32 V elements with
+their scales: `i8h` 8.06 an element, `fp8` 8, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h`
+3.5; rotation and the V mean cost none.
 
-The budget counts the bits of a group of 32 K and 32 V elements with their scales: `fp8` 8 an
-element, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h` 3.5. `--bits 8` keeps every layer
-`fp8`, `--bits 3.5` narrows every one to `k4h_v2h`, and in between the bits go to the layers whose
-KL moves most. `k4h_v4` and `k4h_v2h` are written `layer N k4h_v4` and load rotated (GUIDE.md
-§4.4). Only `qwen4exp_fp8` serves them, so on another model the default candidates stop at the
-first `k4h_v4` run, refused at startup: pass `--layouts fp8_v4,k6_v4` there.
+**Candidates.** Every layout of the recipe table (`kKvLayouts`, core/config.cpp) as the recipe
+parser reads it plain, `rotated` and, with `--vmean`, `vmean` and `rotated vmean`
+(`kv_autoquant_variants`, core/kv_autoquant.h). A combination the parser refuses (`fp8 vmean`: E4M3
+V has no group scale) is no variant, and one it reads as another (`k4h_v4 rotated` is `k4h_v4`) is
+listed once, so a layout or recipe word added to the table and the parser is a candidate with no
+change to the tool. Today that is 9 variants, 16 with `--vmean`: `i8h`, `fp8`, `fp8 rotated`,
+`fp8_v4` and `k6_v4` plain and rotated, `k4h_v4`, `k4h_v2h`, and with `--vmean` the `vmean` form of
+every one but the two `fp8`s. `--layouts` keeps only some layouts' variants, `--variants` only the
+named variants; given both, what both allow. `k4h_v4`, `k4h_v2h`, `i8h` and the V mean are served
+only by `qwen4exp_fp8`, so on another model the first run of one stops the calibration, refused at
+startup: pass `--layouts fp8,fp8_v4,k6_v4` there.
 
-The reference must be the same model, flags and corpus with a bf16 cache, so that a run's KL is
-what its cache costs and nothing of the weights' quantisation. The flags after `--` go to every
-run unchanged; the cache and KL flags are the tool's (`--kv-cache-dtype`, `--kv-recipe`,
-`--kld-*` there are refused). Each run's recipe, `--kld-out` report and log stay in the work
-directory, and a failed run stops the tool with its log's last lines and no recipe written.
+**What it runs.**
+
+1. *Every variant uniform*, every listed layer in it: C runs for C variants. The *base* is the one
+   of least mean KL (of equal ones the fewer bits): today `i8h`, or `i8h vmean` where that measures
+   lower. A layer's cost is measured above the base, so a KL limit under `fp8`'s is reachable when
+   the base meets it, and the clamp at zero below only takes up noise.
+2. *Screening.* A variant that another of no more bits beats on its uniform run gets no per-layer
+   runs; at equal bits the lower KL stays, an exact tie keeps the earlier. A heuristic, as one layer
+   can differ from the model's average: `--keep-dominated` measures them all. A dropped variant's
+   uniform recipe still competes for the answer.
+3. *Per-layer costs*: each layer alone in each kept variant, the rest at the base, L (K - 1) runs
+   for L layers and K kept variants (the base among them). A layer's cost in a variant is its run's
+   mean KL above the base's; a run under it costs nothing.
+4. `--max-kl`: *solve, measure, tighten* (`kv_autoquant_fit`). The assignment of fewest bits whose
+   summed costs fit the limit above the base (`kv_autoquant_solve_kl`, the bit-budget knapsack's
+   table read the other way) is measured. The costs do not add up exactly when layouts are mixed
+   (Flash-Next's 5.5-bit v1 recipe: 0.0349 predicted, 0.0363 measured), so where it measures over,
+   the room the solver may predict becomes that prediction times allowed / measured excess (the
+   tightest of the KL and top-1 checks), kept under the prediction, and it is solved again; at most
+   `--verify` times. A solution with no fewer bits than a recipe already measured within the limits
+   is not run, and one already measured (a uniform or single-layer recipe) is not run again.
+   `--bits`: the assignment of least summed cost within the budget (`kv_autoquant_solve`), written
+   with its predicted KL, unmeasured. `--bits 3.5` narrows every layer to `k4h_v2h`; at a budget
+   with bits to spare a tie keeps the wider variant.
+
+So a search costs **C + L (K - 1) runs, plus at most `--verify` with `--max-kl`**: C variants, K of
+them kept by screening (K = C with `--keep-dominated`), L layers. The counts are printed as it
+goes: the bound L (C - 1) before anything runs, the exact per-layer count after screening.
+
+**The answer** under `--max-kl` is the fewest bits of every recipe measured within the limits
+(uniform, single-layer or solved), the lowest KL of equal ones, so it is never worse than the best
+uniform variant. The recipe carries, as comments, every uniform run, the variants screening
+dropped, the per-layer costs, each solved round with its room, prediction and measurement, and the
+chosen run. Where nothing measured is within the limits (the base itself is over), the tool says
+so with the base's numbers and writes nothing.
+
+**Noise.** Each run's mean KL and top-1 agreement are given with a 95 % interval from its `.rows`
+(`kv_autoquant_interval`): batch means with each document as a stratum (its scored positions,
+`tokens - 1 - score_from`, from the reference's `kld.json`, cut into max(2, ceil(32 / documents))
+contiguous stretches), Student's t at the pooled degrees of freedom. A limit is stated on this
+corpus, so which documents it holds is fixed and only where in them the positions fall is sampled;
+on Flash-Next's four documents the half-width is about 0.0025 at `fp8` and 0.0034 at `k6_v4`, as
+large as the steps between layouts. `--strict` checks mean + half-width against `--max-kl` and
+top-1 − half-width against `--min-top1`, and refuses runs without `.rows`; without it the means are
+checked and the intervals only reported. Leave the margin, or record a larger corpus.
+
+**Re-solving.** With `--reuse`, a run whose recipe, command line (`NAME.args`, written once the
+run has succeeded, with the V mean file's content hash where the recipe reads it) and report in
+the work directory are this run's is read back instead of run again. Runs are named
+`uniform_VARIANT`, `layerN_VARIANT` (the variant's words joined by `+`) and `verify_HASH` (of the
+solved recipe's text), so a second search at another `--max-kl` or `--min-top1` reruns only the
+solved recipes it has not measured; a change to the engine's flags, the reference, the engine's
+path or the V means runs everything again. The engine binary's content is not compared: after
+rebuilding it, drop `--reuse` or the work directory.
 
 **Long documents.** A narrowed layer's error is paid where attention reaches far back, which a
 short document never asks for: a few hundred tokens of context would rank every layer harmless.
@@ -960,38 +1019,29 @@ default), naming it. A smaller bound is the explicit override; record the refere
 `--max-model-len` covering the longest document, and score only the tail (`score_from`) to keep
 the reference small without shortening the context the scored positions see.
 
-The costs are measured one layer at a time and summed, so the recipe's real KL can differ from
-the prediction where layers' errors interact; score the written recipe with `--kld-ref` and
-`--kv-recipe` before deploying it.
+On Flash-Next (12 attention layers, `--vmean`): 16 uniform runs; if screening keeps the base and
+one variant of each narrower layout that the uniform runs order by bits (about K = 5), 48
+per-layer runs; and up to 6 solved recipes: 64 to 70 runs. With `--keep-dominated`,
+16 + 12 x 15 = 196 plus the solved ones.
 
-**A KL limit instead of a budget.** `--max-kl K` asks the converse: the fewest bits whose mean KL
-stays within `K`, the absolute mean KL the KL mode reports against the bf16 reference (every layer
-`fp8` is the widest a recipe can be, so a `K` under its run is refused). The same knapsack answers
-it (`kv_autoquant_solve_kl`): the fewest bits whose summed costs fit `K` minus the base, and of
-those the least KL. Because the costs do not add up exactly when layouts are mixed, this mode
-measures what it writes:
+**Not yet in the search.** Three choices on the project's list would join it as follows; none is
+built.
 
-1. the base and the per-layer runs, as with `--bits`;
-2. every layout uniform across the layers, one run each;
-3. the solver's answer, measured. Within `K`, the search stops. Above it, the room the solver may
-   predict is scaled by how far that prediction fell short of the measurement, and kept under it,
-   and the solver is asked again; at most `--verify` times (default 6);
-4. the recipe written is the fewest bits among every recipe measured within `K` (base, uniform or
-   solved), the least measured KL of equal ones. The base always qualifies, so a recipe is
-   always written.
-
-The recipe's comments list every measured recipe with its predicted and measured mean KL. So
-`--max-kl` costs `1 + L (C - 1) + (C - 1)` runs plus at most `--verify`, on Flash-Next's 12 layers
-and 5 layouts 53 to 59. The limit is compared with a measurement over the reference's corpus,
-whose noise (about ±0.002 on four 30K-token documents) is as large as the steps between layouts:
-leave that much margin, or record a larger corpus.
-
-**Re-solving.** With `--reuse`, a run whose recipe, command line (`NAME.args`, written once the run
-has succeeded) and report in the work directory are this run's is read back instead of run again.
-A second search over the same work directory at another `--max-kl` or `--bits` runs only the
-recipes it has not measured yet; a change to the engine's flags, the reference or the engine's
-path runs everything again. The engine binary's content is not compared: after rebuilding it,
-drop `--reuse` or the work directory.
+- *A global knob*, one setting for the whole model rather than per layer: the QSA block-key dtype
+  (`--qsa-bkey-dtype`, RadianceMemory #12) or `--state-cache-dtype`. It joins after the per-layer
+  search as one more uniform-style run per non-default value: the chosen recipe measured with the
+  knob's flag added to the engine flags, kept where it stays within the limits for fewer bytes. The
+  answer's size is then counted in bytes a token (the knob's own storage beside the KV bits), and
+  the tool takes the flag out of the engine flags it accepts, as it does `--kv-cache-dtype` now.
+  The count grows by the sum over knobs of their values less one.
+- *A demoted layout* for the host middle under window residency (tiered precision: the tokens a
+  resident window does not hold kept narrower in pinned host memory): a second per-layer axis. A
+  layer's candidate becomes a pair, its resident variant and its demoted one; the demoted one is
+  measured as the per-layer runs are (that layer's middle demoted, everything else at the base,
+  L (D - 1) more runs for D demote layouts) and priced in host bytes, not card bits. The solver
+  then minimises card bits under the KL limit with host bytes as a second budget (or priced into
+  the one sum at the deployment's exchange rate), which the dynamic programme carries as a second
+  table dimension.
 
 ---
 

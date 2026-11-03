@@ -1,0 +1,65 @@
+# rad-autoquant v1 (--bits 6) on Qwen3.8-Flash-Next fp8-iq4r-moe, --tp 2, two R9700s, against a
+# bf16-cache KL reference over 4 documents of ~34K tokens (16380 scored positions).
+# Each line: a run's mean KL, every attention layer fp8 ('base') or one layer alone in a layout.
+# The last layer's k4h_v2h run was repeated after the calibration (it stopped there).
+# Uniform and solved recipes measured afterwards, as 'recipe NAME BITS MEAN_KL' (solve.py's
+# recipes at 7, 6, 5.5, 5 and 4 bits, the per-layer costs summed, predicted vs measured).
+base 0.026249
+3 fp8_v4 0.027644
+3 k6_v4 0.027159
+3 k4h_v4 0.028562
+3 k4h_v2h 0.034986
+7 fp8_v4 0.028557
+7 k6_v4 0.027324
+7 k4h_v4 0.028852
+7 k4h_v2h 0.043014
+11 fp8_v4 0.027115
+11 k6_v4 0.027155
+11 k4h_v4 0.028406
+11 k4h_v2h 0.042633
+15 fp8_v4 0.027581
+15 k6_v4 0.028161
+15 k4h_v4 0.028278
+15 k4h_v2h 0.054500
+19 fp8_v4 0.027142
+19 k6_v4 0.027541
+19 k4h_v4 0.028455
+19 k4h_v2h 0.041765
+23 fp8_v4 0.026932
+23 k6_v4 0.027333
+23 k4h_v4 0.027248
+23 k4h_v2h 0.036158
+27 fp8_v4 0.027813
+27 k6_v4 0.027649
+27 k4h_v4 0.028665
+27 k4h_v2h 0.048581
+31 fp8_v4 0.027137
+31 k6_v4 0.027096
+31 k4h_v4 0.028704
+31 k4h_v2h 0.051368
+35 fp8_v4 0.026816
+35 k6_v4 0.026774
+35 k4h_v4 0.027360
+35 k4h_v2h 0.033608
+39 fp8_v4 0.026425
+39 k6_v4 0.026294
+39 k4h_v4 0.026769
+39 k4h_v2h 0.029486
+43 fp8_v4 0.026376
+43 k6_v4 0.026377
+43 k4h_v4 0.026901
+43 k4h_v2h 0.033592
+47 fp8_v4 0.026406
+47 k6_v4 0.026370
+47 k4h_v4 0.026616
+47 k4h_v2h 0.031259
+recipe fp8 8 0.0262
+recipe fp8_v4 6.25 0.0368
+recipe k6_v4 5.5 0.0344
+recipe k4h_v4 4.5 0.0437
+recipe k4h_v2h 3.5 0.1372
+recipe aq-b7 7 0.0280
+recipe aq-b6 6 0.0323
+recipe aq-b5.5 5.5 0.0363
+recipe aq-b5 5 0.0384
+recipe aq-b4 4 0.0779
