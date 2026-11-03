@@ -14,7 +14,7 @@ live in `scripts/`:
 | [`rad-tune`](#rad-tune) | benchmark each kernel's tunable space at this model's shapes, on this machine |
 | [`rad-schemas`](#rad-schemas) | print and diff the op schemas plugins declare |
 | [`rad-tokcheck`](#rad-tokcheck) | compare the tokeniser with its reference encoder and with HuggingFace's ids over real text, and time it |
-| [`rad-autoquant`](#rad-autoquant) | a `--kv-recipe` from measurement: each attention layer's KV layout, least KL under an average bit budget |
+| [`rad-autoquant`](#rad-autoquant) | a `--kv-recipe` from measurement: each attention layer's KV layout, least KL under an average bit budget or fewest bits within a KL limit |
 | [`radiance --kld-*`](#the-kl-mode) | KL divergence of a quantised model against the bf16 one, at every position of a corpus |
 | [`scripts/`](#the-shell-harnesses) | bring a model up, measure it, assert on what comes back |
 
@@ -909,11 +909,15 @@ over long documents with a bf16 cache, and not over the documents the KL mode wi
 ```
 radiance --model M.rad <serve flags> --kv-cache-dtype bf16 --kld-record REF --kld-corpus LONG.jsonl
 rad-autoquant --kld-ref REF --layers 3,7,...,63 --bits 6 -o M.kvrecipe -- --model M.rad <serve flags>
+rad-autoquant --kld-ref REF --layers 3,7,...,47 --max-kl 0.035 -o M.kvrecipe -- --model M.rad <serve flags>
 
   --kld-ref DIR       the reference: this model with a bf16 cache, over long documents
   --layers N,N,...    the model's attention layers, numbered as the checkpoint numbers them
   --bits B            the average bits a cached K or V element may cost, scales included
+  --max-kl K          instead of --bits: the mean KL against the reference a recipe may measure
   -o FILE             the recipe (GUIDE.md §4.4, --kv-recipe)
+  --verify N          with --max-kl, the solved recipes measured at most (default 6)
+  --reuse             take a run's KL from the work dir when its recipe and command line match
   --layouts L,L,...   the layouts to choose from; default every one a recipe names, and fp8,
                       the base, is always among them
   --work DIR          each run's recipe, KL report and log (default FILE.work)
@@ -957,6 +961,35 @@ the reference small without shortening the context the scored positions see.
 The costs are measured one layer at a time and summed, so the recipe's real KL can differ from
 the prediction where layers' errors interact; score the written recipe with `--kld-ref` and
 `--kv-recipe` before deploying it.
+
+**A KL limit instead of a budget.** `--max-kl K` asks the converse: the fewest bits whose mean KL
+stays within `K`, the absolute mean KL the KL mode reports against the bf16 reference (every layer
+`fp8` is the widest a recipe can be, so a `K` under its run is refused). The same knapsack answers
+it (`kv_autoquant_solve_kl`): the fewest bits whose summed costs fit `K` minus the base, and of
+those the least KL. Because the costs do not add up exactly when layouts are mixed, this mode
+measures what it writes:
+
+1. the base and the per-layer runs, as with `--bits`;
+2. every layout uniform across the layers, one run each;
+3. the solver's answer, measured. Within `K`, the search stops. Above it, the room the solver may
+   predict is scaled by how far that prediction fell short of the measurement, and kept under it,
+   and the solver is asked again; at most `--verify` times (default 6);
+4. the recipe written is the fewest bits among every recipe measured within `K` (base, uniform or
+   solved), the least measured KL of equal ones. The base always qualifies, so a recipe is
+   always written.
+
+The recipe's comments list every measured recipe with its predicted and measured mean KL. So
+`--max-kl` costs `1 + L (C - 1) + (C - 1)` runs plus at most `--verify`, on Flash-Next's 12 layers
+and 5 layouts 53 to 59. The limit is compared with a measurement over the reference's corpus,
+whose noise (about ±0.002 on four 30K-token documents) is as large as the steps between layouts:
+leave that much margin, or record a larger corpus.
+
+**Re-solving.** With `--reuse`, a run whose recipe, command line (`NAME.args`, written once the run
+has succeeded) and report in the work directory are this run's is read back instead of run again.
+A second search over the same work directory at another `--max-kl` or `--bits` runs only the
+recipes it has not measured yet; a change to the engine's flags, the reference or the engine's
+path runs everything again. The engine binary's content is not compared: after rebuilding it,
+drop `--reuse` or the work directory.
 
 ---
 
