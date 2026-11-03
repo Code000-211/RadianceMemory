@@ -1912,7 +1912,9 @@ static void attn_decode_scratch_band_case(const Plugin& pl) {
         const char* kvs = std::strrchr(r->name, '_') + 1;
         const bool bf = !std::strcmp(kvs, "bf16kv");
         const int64_t rowe = !std::strcmp(kvs, "fp8v4") ? 25 * hd / 16
-                           : !std::strcmp(kvs, "k6v4") ? 22 * hd / 16 : 2 * hd;
+                           : !std::strcmp(kvs, "k6v4") ? 22 * hd / 16
+                           : !std::strcmp(kvs, "k4hv4") ? 18 * hd / 16
+                           : !std::strcmp(kvs, "k4hv2h") ? 14 * hd / 16 : 2 * hd;
         const int64_t bs = std::strstr(r->name, "_bs4_") ? 4 : 16;
         const int64_t max_seqs = 32, max_ctx = 200000, mb = (max_ctx + bs - 1) / bs;
         const int top = std::max(1, 64 / gqa);
@@ -24501,7 +24503,8 @@ static void sam_attn_case(const Plugin& pl) {
  * cold. The selection and the pool are both compared whole, not just the rewritten positions.
  */
 static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t slot_pitch,
-                         int64_t pool_pitch, int64_t store_skew, bool kv_shaped = false) {
+                         int64_t pool_pitch, int64_t store_skew, bool kv_shaped = false,
+                         int64_t kv_rowb = 0) {
     const RadKernelInfo* r = find(pl, "qsa_page_u8");
     if (!r || !g_plugin) { ok(what, false, "row or plugin path absent"); return; }
     std::string path(g_plugin);
@@ -24545,6 +24548,11 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
          * plane -- here bf16 [blocks, 1 head, 2 tokens, bb / 4] with the same byte pitch. */
         RadTensor tp = kv_shaped ? T(dp, RAD_BF16, { blocks, 1, 2, bb / 4 }) : T(dp, RAD_U8, { blocks, bb });
         tp.stride[0] = kv_shaped ? pool_pitch / 2 : pool_pitch;
+        /* A packed layout's pool: [blocks, heads, 4-token page, row] of E4M3-typed bytes. */
+        if (kv_rowb > 0) {
+            tp = T(dp, RAD_F8E4M3, { blocks, bb / (4 * kv_rowb), 4, kv_rowb });
+            tp.stride[0] = pool_pitch;
+        }
         ts = { T(ds, RAD_I32, { M, w }), tst, tp, T(dc, RAD_I32, { M, w }) };
     };
     /* The optional counter operand, seeded non-zero: the op adds, it does not store. */
@@ -24611,6 +24619,467 @@ static void qsa_page_case(const Plugin& pl) {
                  37, 51, 45, 1);
     qsa_page_one(pl, "qsa_page vs libref byte for byte, the pool in its KV shape (bf16, rank 4)",
                  96, 128, 112, 0, /*kv_shaped=*/true);
+    /* Flash-Next's fragments at every recipe layout's width (4-token pages, a token's row 512, 400,
+     * 352, 288, 224 bytes), as a mixed recipe's store holds them: a slot is the widest group's block
+     * over both ranks (2 x 4 x 512), and rank 1's view starts at its offset, so its narrower
+     * fragment sits mid-slot. One KV head a rank (--tp 2), and two (one rank). */
+    static const struct { const char* name; int64_t rowb; } lay[] = {
+        { "fp8", 512 }, { "fp8_v4", 400 }, { "k6_v4", 352 }, { "k4h_v4", 288 }, { "k4h_v2h", 224 } };
+    for (const auto& l : lay) {
+        const int64_t b1 = 4 * l.rowb, b2 = 8 * l.rowb;
+        qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, %s fragment, rank 1 of 2 in a mixed slot",
+                             l.name).c_str(), b1, 2 * 2048, b1 + 16, 2048, false, l.rowb);
+        qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, %s fragment, two heads on one rank",
+                             l.name).c_str(), b2, 2 * 4096, b2, 0, false, l.rowb);
+    }
+}
+
+/* ------------------------------------------------------------------ rotated KV layers on the card
+ *
+ * had_rotate and the k4h_v4 / k4h_v2h store and attention rows, against libref (the oracle,
+ * docs/OPS.md) on host copies of the same operands. The cases are tests/r4d_emu's (test_had.cpp,
+ * test_k4h.cpp), which hold the same kernels to the same reference in the emulator; here the
+ * compiled gfx kernel runs. */
+
+/* libref's row `name`, from the libref.so beside the plugin under test, or null. */
+static RadLaunchFn libref_row(const char* name, bool by_op = false) {
+    static void* h = nullptr;
+    if (!h) {
+        if (!g_plugin) return nullptr;
+        std::string path(g_plugin);
+        path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+        h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) return nullptr;
+        auto open = (int (*)(void))dlsym(h, "rad_plugin_open");   /* as the loader does */
+        if (open && open() < 0) { h = nullptr; return nullptr; }
+    }
+    auto cnt = (int (*)(void))dlsym(h, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+    if (!cnt || !at) return nullptr;
+    for (int i = 0; i < cnt(); ++i) {
+        const RadKernelInfo* k = at(i);
+        const char* key = k ? (by_op ? k->op : k->name) : nullptr;
+        if (key && !std::strcmp(key, name)) return k->launch;
+    }
+    return nullptr;
+}
+
+/* had_rotate in place over [rows, width] at `pitch` elements: the card's bytes equal libref's
+ * everywhere, the gaps between rows included, and most of the rows moved. */
+static void had_rotate_case(const Plugin& pl, const char* row, int64_t g) {
+    if (!sel(row)) return;
+    const RadKernelInfo* r = find(pl, row);
+    const RadLaunchFn ref = libref_row("had_rotate", true);
+    if (!r || !ref) { ok(row, false, "row or libref's had_rotate absent"); return; }
+    struct C { const char* name; int64_t rows, width, pitch, n; float lo, hi; bool outlier; };
+    const C cases[] = {
+        { "q, six heads a token",                    3, 6 * g, 6 * g, g,     1e-2f, 4.0f, false },
+        { "k, a step's rows of a wider buffer",      5, 4 * g, 7 * g, g,     1e-2f, 4.0f, false },
+        { "a row of two groups, each rotated alone", 2, 2 * g, 2 * g, 2 * g, 1e-2f, 4.0f, false },
+        { "one block",                               1, g,     g,     g,     1e-2f, 4.0f, false },
+        { "300 blocks from 1e-3 to 1e3, an outlier", 50, 6 * g, 6 * g, g,    1e-3f, 1e3f, true },
+        { "an outlier, pitched",                     33, 2 * g, 3 * g, g,    1e-3f, 1e3f, true },
+    };
+    std::mt19937 rng(20261103);
+    for (const C& c : cases) {
+        const int64_t total = c.rows * c.pitch;
+        const uint16_t gap = 0x7fa5;
+        std::vector<uint16_t> in((size_t)total, gap);
+        std::uniform_real_distribution<float> e(std::log(c.lo), std::log(c.hi));
+        for (int64_t i = 0; i < c.rows; ++i)
+            for (int64_t j = 0; j < c.width; ++j) {
+                float v = std::exp(e(rng)) * ((rng() & 1) ? -1.0f : 1.0f);
+                if (c.outlier && j % g == 17) v *= 100.0f;
+                in[(size_t)(i * c.pitch + j)] = rad_f32_to_bf16(v);
+            }
+        auto view = [&](void* p) {
+            RadTensor t = T(p, RAD_BF16, { c.rows, c.width });
+            t.stride[0] = c.pitch;
+            return t;
+        };
+        std::vector<RadParam> ps = { PI("M", c.rows * c.width / c.n), PI("n", c.n), PI("group", g),
+                                     PS("dtype", "bf16") };
+        std::vector<uint16_t> want = in;
+        RadTensor ht = view(want.data());
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = &ht; a.n_t = 1; a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rr = ref(&a, nullptr);
+        void* d = dalloc((size_t)total * 2);
+        st_memcpy(d, in.data(), (size_t)total * 2, hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = { view(d) };
+        run_case(r, ts, ps);
+        std::vector<uint16_t> got((size_t)total);
+        st_memcpy(got.data(), d, (size_t)total * 2, hipMemcpyDeviceToHost);
+        int64_t diff = 0, moved = 0;
+        for (int64_t i = 0; i < total; ++i) {
+            diff += got[(size_t)i] != want[(size_t)i];
+            moved += got[(size_t)i] != in[(size_t)i];
+        }
+        ok(fmt("%s vs libref byte for byte, %s", row, c.name).c_str(),
+           rr == RAD_OK && diff == 0 && moved >= c.rows * c.width / 2,
+           fmt("libref rc=%d, %lld elements differ, %lld moved", rr, (long long)diff, (long long)moved));
+        dfree_all();
+    }
+}
+
+
+/* A k4h layout: its kv_dtype, a token's row at head_dim 256, where the scales start, V in two bits. */
+struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2; };
+static const K4hLayout kK4hv4L  = { "k4h_v4",  "k4hv4",  18 * 256 / 16, 256,         false };
+static const K4hLayout kK4hv2hL = { "k4h_v2h", "k4hv2h", 14 * 256 / 16, 3 * 256 / 4, true };
+
+/* One kv_store launch (host or device pointers alike), k and v [T, kvh * 256] at pitch `ld`. */
+static int k4h_store(RadLaunchFn fn, const K4hLayout& L, const void* k, const void* v, int64_t T_,
+                     int64_t kvh, int64_t ld, const void* slots, void* cache, int64_t nb,
+                     double ks, double vs) {
+    RadTensor t[4];
+    t[0] = T((void*)k, RAD_BF16, { T_, kvh * 256 });
+    t[0].stride[0] = ld;
+    t[1] = T((void*)v, RAD_BF16, { T_, kvh * 256 });
+    t[1].stride[0] = ld;
+    t[2] = T((void*)slots, RAD_I32, { T_ });
+    t[3] = T(cache, RAD_F8E4M3, { nb, kvh, 4, L.row });
+    std::vector<RadParam> ps = { PI("M", T_), PI("head_dim", 256), PI("n_head_kv", kvh),
+                                 PI("block_size", 4), PS("kv_dtype", L.kv_dtype),
+                                 PF("k_scale", ks), PF("v_scale", vs) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = t; a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    const int rc = fn(&a, nullptr);
+    st_stream_sync(nullptr);
+    return rc;
+}
+
+/* kv_store at a k4h layout: the card's cache bytes equal libref's over the whole cache (written
+ * rows, scales, and every byte a slot of -1 or the rest of a page must leave alone), for spread
+ * values with an outlier channel and the quantiser's edges (test_k4h.cpp's store_case). */
+static void k4h_store_case(const Plugin& pl, const K4hLayout& L) {
+    const std::string row = std::string("kv_store_") + L.tag;
+    if (!sel(row.c_str())) return;
+    const RadKernelInfo* r = find(pl, row.c_str());
+    const RadLaunchFn ref = libref_row("ref_kv_store");
+    if (!r || !ref) { ok(row.c_str(), false, "row or libref's kv_store absent"); return; }
+    struct C { const char* name; int64_t T_, kvh, extra; double ks, vs; bool edges; };
+    const C cases[] = {
+        { "Flash-Next's two kv heads, a prefill chunk", 37, 2, 0, 1.0, 1.0, false },
+        { "slices of the fused qkv row, edges", 9, 2, 3 * 256 + 64, 1.0, 1.0, true },
+        { "one kv head (four ranks), a decode token", 1, 1, 0, 1.0, 1.0, false },
+        { "a descale on each side, edges", 6, 2, 0, 0.75, 1.5, true },
+        { "a long prefill chunk", 1024, 1, 0, 1.0, 1.0, false },
+    };
+    std::mt19937 rng(20261104);
+    for (const C& c : cases) {
+        const int64_t ld = c.kvh * 256 + c.extra, nb = (c.T_ + 3) / 4 + 3;
+        std::vector<uint16_t> k((size_t)(c.T_ * ld), 0x7fa5), v((size_t)(c.T_ * ld), 0x7fa5);
+        std::uniform_real_distribution<float> mag(std::log(1e-3f), std::log(1e3f));
+        std::normal_distribution<float> nrm(0.f, 1.f);
+        for (int64_t t = 0; t < c.T_; ++t)
+            for (int64_t g = 0; g < c.kvh * 256 / 32; ++g) {
+                const float m = std::exp(mag(rng));
+                for (int i = 0; i < 32; ++i) {
+                    float kx = nrm(rng) * m;
+                    const float vx = nrm(rng) * m;
+                    if (i == 17) kx *= 30.0f;
+                    k[(size_t)(t * ld + g * 32 + i)] = rad_f32_to_bf16(kx);
+                    v[(size_t)(t * ld + g * 32 + i)] = rad_f32_to_bf16(vx);
+                }
+            }
+        if (c.edges) {
+            uint16_t* r0 = k.data();
+            for (int i = 0; i < 32; ++i) r0[i] = 0;
+            const float tie[8] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f, 0.875f };
+            for (int i = 0; i < 32; ++i) r0[32 + i] = rad_f32_to_bf16(i < 8 ? tie[i] : 0.0f);
+            for (int i = 0; i < 32; ++i) r0[64 + i] = rad_f32_to_bf16((i & 1 ? -1.f : 1.f) * 1e5f * (1 + i));
+            r0[96 + 3] = 0x7f80;
+            r0[128 + 5] = 0x7fc0;
+            uint16_t* v1 = v.data() + ld;
+            for (int i = 0; i < 32; ++i) v1[160 + i] = 0xffc0;
+            if (L.v2) {
+                for (int i = 0; i < 160; ++i) v[(size_t)i] = k[(size_t)i];
+                for (int i = 0; i < 32; ++i) v[(size_t)(160 + i)] = rad_f32_to_bf16(i & 1 ? -2.0f : 2.0f);
+            }
+        }
+        std::vector<int32_t> all((size_t)(nb * 4)), slot((size_t)c.T_);
+        for (size_t i = 0; i < all.size(); ++i) all[i] = (int32_t)i;
+        std::shuffle(all.begin(), all.end(), rng);
+        for (int64_t t = 0; t < c.T_; ++t) slot[(size_t)t] = all[(size_t)t];
+        if (c.T_ > 2) slot[1] = -1;
+        const size_t bytes = (size_t)(nb * c.kvh * 4 * L.row);
+        std::vector<uint8_t> want(bytes, 0xa5), got(bytes);
+        const int rr = k4h_store(ref, L, k.data(), v.data(), c.T_, c.kvh, ld, slot.data(), want.data(),
+                                 nb, c.ks, c.vs);
+        void* dk = dalloc(k.size() * 2);
+        void* dv = dalloc(v.size() * 2);
+        void* ds = dalloc(slot.size() * 4);
+        void* dc = dalloc(bytes);
+        st_memcpy(dk, k.data(), k.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dv, v.data(), v.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(ds, slot.data(), slot.size() * 4, hipMemcpyHostToDevice);
+        st_memset(dc, 0xa5, bytes);
+        const int re = k4h_store(r->launch, L, dk, dv, c.T_, c.kvh, ld, ds, dc, nb, c.ks, c.vs);
+        st_memcpy(got.data(), dc, bytes, hipMemcpyDeviceToHost);
+        int64_t diff = 0, first = -1, moved = 0;
+        for (size_t i = 0; i < bytes; ++i) {
+            if (got[i] != want[i]) { ++diff; if (first < 0) first = (int64_t)i; }
+            moved += want[i] != 0xa5;
+        }
+        const int64_t stored = (c.T_ - (c.T_ > 2 ? 1 : 0)) * c.kvh * L.row;
+        ok(fmt("%s vs libref byte for byte, %s", row.c_str(), c.name).c_str(),
+           rr == RAD_OK && re == RAD_OK && diff == 0 && moved >= stored / 2,
+           fmt("libref rc=%d card rc=%d, %lld bytes differ (first %lld), %lld written", rr, re,
+               (long long)diff, (long long)first, (long long)moved));
+        dfree_all();
+    }
+}
+
+/* One attention case at a k4h layout (test_k4h.cpp's attn_case on the card): a cache stored by
+ * libref's kv_store, poisoned (codes 0x88, NaN scales) wherever no visible key lives, read by the
+ * card's row and by libref's attn_paged. `decisive` cases (one key a row outscores the rest past
+ * f32's exponent, power-of-two codes) must match byte for byte; spread ones within the attention
+ * rounding (RMS relative error under 5e-3, no element out of bounds). `splits` > 0 forces the
+ * prefill's KV split, checked through the unit's last-splits hook. A negative control corrupts the
+ * reference and requires the comparison to fail. */
+struct K4hCase { const char* name; bool decode; int kvh; std::vector<int> qlen, ctx; bool ragged, decisive;
+                 bool scratch; int splits; };
+static void k4h_attn_one(const Plugin& pl, const K4hLayout& L, const char* rowname, int gqa,
+                         int verify_max, const char* hook, const K4hCase& c, std::mt19937& rng) {
+    const RadKernelInfo* r = find(pl, rowname);
+    const RadLaunchFn kst = libref_row("ref_kv_store"), att = libref_row("ref_attn_paged");
+    const std::string what = fmt("%s vs libref, %s", rowname, c.name);
+    if (!r || !kst || !att) { ok(what.c_str(), false, "row or libref's kv_store/attn_paged absent"); return; }
+    const int HD = 256, BS = 4, ROW = L.row;
+    const int n_seq = (int)c.qlen.size(), kvh = c.kvh, nh = kvh * gqa;
+    int rows = 0, maxq = 0, maxctx = 0;
+    for (int s = 0; s < n_seq; ++s) {
+        rows += c.qlen[(size_t)s];
+        maxq = std::max(maxq, c.qlen[(size_t)s]);
+        maxctx = std::max(maxctx, c.ctx[(size_t)s]);
+    }
+    const int maxb = (maxctx + BS - 1) / BS + 1, nblocks = n_seq * maxb + 3;
+    std::vector<int> ids((size_t)nblocks);
+    for (int i = 0; i < nblocks; ++i) ids[(size_t)i] = i;
+    std::shuffle(ids.begin(), ids.end(), rng);
+    std::vector<int32_t> bt((size_t)(n_seq * maxb), -1);
+    int nx = 0;
+    for (int s = 0; s < n_seq; ++s)
+        for (int b = 0; b < (c.ctx[(size_t)s] + BS - 1) / BS; ++b) bt[(size_t)(s * maxb + b)] = ids[(size_t)nx++];
+    const size_t bytes = (size_t)nblocks * kvh * BS * ROW;
+    std::vector<uint8_t> cache(bytes, 0x88);
+    for (size_t q = 0; q < bytes / ROW; ++q)
+        for (int i = L.scales; i < ROW; i += 2) { cache[q * ROW + i] = 0x00; cache[q * ROW + i + 1] = 0x7e; }
+
+    std::normal_distribution<float> nrm(0.f, 1.f);
+    std::uniform_int_distribution<int> code(-7, 7);
+    std::vector<uint16_t> qb((size_t)rows * nh * HD, 0);
+    int tok0 = 0;
+    for (int s = 0; s < n_seq; ++s) {
+        const int ctx = c.ctx[(size_t)s], ql = c.qlen[(size_t)s];
+        std::vector<uint16_t> kt((size_t)ctx * kvh * HD), vt((size_t)ctx * kvh * HD);
+        std::vector<int> dim((size_t)ctx * kvh, -1);
+        if (c.decisive) {
+            std::vector<int> used((size_t)kvh, 0);
+            for (int i = 0; i < ql; ++i)
+                for (int h = 0; h < nh; ++h) {
+                    const int kh = h / gqa, pos = ctx - ql + i;
+                    int j = (int)(rng() % (unsigned)(pos + 1));
+                    if (dim[(size_t)(j * kvh + kh)] < 0) {
+                        if (used[(size_t)kh] >= HD) j = -1;
+                        else dim[(size_t)(j * kvh + kh)] = used[(size_t)kh]++;
+                    }
+                    if (j < 0) continue;
+                    const int d = dim[(size_t)(j * kvh + kh)];
+                    qb[((size_t)(tok0 + i) * nh + h) * HD + (size_t)d] = rad_f32_to_bf16(128.0f);
+                }
+            for (int kh = 0; kh < kvh; ++kh) {
+                std::vector<int> perm(HD);
+                for (int d = 0; d < HD; ++d) perm[(size_t)d] = d;
+                std::shuffle(perm.begin(), perm.end(), rng);
+                for (int j = 0; j < ctx; ++j) {
+                    int& d = dim[(size_t)(j * kvh + kh)];
+                    if (d >= 0) d = perm[(size_t)d];
+                }
+                for (int i = 0; i < ql; ++i)
+                    for (int h = kh * gqa; h < (kh + 1) * gqa; ++h) {
+                        uint16_t* qr = &qb[((size_t)(tok0 + i) * nh + h) * HD];
+                        std::vector<uint16_t> tmp(qr, qr + HD);
+                        for (int d = 0; d < HD; ++d) qr[d] = 0;
+                        for (int d = 0; d < HD; ++d)
+                            if (tmp[(size_t)d]) qr[perm[(size_t)d]] = tmp[(size_t)d];
+                    }
+            }
+            for (int j = 0; j < ctx; ++j)
+                for (int kh = 0; kh < kvh; ++kh) {
+                    const int d = dim[(size_t)(j * kvh + kh)];
+                    const int e = (int)(rng() % 5) - 2;
+                    for (int x = 0; x < HD; ++x) {
+                        const size_t at = ((size_t)j * kvh + kh) * HD + (size_t)x;
+                        kt[at] = rad_f32_to_bf16(x == d ? 28.0f : 0.0f);
+                        const int cv = L.v2 ? (rng() & 1 ? 1 : -1) * (x % 2 ? 1 : 3)
+                                     : x % 32 == 0 ? (rng() & 1 ? 7 : -7) : code(rng);
+                        vt[at] = rad_f32_to_bf16(std::ldexp((float)cv, e));
+                    }
+                }
+        } else {
+            for (size_t x = 0; x < kt.size(); ++x) {
+                kt[x] = rad_f32_to_bf16(nrm(rng));
+                vt[x] = rad_f32_to_bf16(nrm(rng) * 0.7f);
+            }
+            for (int i = 0; i < ql; ++i)
+                for (int x = 0; x < nh * HD; ++x)
+                    qb[(size_t)(tok0 + i) * nh * HD + (size_t)x] = rad_f32_to_bf16(nrm(rng));
+        }
+        std::vector<int32_t> slots((size_t)ctx);
+        for (int j = 0; j < ctx; ++j) slots[(size_t)j] = bt[(size_t)(s * maxb + j / BS)] * BS + j % BS;
+        if (k4h_store(kst, L, kt.data(), vt.data(), ctx, kvh, kvh * HD, slots.data(), cache.data(),
+                      nblocks, 1.0, 1.0) != RAD_OK) {
+            ok(what.c_str(), false, "libref's kv_store would not build the cache");
+            return;
+        }
+        tok0 += ql;
+    }
+    std::vector<int32_t> su(c.ctx.begin(), c.ctx.end()), cu((size_t)n_seq + 1, 0);
+    for (int s = 0; s < n_seq; ++s) cu[(size_t)s + 1] = cu[(size_t)s] + c.qlen[(size_t)s];
+    const size_t oel = (size_t)rows * nh * HD;
+    std::vector<uint16_t> want(oel, 0xffff), got(oel, 0xffff);
+
+    auto args = [&](void* q, void* kv, void* btp, void* sup, void* cup, void* out,
+                    std::vector<RadTensor>& t, std::vector<RadParam>& p) {
+        t.assign(8, RadTensor{});
+        t[0] = T(q, RAD_BF16, { rows, nh * HD });
+        t[1] = T(kv, RAD_F8E4M3, { nblocks, kvh, BS, ROW });
+        t[2] = T(btp, RAD_I32, { n_seq, maxb });
+        t[3] = T(sup, RAD_I32, { n_seq });
+        absent(t[4]); absent(t[5]);
+        t[6] = T(cup, RAD_I32, { n_seq + 1 });
+        if (!c.ragged) absent(t[6]);
+        t[7] = T(out, RAD_BF16, { rows, nh, HD });
+        p = { PI("q_len", c.decode ? verify_max : maxq + 3), PI("head_dim", HD), PI("gqa", gqa),
+              PI("block_size", BS), PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
+              PS("kv_dtype", L.kv_dtype), PF("scale", 1.0 / 16.0), PI("n_head", nh),
+              PI("max_seqs", n_seq), PI("max_ctx", maxctx) };
+        if (c.splits > 0) p.push_back(PI("splits", c.splits));
+    };
+    {
+        std::vector<RadTensor> t;
+        std::vector<RadParam> p;
+        args(qb.data(), cache.data(), bt.data(), su.data(), cu.data(), want.data(), t, p);
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = t.data(); a.n_t = 8; a.p = p.data(); a.n_p = (int)p.size();
+        if (att(&a, nullptr) != RAD_OK) { ok(what.c_str(), false, "libref refused the case"); return; }
+    }
+    void* dq = dalloc(qb.size() * 2);
+    void* dkv = dalloc(bytes);
+    void* dbt = dalloc(bt.size() * 4);
+    void* dsu = dalloc(su.size() * 4);
+    void* dcu = dalloc(cu.size() * 4);
+    void* dout = dalloc(oel * 2);
+    if (!dq || !dkv || !dbt || !dsu || !dcu || !dout) { ok(what.c_str(), false, "hipMalloc failed"); dfree_all(); return; }
+    st_memcpy(dq, qb.data(), qb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dkv, cache.data(), bytes, hipMemcpyHostToDevice);
+    st_memcpy(dbt, bt.data(), bt.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(dsu, su.data(), su.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(dcu, cu.data(), cu.size() * 4, hipMemcpyHostToDevice);
+    st_memset(dout, 0xff, oel * 2);
+    std::vector<RadTensor> t;
+    std::vector<RadParam> p;
+    args(dq, dkv, dbt, dsu, dcu, dout, t, p);
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = t.data(); a.n_t = 8; a.p = p.data(); a.n_p = (int)p.size();
+    a.world_size = 1;
+    const int64_t need = c.scratch && r->scratch ? r->scratch(&a) : 0;
+    if (need > 0) {
+        /* A forced split count past the declared worst case is cut to what the scratch holds
+         * (r4d_prefill_splits), so the forced case gets room for its segments. */
+        const int64_t have = c.splits > 0 ? need * c.splits : need;
+        a.scratch = dalloc((size_t)have);
+        a.scratch_bytes = have;
+        if (a.scratch) st_memset(a.scratch, 0x7f, (size_t)have);   /* a segment nobody wrote shows */
+    }
+    using LastFn = int (*)(void);
+    const LastFn last = hook ? (LastFn)dlsym(pl.h, (std::string(hook) + "_last_splits").c_str()) : nullptr;
+    const int rc = r->launch(&a, nullptr);
+    const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+    const int used_splits = last ? last() : 0;
+    st_memcpy(got.data(), dout, oel * 2, hipMemcpyDeviceToHost);
+    dfree_all();
+    if (rc != RAD_OK || he != hipSuccess || need < 0) {
+        ok(what.c_str(), false, fmt("rc=%d need=%lld hip=%s", rc, (long long)need, hipGetErrorString(he)));
+        return;
+    }
+    auto compare = [&](const std::vector<float>& wf, int64_t& diff, int64_t& bad, int64_t& nan,
+                       int64_t& nonzero, double& rel) {
+        diff = bad = nan = nonzero = 0;
+        double se = 0, sr = 0;
+        for (size_t i = 0; i < oel; ++i) {
+            const float w = wf[i], x = rad_bf16_to_f32(got[i]);
+            diff += rad_f32_to_bf16(w) != got[i];
+            nonzero += w != 0.0f;
+            if (std::isnan(x) || std::isnan(w)) { ++nan; continue; }
+            const double e = std::fabs((double)x - w);
+            se += e * e;
+            sr += (double)w * w;
+            if (e > 1e-2 * std::max(1.0, (double)std::fabs(w)) + 4e-3 * std::fabs(w)) ++bad;
+        }
+        rel = std::sqrt(se / std::max(sr, 1e-30));
+    };
+    std::vector<float> wf(oel);
+    for (size_t i = 0; i < oel; ++i) wf[i] = rad_bf16_to_f32(want[i]);
+    int64_t diff, bad, nan, nonzero;
+    double rel;
+    compare(wf, diff, bad, nan, nonzero, rel);
+    bool good = nan == 0 && nonzero > (int64_t)oel / 4;
+    good = good && (c.decisive ? diff == 0 : (bad == 0 && rel < 5e-3));
+    const bool split_ok = c.splits <= 0 || (last && used_splits == c.splits);
+    ok(what.c_str(), good && split_ok,
+       fmt("%lld differ, rel_l2 %.3g, %lld out of bounds, %lld NaN, %lld nonzero of %zu, splits %d (want %d)",
+           (long long)diff, rel, (long long)bad, (long long)nan, (long long)nonzero, oel, used_splits,
+           c.splits));
+    /* Negative control: the same comparison against a corrupted reference must fail. */
+    for (size_t i = 0; i < oel; i += 8) wf[i] += 0.5f;
+    compare(wf, diff, bad, nan, nonzero, rel);
+    ok((what + " (negative control)").c_str(), c.decisive ? diff > 0 : (bad > 0 || rel >= 5e-3),
+       "a corrupted reference passed");
+}
+
+/* Every k4h attention row at both of Flash-Next's ratios: gqa 12 (one and two ranks) and gqa 6 at
+ * 4-token pages (four ranks), decode, verify and prefill, split or not. */
+static void k4h_attn_case(const Plugin& pl, const K4hLayout& L) {
+    struct G { int gqa, vq; const char* pre_fmt; const char* dec_fmt; const char* hook; };
+    const G geos[] = {
+        { 12, 5,  "attn_prefill_h256_gqa12_%s",     "attn_decode_h256_gqa12_%s",     "r4d_attn_prefill_h256_gqa12_bs4" },
+        { 6,  10, "attn_prefill_h256_gqa6_bs4_%s",  "attn_decode_h256_gqa6_bs4_%s",  "r4d_attn_prefill_h256_gqa6_bs4" },
+    };
+    for (const G& g : geos) {
+        const std::string pre = fmt(g.pre_fmt, L.tag), dec = fmt(g.dec_fmt, L.tag);
+        std::mt19937 rng(20261104u + (unsigned)g.gqa);
+        if (sel(dec.c_str())) {
+            const std::vector<K4hCase> cases = {
+                { "decode, three sequences, decisive", true, 1, { 1, 1, 1 }, { 1, 77, 301 }, false, true, true, 0 },
+                { "decode at depth 1500, decisive", true, 2, { 1 }, { 1500 }, false, true, true, 0 },
+                { "decode at depth 20000, spread", true, 1, { 1 }, { 20000 }, false, false, true, 0 },
+                { "decode, spread", true, 2, { 1, 1 }, { 45, 640 }, false, false, true, 0 },
+                { "verify, MTP's four rows, decisive", true, 1, { 4, 4 }, { 60, 203 }, false, true, true, 0 },
+                { "verify at the band's bound, ragged, spread", true, 2, { g.vq, 1 }, { 90, 33 }, true, false, true, 0 },
+            };
+            for (const K4hCase& c : cases) k4h_attn_one(pl, L, dec.c_str(), g.gqa, g.vq, nullptr, c, rng);
+        }
+        if (sel(pre.c_str())) {
+            const std::vector<K4hCase> cases = {
+                { "prefill, one chunk from empty, decisive", false, 1, { 70 }, { 70 }, false, true, true, 0 },
+                { "prefill chunk over a history, spread", false, 2, { 40 }, { 230 }, false, false, true, 0 },
+                { "prefill, ragged with a decode row, decisive", false, 2, { 33, 1 }, { 120, 57 }, true, true, true, 0 },
+                { "prefill without scratch, spread", false, 1, { 50 }, { 50 }, false, false, false, 0 },
+                { "prefill, a 512-row chunk over 4096, spread", false, 1, { 512 }, { 4096 }, false, false, true, 0 },
+                { "prefill over a deep history, 8 splits, decisive", false, 1, { 24 }, { 1800 }, false, true, true, 8 },
+                { "prefill over a deep history, 5 splits, spread", false, 2, { 40 }, { 1300 }, false, false, true, 5 },
+            };
+            for (const K4hCase& c : cases) k4h_attn_one(pl, L, pre.c_str(), g.gqa, g.vq, g.hook, c, rng);
+        }
+    }
 }
 
 /* qsa_select, against a host sort of the same scores.
@@ -31889,6 +32358,14 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_page_u8")) {
         if (!g_case) std::printf("\nthe QSA pager, against libref's reference\n");
         qsa_page_case(pl);
+    }
+
+    /* Rotated KV layers: the rotation, and the k4h_v4 / k4h_v2h store and attention. */
+    had_rotate_case(pl, "had_rotate_g128_bf16", 128);
+    had_rotate_case(pl, "had_rotate_g256_bf16", 256);
+    for (const K4hLayout* L : { &kK4hv4L, &kK4hv2hL }) {
+        k4h_store_case(pl, *L);
+        k4h_attn_case(pl, *L);
     }
 
     if (sel("qsa_select_i32")) {
