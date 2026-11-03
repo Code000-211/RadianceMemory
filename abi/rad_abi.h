@@ -48,8 +48,12 @@ extern "C" {
  *
  * 40: the QSA indexer's block keys in int8 (--qsa-bkey-dtype i8): RadBuildCtx gained
  * qsa_bkey_dtype and RadArchProbe qsa_bkey_i8_ok (rad_builder.h). A plugin built at 39 would keep
- * bf16 block keys under a flag that promised half their memory. */
-#define RAD_ABI_VERSION 40u
+ * bf16 block keys under a flag that promised half their memory.
+ *
+ * 41: a seventh kv_recipe layout, RAD_KVQ_BF16 (the layer keeps the plain bf16 cache
+ * --kv-cache-dtype bf16 keeps, beside fp8-family layers; rad_builder.h), and its kv_quant_ok bit;
+ * no struct moved. A plugin built at 40 would read a bf16 layer as a layout it does not know. */
+#define RAD_ABI_VERSION 41u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

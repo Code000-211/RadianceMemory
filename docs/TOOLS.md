@@ -942,7 +942,7 @@ flags after `--` go to every run unchanged; the cache and KL flags are the tool'
 (`--kv-cache-dtype`, `--kv-recipe`, `--kld-*` there are refused). Each run's recipe, `--kld-out`
 report with its `.rows`, and log stay in the work directory, and a failed run stops the tool with
 its log's last lines and no recipe written. Bits count a group of 32 K and 32 V elements with
-their scales: `i8h` 8.06 an element, `fp8` 8, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h`
+their scales: `bf16` 16 an element, `i8h` 8.06, `fp8` 8, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h`
 3.5; rotation and the V mean cost none.
 
 **Candidates.** Every layout of the recipe table (`kKvLayouts`, core/config.cpp) as the recipe
@@ -950,18 +950,19 @@ parser reads it plain, `rotated` and, with `--vmean`, `vmean` and `rotated vmean
 (`kv_autoquant_variants`, core/kv_autoquant.h). A combination the parser refuses (`fp8 vmean`: E4M3
 V has no group scale) is no variant, and one it reads as another (`k4h_v4 rotated` is `k4h_v4`) is
 listed once, so a layout or recipe word added to the table and the parser is a candidate with no
-change to the tool. Today that is 9 variants, 16 with `--vmean`: `i8h`, `fp8`, `fp8 rotated`,
+change to the tool. Today that is 10 variants, 17 with `--vmean`: `bf16` (plain only), `i8h`, `fp8`, `fp8 rotated`,
 `fp8_v4` and `k6_v4` plain and rotated, `k4h_v4`, `k4h_v2h`, and with `--vmean` the `vmean` form of
 every one but the two `fp8`s. `--layouts` keeps only some layouts' variants, `--variants` only the
-named variants; given both, what both allow. `k4h_v4`, `k4h_v2h`, `i8h` and the V mean are served
-only by `qwen4exp_fp8`, so on another model the first run of one stops the calibration, refused at
-startup: pass `--layouts fp8,fp8_v4,k6_v4` there.
+named variants; given both, what both allow. `bf16`, `k4h_v4`, `k4h_v2h`, `i8h` and the V mean are
+served only by `qwen4exp_fp8`, so on another model the first run of one stops the calibration,
+refused at startup: pass `--layouts fp8,fp8_v4,k6_v4` there.
 
 **What it runs.**
 
 1. *Every variant uniform*, every listed layer in it: C runs for C variants. The *base* is the one
-   of least mean KL (of equal ones the fewer bits): today `i8h`, or `i8h vmean` where that measures
-   lower. A layer's cost is measured above the base, so a KL limit under `fp8`'s is reachable when
+   of least mean KL (of equal ones the fewer bits): `bf16`, the unquantised cache, whose KL against
+   the bf16 reference is about zero, so any limit down to that is reachable (`i8h` where `--layouts`
+   leaves `bf16` out). A layer's cost is measured above the base, so a KL limit under `fp8`'s is reachable when
    the base meets it, and the clamp at zero below only takes up noise.
 2. *Screening.* A variant that another of no more bits beats on its uniform run gets no per-layer
    runs; at equal bits the lower KL stays, an exact tie keeps the earlier. A heuristic, as one layer

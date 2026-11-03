@@ -951,8 +951,8 @@ layer 63 k6_v4
 ```
 
 The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
-line that is not three words, a layer number that is not one, a layout outside `fp8`, `fp8_v4`,
-`k6_v4`, `k4h_v4`, `k4h_v2h` and `i8h`, a layer named twice, or no layer at all. At startup the server refuses the flag,
+line that is not three words, a layer number that is not one, a layout outside `bf16`, `fp8`, `fp8_v4`,
+`k6_v4`, `k4h_v4`, `k4h_v2h` and `i8h`, `rotated` or `vmean` on a `bf16` line, a layer named twice, or no layer at all. At startup the server refuses the flag,
 naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
 MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
 layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
@@ -968,7 +968,7 @@ reference, it leaves the KL of an fp8 or i8h cache within noise (docs/QSA.md, "B
 storage").
 
 Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`,
-`kv_attn_k4h_v4`, `kv_attn_k4h_v2h`, `kv_attn_i8h`), and the
+`kv_attn_k4h_v4`, `kv_attn_k4h_v2h`, `kv_attn_i8h`, `kv_attn_bf16`), and the
 pool is split so every group holds the same tokens, each paying its own page. Startup logs the
 groups beside the rest of the pool (`kv:`) and then the recipe and what it buys:
 
@@ -1110,19 +1110,31 @@ output a tenth less than `fp8` for 0.8 % more bytes (paired by position, a boots
 bits, does not at eight (+0.0008, -0.0002 to +0.0017: no gain this corpus can see). Speed is not
 measured.
 
+**Unquantised for one layer: `bf16`.** `layer 7 bf16` keeps that layer's cache exactly as
+`--kv-cache-dtype bf16` keeps every layer's: a `kv_attn_bf16` group at head_dim 256 and bf16, the
+bf16 store and attention kernels (prologue fold, streamed store and the sparse decode's
+gate-in-merge included), 1024 bytes a token and head, 16 bits an element; the recipe's other layers
+keep their layouts. The MTP head behind a `bf16` last layer is the bf16 head, and the residency
+pager moves that layer's fragment at its own width (the store's slot is then a `bf16` block). It
+takes neither `rotated` nor `vmean`. `qwen4exp_fp8` serves it at every geometry; `--kv-cache-dtype
+fp8` stays the recipe's flag (a drafter's cache is fp8 whatever the recipe says), and a recipe of
+`bf16` alone is `--kv-cache-dtype bf16`'s attention cache byte for byte. It is what a KL limit
+under every 8-bit layout's is met with: keep the sensitive layers unquantised.
+
 **A measured recipe.** `rad-autoquant` writes the recipe from the KL mode, against a bf16-cache
 reference over long documents. `--max-kl 0.035` asks for the fewest bits whose *measured* mean KL
 stays within 0.035 (`--min-top1` adds a floor on top-1 agreement, `--strict` checks both at the
 95 % bound from the per-position rows, each document a stratum). Every layout above is a
-candidate, plain, `rotated` and, given the `--vmean` file, `vmean`: 16 variants on
-`qwen4exp_fp8`. It measures each variant on every layer, takes the most accurate (`i8h` today) as
+candidate, plain, `rotated` and, given the `--vmean` file, `vmean`: 17 variants on
+`qwen4exp_fp8`. It measures each variant on every layer, takes the most accurate (`bf16`, whose
+KL against the bf16 reference is about zero, so limits down to that are met) as
 the base, measures each layer alone in each variant not beaten outright by one of no more bits,
 solves for the fewest bits from those costs, and measures what it solved, tightening while the
 mixed recipe measures over the limit (the costs do not add up exactly). It writes the cheapest
 recipe measured within the limit, uniform ones included, so it is never worse than the best
 uniform layout: C + L (K - 1) runs plus at most six solved ones for C variants, K kept and L
 layers, 64 to 70 on Flash-Next. `--bits 6` instead picks the least predicted KL within an average
-budget, unmeasured. On a model whose plugin does not serve `i8h`, the `k4h` layouts or the V mean
+budget, unmeasured. On a model whose plugin does not serve `bf16`, `i8h`, the `k4h` layouts or the V mean
 (`qwen35_fp8`), pass `--layouts fp8,fp8_v4,k6_v4` or the first such run stops the calibration. A
 reference whose documents are shorter than 32768 tokens is refused unless the bound is lowered.
 The flags, the cost of the runs, the noise and what is not yet searched (global knobs, a demoted
@@ -2297,7 +2309,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
-| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, `bf16` (`qwen4exp_fp8`), one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
 | `--qsa-bkey-dtype T` | bf16 | `bf16` or `i8`: the QSA indexer's block keys; i8 is int8 with one f16 scale a key, 1.73 instead of 3.25 KiB a 4-token block on Qwen3.8-Flash-Next (the part window residency never demotes), and moves the selection about as much as an fp8 attention cache does; `qwen4exp_fp8` only (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins and `qwen4exp_fp8` (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |

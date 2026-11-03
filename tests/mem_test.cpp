@@ -8679,6 +8679,59 @@ TEST(a_mixed_recipes_store_slot_is_its_widest_layouts_block_and_each_layer_its_o
     CHECK_OK(r1.set_residency_store(nullptr, 0));
 }
 
+/* A recipe with bf16 layers (RAD_KVQ_BF16) beside i8h ones, in miniature: the bf16 group is declared
+ * as --kv-cache-dtype bf16 declares its cache, RAD_BF16 at head_dim 32 (4096 bytes a layer and
+ * block), the i8h one as 34 E4M3 columns (a 68-byte row, 2176 bytes). The bf16 block is now the
+ * widest, so it sets the slot; each layer's fragment keeps its own width, the bf16 layers' at two
+ * bytes an element, and a second rank's window starts past the first's whole bf16 block. */
+TEST(a_bf16_recipe_layer_sizes_the_residency_slot_at_its_own_two_byte_fragment) {
+    auto attn = [](const char* name, uint32_t dtype, int64_t head_dim, std::vector<int32_t> layers) {
+        KVGroupInfo k = paged_group(name, RAD_KV_FULL, 2, 16, std::move(layers));
+        k.decl.dtype = dtype;
+        k.decl.head_dim = head_dim;
+        k.decl.residency_window = 512;
+        return k;
+    };
+    auto groups = [&] {
+        std::vector<KVGroupInfo> g;
+        g.push_back(null_group());
+        g.push_back(attn("kv_attn_i8h", RAD_F8E4M3, 34, { 11, 15 }));
+        g.push_back(attn("kv_attn_bf16", RAD_BF16, 32, { 3, 7 }));
+        g.push_back(paged_group("kv_qsa_bkey", RAD_KV_FULL, 1, 16, { 3, 7, 11, 15 }));
+        return g;
+    };
+    enum : int32_t { G_I8H = 1, G_BF16 = 2 };
+    ResidencyFixture f;
+    CHECK_OK(f.build_groups(groups(), /*slots=*/16));
+    CHECK_EQ(f.kv.residency_block_bytes(G_I8H), 2 * 2176ll);
+    CHECK_EQ(f.kv.residency_block_bytes(G_BF16), 2 * 4096ll);
+    CHECK_EQ(f.kv.residency_shard_bytes(), 8192ll);
+    CHECK_EQ(f.kv.residency_slot_bytes(), 8192ll);
+    CHECK_EQ(f.store.slot_bytes(), 8192ll);
+    const std::vector<int64_t>& ob = f.kv.residency_layer_off(G_BF16);
+    const std::vector<int64_t>& oi = f.kv.residency_layer_off(G_I8H);
+    REQUIRE_EQ(ob.size(), (size_t)8);
+    REQUIRE_EQ(oi.size(), (size_t)16);
+    CHECK_EQ(ob[3], 0ll); CHECK_EQ(ob[7], 4096ll); CHECK_EQ(ob[0], -1ll);
+    CHECK_EQ(oi[11], 0ll); CHECK_EQ(oi[15], 2176ll); CHECK_EQ(oi[3], -1ll);
+
+    Pools p1;
+    Config c1 = small_config();
+    REQUIRE_EQ(configure_pools(p1, c1), RAD_OK);
+    KVManager r1;
+    REQUIRE_EQ(r1.configure(groups(), c1, p1.kv()), RAD_OK);
+    HostArena shared;
+    CHECK_OK(shared.open(2 * 8192, 2 * 8192 * 8));
+    CHECK_OK(f.kv.set_residency_store(&shared, 0));
+    CHECK_EQ(r1.set_residency_store(&shared, 8192 + 1), (int)RAD_E_INVAL);
+    CHECK_OK(r1.set_residency_store(&shared, 8192));
+    CHECK_EQ(r1.residency_slot_bytes(), 2 * 8192ll);
+    CHECK_EQ(r1.residency_layer_off(G_BF16)[7], 8192 + 4096ll);
+    CHECK_EQ(r1.residency_layer_off(G_I8H)[15], 8192 + 2176ll);
+    CHECK_OK(f.kv.set_residency_store(nullptr, 0));   /* `shared` goes before the managers do */
+    CHECK_OK(r1.set_residency_store(nullptr, 0));
+}
+
 /* Demote, overwrite, promote with two layouts in one model: each group's blocks leave at their own
  * width, the pool is overwritten, and promotion brings every layer of every block back byte for
  * byte into fresh blocks, from slots that never alias across groups. Nothing about the movement

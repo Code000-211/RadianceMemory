@@ -891,8 +891,9 @@ TEST(a_kv_recipe_file_is_read_into_one_layout_a_layer) {
              std::string("fp8 at layer 3; fp8_v4 at layer 11; k6_v4 at layer 7"));
     CHECK_EQ(kv_recipe_summary({ RAD_KVQ_V4, -1, RAD_KVQ_V4 }), std::string("fp8_v4 at layers 0, 2"));
 
-    /* Every layout is a narrowing of the fp8 cache, so the recipe needs that flag, given before
-     * or after it; bf16 (the default) and the uniform narrow names are refused. */
+    /* A recipe sets layouts within the fp8 cache (a `bf16` layer the per-layer exception), so it
+     * needs that flag, given before or after it; bf16 (the default) and the uniform narrow names
+     * are refused. */
     CHECK_EQ(parse_fresh({ "--kv-recipe", path.c_str(), "--kv-cache-dtype", "fp8" }), RAD_OK);
     CHECK_EQ(parse_fresh({ "--kv-recipe", path.c_str() }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "k6_v4", "--kv-recipe", path.c_str() }),
@@ -927,7 +928,7 @@ TEST(a_malformed_kv_recipe_is_refused_by_name_and_line) {
     CHECK(has(refusal("layer 3x fp8\n"), "layer '3x' is not a layer number"));
     CHECK(has(refusal("layer 4096 fp8\n"), "layer '4096' is not a layer number"));
     CHECK(has(refusal("layer 3 k4_v2\n"), "line 1: layer 3: 'k4_v2' is not a KV layout"));
-    CHECK(has(refusal("layer 3 bf16\n"), "'bf16' is not a KV layout"));
+    CHECK(has(refusal("layer 3 f16\n"), "'f16' is not a KV layout"));
     CHECK(has(refusal("layer 3 fp8\n# again\nlayer 3 k6_v4\n"), "line 3: layer 3 is named twice"));
     CHECK(has(refusal(""), "names no layer"));
     CHECK(has(refusal("# only a comment\n\n"), "names no layer"));
@@ -995,7 +996,7 @@ TEST(a_k4h_v4_recipe_line_is_rotated_whether_or_not_it_says_so) {
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v4'"));
     std::vector<int32_t> out;
     err = stderr_of([&] { CHECK_EQ(kv_recipe_parse("layer 0 k4h\n", "r.txt", &out), RAD_E_INVAL); });
-    CHECK(has(err, "'k4h' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h or i8h"));
+    CHECK(has(err, "'k4h' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h or i8h"));
 }
 
 /* k4h_v2h (int4 K, KVarN-normalised int2 V) is rotated as k4h_v4 is: its line loads rotated with
@@ -1041,6 +1042,57 @@ TEST(an_i8h_recipe_line_is_rotated_takes_a_v_mean_and_is_priced_just_over_fp8) {
         CHECK(parse_fresh({ "--kv-cache-dtype", "i8h" }) < 0);
     });
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'i8h'"));
+}
+
+/* bf16 is a recipe layout too (RAD_KVQ_BF16): the layer keeps the unquantised cache, beside fp8
+ * layouts in the same file, priced at 1024 bits a 32 + 32 group (twice fp8) and listed first, the
+ * widest. It is neither rotated nor centred, so `rotated` and `vmean` on its line are refused with
+ * the line. A recipe naming only bf16 still needs --kv-cache-dtype fp8, the recipe's flag, and
+ * --kv-cache-dtype bf16 stays the whole-model spelling of it. */
+TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_or_v_mean) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 0 bf16\nlayer 1 i8h\nlayer 2 bf16  # the sensitive one\n"
+                             "layer 3 fp8\n", "r.txt", &r), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_BF16, RAD_KVQ_I8H | rot, RAD_KVQ_BF16,
+                                      RAD_KVQ_NONE }));
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("bf16 at layers 0, 2; fp8 at layer 3; i8h rotated at layer 1"));
+    CHECK_EQ(kv_layout_of("bf16"), (int)RAD_KVQ_BF16);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_BF16)), std::string("bf16"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_BF16), 1024);
+    REQUIRE(!kv_layouts().empty());
+    CHECK_EQ(kv_layouts()[0], (int)RAD_KVQ_BF16);
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 0 fp8\nlayer 3 bf16 rotated\n"),
+              "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'rotated'"));
+    CHECK(has(refusal("vmean m.txt\nlayer 3 bf16 vmean\n"),
+              "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'vmean'"));
+    CHECK(has(refusal("vmean m.txt\nlayer 3 bf16 rotated vmean\n"), "takes no 'rotated'"));
+
+    const std::string path = radtest::tmp_path("bf16.kvrecipe");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    std::fputs("layer 3 bf16\nlayer 7 bf16\n", fp);
+    std::fclose(fp);
+    Config c;
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }, &c), RAD_OK);
+    CHECK(c.kv_recipe == std::vector<int32_t>({ -1, -1, -1, RAD_KVQ_BF16, -1, -1, -1,
+                                                RAD_KVQ_BF16 }));
+    std::string err = stderr_of([&] {
+        CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "bf16", "--kv-recipe", path.c_str() }),
+                 RAD_E_INVAL);
+    });
+    CHECK(has(err, "pass --kv-cache-dtype fp8"));
+    unlink(path.c_str());
 }
 
 namespace {

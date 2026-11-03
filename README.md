@@ -302,7 +302,7 @@ flowchart TB
 | item | size | where it is charged |
 |---|---|---|
 | scratch pages | `(window/block + 1) × max_seqs × (1 + n_spec)` blocks per residency group, about 208 MiB on Flash-Next at 8 decode rows | fixed costs, before the VRAM split, so the budget resolver sees them |
-| residency store | `--kv-residency-mib`, slot = one block of one group (every rank's shard); under a mixed `--kv-recipe`, the widest layout's block | pinned host memory, opened host-mapped |
+| residency store | `--kv-residency-mib`, slot = one block of one group (every rank's shard); under a mixed `--kv-recipe`, the widest layout's block (a `bf16` layer's, twice fp8's, where the recipe has one) | pinned host memory, opened host-mapped |
 | per-block bookkeeping | 4 bytes a block (the table entry already holds the slot) | none worth counting |
 
 At 200 K tokens a sequence holds 50 K attention blocks. With a 512-token sink and a 2 048-token tail

@@ -93,10 +93,12 @@ std::vector<int> kvq_of(const std::vector<std::vector<KvCandidate>>& layers,
 /* ================================================================== the solver */
 
 TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
-    CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_I8H, RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4,
-                                             RAD_KVQ_K4H, RAD_KVQ_K4HV2H }));
+    CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_BF16, RAD_KVQ_I8H, RAD_KVQ_NONE, RAD_KVQ_V4,
+                                             RAD_KVQ_K6V4, RAD_KVQ_K4H, RAD_KVQ_K4HV2H }));
     /* fp8's 8 bits an element, and the 25/32, 22/32, 18/32 and 14/32 of it docs/GUIDE.md §4.4
-     * states; i8h at 258/256 of it (an f16 scale a 256-dim head is 2 bits a group of 32). */
+     * states; i8h at 258/256 of it (an f16 scale a 256-dim head is 2 bits a group of 32); bf16 at
+     * twice it, 16 bits an element and no scale. */
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_BF16), 1024);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_I8H), 516);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_NONE), 512);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_V4), 400);
@@ -533,28 +535,30 @@ TEST(the_interval_from_the_rows_is_batch_means_with_the_documents_as_strata) {
 /* ================================================================== the variants */
 
 /* The candidates come from the layout table and the recipe parser: each layout plain, `vmean`,
- * `rotated` and both, where the parser takes the words and they make another cache. fp8 has no
- * integer V to centre; i8h, k4h_v4 and k4h_v2h are rotated by their names. Each is a recipe line
+ * `rotated` and both, where the parser takes the words and they make another cache. bf16 takes
+ * neither word, so it is one variant; fp8 has no integer V to centre; i8h, k4h_v4 and k4h_v2h are
+ * rotated by their names. Each is a recipe line
  * config_parse loads, with its means, as the flags the variant names. */
 TEST(every_variant_is_a_recipe_line_the_server_loads_as_that_variant) {
     const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
     std::vector<int32_t> plain, centred;
     for (const KvVariant& v : kv_autoquant_variants(false)) plain.push_back(v.kvq);
-    CHECK(plain == std::vector<int32_t>({ RAD_KVQ_I8H | R, RAD_KVQ_NONE, RAD_KVQ_NONE | R,
+    CHECK(plain == std::vector<int32_t>({ RAD_KVQ_BF16, RAD_KVQ_I8H | R, RAD_KVQ_NONE, RAD_KVQ_NONE | R,
                                           RAD_KVQ_V4, RAD_KVQ_V4 | R, RAD_KVQ_K6V4,
                                           RAD_KVQ_K6V4 | R, RAD_KVQ_K4H | R, RAD_KVQ_K4HV2H | R }));
     const std::vector<KvVariant> all = kv_autoquant_variants(true);
     for (const KvVariant& v : all) centred.push_back(v.kvq);
     CHECK(centred == std::vector<int32_t>({
-              RAD_KVQ_I8H | R, RAD_KVQ_I8H | R | M, RAD_KVQ_NONE, RAD_KVQ_NONE | R, RAD_KVQ_V4,
+              RAD_KVQ_BF16, RAD_KVQ_I8H | R, RAD_KVQ_I8H | R | M, RAD_KVQ_NONE, RAD_KVQ_NONE | R, RAD_KVQ_V4,
               RAD_KVQ_V4 | M, RAD_KVQ_V4 | R, RAD_KVQ_V4 | R | M, RAD_KVQ_K6V4, RAD_KVQ_K6V4 | M,
               RAD_KVQ_K6V4 | R, RAD_KVQ_K6V4 | R | M, RAD_KVQ_K4H | R, RAD_KVQ_K4H | R | M,
               RAD_KVQ_K4HV2H | R, RAD_KVQ_K4HV2H | R | M }));
-    REQUIRE_EQ(all.size(), (size_t)16);
-    CHECK_EQ(all[0].words, std::string("i8h"));
-    CHECK_EQ(all[7].words, std::string("fp8_v4 rotated vmean"));
-    CHECK_EQ(all[12].words, std::string("k4h_v4"));
-    CHECK_EQ(all[13].words, std::string("k4h_v4 vmean"));
+    REQUIRE_EQ(all.size(), (size_t)17);
+    CHECK_EQ(all[0].words, std::string("bf16"));
+    CHECK_EQ(all[1].words, std::string("i8h"));
+    CHECK_EQ(all[8].words, std::string("fp8_v4 rotated vmean"));
+    CHECK_EQ(all[13].words, std::string("k4h_v4"));
+    CHECK_EQ(all[14].words, std::string("k4h_v4 vmean"));
 
     tiny::TempDir dir("autoquant-variants");
     REQUIRE(dir.ok());
@@ -610,7 +614,7 @@ struct Bench {
             "    if (a[1] == \"fail\") f[a[2] \" \" a[3]] = 1; else if (a[1] == \"pair\") p = a[2];\n"
             "    else if (a[1] == \"all\") u[a[2]] = a[3]; else c[a[1] \" \" a[2]] = a[3] } }\n"
             "  $1 == \"layer\" { w = $3; for (i = 4; i <= NF; ++i) w = w \"+\" $i; k = $2 \" \" w;\n"
-            "    s += (k in c) ? c[k] : c[$2 \" \" $3]; if ($3 != \"fp8\" && $3 != \"i8h\") n++;\n"
+            "    s += (k in c) ? c[k] : c[$2 \" \" $3]; if ($3 != \"fp8\" && $3 != \"i8h\" && $3 != \"bf16\") n++;\n"
             "    if (f[k]) bad = 1; if (!nl++) first = w; else if (w != first) mixed = 1 }\n"
             "  END { if (bad && mixed) { print \"stand-in: refused\" > \"/dev/stderr\"; exit 1 }\n"
             "        if (n > 1) s += p * (n - 1); if (!mixed && (first in u)) s = u[first]\n"
@@ -674,11 +678,12 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
 
-    /* 9 uniform runs (i8h, fp8, fp8 rotated, fp8_v4, fp8_v4 rotated, k6_v4, k6_v4 rotated, k4h_v4,
-     * k4h_v2h), then 4 layers x the 4 narrower layouts: screening drops i8h (fp8 measures as well
-     * for fewer bits) and the rotated ones (the stand-in prices them as their plain layouts, and an
-     * exact tie keeps the earlier). Each with the engine's flags and the driver's. */
-    CHECK_EQ(b.lines(b.calls), 25);
+    /* 10 uniform runs (bf16, i8h, fp8, fp8 rotated, fp8_v4, fp8_v4 rotated, k6_v4, k6_v4 rotated,
+     * k4h_v4, k4h_v2h), then 4 layers x the 4 narrower layouts: screening drops bf16 and i8h (the
+     * stand-in prices neither above fp8, so a narrower one measures as well for fewer bits) and
+     * the rotated ones (priced as their plain layouts, and an exact tie keeps the earlier). Each with the engine's flags and the driver's. */
+    CHECK_EQ(b.lines(b.calls), 26);
+    CHECK(has(log, "screening drops bf16 (0.040000 at 16.00 bits; i8h: 0.040000 at 8.06)"));
     CHECK(has(log, "screening drops i8h (0.040000 at 8.06 bits; fp8: 0.040000 at 8.00)"));
     CHECK(has(log, "screening drops fp8_v4 rotated ("));
     CHECK(has(log, "the base, the most accurate: every layer fp8\n"));
@@ -795,7 +800,7 @@ TEST(the_driver_refuses_bad_arguments_and_stops_at_a_failed_run) {
     refused({ "--layers", "3,7", "--bits", "6", "--layouts", "k4h_v4", "--variants", "fp8_v4",
               "--", "--model", "m" }, "--layouts and --variants leave no variant");
     refused({ "--layers", "3,7", "--bits", "6", "--variants", "k4_v2", "--", "--model", "m" },
-            "--variants: 'k4_v2' is not a variant; they are i8h, i8h+vmean, fp8, fp8+rotated, "
+            "--variants: 'k4_v2' is not a variant; they are bf16, i8h, i8h+vmean, fp8, fp8+rotated, "
             "fp8_v4, fp8_v4+vmean, fp8_v4+rotated, fp8_v4+rotated+vmean,");
     refused({ "--layers", "3,7", "--bits", "6", "--variants", "fp8+vmean", "--", "--model", "m" },
             "'fp8+vmean' is not a variant");
@@ -878,8 +883,8 @@ TEST(the_driver_writes_the_fewest_bits_within_a_kl_limit) {
                            "/m/x.rad" }, &log);
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
-    /* 9 uniform, 16 per-layer runs, 1 verified. */
-    CHECK_EQ(b.lines(b.calls), 26);
+    /* 10 uniform, 16 per-layer runs, 1 verified. */
+    CHECK_EQ(b.lines(b.calls), 27);
 
     KvAssignment want;
     REQUIRE_EQ(kv_autoquant_solve_kl(cost_layers(), 0.0012, &want), RAD_OK);
@@ -967,7 +972,7 @@ TEST(the_driver_refuses_a_kl_limit_it_cannot_serve) {
     CHECK(has(log, "no recipe measured is within the limits: the most accurate, every layer fp8, "
                    "measures a mean KL of 0.040000, above --max-kl 0.03"));
     /* The uniform runs, and no per-layer run: below the base the costs have nothing to give. */
-    CHECK_EQ(b.lines(b.calls), 9);
+    CHECK_EQ(b.lines(b.calls), 10);
     struct stat st{};
     CHECK(::stat(b.out.c_str(), &st) != 0);
     log.clear();
@@ -1035,9 +1040,38 @@ TEST(the_driver_takes_the_most_accurate_variant_as_its_base_and_meets_a_limit_un
     CHECK_EQ(c.kv_recipe[7], (int32_t)RAD_KVQ_K6V4);
 }
 
+/* bf16 joins from the layout table as the most accurate variant, so it is the base and a limit
+ * under every 8-bit layout's is met: here i8h costs 0.001 a layer (0.044 uniform) and fp8 more,
+ * and --max-kl 0.0402 is under both. Layer 7 alone in fp8 (0.04015, the rest bf16) is the fewest
+ * bits within it, written without a run of its own; 4 uniform runs (bf16, i8h, fp8, fp8 rotated,
+ * the last dropped as fp8's tie) and 4 layers x i8h and fp8. */
+TEST(the_driver_takes_bf16_as_its_base_and_meets_a_limit_under_i8hs) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, "3 i8h 0.001\n7 i8h 0.001\n11 i8h 0.001\n15 i8h 0.001\n"
+                                      "3 fp8 0.002\n7 fp8 0.00015\n11 fp8 0.002\n15 fp8 0.002\n"));
+    std::string log;
+    const int rc = b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0402", "--layouts",
+                           "bf16,i8h,fp8", "--", "--model", "/m/x.rad" }, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(log, "the base, the most accurate: every layer bf16\n"));
+    CHECK_EQ(b.lines(b.calls), 4 + 8);
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# every layer bf16: mean KL 0.040000, top-1 0.9500 (the base)\n"));
+    CHECK(has(recipe, "# every layer i8h: mean KL 0.044000"));
+    CHECK(has(recipe, "\nlayer 3 bf16\nlayer 7 fp8\nlayer 11 bf16\nlayer 15 bf16\n"));
+    CHECK(has(recipe, "(layer 7 fp8), the fewest bits measured within 0.0402"));
+    Config c;
+    Argv a({ "--model", "/m/x.rad", "--kv-cache-dtype", "fp8", "--kv-recipe", b.out });
+    REQUIRE_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_OK);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)RAD_KVQ_BF16);
+    CHECK_EQ(c.kv_recipe[7], (int32_t)RAD_KVQ_NONE);
+}
+
 /* Screening: a variant beaten on its uniform run by one of no more bits gets no per-layer runs
- * (here i8h and the rotated variants, which tie with fp8 and their plain layouts); with
- * --keep-dominated every variant has them, 9 + 4 x 8 runs. The predicted KL is the same, and a
+ * (here bf16, i8h and the rotated variants, which tie with fp8 and their plain layouts); with
+ * --keep-dominated every variant has them, 10 + 4 x 9 runs. The predicted KL is the same, and a
  * tie keeps the earlier variant: never a rotated one, which costs the same bits as its plain
  * layout, but i8h where the budget has 4 bits to spare for a layer the stand-in prices as fp8
  * (the solver keeps ties wide). */
@@ -1049,7 +1083,7 @@ TEST(the_driver_screens_out_dominated_variants_unless_asked_to_keep_them) {
                                             "--model", "/m/x.rad" };
     std::string log;
     REQUIRE_EQ(b.run(args, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 9 + 16);
+    CHECK_EQ(b.lines(b.calls), 10 + 16);
     const std::vector<int> screened = written(b);
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# no per-layer runs: i8h (0.040000 at 8.06 bits; fp8: 0.040000 at 8.00)"));
@@ -1060,7 +1094,7 @@ TEST(the_driver_screens_out_dominated_variants_unless_asked_to_keep_them) {
     std::remove(b.calls.c_str());
     log.clear();
     REQUIRE_EQ(b.run(keep, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 9 + 4 * 8);
+    CHECK_EQ(b.lines(b.calls), 10 + 4 * 9);
     CHECK(has(tiny::read_text(b.calls), "/layer3_k6_v4+rotated.kvrecipe"));
     CHECK(!has(log, "screening drops i8h"));
     const std::string kept = tiny::read_text(b.out);
@@ -1088,8 +1122,8 @@ TEST(the_driver_keeps_a_uniform_recipe_that_measures_cheaper_than_any_solved_one
     REQUIRE_EQ(rc, 0);
     CHECK(written(b) == std::vector<int>(4, RAD_KVQ_K6V4));
     CHECK(has(log, "screening drops fp8_v4 (0.044400 at 6.25 bits; k6_v4: 0.040500 at 5.50)"));
-    /* 9 uniform, 4 layers x k6_v4, k4h_v4, k4h_v2h; no verification. */
-    CHECK_EQ(b.lines(b.calls), 9 + 12);
+    /* 10 uniform, 4 layers x k6_v4, k4h_v4, k4h_v2h; no verification. */
+    CHECK_EQ(b.lines(b.calls), 10 + 12);
     CHECK(has(log, "the next solution has no fewer bits than every layer k6_v4"));
     CHECK(has(tiny::read_text(b.out), "(every layer k6_v4), the fewest bits measured within 0.0412"));
 }
@@ -1176,7 +1210,7 @@ TEST(the_driver_under_strict_checks_the_limit_at_the_upper_bound_from_the_rows) 
     REQUIRE(tiny::write_text(plain.table, cost_table()));
     log.clear();
     CHECK(plain.run(strict, &log) != 0);
-    CHECK(has(log, "run uniform_i8h left no .rows of the reference's positions, which --strict needs"));
+    CHECK(has(log, "run uniform_bf16 left no .rows of the reference's positions, which --strict needs"));
 }
 
 RAD_TEST_MAIN()

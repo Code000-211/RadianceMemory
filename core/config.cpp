@@ -96,7 +96,7 @@ static const Flag g_flags[] = {
     { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, k4h_v4\n"
                                         "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
                                         "(int8, a scale a token and head, 1.01; all rotated,\n"
-                                        "Flash-Next), a 'layer N\n"
+                                        "Flash-Next) or bf16 (2; Flash-Next), a 'layer N\n"
                                         "LAYOUT [rotated]' line a layer (docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
@@ -533,9 +533,12 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
  * no V mean) belong in the parser below and nowhere else. */
 struct KvLayout { const char* name; int kvq; int group_bits; };
 static const KvLayout kKvLayouts[] = {
+    /* The cache --kv-cache-dtype bf16 keeps, for one layer: nothing rounded but bf16's own. Twice
+     * fp8; what a layer too sensitive for any 8-bit layout keeps (rad-autoquant's base). */
+    { "bf16",   RAD_KVQ_BF16, 32 * 16 + 32 * 16 },
     /* K and V int8, stored rotated, one f16 scale a token and head for each: at head_dim 256 a
-     * group of 32 carries an eighth of a scale, 2 bits, so 258/256 of fp8. The only layout wider
-     * than fp8; it buys resolution (7 bits to E4M3's 3), not room. */
+     * group of 32 carries an eighth of a scale, 2 bits, so 258/256 of fp8. Wider than fp8; it buys
+     * resolution (7 bits to E4M3's 3), not room. */
     { "i8h",    RAD_KVQ_I8H,  (32 * 8 + 2) + (32 * 8 + 2) },
     /* E4M3 K and V; the descales are per (sequence, head), nothing a group. */
     { "fp8",    RAD_KVQ_NONE, 32 * 8 + 32 * 8 },
@@ -581,6 +584,8 @@ std::vector<int> kv_layouts() {
  * RAD_KVQ_I8H): a line of any of them marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
  * (the h is the Hadamard), a k4h or i8h layer without the rotation is not a deployment anyone can ask
  * for, and rad-autoquant writes every layout as `layer N LAYOUT` from the table above.
+ * `bf16` is the plain bf16 cache (RAD_KVQ_BF16) and takes neither word: it rounds nothing a
+ * rotation or a mean would help with, and the bf16 rows serve neither.
  * A line may also end in `vmean` (after `rotated` when both): the layer subtracts a static V mean
  * before its store and adds it to the attention output (RAD_KVQ_VMEAN), taken from the file one
  * `vmean FILE` line names, which `vmean_file` receives as written. Only a layout with integer V
@@ -642,8 +647,14 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const int q = kv_layout_of(layout.c_str());
         if (q < 0) {
-            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4, "
-                    "k4h_v2h or i8h", name, ln, l, layout.c_str());
+            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, "
+                    "k4h_v4, k4h_v2h or i8h", name, ln, l, layout.c_str());
+            return RAD_E_INVAL;
+        }
+        if (q == RAD_KVQ_BF16 && (rot_word || vmean)) {
+            RAD_ERR("%s line %d: layer %ld: bf16 is the unquantised cache and takes no '%s'; a "
+                    "rotation or a V mean only helps a layout that rounds to a narrower code",
+                    name, ln, l, rot_word ? "rotated" : "vmean");
             return RAD_E_INVAL;
         }
         if (vmean && q == RAD_KVQ_NONE) {
@@ -1664,9 +1675,10 @@ int config_parse(int argc, char** argv, Config* c) {
      * (--kv-residency-mib, spec §7.3) keeps it on the card and demotes what the window does not
      * cover. Both rewrite the same group's selection and own its blocks' placement, so one server
      * runs one of them. */
-    /* Every layout a recipe names narrows the E4M3 cache (RadBuildCtx::kv_recipe), and a drafter's
-     * cache stays E4M3; under bf16 or one of the narrow names the two flags would say two things
-     * about the same layers. */
+    /* A recipe sets each layer's layout within the E4M3 cache (RadBuildCtx::kv_recipe), its `bf16`
+     * layers (RAD_KVQ_BF16) the one exception it names per layer, and a drafter's cache stays
+     * E4M3; under bf16 or one of the narrow names the two flags would say two things about the
+     * same layers. */
     if (!c->kv_recipe.empty() && c->kv_cache_dtype != "fp8") {
         RAD_ERR("--kv-recipe %s sets each attention layer's layout within the fp8 cache, and "
                 "--kv-cache-dtype is %s; pass --kv-cache-dtype fp8", c->kv_recipe_path.c_str(),

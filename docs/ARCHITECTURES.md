@@ -226,7 +226,7 @@ Three groups, which is why hybrid KV groups are first-class:
 
 | group | kind | geometry |
 |---|---|---|
-| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md). `--kv-recipe` (`qwen35_fp8`, `qwen4exp_fp8`) declares one such group per layout it names, `kv_attn_fp8` / `_fp8_v4` / `_k6_v4` (and on `qwen4exp_fp8` `_k4h_v4`, `_k4h_v2h` and `_i8h`, head_dim 144, 112 and 258, always rotated), each layer bound to its own and the MTP head to the last attention layer's; a `rotated` layer's group is its layout's, holding K and V rotated by `had_rotate` (GUIDE §4.4) |
+| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md). `--kv-recipe` (`qwen35_fp8`, `qwen4exp_fp8`) declares one such group per layout it names, `kv_attn_fp8` / `_fp8_v4` / `_k6_v4` (and on `qwen4exp_fp8` `_k4h_v4`, `_k4h_v2h` and `_i8h`, head_dim 144, 112 and 258, always rotated, and `_bf16`, the `--kv-cache-dtype bf16` group), each layer bound to its own and the MTP head to the last attention layer's; a `rotated` layer's group is its layout's, holding K and V rotated by `had_rotate` (GUIDE §4.4) |
 | GDN recurrent state | `RAD_KV_LINEAR` | 48 layers, 48 states of 128 x 128 |
 | GDN conv state | `RAD_KV_CONV` | 48 layers, 2*16 + 48 = 80 heads x 128 = 10240 channels, a rolling `conv_width - 1 + n_spec` window |
 

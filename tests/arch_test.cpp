@@ -10379,7 +10379,7 @@ TEST(a_k4h_v4_recipe_layer_on_flashnext_is_a_rotated_288_byte_cache_on_its_own_r
     RadArchProbe p4{};
     CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
     CHECK_EQ(p4.kv_quant_ok, (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H) |
-                             (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H));
+                             (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H) | (1 << RAD_KVQ_BF16));
 
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
@@ -10704,6 +10704,204 @@ TEST(an_i8h_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
                                         { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
                                           (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED })),
               "layer 7 asks for i8h"));
+}
+
+/* bf16 as a recipe layout (RAD_KVQ_BF16) on Flash-Next: a recipe of bf16 alone is
+ * --kv-cache-dtype bf16's attention cache byte for byte at one, two and four ranks -- the same
+ * declarations (one `kv_attn` group at RAD_BF16 and head_dim 256, the same pager fragment with the
+ * residency store asked for, the MTP head behind it), and the same launches on decode, prefill,
+ * a mixed step and the verify with the head's passes -- although the recipe arrives under the fp8
+ * flag's RadBuildCtx::kv_dtype. The probe offers bf16 at every geometry, gqa 8 included. */
+TEST(a_uniform_bf16_recipe_on_flashnext_is_the_bf16_kv_cache_dtype_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = r[7] = RAD_KVQ_BF16;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx flag = q4_ctx(rank, world);
+            flag.max_tok      = 4096;   /* pinned_steps' prefill */
+            flag.kv_dtype     = RAD_BF16;
+            flag.kv_residency = 1;
+            RadBuilder a;
+            a.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &flag), RAD_OK);
+            /* Stepped before the next declare, which replaces the plugin's model. */
+            const uint64_t flag_steps = pinned_steps(a, qwen4exp_fp8::step, rank, world);
+
+            RadBuildCtx rc = q4_ctx(rank, world);
+            rc.max_tok = 4096;
+            rc = with_recipe(rc, r);
+            rc.kv_residency = 1;
+            RadBuilder b;
+            b.encs = a.encs;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &rc), RAD_OK);
+            CHECK_EQ(program_diff(a, b), std::string());
+            REQUIRE(!b.kv_groups.empty());
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 256);
+            CHECK_EQ(pinned_steps(b, qwen4exp_fp8::step, rank, world), flag_steps);
+        }
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok, 1 << RAD_KVQ_BF16);
+}
+
+/* A mixed recipe with a bf16 layer on Flash-Next, at one, two and four ranks: layer 3 in bf16 and
+ * layer 7 in i8h are two groups in RAD_KVQ_* order, `kv_attn_i8h` (258 E4M3 columns) and
+ * `kv_attn_bf16` (RAD_BF16 at head_dim 256), and the MTP head (layer 8) follows layer 7 into i8h,
+ * rotated. Each layer's pager moves its own fragment, layer 3's at bf16's width (K and V of a
+ * four-token page, two bytes an element). Layer 3 runs exactly the bf16 flag's path: the ops that
+ * touch its cache, in order, are the flag build's on decode and prefill (the prologue's store fold
+ * and the sparse decode's gate-in-merge included, nothing turned off), every one banding on
+ * kv_dtype bf16, and no rotation is issued for it. */
+TEST(a_bf16_layer_beside_i8h_on_flashnext_keeps_the_bf16_flags_cache_and_path) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = RAD_KVQ_BF16;
+    r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_i8h"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_bf16"));
+            CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_F8E4M3);
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 258);
+            CHECK_EQ(b.kv_groups[1].d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 256);
+            CHECK_EQ(b.kv_groups[0].d.residency_window, b.kv_groups[1].d.residency_window);
+            CHECK(b.kv_groups[1].d.residency_window > 0);
+            CHECK(!noted(b, "kv cache bf16"));
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound.size(), (size_t)3);
+            CHECK_EQ(bound[3], (rad_kvgroup)2);
+            CHECK_EQ(bound[7], (rad_kvgroup)1);
+            CHECK_EQ(bound[8], (rad_kvgroup)1);   /* the MTP head, behind layer 7 */
+
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 256 * 2));   /* layer 3, bf16 */
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 258));       /* layer 7, i8h */
+                CHECK_EQ(page[2], page[1]);                              /* the head */
+                CHECK_EQ(rot_ops, 2);   /* layer 7's and the head's */
+            }
+
+            /* Layer 3's ops on decode and prefill, the rotations of layer 7 and the head left out. */
+            std::vector<std::string> mine[2];
+            int pass = 0;
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                for (const std::string& e : around_layer(b, *v[0], 3))
+                    if (e.rfind("rot:", 0) != 0) mine[pass].push_back(e);
+                ++pass;
+                if (!has_cache) continue;
+                CHECK(!mine[pass - 1].empty());
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd) {
+                        if (d.kind != RAD_OPK_KV || (d.handle != 1 && d.handle != 2)) continue;
+                        CHECK_EQ(d.offset, (int64_t)(d.handle == 2 ? 3 : 7));
+                        const std::string kd = pstr(o, "kv_dtype");
+                        if (!kd.empty())
+                            CHECK_EQ(kd, std::string(d.handle == 2 ? "bf16" : "i8h"));
+                        on += d.handle == 2;
+                    }
+                }
+                CHECK(on > 0);
+            }
+            /* The flag's build after the recipe's passes: a declare replaces the plugin's model. */
+            RadBuildCtx flag = q4_ctx(rank, world);
+            flag.kv_dtype = RAD_BF16;
+            flag.kv_residency = 1;
+            RadBuilder f;
+            f.encs = b.encs;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&f, &meta, &flag), RAD_OK);
+            pass = 0;
+            for (const auto& k : { kit(f, { 1, 1, 1, 1 }, {}), kit(f, {}, { 64, 64 }, 9000) }) {
+                const auto w = run_passes(f, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(f, w);
+                CHECK(mine[pass++] == around_layer(f, *w[0], 3));
+            }
+        }
+}
+
+/* The MTP head follows the last attention layer into bf16: with layer 7 in bf16 and layer 3 in
+ * i8h, the head is bound to the bf16 group and unrotated (a verify's history pass issues no
+ * rotation beside layer 3's four). At one and two ranks. */
+TEST(the_mtp_head_behind_a_bf16_layer_on_flashnext_shares_its_cache_unrotated) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+    r[7] = RAD_KVQ_BF16;
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            const RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            const bool has_cache = !b.kv_groups[0].zero;
+            CHECK_EQ(rot_ops, has_cache ? 1 : 0);   /* layer 3's only */
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            int head_rots = 0;
+            for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+            CHECK_EQ(head_rots, 0);
+        }
+}
+
+/* bf16's refusals: rotated or centred (a hand-built context; the recipe parser refuses both
+ * words), and as every layer's kv_quant, which --kv-cache-dtype bf16 spells as kv_dtype. */
+TEST(a_bf16_recipe_entry_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](const RadBuildCtx& ctx) {
+        MetaKV mk = q4_small();
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    CHECK(has(refusal(with_recipe(q4_ctx(0, 1), { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                                  (int)RAD_KVQ_BF16 | RAD_KVQ_ROTATED })),
+              "layer 7 asks for bf16 rotated"));
+    CHECK(has(refusal(with_recipe(q4_ctx(0, 1), { -1, -1, -1, (int)RAD_KVQ_BF16 | RAD_KVQ_VMEAN,
+                                                  -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for bf16 with a V mean"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_BF16;
+    CHECK(has(refusal(flag), "KV cache layout 6 is not one this plugin knows"));
 }
 
 /* The fp8-rounding experiment (RADIANCE_DEBUG_KV_E4M3R, rad_block_attn_gated_fp8.h) on Flash-Next

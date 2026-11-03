@@ -13,9 +13,10 @@
  * the recipe parser takes the words. So a layout or recipe word added there is calibrated with no
  * change here. --layouts and --variants restrict the set.
  *
- *   1. Every variant uniform, one run each. The base is the one of least mean KL (today i8h): a
- *      layer's cost in another variant is measured above it, so nothing reads as better than the
- *      base and the clamp at zero below only absorbs noise.
+ *   1. Every variant uniform, one run each. The base is the one of least mean KL (bf16, the
+ *      unquantised cache, whose KL against the bf16 reference is about zero; i8h with --layouts
+ *      leaving bf16 out): a layer's cost in another variant is measured above it, so nothing
+ *      reads as better than the base and the clamp at zero below only absorbs noise.
  *   2. Screening: a variant another of no more bits beats uniformly gets no per-layer runs
  *      (--keep-dominated measures it anyway). Its uniform recipe still competes in --max-kl.
  *   3. Each layer alone in each kept variant, the rest at the base. A layer's cost is the run's
@@ -85,7 +86,7 @@ void usage() {
         "  --kld-ref DIR       a KL reference recorded by this model with a bf16 cache\n"
         "  --layers N,N,...    the model's attention layers, as the checkpoint numbers them\n"
         "  --bits B            the average bits a cached K or V element may cost, scales\n"
-        "                      included (i8h 8.06, fp8 8, fp8_v4 6.25, k6_v4 5.5, k4h_v4 4.5,\n"
+        "                      included (bf16 16, i8h 8.06, fp8 8, fp8_v4 6.25, k6_v4 5.5, k4h_v4 4.5,\n"
         "                      k4h_v2h 3.5): the least KL within them, predicted\n"
         "  --max-kl K          the mean KL against the reference a recipe may measure: the\n"
         "                      fewest bits measured within it\n"

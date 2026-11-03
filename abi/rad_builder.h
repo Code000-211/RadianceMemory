@@ -107,14 +107,22 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *
  * Codes are two's complement (int4 -7..7, int6 -31..31, int8 -127..127). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
- * it. */
+ * it.
+ *
+ *   RAD_KVQ_BF16 (bf16, ABI 41), 4 * HD bytes: a kv_recipe entry only. The layer keeps the cache
+ *     --kv-cache-dtype bf16 keeps -- a group declared RAD_BF16 at head_dim HD, served by the bf16
+ *     store and attention rows -- while the recipe's other layers keep theirs. The widest layout,
+ *     so the one a KL limit below every narrowed cache's is met with. Never rotated or centred
+ *     (the recipe parser refuses both and a plugin refuses such an entry): it rounds nothing for
+ *     a rotation or a mean to help. */
 enum {
     RAD_KVQ_NONE = 0,
     RAD_KVQ_V4   = 1,
     RAD_KVQ_K6V4 = 2,
     RAD_KVQ_K4H  = 3,
     RAD_KVQ_K4HV2H = 4,
-    RAD_KVQ_I8H  = 5
+    RAD_KVQ_I8H  = 5,
+    RAD_KVQ_BF16 = 6
 };
 
 /* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):
@@ -372,7 +380,8 @@ typedef struct RadBuildCtx {
      * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
      * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has
      * RadArchProbe::kv_recipe_ok and, for each layout the recipe names, that layout's bit in
-     * kv_quant_ok. A plugin with kv_recipe_ok serves RAD_KVQ_ROTATED on every layout it serves. The plugin refuses an entry for a layer that keeps no attention cache, and an
+     * kv_quant_ok. A plugin with kv_recipe_ok serves RAD_KVQ_ROTATED on every layout it serves
+     * but RAD_KVQ_BF16. The plugin refuses an entry for a layer that keeps no attention cache, and an
      * attention layer with none, naming the layer: a recipe written for another model must not
      * load as a near miss. A recipe giving every layer one layout is that layout's
      * --kv-cache-dtype, the same program byte for byte.
