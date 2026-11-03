@@ -161,6 +161,9 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
+if(NOT RAD_HIP_FOUND)
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
+endif()
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
@@ -258,16 +261,28 @@ foreach(t ${RAD_TESTS})
   if(n STREQUAL "mem_test")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
   endif()
-  if(DEFINED RAD_TEST_SHARDS_${n})
-    math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
-    foreach(k RANGE ${last})
-      rad_unit_test(${n}_shard${k} ${n} --shard ${k}/${RAD_TEST_SHARDS_${n}})
-    endforeach()
+  if(n STREQUAL "dspark_device_test")
+    if(RAD_HIP_FOUND AND TARGET libr4d)
+      add_dependencies(${n} libr4d)
+      add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
   else()
-    rad_unit_test(${n} ${n})
+    if(DEFINED RAD_TEST_SHARDS_${n})
+      math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
+      foreach(k RANGE ${last})
+        rad_unit_test(${n}_shard${k} ${n} --shard ${k}/${RAD_TEST_SHARDS_${n}})
+      endforeach()
+    else()
+      rad_unit_test(${n} ${n})
+    endif()
+    string(APPEND RAD_PERF_SCRIPT
+           "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
   endif()
-  string(APPEND RAD_PERF_SCRIPT
-         "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
 endforeach()
 
 # ================================================================== perf_ cases
