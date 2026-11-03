@@ -216,9 +216,10 @@ static void checkpoint_head(Fn head, Fn walk, const char* weights_path) {
 }
 
 int main(int argc,char** argv) {
+    check(argc==2 || (argc==4 && !std::strcmp(argv[2],"--head-weights")),"usage: dspark_device_test libr4d.so [--head-weights file]");
     int n_devices = 0;
     if (hipGetDeviceCount(&n_devices) != hipSuccess || n_devices == 0) return 77;
-    check(argc==2 || (argc==4 && !std::strcmp(argv[2],"--head-weights")),"usage: dspark_device_test libr4d.so [--head-weights file]"); void* h=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
+    void* h=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
     if(!h) { std::fprintf(stderr,"dlopen: %s\n",dlerror()); return 1; }
     Fn fn=symbol(h,"r4d_rad_dflash_markov_greedy");
     Fn fn_f32=symbol(h,"r4d_rad_dflash_markov_greedy_f32");
