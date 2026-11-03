@@ -8,6 +8,9 @@
  * whole number of bits and every candidate's cost a small one (fp8's 512 a group of 32 K and 32 V
  * elements, docs/GUIDE.md §4.4), so the knapsack is solved exactly by dynamic programming over the
  * bits spent, not approximated by a greedy exchange that can miss the optimum.
+ *
+ * The same table answers the converse question: the fewest bits whose summed KL stays within a
+ * limit (kv_autoquant_solve_kl), which is what `rad-autoquant --max-kl` asks.
  */
 #pragma once
 
@@ -39,5 +42,15 @@ struct KvAssignment {
  * are not positive or whose cost is not finite, or a budget below the narrowest assignment. */
 int kv_autoquant_solve(const std::vector<std::vector<KvCandidate>>& layers, int64_t budget,
                        KvAssignment* out);
+
+/* The assignment of fewest summed bits whose summed KL is at most `max_kl`; of those, the one of
+ * least summed KL, with the same tie-break as kv_autoquant_solve. A sum within a relative 1e-12 of
+ * `max_kl` counts as within it, so a limit copied from a solved cost is met by that assignment.
+ *
+ * RAD_E_INVAL, with `out` empty, for the inputs kv_autoquant_solve refuses or a `max_kl` that is
+ * negative or not finite; RAD_E_NOTFOUND, with `out` empty, when even the assignment of least
+ * summed KL is above `max_kl`. */
+int kv_autoquant_solve_kl(const std::vector<std::vector<KvCandidate>>& layers, double max_kl,
+                          KvAssignment* out);
 
 }  /* namespace rad */
