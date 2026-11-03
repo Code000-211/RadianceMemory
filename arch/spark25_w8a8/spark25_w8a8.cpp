@@ -647,6 +647,32 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_m
 /* The speculation depth this container supports: zero without a drafter, or the block length a
  * DSpark drafter was trained at. `draft_depth_fixed` because a block-diffusion drafter denoises
  * exactly that many mask positions, and `declare` refuses to run it at any other depth. */
+#ifdef SPARK25_HAVE_PREFILL_SPLIT
+static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
+    if (!c || !batch) return 0;
+    Model& m = models[rad_rank(c)];
+    int group = -1;
+    if (batch->kv) for (int i = 0; i < batch->n_kv_groups; ++i)
+        if (batch->kv[i].group == m.kv) { group = i; break; }
+    spark25_prefill_key::Request r;
+    r.phase = batch->phase;
+    r.n_tok = batch->n_tok;
+    r.n_seq = batch->n_seq;
+    r.max_q_len = batch->max_q_len;
+    r.max_ctx = m.g.max_ctx;
+    r.n_spec = batch->n_spec;
+    r.draft_pass = batch->draft_pass;
+    r.enc = batch->enc != 0;
+    r.head_dim = m.g.head_dim;
+    r.gqa = m.g.gqa();
+    r.kv_heads = m.g.n_head_kv;
+    r.kv_group_found = group >= 0;
+    r.used = used_max_h && group >= 0 ? used_max_h[group] : 0;
+    r.wgps = rad_ctx_wgp_count(c);
+    return spark25_prefill_key::pass_key(r);
+}
+#endif
+
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
