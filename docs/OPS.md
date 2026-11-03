@@ -1175,7 +1175,7 @@ base belongs to the block manager, not the batch.
 **Under a per-layer recipe each layer names its own group.** `--kv-recipe`
 (`RadBuildCtx::kv_recipe`) puts the layers of one layout in one group, so `RAD_KV(group, layer)`
 names the group of the layer's layout and the ops on it carry that layout's `kv_dtype`
-(`fp8_e4m3`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`). No op or row changes: a layer reads a cache in one
+(`fp8_e4m3`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`). No op or row changes: a layer reads a cache in one
 layout, as under `--kv-cache-dtype`.
 A `rotated` layer's cache holds K and V rotated by `had_rotate`, issued over q, k and v before
 the store and over the output after the attention; the store and attention ops on it are the
@@ -1187,8 +1187,8 @@ int4 codes, then K's f16 group scales and V's, groups of 32 dims. `kv_store` qua
 to `absmax / 7` (the f32 quotient rounded once to f16, capped at 8188) and each element to
 `rint(x / scale)` clamped to ±7; `attn_paged` reads a code as code times its group's scale. Four
 bits hold K only rotated, so a k4h_v4 layer is always a rotated one: the recipe marks it so,
-`--kv-cache-dtype` does not take it, and a plugin refuses an entry without the rotation. It and
-`k4h_v2h` below are the packed layouts libref serves (`kv_store` and `attn_paged` at their
+`--kv-cache-dtype` does not take it, and a plugin refuses an entry without the rotation. It,
+`k4h_v2h` and `i8h` below are the packed layouts libref serves (`kv_store` and `attn_paged` at their
 `kv_dtype`; each refuses a cache of any other row width). libr4d has it on Flash-Next's QSA geometry: `kv_store_k4hv4`,
 byte-identical to libref, and `attn_prefill_h256_gqa12_k4hv4`, `attn_decode_h256_gqa12_k4hv4`
 and their `_gqa6_bs4_` twins (head_dim 256, 4-token pages; the decode rows serve the speculative
@@ -1222,6 +1222,27 @@ rotation has already evened the channels, and rotated values are centred. libref
 `attn_prefill_h256_gqa12_k4hv2h`, `attn_decode_h256_gqa12_k4hv2h` and their `_gqa6_bs4_` twins,
 the k4h_v4 kernels with V's codes widened from two bits; `r4d_emu_k4h` holds them to libref as it
 holds k4h_v4's. rad-kbench describes the store's operands, not the attention's.
+
+**`i8h` is the rotated layout at eight bits** (`RAD_KVQ_I8H`): a row of `2 * head_dim + 4` bytes,
+K's int8 codes (dim d in byte d, two's complement), V's, then one f16 scale for the token's K head
+and one for its V head. For each head x (bf16 times `1 / k_scale` or `1 / v_scale`): `amax` the
+largest |x| by `fmax` (which drops a NaN; a head of NaNs is NaN), `scale = f16(fmin(amax / 127,
+512))` (the f32 quotient rounded once; the cap keeps 127 times it an f16, so an infinity or a NaN
+head decodes finite), and each code `clamp(rint(x / scale), -127, 127)` (0 where the scale is 0;
+the clamp is `fmin(fmax(.))`, so a NaN is -127; -128 is never stored). `attn_paged` reads code
+times scale. Rotated always, as k4h_v4. libr4d: `kv_store_i8h` (a wave a token and head),
+byte-identical to libref, and `attn_prefill_h256_gqa12_i8h`, `attn_decode_h256_gqa12_i8h` and
+their `_gqa6_bs4_` twins, k4h_v4's kernels with the codes widened from bytes (`0x6400 | (c ^
+0x80)` less 1152 is c in f16) and read a 4-byte word at a time, since a 516-byte row is not
+16-byte aligned. `r4d_emu_k4h` and r4d_selftest hold them to libref as k4h_v4's.
+
+**`kv_dtype` `bf16_e4m3r` is an experiment, not a layout**: `kv_store` into a bf16 cache of the
+shared layout, each value `x / k_scale` clamped to ±448 (a NaN to -448), rounded to E4M3 to
+nearest even, decoded and multiplied by `k_scale` (V likewise), then rounded to bf16 (exact at the
+default scale of 1). The bf16 attention reads it as any bf16 cache, so it sees the values the fp8
+attention sees in an E4M3 cache. Only `kv_store` takes the name: libref and libr4d's
+`kv_store_bf16_e4m3r`, byte-identical (emulator and card). An architecture issues it only under
+`RADIANCE_DEBUG_KV_E4M3R` (arch/common/rad_block_attn_gated_fp8.h, GUIDE §4.4).
 
 **A `vmean` layer stores V less a static mean** (`RAD_KVQ_VMEAN`, --kv-recipe `vmean`): the
 layer issues `add` with its one broadcast form, a row of n elements down every row, twice. Before

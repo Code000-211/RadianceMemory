@@ -1914,7 +1914,8 @@ static void attn_decode_scratch_band_case(const Plugin& pl) {
         const int64_t rowe = !std::strcmp(kvs, "fp8v4") ? 25 * hd / 16
                            : !std::strcmp(kvs, "k6v4") ? 22 * hd / 16
                            : !std::strcmp(kvs, "k4hv4") ? 18 * hd / 16
-                           : !std::strcmp(kvs, "k4hv2h") ? 14 * hd / 16 : 2 * hd;
+                           : !std::strcmp(kvs, "k4hv2h") ? 14 * hd / 16
+                           : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 2 * hd;
         const int64_t bs = std::strstr(r->name, "_bs4_") ? 4 : 16;
         const int64_t max_seqs = 32, max_ctx = 200000, mb = (max_ctx + bs - 1) / bs;
         const int top = std::max(1, 64 / gqa);
@@ -24624,11 +24625,14 @@ static void qsa_page_case(const Plugin& pl) {
      * over both ranks (2 x 4 x 512), and rank 1's view starts at its offset, so its narrower
      * fragment sits mid-slot. One KV head a rank (--tp 2), and two (one rank). */
     static const struct { const char* name; int64_t rowb; } lay[] = {
-        { "fp8", 512 }, { "fp8_v4", 400 }, { "k6_v4", 352 }, { "k4h_v4", 288 }, { "k4h_v2h", 224 } };
+        { "fp8", 512 }, { "fp8_v4", 400 }, { "k6_v4", 352 }, { "k4h_v4", 288 }, { "k4h_v2h", 224 },
+        { "i8h", 516 } };
     for (const auto& l : lay) {
         const int64_t b1 = 4 * l.rowb, b2 = 8 * l.rowb;
+        /* i8h's block (2064 bytes) is wider than fp8's, so it sets the slot when present. */
+        const int64_t half = std::max<int64_t>(2048, b1);
         qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, %s fragment, rank 1 of 2 in a mixed slot",
-                             l.name).c_str(), b1, 2 * 2048, b1 + 16, 2048, false, l.rowb);
+                             l.name).c_str(), b1, 2 * half, b1 + 16, half, false, l.rowb);
         qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, %s fragment, two heads on one rank",
                              l.name).c_str(), b2, 2 * 4096, b2, 0, false, l.rowb);
     }
@@ -24777,10 +24781,12 @@ static void vmean_add_case(const Plugin& pl) {
         }
 }
 
-/* A k4h layout: its kv_dtype, a token's row at head_dim 256, where the scales start, V in two bits. */
-struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2; };
-static const K4hLayout kK4hv4L  = { "k4h_v4",  "k4hv4",  18 * 256 / 16, 256,         false };
-static const K4hLayout kK4hv2hL = { "k4h_v2h", "k4hv2h", 14 * 256 / 16, 3 * 256 / 4, true };
+/* A rotated layout: its kv_dtype, a token's row at head_dim 256, where the scales start, V in two
+ * bits, and i8h's int8 codes under one scale a head. */
+struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2, i8; };
+static const K4hLayout kK4hv4L  = { "k4h_v4",  "k4hv4",  18 * 256 / 16, 256,         false, false };
+static const K4hLayout kK4hv2hL = { "k4h_v2h", "k4hv2h", 14 * 256 / 16, 3 * 256 / 4, true,  false };
+static const K4hLayout kI8hL    = { "i8h",     "i8h",    2 * 256 + 4,   2 * 256,     false, true };
 
 /* One kv_store launch (host or device pointers alike), k and v [T, kvh * 256] at pitch `ld`. */
 static int k4h_store(RadLaunchFn fn, const K4hLayout& L, const void* k, const void* v, int64_t T_,
@@ -24839,7 +24845,20 @@ static void k4h_store_case(const Plugin& pl, const K4hLayout& L) {
                     v[(size_t)(t * ld + g * 32 + i)] = rad_f32_to_bf16(vx);
                 }
             }
-        if (c.edges) {
+        if (c.edges && L.i8) {
+            /* i8h: a head each, as test_k4h.cpp's (token 1 is the dropped slot). */
+            auto head = [&](std::vector<uint16_t>& x, int t, int h) { return x.data() + t * ld + h * 256; };
+            const float tie[8] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f, 0.875f };
+            for (int i = 0; i < 256; ++i) {
+                head(k, 0, 0)[i] = 0;
+                head(k, 0, 1)[i] = rad_f32_to_bf16(i == 0 ? 31.75f : i < 9 ? tie[i - 1] : 0.0f);
+                head(k, 2, 0)[i] = rad_f32_to_bf16((i & 1 ? -1.f : 1.f) * 1e5f * (1 + i % 32));
+                head(v, 4, 0)[i] = head(k, 0, 1)[i];
+                head(v, 3, 1)[i] = 0xffc0;
+            }
+            head(k, 2, 1)[7] = 0x7f80;
+            head(k, 3, 0)[11] = 0x7fc0;
+        } else if (c.edges) {
             uint16_t* r0 = k.data();
             for (int i = 0; i < 32; ++i) r0[i] = 0;
             const float tie[8] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f, 0.875f };
@@ -24887,6 +24906,77 @@ static void k4h_store_case(const Plugin& pl, const K4hLayout& L) {
     }
 }
 
+/* kv_store_bf16_e4m3r (the fp8-rounding experiment, rad_block_attn_gated_fp8.h): the card's bf16
+ * cache equals libref's over the whole cache, for values past E4M3's range, in its subnormals, an
+ * infinity and a NaN, at a descale of 1 and one of 0.75 / 1.5 (test_k4h.cpp's e4m3r_case). */
+static void e4m3r_store_case(const Plugin& pl) {
+    const char* row = "kv_store_bf16_e4m3r";
+    if (!sel(row)) return;
+    const RadKernelInfo* r = find(pl, row);
+    const RadLaunchFn ref = libref_row("ref_kv_store");
+    if (!r || !ref) { ok(row, false, "row or libref's kv_store absent"); return; }
+    struct C { const char* name; int64_t T_, kvh; double ks, vs; };
+    const C cases[] = { { "two kv heads, a prefill chunk", 37, 2, 1.0, 1.0 },
+                        { "one kv head, a descale on each side", 9, 1, 0.75, 1.5 } };
+    std::mt19937 rng(20261105);
+    for (const C& c : cases) {
+        const int64_t hd = 256, ld = c.kvh * hd, nb = (c.T_ + 3) / 4 + 2;
+        std::vector<uint16_t> k((size_t)(c.T_ * ld)), v((size_t)(c.T_ * ld));
+        std::uniform_real_distribution<float> mag(std::log(1e-4f), std::log(2e3f));
+        for (size_t i = 0; i < k.size(); ++i) {
+            k[i] = rad_f32_to_bf16(std::exp(mag(rng)) * (rng() & 1 ? -1.f : 1.f));
+            v[i] = rad_f32_to_bf16(std::exp(mag(rng)) * (rng() & 1 ? -1.f : 1.f));
+        }
+        k[3] = 0x7f80;
+        v[5] = 0x7fc0;
+        std::vector<int32_t> all((size_t)(nb * 4)), slot((size_t)c.T_);
+        for (size_t i = 0; i < all.size(); ++i) all[i] = (int32_t)i;
+        std::shuffle(all.begin(), all.end(), rng);
+        for (int64_t t = 0; t < c.T_; ++t) slot[(size_t)t] = all[(size_t)t];
+        slot[1] = -1;
+        const size_t el = (size_t)(nb * c.kvh * 4 * 2 * hd);
+        auto launch = [&](RadLaunchFn fn, const void* kp, const void* vp, const void* sp, void* cp) {
+            RadTensor t[4];
+            t[0] = T((void*)kp, RAD_BF16, { c.T_, ld });
+            t[1] = T((void*)vp, RAD_BF16, { c.T_, ld });
+            t[2] = T((void*)sp, RAD_I32, { c.T_ });
+            t[3] = T(cp, RAD_BF16, { nb, c.kvh, 4, 2 * hd });
+            std::vector<RadParam> ps = { PI("M", c.T_), PI("head_dim", hd), PI("n_head_kv", c.kvh),
+                                         PI("block_size", 4), PS("kv_dtype", "bf16_e4m3r"),
+                                         PF("k_scale", c.ks), PF("v_scale", c.vs) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = t; a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            const int rc = fn(&a, nullptr);
+            st_stream_sync(nullptr);
+            return rc;
+        };
+        std::vector<uint16_t> want(el, 0xa5a5), got(el);
+        const int rr = launch(ref, k.data(), v.data(), slot.data(), want.data());
+        void* dk = dalloc(k.size() * 2);
+        void* dv = dalloc(v.size() * 2);
+        void* ds = dalloc(slot.size() * 4);
+        void* dc = dalloc(el * 2);
+        st_memcpy(dk, k.data(), k.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dv, v.data(), v.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(ds, slot.data(), slot.size() * 4, hipMemcpyHostToDevice);
+        st_memset(dc, 0xa5, el * 2);
+        const int re = launch(r->launch, dk, dv, ds, dc);
+        st_memcpy(got.data(), dc, el * 2, hipMemcpyDeviceToHost);
+        int64_t diff = 0, moved = 0;
+        for (size_t i = 0; i < el; ++i) {
+            diff += got[i] != want[i];
+            moved += want[i] != 0xa5a5;
+        }
+        ok(fmt("%s vs libref byte for byte, %s", row, c.name).c_str(),
+           rr == RAD_OK && re == RAD_OK && diff == 0 && moved >= (c.T_ - 1) * ld * 2,
+           fmt("libref rc=%d card rc=%d, %lld elements differ, %lld written", rr, re,
+               (long long)diff, (long long)moved));
+        dfree_all();
+    }
+}
+
 /* One attention case at a k4h layout (test_k4h.cpp's attn_case on the card): a cache stored by
  * libref's kv_store, poisoned (codes 0x88, NaN scales) wherever no visible key lives, read by the
  * card's row and by libref's attn_paged. `decisive` cases (one key a row outscores the rest past
@@ -24919,12 +25009,12 @@ static void k4h_attn_one(const Plugin& pl, const K4hLayout& L, const char* rowna
     for (int s = 0; s < n_seq; ++s)
         for (int b = 0; b < (c.ctx[(size_t)s] + BS - 1) / BS; ++b) bt[(size_t)(s * maxb + b)] = ids[(size_t)nx++];
     const size_t bytes = (size_t)nblocks * kvh * BS * ROW;
-    std::vector<uint8_t> cache(bytes, 0x88);
+    std::vector<uint8_t> cache(bytes, L.i8 ? 0x80 : 0x88);   /* a code no store writes */
     for (size_t q = 0; q < bytes / ROW; ++q)
         for (int i = L.scales; i < ROW; i += 2) { cache[q * ROW + i] = 0x00; cache[q * ROW + i + 1] = 0x7e; }
 
     std::normal_distribution<float> nrm(0.f, 1.f);
-    std::uniform_int_distribution<int> code(-7, 7);
+    std::uniform_int_distribution<int> code(L.i8 ? -127 : -7, L.i8 ? 127 : 7);
     std::vector<uint16_t> qb((size_t)rows * nh * HD, 0);
     int tok0 = 0;
     for (int s = 0; s < n_seq; ++s) {
@@ -24970,7 +25060,8 @@ static void k4h_attn_one(const Plugin& pl, const K4hLayout& L, const char* rowna
                         const size_t at = ((size_t)j * kvh + kh) * HD + (size_t)x;
                         kt[at] = rad_f32_to_bf16(x == d ? 28.0f : 0.0f);
                         const int cv = L.v2 ? (rng() & 1 ? 1 : -1) * (x % 2 ? 1 : 3)
-                                     : x % 32 == 0 ? (rng() & 1 ? 7 : -7) : code(rng);
+                                     : x % (L.i8 ? 256 : 32) == 0
+                                         ? (rng() & 1 ? 1 : -1) * (L.i8 ? 127 : 7) : code(rng);
                         vt[at] = rad_f32_to_bf16(std::ldexp((float)cv, e));
                     }
                 }
@@ -32413,15 +32504,17 @@ static void device_phase(const Plugin& pl) {
         qsa_page_case(pl);
     }
 
-    /* Rotated KV layers: the rotation, and the k4h_v4 / k4h_v2h store and attention. */
+    /* Rotated KV layers: the rotation, the k4h_v4 / k4h_v2h / i8h store and attention, and the
+     * fp8-rounding experiment's store. */
     had_rotate_case(pl, "had_rotate_g128_bf16", 128);
     had_rotate_case(pl, "had_rotate_g256_bf16", 256);
     /* A `vmean` layer's adds: the broadcast row over V and over the output. */
     vmean_add_case(pl);
-    for (const K4hLayout* L : { &kK4hv4L, &kK4hv2hL }) {
+    for (const K4hLayout* L : { &kK4hv4L, &kK4hv2hL, &kI8hL }) {
         k4h_store_case(pl, *L);
         k4h_attn_case(pl, *L);
     }
+    e4m3r_store_case(pl);
 
     if (sel("qsa_select_i32")) {
         if (!g_case) std::printf("\nthe QSA selection, against a host sort\n");

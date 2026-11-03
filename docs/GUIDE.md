@@ -951,7 +951,7 @@ layer 63 k6_v4
 
 The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
 line that is not three words, a layer number that is not one, a layout outside `fp8`, `fp8_v4`,
-`k6_v4`, `k4h_v4` and `k4h_v2h`, a layer named twice, or no layer at all. At startup the server refuses the flag,
+`k6_v4`, `k4h_v4`, `k4h_v2h` and `i8h`, a layer named twice, or no layer at all. At startup the server refuses the flag,
 naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
 MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
 layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
@@ -962,7 +962,7 @@ Qwen3.8-Flash-Next only the attention cache takes a recipe; the QSA indexer's bl
 their own cache, and each layer's pager (`--kv-residency-mib`) moves its own layout's fragment.
 
 Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`,
-`kv_attn_k4h_v4`, `kv_attn_k4h_v2h`), and the
+`kv_attn_k4h_v4`, `kv_attn_k4h_v2h`, `kv_attn_i8h`), and the
 pool is split so every group holds the same tokens, each paying its own page. Startup logs the
 groups beside the rest of the pool (`kv:`) and then the recipe and what it buys:
 
@@ -1029,7 +1029,7 @@ layer 11 fp8          # fp8's V is E4M3, with no group scale to spare: no vmean
 ...
 ```
 
-Only a layout with integer V takes it (`fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`). A mean from other
+Only a layout with integer V takes it (`fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`). A mean from other
 documents is nearly as good as a document's own, so one calibration serves every request; record
 it with the calibration mode (TOOLS.md), over long documents and a bf16 cache:
 
@@ -1069,10 +1069,46 @@ documents of 127K tokens; `fp8` scores 0.0262, 0.267, 94.4 %):
 The KL above `fp8`'s falls by a quarter to a half; `k4h_v2h`'s halves. Speed is not measured (two
 elementwise adds a layer, and the sparse decode's gate as its own op).
 
+**Eight bits with a resolution: `i8h`.** K and V as int8, rotated as the k4h layouts are, with one
+f16 scale for a token's whole head (absmax / 127): 516 bytes a token and head at head_dim 256,
+258/256 of `fp8`, recipe-only and always rotated (`layer 7 i8h` loads rotated; `vmean` allowed), on
+the same plugin and geometry, the MTP head rotating behind it. E4M3 keeps three mantissa bits, int8
+seven; once the rotation has spread a head's outlier channels one scale holds the head, and on the
+card's real q/k/v the attention output's error is about a quarter of the E4M3 cache's (0.0036
+against 0.0152). The rows are 4-byte aligned only, so its kernels read codes a word at a time.
+
+Where `fp8`'s KL comes from was measured with an experiment, not a layout:
+`RADIANCE_DEBUG_KV_E4M3R=1` with `--kv-cache-dtype bf16` stores every K and V value of the bf16
+cache rounded through E4M3 exactly as the fp8 store rounds it (same clamp, same descale of 1),
+and the bf16 attention reads it. Its KL is the storage rounding alone; `fp8`'s above it would be
+the fp8 attention path's. Startup says so on stderr, and the layer stores with plain `kv_store`
+(the prologue's fold has no such row; a streamed group fails the step). Measured as the `vmean`
+table above (Flash-Next `--tp 2`, 4 documents of 32K tokens, 16380 positions; means from
+`kv_vmean.txt` of the calibration above); the pool holds the same tokens throughout because 2
+sequences at 36864 is its worst case, and a page of the 12 attention layers costs 24.00 KiB at
+`fp8`, 24.19 KiB at `i8h` and 48 KiB at bf16:
+
+| cache | bits | mean KL | p99 KL | top-1 | pool tokens |
+|---|--:|--:|--:|--:|--:|
+| bf16 (the reference itself) | 16 | 0 | 0 | 100 % | 73768 |
+| `fp8` | 8 | 0.0262 | 0.267 | 94.35 % | 73804 |
+| bf16, values rounded through E4M3 | 16 | 0.0262 | 0.267 | 94.35 % | 73768 |
+| `i8h` every layer | 8.06 | 0.0236 | 0.236 | 94.77 % | 73744 |
+| `i8h` every layer, `vmean` | 8.06 | 0.0243 | 0.240 | 94.36 % | 73744 |
+
+The E4M3-rounded bf16 cache scores `fp8`'s KL position for position (the per-position records are
+byte-identical): all of `fp8`'s KL is the rounding of the stored values, none of it the fp8
+attention, whose kernels widen E4M3 to the same f16 the bf16 ones widen bf16 to. `i8h` moves the
+output a tenth less than `fp8` for 0.8 % more bytes (paired by position, a bootstrap over blocks of
+256 positions puts the difference at -0.0037 to -0.0018); the V mean, which pays at four and two
+bits, does not at eight (+0.0008, -0.0002 to +0.0017: no gain this corpus can see). Speed is not
+measured.
+
 **A measured recipe.** `rad-autoquant` writes the recipe from the KL mode: it measures each layer
 in each layout against a bf16-cache reference over long documents and picks, per layer, the
 layouts of least total KL within an average bit budget (`--bits 6`: between `k4h_v2h`'s 3.5 and
-`fp8`'s 8). Its candidates are every recipe layout, `k4h_v4` and `k4h_v2h` included; on a model
+`fp8`'s 8). Its candidates are every recipe layout no wider than `fp8`, `k4h_v4` and `k4h_v2h`
+included (`i8h` is not: its cost above the `fp8` base would read as none); on a model
 whose plugin does not serve them (`qwen35_fp8`), pass `--layouts fp8_v4,k6_v4` or the first
 `k4h_v4` run stops the calibration. A reference whose documents are shorter than 32768 tokens is refused unless the bound
 is lowered. The flags, the cost of the runs and what the prediction assumes are in
@@ -2241,7 +2277,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
-| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |

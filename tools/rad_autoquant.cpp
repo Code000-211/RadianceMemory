@@ -10,8 +10,10 @@
  * is the run's mean KL above the base's; a run under it is measurement noise and counts as no
  * cost. With the costs taken as adding up across layers, kv_autoquant_solve (core/kv_autoquant.h)
  * picks the assignment of least summed cost within the budget, and the recipe is written with
- * the measurements in its comments. The candidate set is every layout a recipe can name
- * (core/config.cpp, kKvLayouts), so a layout added there is calibrated without a change here.
+ * the measurements in its comments. The candidate set is every layout a recipe can name that is
+ * no wider than the fp8 base (core/config.cpp, kKvLayouts), so a narrower layout added there is
+ * calibrated without a change here. A wider one (i8h) is left out: a cost is measured above the
+ * base and clamped at zero, so a layout that beats fp8 would only ever read as free.
  *
  * Every run is a child `radiance` with the flags after `--`, plus the cache and KL flags this tool
  * sets; its recipe, report and log stay in the work directory, so a surprising number can be
@@ -67,8 +69,8 @@ void usage() {
         "                      included (fp8 8, fp8_v4 6.25, k6_v4 5.5, k4h_v4 4.5,\n"
         "                      k4h_v2h 3.5)\n"
         "  -o FILE             the recipe to write (--kv-recipe FILE)\n"
-        "  --layouts L,L,...   the layouts to choose from (default every one); fp8, the base,\n"
-        "                      is always among them\n"
+        "  --layouts L,L,...   the layouts to choose from (default every one no wider than\n"
+        "                      fp8); fp8, the base, is always among them\n"
         "  --work DIR          each run's recipe, report and log (default FILE.work)\n"
         "  --min-context N     refuse a reference with a document under N tokens (default\n"
         "                      %lld); 0 measures any\n"
@@ -251,11 +253,15 @@ int main(int argc, char** argv) {
     std::vector<int> layouts;
     std::set<int> want = { RAD_KVQ_NONE };
     if (layouts_arg.empty()) {
-        for (int q : kv_layouts()) want.insert(q);
+        for (int q : kv_layouts())
+            if (kv_layout_group_bits(q) <= kv_layout_group_bits(RAD_KVQ_NONE)) want.insert(q);
     } else {
         for (const std::string& s : split(layouts_arg, ',')) {
             const int q = kv_layout_of(s.c_str());
             if (q < 0) return fail("--layouts: '%s' is not a KV layout", s.c_str());
+            if (kv_layout_group_bits(q) > kv_layout_group_bits(RAD_KVQ_NONE))
+                return fail("--layouts: %s is wider than the fp8 base, and a cost is measured "
+                            "above the base", s.c_str());
             want.insert(q);
         }
     }

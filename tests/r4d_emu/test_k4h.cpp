@@ -1,5 +1,6 @@
-/* tests/r4d_emu: the k4h_v4 and k4h_v2h caches (RAD_KVQ_K4H, RAD_KVQ_K4HV2H, abi/rad_builder.h) on
- * the host SIMT emulator, held to libref's kv_store and attn_paged at their kv_dtype. libref is the
+/* tests/r4d_emu: the k4h_v4, k4h_v2h and i8h caches (RAD_KVQ_K4H, RAD_KVQ_K4HV2H, RAD_KVQ_I8H,
+ * abi/rad_builder.h) on the host SIMT emulator, held to libref's kv_store and attn_paged at their
+ * kv_dtype. libref is the
  * oracle (docs/OPS.md), so the test needs it: ctest sets $RADIANCE_HOME, and without one the test
  * fails rather than checking nothing. Every case below runs once for each layout.
  *
@@ -11,6 +12,9 @@
  * round to even), values past the scale cap, an infinity and a NaN. k4h_v2h's V takes the same
  * edges, plus a group whose values sit on its quantiser's boundaries (whole multiples of its root
  * mean square), since its variance normalisation sums, divides and floors where k4h_v4 takes a max.
+ * i8h's scale is a whole head's, so its edges are a head each: all zero, ties of rint, past the
+ * cap, an infinity, a NaN, and a head of NaNs. The bf16_e4m3r experiment's store is held to
+ * libref's bytes the same way.
  *
  * The attention (Flash-Next's QSA layers: head_dim 256, 4-token pages, gqa 12 at one and two ranks
  * and gqa 6 at four; prefill, decode and the speculative verify, which is the decode kernel at a
@@ -62,6 +66,16 @@ int     r4d_rad_attn_prefill_h256_gqa6_k4hv2h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv2h_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_k4hv2h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_k4hv2h_scratch(const RadArgs*);
+int     r4d_rad_kv_store_i8h(const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_gqa12_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_i8h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_i8h_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_i8h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_i8h_scratch(const RadArgs*);
+int     r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
 }
 extern int emu_grids;
 
@@ -69,15 +83,17 @@ namespace {
 
 constexpr int HD = 256, BS = 4;
 
-/* The layout under test: its kv_dtype, a token's row (288 or 224 bytes), where the scales start
- * (after K's and V's codes), and whether V is k4h_v2h's int2. */
+/* The layout under test: its kv_dtype, a token's row (288, 224 or 516 bytes), where the scales
+ * start (after K's and V's codes), whether V is k4h_v2h's int2, and whether the codes are i8h's
+ * bytes under one scale a head. */
 struct Layout {
     const char* kv_dtype;
     int row, scales;
-    bool v2;
+    bool v2, i8;
 };
-const Layout kK4hv4  = { "k4h_v4", 18 * HD / 16, HD, false };
-const Layout kK4hv2h = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true };
+const Layout kK4hv4  = { "k4h_v4", 18 * HD / 16, HD, false, false };
+const Layout kK4hv2h = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true, false };
+const Layout kI8h    = { "i8h", 2 * HD + 4, 2 * HD, false, true };
 const Layout* L = &kK4hv4;
 
 int g_fails = 0;
@@ -181,7 +197,24 @@ void store_case(Fn ref, Fn kernel, const char* name, int64_t T, int64_t kvh, int
                 v[(size_t)(t * ld + g * 32 + i)] = rad_f32_to_bf16(vx);
             }
         }
-    if (edges && T >= 2 && kvh * HD >= 6 * 32) {
+    if (edges && L->i8 && T >= 6 && kvh == 2) {
+        /* A head each (token 1 is the dropped slot): token 0's K head 0 all zero (scale 0); its
+         * head 1 at amax 31.75, scale 31.75 / 127 = 0.25 exactly, with x.5 steps that round to
+         * even; token 2's K head 0 past the cap (512 * 127), so codes clamp at +-127, its head 1
+         * holding +inf; token 3's K head 0 a NaN, its V head 1 all NaN; token 4's V head 0 the ties
+         * again. */
+        auto head = [&](std::vector<uint16_t>& x, int t, int h) { return x.data() + t * ld + h * HD; };
+        const float tie[8] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f, 0.875f };
+        for (int i = 0; i < HD; ++i) {
+            head(k, 0, 0)[i] = 0;
+            head(k, 0, 1)[i] = rad_f32_to_bf16(i == 0 ? 31.75f : i < 9 ? tie[i - 1] : 0.0f);
+            head(k, 2, 0)[i] = rad_f32_to_bf16((i & 1 ? -1.f : 1.f) * 1e5f * (1 + i % 32));
+            head(v, 4, 0)[i] = head(k, 0, 1)[i];
+            head(v, 3, 1)[i] = 0xffc0;
+        }
+        head(k, 2, 1)[7] = 0x7f80;
+        head(k, 3, 0)[11] = 0x7fc0;
+    } else if (edges && T >= 2 && kvh * HD >= 6 * 32) {
         uint16_t* r0 = k.data();
         for (int i = 0; i < 32; ++i) r0[i] = 0;                          /* group 0: all zero */
         /* group 1: scale 7 * 0.25 / 7 = 0.25 exactly, then x.5 steps: rint ties to even */
@@ -232,6 +265,61 @@ void store_case(Fn ref, Fn kernel, const char* name, int64_t T, int64_t kvh, int
                 diff ? "DIFFERS" : "libref's bytes");
 }
 
+/* The bf16_e4m3r experiment's store (kv_store_bf16_e4m3r): a bf16 cache [nb, kvh, BS, 2 * HD]
+ * whose every value went through E4M3 at the descale, held to libref's bytes over the whole cache.
+ * The inputs reach past E4M3's range (clamped to 448), into its subnormals, and hold an infinity
+ * and a NaN (the clamp makes it -448 on both sides). */
+void e4m3r_case(Fn ref, const char* name, int64_t T, int64_t kvh, double ks, double vs,
+                std::mt19937& rng) {
+    const int64_t ld = kvh * HD, nb = (T + BS - 1) / BS + 2;
+    std::vector<uint16_t> k((size_t)(T * ld)), v((size_t)(T * ld));
+    std::uniform_real_distribution<float> mag(std::log(1e-4f), std::log(2e3f));
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = rad_f32_to_bf16(std::exp(mag(rng)) * (rng() & 1 ? -1.f : 1.f));
+        v[i] = rad_f32_to_bf16(std::exp(mag(rng)) * (rng() & 1 ? -1.f : 1.f));
+    }
+    k[3] = 0x7f80;
+    v[5] = 0x7fc0;
+    std::vector<int32_t> all((size_t)(nb * BS)), slot((size_t)T);
+    for (size_t i = 0; i < all.size(); ++i) all[i] = (int32_t)i;
+    std::shuffle(all.begin(), all.end(), rng);
+    for (int64_t t = 0; t < T; ++t) slot[(size_t)t] = all[(size_t)t];
+    if (T > 2) slot[1] = -1;
+    const size_t el = (size_t)(nb * kvh * BS * 2 * HD);
+    Buf want(el * 2, 0xa5), got(el * 2, 0xa5);
+    auto run = [&](Fn fn, uint8_t* cache) {
+        RadTensor t[4];
+        t[0] = tens(k.data(), RAD_BF16, { T, kvh * HD });
+        t[1] = tens(v.data(), RAD_BF16, { T, kvh * HD });
+        t[2] = tens(slot.data(), RAD_I32, { T });
+        t[3] = tens(cache, RAD_BF16, { nb, kvh, BS, 2 * HD });
+        Params p;
+        p.i("M", T); p.i("head_dim", HD); p.i("n_head_kv", kvh); p.i("block_size", BS);
+        p.s("kv_dtype", "bf16_e4m3r"); p.f("k_scale", ks); p.f("v_scale", vs);
+        RadArgs a{};
+        a.t = t; a.n_t = 4; a.p = p.p.data(); a.n_p = (int)p.p.size();
+        return fn(&a, nullptr);
+    };
+    const int rr = run(ref, want.p), re = run(r4d_rad_kv_store_bf16_e4m3r, got.p);
+    int64_t diff = 0, moved = 0, nonbf = 0;
+    const uint16_t* w = (const uint16_t*)want.p;
+    for (size_t i = 0; i < el; ++i) {
+        diff += w[i] != ((const uint16_t*)got.p)[i];
+        if (w[i] == 0xa5a5) continue;
+        ++moved;
+        /* Each stored value is an E4M3 value times the descale: at descale 1, three mantissa bits. */
+        if (ks == 1.0 && vs == 1.0) nonbf += (w[i] & 0x0f) != 0;
+    }
+    const bool good = rr == RAD_OK && re == RAD_OK && diff == 0 &&
+                      moved >= (T - 1) * kvh * 2 * HD && nonbf == 0;
+    if (!good)
+        fail(std::string(name) + ": libref " + std::to_string(rr) + ", emulated " +
+             std::to_string(re) + ", " + std::to_string(diff) + " elements differ, " +
+             std::to_string(moved) + " written, " + std::to_string(nonbf) + " past E4M3's mantissa");
+    std::printf("  %-48s %3lld tokens x %lld heads: %s\n", name, (long long)T, (long long)kvh,
+                good ? "libref's bytes" : "DIFFERS");
+}
+
 /* ------------------------------------------------------------------ the attention */
 
 struct Geo {
@@ -276,13 +364,14 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
      * kernel that reads a slot no visible key lives in turns its row NaN. */
     const int ROW = L->row;
     const size_t bytes = (size_t)nblocks * kvh * BS * ROW;
-    Buf cache(bytes, 0x88);
+    /* i8h's never-stored code is -128. */
+    Buf cache(bytes, L->i8 ? 0x80 : 0x88);
     for (size_t r = 0; r < bytes / ROW; ++r)
         for (int i = L->scales; i < ROW; i += 2) { cache.p[r * ROW + i] = 0x00; cache.p[r * ROW + i + 1] = 0x7e; }
 
     /* Every sequence's keys, stored by libref's kv_store, a token at a time in key order. */
     std::normal_distribution<float> nrm(0.f, 1.f);
-    std::uniform_int_distribution<int> code(-7, 7);
+    std::uniform_int_distribution<int> code(L->i8 ? -127 : -7, L->i8 ? 127 : 7);
     std::vector<uint16_t> qb((size_t)rows * nh * HD, 0);
     /* Decisive: per (sequence, query row, head), a target key among the visible ones; a target's
      * K is 28 (code 7, scale 4) at a dim no other target of the sequence uses, every other key's K
@@ -335,13 +424,16 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
                         /* V: whole codes times 2^e, one of them +-7 so the stored scale is 2^e.
                          * k4h_v2h: odd levels, +-3 at even dims and +-1 at odd, a mean square of
                          * 5 a group, so each value is its own level and the scale that keeps the
-                         * group's sum of squares is 2^e. */
+                         * group's sum of squares is 2^e. i8h: codes to +-127, dim 0 at +-127 (one
+                         * scale a head), each exact in f16 and in bf16. K's 28 is then stored as
+                         * 127 * f16(28 / 127), about 28: still decisive, only not a power of two. */
                         const int e = (int)(rng() % 5) - 2;
                         for (int x = 0; x < HD; ++x) {
                             const size_t at = ((size_t)j * kvh + kh) * HD + (size_t)x;
                             kt[at] = rad_f32_to_bf16(x == d ? 28.0f : 0.0f);
                             const int cv = L->v2 ? (rng() & 1 ? 1 : -1) * (x % 2 ? 1 : 3)
-                                         : x % 32 == 0 ? (rng() & 1 ? 7 : -7) : code(rng);
+                                         : x % (L->i8 ? HD : 32) == 0
+                                             ? (rng() & 1 ? 1 : -1) * (L->i8 ? 127 : 7) : code(rng);
                             vt[at] = rad_f32_to_bf16(std::ldexp((float)cv, e));
                         }
                     }
@@ -475,6 +567,13 @@ int main() {
             { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_k4hv2h, r4d_rad_attn_decode_h256_gqa6_k4hv2h,
               r4d_rad_attn_prefill_h256_gqa6_k4hv2h_scratch,
               r4d_rad_attn_decode_h256_gqa6_k4hv2h_scratch, 10 } } },
+        { &kI8h, r4d_rad_kv_store_i8h,
+          { { "gqa12", 12, r4d_rad_attn_prefill_h256_gqa12_i8h, r4d_rad_attn_decode_h256_gqa12_i8h,
+              r4d_rad_attn_prefill_h256_gqa12_i8h_scratch,
+              r4d_rad_attn_decode_h256_gqa12_i8h_scratch, 5 },
+            { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_i8h, r4d_rad_attn_decode_h256_gqa6_i8h,
+              r4d_rad_attn_prefill_h256_gqa6_i8h_scratch,
+              r4d_rad_attn_decode_h256_gqa6_i8h_scratch, 10 } } },
     };
     for (const Run& run : runs) {
         L = run.layout;
@@ -507,6 +606,10 @@ int main() {
             for (const Case& c : cases) attn_case(att, g, c, rng);
         }
     }
+
+    std::printf("kv_store bf16_e4m3r (the experiment): the emulated kernel against libref\n");
+    e4m3r_case(kst, "two kv heads, a prefill chunk", 21, 2, 1.0, 1.0, rng);
+    e4m3r_case(kst, "a descale on each side", 7, 1, 0.75, 1.5, rng);
 
     std::printf(g_fails ? "k4h layouts: %d failure(s)\n" : "k4h layouts: all cases pass\n", g_fails);
     return g_fails ? 1 : 0;

@@ -3363,12 +3363,16 @@ int store_k4h(T& k, T& v, T& sm, T& kv, int64_t M, int64_t hd, int64_t nkv, int6
 }
 
 /* attend()'s prefill over a k4h_v4 (or `layout`) cache: bf16 q, k and v, optionally rotated as a
- * recipe layer is, the output in f32. */
+ * recipe layer is, the output in f32. `layout` may also be i8h, fp8_e4m3 (the plain E4M3 cache)
+ * or bf16_e4m3r (the experiment's bf16 cache, read as bf16). */
 std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<float>& k,
                               const std::vector<float>& v, int64_t Tn, bool rotated,
                               const char* layout = "k4h_v4") {
-    const int64_t r16 = std::strcmp(layout, "k4h_v2h") == 0 ? 14 : 18;
     const int64_t hd = 256, nh = 4, nkv = 2, bs = 16;
+    const bool fp8 = std::strcmp(layout, "fp8_e4m3") == 0, e4r = std::strcmp(layout, "bf16_e4m3r") == 0;
+    const int64_t row = std::strcmp(layout, "k4h_v2h") == 0 ? 14 * hd / 16
+                      : std::strcmp(layout, "i8h") == 0 ? 2 * hd + 4
+                      : fp8 || e4r ? 2 * hd : 18 * hd / 16;
     T tq(RAD_BF16, {Tn, nh, hd}), tk(RAD_BF16, {Tn, nkv, hd}), tv(RAD_BF16, {Tn, nkv, hd});
     tq.f(q); tk.f(k); tv.f(v);
     if (rotated) {
@@ -3380,14 +3384,14 @@ std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<flo
     std::vector<int64_t> slots;
     for (int64_t t = 0; t < Tn; ++t) slots.push_back(t);
     sm.n(slots);
-    T kv(RAD_F8E4M3, {1, nkv, bs, r16 * hd / 16});
+    T kv(e4r ? RAD_BF16 : RAD_F8E4M3, {1, nkv, bs, row});
     CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, layout));
     T bt(RAD_I32, {1, 1}); bt.n({0});
     T su(RAD_I32, {1});    su.n({Tn});
     T out(RAD_BF16, {Tn, nh, hd});
     A at; at.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
              .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
-             .i("causal", 1).i("window", 0).s("q_dtype", "bf16").s("kv_dtype", layout);
+             .i("causal", 1).i("window", 0).s("q_dtype", "bf16").s("kv_dtype", e4r ? "bf16" : layout);
     CHECK_OK(run("attn_paged", at));
     if (rotated) CHECK_OK(had_rotate(out, hd, hd));
     std::vector<float> o((size_t)(Tn * nh * hd));
@@ -3538,6 +3542,211 @@ TEST(a_k4h_v4_cache_of_the_wrong_shape_is_refused) {
              .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
              .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v4");
     CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
+/* ================================================================== the i8h cache */
+
+/* Worked by hand at head_dim 32 (a head is the scale's unit, so one head is the whole row's half).
+ * K's absmax is 127, so its scale is 127 / 127 = 1.0 (f16 0x3c00) and its codes are the values
+ * rounded to even -- 3.5 to 4, 2.5 to 2, -0.5 to 0, 6.75 to 7 -- a byte each, two's complement
+ * (-127 is 0x81). V is all zero: scale 0, codes 0. The row is K's 32 code bytes, V's 32, K's
+ * scale, V's: 68 bytes. The other slot of the block keeps its bytes, a slot of -1 writes nothing. */
+TEST(an_i8h_store_writes_int8_codes_and_one_absmax_over_127_scale_a_head) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, 0.0f);
+    const float g[] = { 127, -127, 3.5f, 2.5f, 1, -0.5f, 6.75f, 100.25f };
+    for (int i = 0; i < 8; ++i) kx[(size_t)(24 + i)] = g[i];
+    for (int i = 32; i < 64; ++i) kx[(size_t)i] = 1000.0f;   /* token 1, dropped */
+    k.f(kx);
+    T sm(RAD_I32, {2}); sm.n({1, -1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 68});
+    std::vector<uint8_t> fill(136, 0x5a);
+    kv.raw(fill);
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2, "i8h"));
+    const uint8_t* b = kv.mem.data();
+    for (int i = 0; i < 68; ++i) CHECK_EQ((int)b[i], 0x5a);          /* slot 0: untouched */
+    const uint8_t* r = b + 68;                                        /* slot 1: token 0 */
+    const int want[8] = { 0x7f, 0x81, 0x04, 0x02, 0x01, 0x00, 0x07, 0x64 };
+    for (int i = 0; i < 24; ++i) CHECK_EQ((int)r[i], 0);
+    for (int i = 0; i < 8; ++i) CHECK_EQ((int)r[24 + i], want[i]);
+    for (int i = 32; i < 64; ++i) CHECK_EQ((int)r[i], 0);            /* V's codes */
+    CHECK_EQ((int)r[64], 0x00); CHECK_EQ((int)r[65], 0x3c);         /* K's scale, 1.0 */
+    CHECK_EQ((int)r[66], 0x00); CHECK_EQ((int)r[67], 0x00);         /* V's scale, 0 */
+}
+
+/* The scale is absmax / 127 rounded once to f16, capped at 512 so a head past 512 * 127 clamps its
+ * codes at +-127 and 127 times the scale stays an f16. A NaN drops out of the absmax and stores
+ * the clamp's -127; an infinity takes the cap and stores +127; a head of NaNs is NaN's absmax,
+ * capped, every code -127. Nothing stores -128. */
+TEST(an_i8h_store_caps_the_scale_and_clamps_nan_and_infinity) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, std::nanf("")), vx(64, 0.0f);
+    for (int i = 0; i < 32; ++i) kx[(size_t)i] = 0.0f;
+    kx[0] = 1e6f; kx[1] = -2e5f; kx[2] = 5000.0f;
+    vx[0] = 0.7f; vx[1] = std::nanf(""); vx[2] = INFINITY; vx[3] = -INFINITY;
+    k.f(kx); v.f(vx);
+    T sm(RAD_I32, {2}); sm.n({0, 1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 68});
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2, "i8h"));
+    const uint8_t* r = kv.mem.data();
+    auto scale = [&](const uint8_t* p) { uint16_t s16; std::memcpy(&s16, p, 2); return rad_f16_to_f32(s16); };
+    CHECK_EQ(scale(r + 64), 512.0f);           /* 1e6 / 127 capped */
+    CHECK_EQ(scale(r + 66), 512.0f);           /* inf / 127 capped */
+    CHECK_EQ((int)r[0], 0x7f);                 /* 1e6 to +127 */
+    CHECK_EQ((int)r[1], 0x81);                 /* -2e5 to -127 */
+    CHECK_EQ((int)r[2], 10);                   /* 5000 / 512 = 9.77 to 10 */
+    CHECK_EQ((int)r[32], 0x00);                /* 0.7 / 512 to 0 */
+    CHECK_EQ((int)r[33], 0x81);                /* NaN to -127 */
+    CHECK_EQ((int)r[34], 0x7f);                /* inf to +127 */
+    CHECK_EQ((int)r[35], 0x81);                /* -inf to -127 */
+    const uint8_t* r1 = r + 68;                /* token 1: K a head of NaNs */
+    CHECK_EQ(scale(r1 + 64), 512.0f);
+    for (int i = 0; i < 32; ++i) CHECK_EQ((int)r1[i], 0x81);
+    CHECK_EQ(scale(r1 + 66), 0.0f);            /* its V all zero */
+}
+
+/* An i8h read is code times the head's scale and then the fp8 path's arithmetic, so attention over
+ * a stored cache is attention over its dequantised values, bit for bit (as for k4h_v4). */
+TEST(attention_over_an_i8h_cache_is_attention_over_its_dequantised_values) {
+    const int64_t Tn = 7, hd = 64, nh = 4, nkv = 2, bs = 4, nb = 2, row = 2 * hd + 4;
+    std::mt19937 rng(12);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    T tq(RAD_F32, {Tn, nh, hd}), tk(RAD_F32, {Tn, nkv, hd}), tv(RAD_F32, {Tn, nkv, hd});
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) st_dt(RAD_F32, tq.t.data, i, nd(rng));
+    for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+        st_dt(RAD_F32, tk.t.data, i, nd(rng) * (i % hd == 9 ? 20.0f : 1.0f));
+        st_dt(RAD_F32, tv.t.data, i, nd(rng));
+    }
+    T sm(RAD_I32, {Tn}); sm.n({4, 5, 6, 7, 0, 1, 2});   /* block 1, then block 0 */
+    T kv(RAD_F8E4M3, {nb, nkv, bs, row});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, "i8h"));
+    /* The same slots, dequantised by hand from the row layout (abi/rad_builder.h). */
+    T f(RAD_F32, {nb, nkv, bs, 2 * hd});
+    const uint8_t* c = kv.mem.data();
+    for (int64_t s = 0; s < nb * nkv * bs; ++s)
+        for (int which = 0; which < 2; ++which) {
+            const uint8_t* r = c + s * row;
+            uint16_t sc;
+            std::memcpy(&sc, r + 2 * hd + 2 * which, 2);
+            for (int64_t d = 0; d < hd; ++d)
+                st_dt(RAD_F32, f.t.data, s * 2 * hd + which * hd + d,
+                      (float)(int8_t)r[which * hd + d] * rad_f16_to_f32(sc));
+        }
+    T bt(RAD_I32, {1, 2}); bt.n({1, 0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T o8(RAD_F32, {Tn, nh, hd}), of(RAD_F32, {Tn, nh, hd});
+    A a8; a8.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(o8)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "i8h");
+    CHECK_OK(run("attn_paged", a8));
+    A af; af.t(tq).t(f).t(bt).t(su).tnull().tnull().tnull().t(of)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", af));
+    int64_t same = 0;
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) same += o8.at(i) == of.at(i);
+    CHECK_EQ(same, Tn * nh * hd);
+    CHECK(o8.at(0) != 0.0f);
+}
+
+/* The ticket's premise on the reference: at fp8's size, rotated int8 with a scale a head holds the
+ * attention several times closer than the E4M3 cache, which keeps three mantissa bits where int8
+ * keeps seven. Keys with an outlier channel and values of spread magnitude, the error taken
+ * against the exact attention: 0.0081 against 0.027 here, the bf16 output's rounding included
+ * (the card's real q/k/v gave 0.0036 against 0.0152 in prep kvstat). */
+TEST(rotated_i8h_holds_the_attention_closer_than_the_fp8_cache) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(9);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd)), v((size_t)(Tn * nkv * hd));
+    for (auto& x : q) x = nd(rng) * 0.3f;
+    for (size_t i = 0; i < k.size(); ++i) k[i] = nd(rng) * (i % hd == 5 ? 30.0f : 1.0f);
+    for (auto& x : v) x = nd(rng);
+    for (auto* w : { &q, &k, &v })
+        for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+    const double e_fp8 = rel_l2(attend_k4h(q, k, v, Tn, false, "fp8_e4m3"), exact);
+    const double e_i8h = rel_l2(attend_k4h(q, k, v, Tn, true, "i8h"), exact);
+    std::printf("    fp8 vs exact %.3g, i8h rotated vs exact %.3g\n", e_fp8, e_i8h);
+    CHECK(e_i8h < 0.5 * e_fp8);
+}
+
+/* A cache whose last extent is not 2 * head_dim + 4 bytes is refused, store and attention alike:
+ * an fp8-sized row has no room for the scales. */
+TEST(an_i8h_cache_of_the_wrong_shape_is_refused) {
+    T k(RAD_F32, {1, 1, 32}), v(RAD_F32, {1, 1, 32});
+    T sm(RAD_I32, {1}); sm.n({0});
+    T plain(RAD_F8E4M3, {1, 1, 1, 64});
+    CHECK_EQ(store_k4h(k, v, sm, plain, 1, 32, 1, 1, "i8h"), RAD_E_SHAPE);
+    T q(RAD_F32, {1, 1, 32}), out(RAD_F32, {1, 1, 32});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({1});
+    A at; at.t(q).t(plain).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "i8h");
+    CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
+/* ================================================================== the fp8-rounding experiment */
+
+/* kv_store at kv_dtype bf16_e4m3r stores into a bf16 cache what the fp8 store stores into an E4M3
+ * one, value for value (k / k_scale rounded to E4M3, times k_scale), and the clamp's -448 for a
+ * NaN where the E4M3 cache keeps a NaN code. At a descale of 1 each stored bf16 is exactly an
+ * E4M3 value. */
+TEST(the_e4m3_rounded_bf16_store_holds_what_the_fp8_store_holds) {
+    const int64_t Tn = 5, hd = 64, nkv = 2, bs = 8;
+    std::mt19937 rng(13);
+    std::uniform_real_distribution<float> mag(std::log(1e-4f), std::log(2e3f));
+    T tk(RAD_BF16, {Tn, nkv, hd}), tv(RAD_BF16, {Tn, nkv, hd});
+    for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+        st_dt(RAD_BF16, tk.t.data, i, std::exp(mag(rng)) * (rng() & 1 ? -1.f : 1.f));
+        st_dt(RAD_BF16, tv.t.data, i, std::exp(mag(rng)) * (rng() & 1 ? -1.f : 1.f));
+    }
+    st_dt(RAD_BF16, tv.t.data, 3, std::nanf(""));
+    T sm(RAD_I32, {Tn}); sm.n({0, 1, 2, 3, 4});
+    for (const double scale : { 1.0, 0.5 }) {
+        T f8(RAD_F8E4M3, {1, nkv, bs, 2 * hd}), e4(RAD_BF16, {1, nkv, bs, 2 * hd});
+        for (int which = 0; which < 2; ++which) {
+            A st; st.t(tk).t(tv).t(sm).t(which ? e4 : f8)
+                     .i("M", Tn).i("head_dim", hd).i("n_head_kv", nkv).i("block_size", bs)
+                     .s("kv_dtype", which ? "bf16_e4m3r" : "fp8_e4m3")
+                     .d("k_scale", scale).d("v_scale", scale);
+            CHECK_OK(run("kv_store", st));
+        }
+        int64_t same = 0, nan = 0, n = 0;
+        for (int64_t i = 0; i < nkv * bs * 2 * hd; ++i) {
+            if ((i % (bs * 2 * hd)) / (2 * hd) >= Tn) continue;   /* slots no token wrote */
+            ++n;
+            const float a = f8.at(i) * (float)scale, b = e4.at(i);
+            if (std::isnan(a)) { nan += b == -448.0f * (float)scale; continue; }
+            same += a == b;
+        }
+        CHECK_EQ(nan, 1);
+        CHECK_EQ(same + nan, n);
+    }
+}
+
+/* What makes it an experiment that isolates storage rounding: the bf16 attention over the rounded
+ * cache is the fp8 attention over the E4M3 cache, bit for bit, in the reference. On the card the
+ * two attentions are different kernels, so what is left between their KLs is the fp8 path's. */
+TEST(attention_over_the_e4m3_rounded_bf16_cache_is_the_fp8_attention_bit_for_bit) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(14);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd)), v((size_t)(Tn * nkv * hd));
+    for (auto& x : q) x = nd(rng);
+    for (auto& x : k) x = nd(rng) * 3.0f;
+    for (auto& x : v) x = nd(rng);
+    const std::vector<float> o8 = attend_k4h(q, k, v, Tn, false, "fp8_e4m3");
+    const std::vector<float> oe = attend_k4h(q, k, v, Tn, false, "bf16_e4m3r");
+    const std::vector<float> ob = attend(RAD_BF16, q, k, v, Tn, false);
+    int64_t same = 0, moved = 0;
+    for (size_t i = 0; i < o8.size(); ++i) {
+        same += o8[i] == oe[i];
+        moved += ob[i] != oe[i];
+    }
+    CHECK_EQ(same, (int64_t)o8.size());
+    CHECK(moved > (int64_t)o8.size() / 4);   /* and the rounding did happen */
 }
 
 /* ================================================================== the k4h_v2h cache */

@@ -131,6 +131,33 @@ __device__ __forceinline__ void v_codes_nm(uint32_t w, uint32_t& n, uint32_t& m)
 }
 template<int V2> struct VBias { static constexpr float v = V2 ? 1027.0f : 1032.0f; };
 
+// The i8h cache's eight dims of one key, int8 codes in `lo` (dims 0-3, a byte each) and `hi` (dims
+// 4-7), as v_codes_nm's two words: `n` dims 0, 2, 4, 6 and `m` dims 1, 3, 5, 7, each code ^ 0x80,
+// which is offset binary u = c + 128 (1..255). 0x6400 | u is the f16 1024 + u, and less 1152 it
+// is c, exact in f16. perm takes bytes 0-3 from its second operand and 4-7 from its first.
+__device__ __forceinline__ void v8_codes_nm(uint32_t lo, uint32_t hi, uint32_t& n, uint32_t& m) {
+    n = __builtin_amdgcn_perm(hi, lo, 0x06040200u) ^ 0x80808080u;
+    m = __builtin_amdgcn_perm(hi, lo, 0x07050301u) ^ 0x80808080u;
+}
+constexpr float kI8Bias = 1152.0f;
+
+// Eight K dims of the i8h cache as four f16 dwords, dims (2i, 2i+1) in dword i, from their codes
+// `lo` / `hi` (v8_codes_nm) and the token's scale `s2` (the f16 in both halves): (1024 + u - 1152)
+// * s, rounded once, as k4x8_to_f16x4w widens int4.
+__device__ __forceinline__ void k8x8_to_f16x4w(uint32_t lo, uint32_t hi, uint32_t s2, uint32_t* w4) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    uint32_t ev, od;
+    v8_codes_nm(lo, hi, ev, od);
+    const h2 s = __builtin_bit_cast(h2, s2);
+    const h2 bias = { (_Float16)kI8Bias, (_Float16)kI8Bias };
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
+        const uint32_t x = __builtin_amdgcn_perm(od, ev, sel) | 0x64006400u;
+        w4[b] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(h2, x) - bias) * s);
+    }
+}
+
 template<class D>
 __device__ __forceinline__ void fp8x8_to_16x4w(uint2 raw, uint32_t* w4) {
     #pragma unroll

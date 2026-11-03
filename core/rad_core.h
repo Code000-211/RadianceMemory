@@ -867,10 +867,10 @@ struct Config {
      * another name. */
     std::string kv_cache_dtype = "bf16";
     /* --kv-recipe FILE: each attention layer's cache layout, from the fp8 set (fp8, fp8_v4,
-     * k6_v4, and k4h_v4 and k4h_v2h, always rotated), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
+     * k6_v4, and k4h_v4, k4h_v2h and i8h, always rotated), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
      * checked at parse, so a malformed file stops the start before the model is opened; the plugin
      * then checks it against the model's layers (RadBuildCtx::kv_recipe). `kv_recipe` is indexed
-     * by layer, a RAD_KVQ_* (with RAD_KVQ_ROTATED for a `rotated` line or a k4h layout) or -1 where the file names
+     * by layer, a RAD_KVQ_* (with RAD_KVQ_ROTATED for a `rotated` line or a k4h or i8h layout) or -1 where the file names
      * no such layer, and empty without a recipe. RAD_KVQ_VMEAN marks a `vmean` layer.
      * A recipe narrows the fp8 cache, so it needs --kv-cache-dtype fp8. */
     std::string kv_recipe_path;
@@ -1236,7 +1236,7 @@ struct Config {
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 /* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
- * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4 and k4h_v2h, rotated
+ * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4, k4h_v2h and i8h, rotated
  * layouts, and RAD_KVQ_VMEAN where it ends in `vmean`) or -1. `vmean_file`, when given, receives
  * the path a `vmean FILE` line names, as written.
  * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
@@ -1257,13 +1257,13 @@ int  kv_vmean_parse(const std::string& text, const char* name, KvVMean* out);
  * file named, where its head_dim or KV heads are not the model's or a vmean layer has no entry. */
 int  kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_t head_dim,
                     int64_t n_head_kv, int64_t n_head, std::vector<uint16_t>* out);
-/* A recipe's RAD_KVQ_* by its name in the file (fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h), and back; -1 / null for
+/* A recipe's RAD_KVQ_* by its name in the file (i8h, fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h), and back; -1 / null for
  * anything else. */
 int         kv_layout_of(const char* name);
 const char* kv_layout_name(int kvq);
 /* Every recipe layout's RAD_KVQ_*, widest first, and what a group of 32 K and 32 V elements of
- * one costs in bits with its scales (fp8 512, fp8_v4 400, k6_v4 352, k4h_v4 288, k4h_v2h 224);
- * -1 for anything else.
+ * one costs in bits with its scales (i8h 516 at head_dim 256, fp8 512, fp8_v4 400, k6_v4 352,
+ * k4h_v4 288, k4h_v2h 224); -1 for anything else.
  * Rotation (RAD_KVQ_ROTATED) does not change the bits. */
 std::vector<int> kv_layouts();
 int              kv_layout_group_bits(int kvq);

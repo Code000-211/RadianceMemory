@@ -66,10 +66,11 @@ std::vector<int> kvq_of(const std::vector<std::vector<KvCandidate>>& layers,
 /* ================================================================== the solver */
 
 TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
-    CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4, RAD_KVQ_K4H,
-                                             RAD_KVQ_K4HV2H }));
+    CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_I8H, RAD_KVQ_NONE, RAD_KVQ_V4, RAD_KVQ_K6V4,
+                                             RAD_KVQ_K4H, RAD_KVQ_K4HV2H }));
     /* fp8's 8 bits an element, and the 25/32, 22/32, 18/32 and 14/32 of it docs/GUIDE.md §4.4
-     * states. */
+     * states; i8h at 258/256 of it (an f16 scale a 256-dim head is 2 bits a group of 32). */
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_I8H), 516);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_NONE), 512);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_V4), 400);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K6V4), 352);
@@ -265,7 +266,8 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
 
-    /* 1 + 4 layers x 4 narrower layouts, each with the engine's flags and the driver's. */
+    /* 1 + 4 layers x 4 narrower layouts (i8h, wider than the base, is no candidate), each with the
+     * engine's flags and the driver's. */
     CHECK_EQ(b.lines(b.calls), 17);
     const std::string calls = tiny::read_text(b.calls);
     CHECK(has(calls, "--model /m/x.rad --tp 2 --kv-cache-dtype fp8 --kv-recipe "));
@@ -374,6 +376,9 @@ TEST(the_driver_refuses_bad_arguments_and_stops_at_a_failed_run) {
             "under the narrowest layout's 6.25");
     refused({ "--layers", "3,7", "--bits", "6", "--layouts", "k4_v2", "--", "--model", "m" },
             "'k4_v2' is not a KV layout");
+    /* A cost is KL above the fp8 base, clamped at zero, so a wider layout cannot be priced. */
+    refused({ "--layers", "3,7", "--bits", "8.5", "--layouts", "i8h", "--", "--model", "m" },
+            "--layouts: i8h is wider than the fp8 base");
     refused({ "--layers", "3,7", "--", "--model", "m" }, "are required");
     CHECK_EQ(b.lines(b.calls), 0);
 

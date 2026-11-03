@@ -448,8 +448,9 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, Rad
  * the k6_v4 cache (352 bytes: int6 K, int4 V), prefill, decode and decode with the gate and
  * quantiser in the merge; the k4h_v4 cache (288 bytes: int4 K and V, stored rotated), prefill and
  * decode only, since a rotated layer rotates its output back before the gate and so never folds
- * the gate into the merge (arch/common/rad_block_attn_gated_fp8.h); and the k4h_v2h cache (224
- * bytes: int4 K, KVarN-normalised int2 V, stored rotated), likewise. */
+ * the gate into the merge (arch/common/rad_block_attn_gated_fp8.h); the k4h_v2h cache (224
+ * bytes: int4 K, KVarN-normalised int2 V, stored rotated), likewise; and the i8h cache (516 bytes:
+ * int8 K and V, one f16 scale a token and head each, stored rotated), likewise. */
 #define G8_V4_ENTRIES(TAG, ROWB, XOPT)                                                        \
 extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG##_scratch)(const RadArgs* a) { \
     return g8_prefill_scratch(a, ROWB);                                                        \
@@ -488,6 +489,7 @@ G8_V4_ENTRIES(k6v4, 352, O_V4 | O_K6)
 G8_V4_GQ_ENTRY(k6v4, 352, O_V4 | O_K6)
 G8_V4_ENTRIES(k4hv4, 288, O_V4 | O_K4)
 G8_V4_ENTRIES(k4hv2h, 224, O_V4 | O_K4 | O_V2)
+G8_V4_ENTRIES(i8h, 516, O_V4 | O_K4 | O_I8)
 #undef G8_V4_ENTRIES
 #undef G8_V4_GQ_ENTRY
 #endif

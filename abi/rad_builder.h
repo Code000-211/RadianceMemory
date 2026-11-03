@@ -80,6 +80,11 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [HD/2, 3HD/4)      V's int2 codes, dim d in bits 2 * (d % 4) of byte d / 4
  *     [3HD/4, 13HD/16)   K's scales (absmax / 7)
  *     [13HD/16, 14HD/16) V's scales (variance-normalised, below)
+ *   RAD_KVQ_I8H (i8h, ABI 39), 2 * HD + 4 bytes, K and V both stored rotated:
+ *     [0, HD)            K's int8 codes, dim d in byte d
+ *     [HD, 2HD)          V's int8 codes
+ *     [2HD, 2HD + 2)     K's scale, one for the token's whole head (absmax / 127)
+ *     [2HD + 2, 2HD + 4) V's scale, likewise
  *
  * k4h_v4 is k6_v4 without K's high-bit words, K's codes and scales read as V's. Four-bit K holds
  * only where the rotation has spread K's outlier channels, so a k4h_v4 layer is always a rotated
@@ -94,7 +99,13 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  * rounding. libref's kv_store is the contract (libref/ref_attn.cpp, docs/OPS.md). Rotated always,
  * as k4h_v4.
  *
- * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
+ * i8h is the 8-bit layout of the rotated family: with the outlier channels spread by the
+ * rotation one scale holds a whole head of a token, so the row costs 8.06 bits an element (fp8's
+ * 8 plus 32 bits of scales a token and head) with seven bits of resolution where E4M3 has three.
+ * Rotated always, as k4h_v4. Its row is 516 bytes at head_dim 256, a multiple of four but not of
+ * sixteen, so its kernels read codes as 4-byte words.
+ *
+ * Codes are two's complement (int4 -7..7, int6 -31..31, int8 -127..127). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
  * it. */
 enum {
@@ -102,7 +113,8 @@ enum {
     RAD_KVQ_V4   = 1,
     RAD_KVQ_K6V4 = 2,
     RAD_KVQ_K4H  = 3,
-    RAD_KVQ_K4HV2H = 4
+    RAD_KVQ_K4HV2H = 4,
+    RAD_KVQ_I8H  = 5
 };
 
 /* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):
@@ -117,7 +129,7 @@ enum {
  * rotation (RadBuildCtx::kv_vmean holds the vectors). A row of attention weights sums to one, so
  * P (V - mu) + mu = P V: exact but for the rounding of the two adds, while the integer V layouts
  * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
- * k6_v4, k4h_v4, k4h_v2h); K, the cache layout and the attention rows are unchanged. */
+ * k6_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged. */
 enum {
     RAD_KVQ_LAYOUT  = 0xff,
     RAD_KVQ_ROTATED = 0x100,

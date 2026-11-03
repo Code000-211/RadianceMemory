@@ -17,6 +17,9 @@
  *     it is the unrotated one.
  *   - Optionally centred (`vmean_sub`/`vmean_add`, --kv-recipe `vmean`): a static mean of V is
  *     subtracted before the store and added to the attention output before its rotation back.
+ *   - An experiment, RADIANCE_DEBUG_KV_E4M3R (kv_e4m3r_debug below): on a bf16 cache the store
+ *     rounds every value through E4M3 as the fp8 cache's store does (kv_store at kv_dtype
+ *     bf16_e4m3r), and the bf16 attention reads it.
  *
  * The q|gate projection is [2*n_head*head_dim, n_embd] = [12288, 5120] at 27B, scale plane
  * [96, 40]. Row-sharding by head keeps whole 128-row scale blocks only because 2*head_dim = 512 is
@@ -28,6 +31,7 @@
 #include "rad_fp8.h"
 #include "rad_calib_vmean.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace rad {
@@ -39,6 +43,21 @@ namespace arch {
 inline bool kv_store_streamed_dtype(const char* kv_dtype) {
     return kv_dtype && (std::strcmp(kv_dtype, "fp8_e4m3") == 0 ||
                         std::strcmp(kv_dtype, "bf16") == 0);
+}
+
+/* RADIANCE_DEBUG_KV_E4M3R set (and not "0"), with --kv-cache-dtype bf16: an experiment that
+ * separates what the fp8 cache costs in storage rounding from what its attention path costs. Each
+ * K and V value is stored as the fp8 store rounds it (k / k_scale clamped to +-448 and rounded to
+ * E4M3, the descales the fp8 cache has here, 1.0), decoded and kept in the bf16 cache, so the bf16
+ * attention reads exactly the values the fp8 attention would (E4M3 values are exact in bf16 and
+ * in the f16 both kernels widen to). Its KL against a bf16 reference is the storage rounding
+ * alone; fp8's KL above it is the fp8 path's. The fused prologue's store fold and the streamed
+ * store have no such row, so the layer stores with kv_store (a streamed group fails the step).
+ * Not a layout: nothing else reads the name, and an fp8 or packed cache ignores the switch. */
+inline bool kv_e4m3r_debug() {
+    /* Read at each declare (startup only), not cached, so a test can set it. */
+    const char* e = std::getenv("RADIANCE_DEBUG_KV_E4M3R");
+    return e && *e && std::strcmp(e, "0") != 0;
 }
 
 /* Layer `l`'s V mean for this rank (RadKvVMean, abi/rad_builder.h), in the rotated basis when
@@ -480,18 +499,26 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     if (qsa_sel && qsa_nsel)
         op_resolve = kv_resolve_declare(b, g, kv, qsa_sel, qsa_nsel, qsa_topk + 1);
 
+    /* The experiment (kv_e4m3r_debug): the store's name for a bf16 cache rounded through E4M3. */
+    const bool e4m3r = kv_e4m3r_debug() && g.kv_dtype && !std::strcmp(g.kv_dtype, "bf16");
+    if (e4m3r) {
+        static const bool said = (fprintf(stderr, "radiance: RADIANCE_DEBUG_KV_E4M3R: the bf16 "
+                                                  "cache stores E4M3-rounded values (an "
+                                                  "experiment, not a deployment)\n"), true);
+        (void)said;
+    }
     op_kv_store = rw(b, RAD_OP(b, "kv_store",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                     RAD_INT("n_head_kv", g.n_head_kv),
                                     RAD_INT("block_size", rad_kv_block_size(b, kv)),
-                                    RAD_STR("kv_dtype", g.kv_dtype)),
+                                    RAD_STR("kv_dtype", e4m3r ? "bf16_e4m3r" : g.kv_dtype)),
                          RAD_NOWEIGHTS),
                      {w.k, w.v}, {});
 
     /* The streamed store: kv_store's operands and parameters plus the residency map and the layer's
      * mirror row, which the batch carries (store_cache). `block_size` does not bind the group;
      * `attn_paged` already has. Only for a layout with a row (kv_store_streamed_dtype). */
-    if (kv_store_streamed_dtype(g.kv_dtype) && rad_op_declared(b, "kv_store_streamed"))
+    if (!e4m3r && kv_store_streamed_dtype(g.kv_dtype) && rad_op_declared(b, "kv_store_streamed"))
         op_kv_stream = rw(b, RAD_OP(b, "kv_store_streamed",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                         RAD_INT("head_dim", g.head_dim),
@@ -505,7 +532,8 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
      * Resolves for E4M3 and bf16 caches. Not on a rotated layer, whose store follows a rotation. */
-    if (op_fused && !rotate && !op_vsub && rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
+    if (op_fused && !rotate && !op_vsub && !e4m3r &&
+        rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
                                        RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
@@ -519,7 +547,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* The fold for a streamed group: also writes the mirror and consults the residency map, whose
      * operands are added at issue. Gated on the same layouts. */
-    if (op_fused && !rotate && !op_vsub && kv_store_streamed_dtype(g.kv_dtype) &&
+    if (op_fused && !rotate && !op_vsub && !e4m3r && kv_store_streamed_dtype(g.kv_dtype) &&
         rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
         op_fused_stream = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store_streamed",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),

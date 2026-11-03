@@ -94,8 +94,9 @@ static const Flag g_flags[] = {
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
     { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, k4h_v4\n"
-                                        "(rotated int4 K and V, 0.56) or k4h_v2h (int2 V, 0.44;\n"
-                                        "both rotated, Flash-Next), a 'layer N\n"
+                                        "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
+                                        "(int8, a scale a token and head, 1.01; all rotated,\n"
+                                        "Flash-Next), a 'layer N\n"
                                         "LAYOUT [rotated]' line a layer (docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
@@ -527,6 +528,10 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
  * calibration candidate at once. */
 struct KvLayout { const char* name; int kvq; int group_bits; };
 static const KvLayout kKvLayouts[] = {
+    /* K and V int8, stored rotated, one f16 scale a token and head for each: at head_dim 256 a
+     * group of 32 carries an eighth of a scale, 2 bits, so 258/256 of fp8. The only layout wider
+     * than fp8; it buys resolution (7 bits to E4M3's 3), not room. */
+    { "i8h",    RAD_KVQ_I8H,  (32 * 8 + 2) + (32 * 8 + 2) },
     /* E4M3 K and V; the descales are per (sequence, head), nothing a group. */
     { "fp8",    RAD_KVQ_NONE, 32 * 8 + 32 * 8 },
     /* V int4 with an f16 scale a group: 25/32 of fp8. */
@@ -567,9 +572,9 @@ std::vector<int> kv_layouts() {
 /* One `layer N LAYOUT` line per attention layer, `layer N LAYOUT rotated` for a layer that stores
  * its K and V rotated (RAD_KVQ_ROTATED: the normalised Hadamard over head_dim, its query rotated
  * before the attention and the output back after it); `#` starts a comment, blank lines are
- * skipped. k4h_v4 and k4h_v2h are rotated layouts (RAD_KVQ_K4H, RAD_KVQ_K4HV2H): a line of
- * either marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
- * (the h is the Hadamard), a k4h layer without the rotation is not a deployment anyone can ask
+ * skipped. k4h_v4, k4h_v2h and i8h are rotated layouts (RAD_KVQ_K4H, RAD_KVQ_K4HV2H,
+ * RAD_KVQ_I8H): a line of any of them marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
+ * (the h is the Hadamard), a k4h or i8h layer without the rotation is not a deployment anyone can ask
  * for, and rad-autoquant writes every layout as `layer N LAYOUT` from the table above.
  * A line may also end in `vmean` (after `rotated` when both): the layer subtracts a static V mean
  * before its store and adds it to the attention output (RAD_KVQ_VMEAN), taken from the file one
@@ -632,13 +637,13 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const int q = kv_layout_of(layout.c_str());
         if (q < 0) {
-            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4 "
-                    "or k4h_v2h", name, ln, l, layout.c_str());
+            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4, "
+                    "k4h_v2h or i8h", name, ln, l, layout.c_str());
             return RAD_E_INVAL;
         }
         if (vmean && q == RAD_KVQ_NONE) {
             RAD_ERR("%s line %d: layer %ld: 'vmean' is for a layout with integer V (fp8_v4, "
-                    "k6_v4, k4h_v4, k4h_v2h); fp8 keeps V in E4M3", name, ln, l);
+                    "k6_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
             return RAD_E_INVAL;
         }
         if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);
@@ -646,7 +651,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
             RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
             return RAD_E_INVAL;
         }
-        const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H;
+        const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
         r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
                        (vmean ? RAD_KVQ_VMEAN : 0);
         vmean_layers += vmean;

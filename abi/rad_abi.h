@@ -40,8 +40,12 @@ extern "C" {
  * at 36 would read a k4h_v2h layer as a layout it does not know.
  *
  * 38: a static V mean per layer (--kv-recipe `vmean`): a kv_recipe entry a third meaning,
- * RAD_KVQ_VMEAN, RadBuildCtx gained kv_vmean, and RadKvVMean (rad_builder.h) is new. */
-#define RAD_ABI_VERSION 38u
+ * RAD_KVQ_VMEAN, RadBuildCtx gained kv_vmean, and RadKvVMean (rad_builder.h) is new.
+ *
+ * 39: a sixth layout, RAD_KVQ_I8H (i8h: rotated int8 K and V, one f16 scale a token and head;
+ * rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built at 38 would read an i8h
+ * layer as a layout it does not know. */
+#define RAD_ABI_VERSION 39u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

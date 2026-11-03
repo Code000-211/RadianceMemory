@@ -57,9 +57,11 @@
 // O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), with O_K6 the k6_v4
 // cache (int6 K, int4 V), with O_K4 the k4h_v4 cache (int4 K and V, stored rotated: the kernel
 // reads it as any other), and O_K4 with O_V2 the k4h_v2h cache (int4 K, int2 V: V's codes two
-// bits, widened by v_codes_nm in r4d_dt16.h); a token's row layout is RadBuildCtx::kv_quant's
+// bits, widened by v_codes_nm in r4d_dt16.h), and O_K4 with O_I8 the i8h cache (int8 K and V, one
+// f16 scale a token and head, stored rotated); a token's row layout is RadBuildCtx::kv_quant's
 // (abi/rad_builder.h).
 #define O_V2    4
+#define O_I8    8192
 #define O_V4    33554432
 #define O_K6    67108864
 #define O_K4    1073741824
@@ -113,13 +115,16 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int KQ    = K6 || K4;
     // k4h_v2h: k4h_v4 with V's codes two bits, K's scales after them.
     constexpr int V2    = ((OPT & O_V2) && K4) ? 1 : 0;
+    // i8h: k4h_v4's walk with a byte a code and one scale a token for each of K and V. Its row
+    // (2 * HEAD_DIM + 4) is 4-byte aligned only, so its codes are read a dword at a time.
+    constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : K4 ? HEAD_DIM * 18 / 16
-                        : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM / 2 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : I8 ? 2 * HEAD_DIM + 4
+                        : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16 : I8 ? 2 * HEAD_DIM + 2
                         : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
@@ -283,7 +288,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // The pair's two scales stay apart until storeV4 packs them: packed here, the fetch is waited on
     // right after it is issued. fp8_v4 packs here, as the prefill kernel does.
     constexpr int OLDV4 = V4 && !KQ;
-    uint32_t v4c[U4][2], v4s[U4][2];
+    // i8h: a key's eight V codes are two words, the second in v8c.
+    uint32_t v4c[U4][2], v4s[U4][2], v8c[I8 ? U4 : 1][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
@@ -302,6 +308,12 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
                                         + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                    if constexpr (I8) {
+                        v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 8);
+                        v8c[r][j] = *(const uint32_t*)(base + VOFF + o * 8 + 4);
+                        sc[j]     = *(const uint16_t*)(base + VSOFF);
+                        continue;
+                    }
                     v4c[r][j] = V2 ? *(const uint16_t*)(base + VOFF + o * 2)
                                    : *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
@@ -324,10 +336,16 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
                 // Each key's codes as offset bytes, even dims in n, odd in m (r4d_dt16.h).
                 uint32_t n0, m0, n1, m1;
-                v_codes_nm<V2>(v4c[r][0], n0, m0);
-                v_codes_nm<V2>(v4c[r][1], n1, m1);
+                if constexpr (I8) {
+                    v8_codes_nm(v4c[r][0], v8c[r][0], n0, m0);
+                    v8_codes_nm(v4c[r][1], v8c[r][1], n1, m1);
+                } else {
+                    v_codes_nm<V2>(v4c[r][0], n0, m0);
+                    v_codes_nm<V2>(v4c[r][1], n1, m1);
+                }
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                const h2 bias = { (_Float16)VBias<V2>::v, (_Float16)VBias<V2>::v };
+                constexpr float VB = I8 ? kI8Bias : VBias<V2>::v;
+                const h2 bias = { (_Float16)VB, (_Float16)VB };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
                                       + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];
                 #pragma unroll
@@ -508,6 +526,14 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                         k6x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
                                        *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * t), h,
                                        sb | (sb << 16), w4);
+                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
+                    } else if constexpr (I8) {
+                        // i8h: this lane's eight dims (16t + 8h ..), a byte each, and the token's
+                        // scale; two dword loads, the row being 4-byte aligned only.
+                        uint32_t w4[4];
+                        const uint32_t sb = *(const uint16_t*)(grow + KSOFF);
+                        const uint8_t* kp = grow + 16 * t + 8 * h;
+                        k8x8_to_f16x4w(*(const uint32_t*)kp, *(const uint32_t*)(kp + 4), sb | (sb << 16), w4);
                         kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     } else if constexpr (K4) {
                         // k4h_v4: this lane's eight dims from their codes and the group's scale.

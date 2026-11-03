@@ -723,7 +723,7 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* kv_store, the bf16, fp8, k4h_v4 and k4h_v2h rows, which differ only in the cache (`kv_dtype`).
+/* kv_store, the bf16, fp8, k4h_v4, k4h_v2h and i8h rows, which differ only in the cache (`kv_dtype`).
  *
  * The paged layout (libref/ref_ops.h, checked by the shim) is
  * kv_cache[n_blocks, kv_heads, block_size, 2 * head_dim], K at [.., d] and V at [.., head_dim + d].
@@ -738,12 +738,14 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
     const int64_t bs  = pi(p, n_p, "block_size");
     const uint32_t KV = dt_act(p, n_p, "kv_dtype");
     if (M <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
-    /* kv_store_k4hv4 / kv_store_k4hv2h: a token's row is 18 / 14 * head_dim / 16 bytes of an
-     * E4M3-declared cache (RAD_KVQ_K4H, RAD_KVQ_K4HV2H), as libref/ref_shapes.cpp describes it. */
+    /* kv_store_k4hv4 / kv_store_k4hv2h / kv_store_i8h: a token's row is 18 / 14 * head_dim / 16 or
+     * 2 * head_dim + 4 bytes of an E4M3-declared cache (RAD_KVQ_K4H, RAD_KVQ_K4HV2H, RAD_KVQ_I8H),
+     * as libref/ref_shapes.cpp describes it. */
     const char* kvs = r4d_pgets(p, n_p, "kv_dtype");
-    const int64_t r16 = !kvs ? 0 : !std::strcmp(kvs, "k4h_v4") ? 18
-                      : !std::strcmp(kvs, "k4h_v2h") ? 14 : 0;
-    const bool k4h = r16 != 0;
+    const int64_t row = !kvs ? 0 : !std::strcmp(kvs, "k4h_v4") ? 18 * hd / 16
+                      : !std::strcmp(kvs, "k4h_v2h") ? 14 * hd / 16
+                      : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 0;
+    const bool k4h = row != 0;
     if (k4h && hd % 32) return RAD_E_UNSUPPORTED;
     /* Two blocks of slack, so the slot mapping is not a dense prefix and the block index is
      * actually tested. */
@@ -756,7 +758,7 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
         /* A scatter destination, so no slot may repeat (two tokens on one slot race). It indexes
          * positions, n_blocks * block_size, which is no operand's leading extent. */
         opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),
-        k4h ? opd((uint32_t)RAD_F8E4M3, nb, kvh, bs, r16 * hd / 16) : opd(KV, nb, kvh, bs, 2 * hd),
+        k4h ? opd((uint32_t)RAD_F8E4M3, nb, kvh, bs, row) : opd(KV, nb, kvh, bs, 2 * hd),
     };
     R4D_PICK(l);
 }

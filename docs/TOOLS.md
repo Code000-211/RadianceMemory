@@ -931,8 +931,10 @@ and costs nothing. Taking the costs as adding up across layers, it then picks th
 least summed cost whose bits fit the budget, exactly (a knapsack solved over the bits spent,
 `core/kv_autoquant.h`), and writes the recipe with the measurements and the predicted mean KL in
 its comments. Where a narrower layout measures no cost the wider one is kept. Every layout a
-recipe names is a candidate, so a layout added to the recipe set is calibrated with no change to
-the tool.
+recipe names that is no wider than `fp8` is a candidate, so a narrower layout added to the recipe
+set is calibrated with no change to the tool. `i8h` (8.06 bits) is wider than the base, whose KL
+every cost is measured above and clamped at, so it would only ever read as free: it is left out of
+the default set, and `--layouts i8h` is refused.
 
 The budget counts the bits of a group of 32 K and 32 V elements with their scales: `fp8` 8 an
 element, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h` 3.5. `--bits 8` keeps every layer

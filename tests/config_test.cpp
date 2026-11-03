@@ -980,7 +980,7 @@ TEST(a_k4h_v4_recipe_line_is_rotated_whether_or_not_it_says_so) {
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v4'"));
     std::vector<int32_t> out;
     err = stderr_of([&] { CHECK_EQ(kv_recipe_parse("layer 0 k4h\n", "r.txt", &out), RAD_E_INVAL); });
-    CHECK(has(err, "'k4h' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4 or k4h_v2h"));
+    CHECK(has(err, "'k4h' is not a KV layout; fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h or i8h"));
 }
 
 /* k4h_v2h (int4 K, KVarN-normalised int2 V) is rotated as k4h_v4 is: its line loads rotated with
@@ -1002,6 +1002,30 @@ TEST(a_k4h_v2h_recipe_line_is_rotated_and_priced_at_fourteen_thirty_seconds_of_f
         CHECK(parse_fresh({ "--kv-cache-dtype", "k4h_v2h" }) < 0);
     });
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v2h'"));
+}
+
+/* i8h (int8 K and V, one f16 scale a token and head) is rotated as the k4h layouts are: its line
+ * loads rotated with or without the word, it takes `vmean` (its V is integer), it is priced at 516
+ * bits a 32 + 32 group (258/256 of fp8 at head_dim 256), and it is a recipe word only, never a
+ * --kv-cache-dtype. */
+TEST(an_i8h_recipe_line_is_rotated_takes_a_v_mean_and_is_priced_just_over_fp8) {
+    std::vector<int32_t> r;
+    std::string file;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 0 i8h\nlayer 1 fp8\nlayer 2 i8h rotated vmean\n",
+                             "r.txt", &r, &file), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_I8H | rot, RAD_KVQ_NONE,
+                                      RAD_KVQ_I8H | rot | RAD_KVQ_VMEAN }));
+    CHECK_EQ(file, std::string("m.txt"));
+    CHECK_EQ(kv_recipe_summary(r), std::string("fp8 at layer 1; i8h rotated at layers 0, 2; V mean "
+                                               "subtracted at layer 2"));
+    CHECK_EQ(kv_layout_of("i8h"), (int)RAD_KVQ_I8H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_I8H)), std::string("i8h"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_I8H), 516);
+    const std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "i8h" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'i8h'"));
 }
 
 namespace {
