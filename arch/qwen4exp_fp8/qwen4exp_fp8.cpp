@@ -860,9 +860,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
         g.kv_dtype = m.kv_dt[last_q];
 
+        /* The delta-net state cache: f32, or f16 under --state-cache-dtype f16
+         * (RadBuildCtx::state_dtype), as qwen35_fp8 declares it. The 36 layers' [128, 128] states
+         * are 54 MiB a sequence on each card at --tp 2 (two copies under speculation); f16 halves
+         * that, the host checkpoints and the state traffic, and rounds the state wherever it is
+         * stored, so the text changes and f32 stays the default. The kernels take the width off
+         * the cache (libr4d's SDT; libref and libavx convert per element), the anchor form's
+         * replay factors included, which live in the same slots. The MTP head has no delta net
+         * and the QSA tail below keeps the activation dtype. */
         RadKVGroupDecl sd{};
         sd.kind         = RAD_KV_LINEAR;
-        sd.dtype        = RAD_F32;   /* f16 trades draft acceptance for a sliver of step time */
+        sd.dtype        = ctx->state_dtype == RAD_F16 ? RAD_F16 : RAD_F32;
+        if (sd.dtype == RAD_F16) rad_note(b, "GDN state cache f16 (--state-cache-dtype f16)");
         sd.n_head_kv    = m.gcfg.n_head_v;
         sd.state_dim[0] = m.gcfg.head_v;
         sd.state_dim[1] = m.gcfg.head_k;
@@ -1898,6 +1907,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     /* --kv-recipe: declare() takes each attention layer's layout from it, among those above,
      * and its rotation (RAD_KVQ_ROTATED, on any of them: AttnGatedFP8::rotate). */
     out->kv_recipe_ok = 1;
+    /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
+    out->state_f16_ok = 1;
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;
     return RAD_OK;

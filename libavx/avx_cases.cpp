@@ -747,6 +747,27 @@ std::vector<Case> build_cases() {
                                        HF("eps", 1e-6), HF("l2_eps", 1e-6),
                                        HF("softplus_thr", 20.0), HS("act", "silu"),
                                        HI("state_fp16", 0), HI("n_head_k", 2), HI("n_seq", 2) });
+    /* The f16 state cache (--state-cache-dtype f16) as Flash-Next runs it: three value heads a key
+     * head, the sigmoid gate, both state forms. `state_fp16` makes libref's shape hooks draw the
+     * cache at f16 (ref_shapes.cpp, GdnGeom::St); the kernels read the width off it. */
+    add("gdn_chunk_scan", { HI("M", 16), HI("head_k", 32), HI("head_v", 32), HI("chunk", 8),
+                            HF("scale", 0.176), HI("state_fp16", 1),
+                            HI("n_head_k", 2), HI("n_head_v", 6), HI("n_seq", 2) });
+    for (const char* form : { "per_candidate", "anchor" }) {
+        add("gdn_recurrent_update", { HI("q_len", 2), HI("head_k", 32), HI("head_v", 32),
+                                      HI("n_head_v", 6), HF("scale", 0.176), HF("eps", 1e-6),
+                                      HF("l2_eps", 1e-6), HF("softplus_thr", 20.0),
+                                      HS("act", "sigmoid"), HI("state_fp16", 1),
+                                      HS("state_form", form), HI("n_head_k", 2),
+                                      HI("n_seq", 2) });
+        add("gdn_conv_recurrent_update", { HI("q_len", 2), HI("head_k", 32), HI("head_v", 32),
+                                           HI("conv_width", 4), HI("n_head_v", 6),
+                                           HF("scale", 0.176), HF("eps", 1e-6),
+                                           HF("l2_eps", 1e-6), HF("softplus_thr", 20.0),
+                                           HS("act", "sigmoid"), HI("state_fp16", 1),
+                                           HS("state_form", form), HI("n_head_k", 2),
+                                           HI("n_seq", 2) });
+    }
     for (const char* act : { "silu", "sigmoid" })
         add("gdn_gated_rmsnorm", { HI("M", 12), HI("channels", 128), HF("eps", 1e-6),
                                    HS("act", act) });

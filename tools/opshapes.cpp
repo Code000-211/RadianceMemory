@@ -268,7 +268,7 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
      *
      *     q, k     [T, Hk, head_k]         v, o  [T, Hv, head_v]
      *     g, beta  [T, Hv]  fp32           A     [T, Hv, chunk]
-     *     h0, ht   [N, Hv, head_v, head_k] fp32  cu    [N+1]
+     *     h0, ht   [N, Hv, head_v, head_k] fp32 (f16 under state_fp16)  cu [N+1]
      *     conv w   [conv_dim, conv_width]        conv_state [n_slots, conv_dim, state_len]
      *
      * with conv_dim = 2 * Hk * head_k + Hv * head_v.
@@ -284,6 +284,8 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
         if (hk <= 0 || hv <= 0 || chunk <= 0 || width <= 1) return RAD_E_UNSUPPORTED;
         const int64_t conv_dim = 2 * Hk * hk + Hv * hv;
         const int64_t S = ctx->n_seq > 0 ? ctx->n_seq : 1;
+        /* The state cache's width, as libref's gdn shape hooks read it (ref_shapes.cpp). */
+        const uint32_t St = gi("state_fp16", 0) ? (uint32_t)RAD_F16 : (uint32_t)RAD_F32;
 
         if (op == "gdn_conv_prep") {
             /* T tokens over S sequences, one conv-state slot each. The state length is
@@ -321,10 +323,10 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
             add_fill(D, {M, Hv, chunk}, OpdShape::FillTriLower, chunk);              /* A */
             add_fill((uint32_t)RAD_F32, {M, Hv}, OpdShape::FillGateCumsum, chunk);   /* g */
             add_fill((uint32_t)RAD_F32, {M, Hv}, OpdShape::FillSigmoid);             /* beta */
-            add((uint32_t)RAD_F32, {S, Hv, hv, hk});   /* h0 */
+            add(St, {S, Hv, hv, hk});                  /* h0 */
             add_cu(S);                                 /* cu */
             add(D, {M, Hv, hv});                       /* o */
-            add((uint32_t)RAD_F32, {S, Hv, hv, hk});   /* ht */
+            add(St, {S, Hv, hv, hk});                  /* ht */
             add_idx({S}, S, -1, /*uniq*/ true);        /* state_idx */
         }
         else if (op == "gdn_conv_update") {
@@ -351,7 +353,7 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
             add(D, {S * M, Hv});                       /* b */
             add((uint32_t)RAD_F32, {Hv});              /* A_log */
             add((uint32_t)RAD_F32, {Hv});              /* dt_bias */
-            add((uint32_t)RAD_F32, {S * M, Hv, hv, hk});  /* state, one per candidate token */
+            add(St, {S * M, Hv, hv, hk});              /* state, one per candidate token */
             add_idx({S, M}, S * M, -1, /*uniq*/ true); /* state_idx */
             add_idx({S}, 0, 1);                        /* num_accepted */
             add_cu(S);                                 /* cu */

@@ -4414,9 +4414,10 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  * The key heads' conv state must have moved, so the check is sensitive. The anchor form runs in a
  * child process, as in gdn_recurrent_anchor. `i8` runs both at int8 codes and also holds the pair's
  * codes to quant_act_i8g over its `o`. `f32w` hands the fold the conv weight in f32, as a GGUF
- * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change. */
+ * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change.
+ * `f16` keeps both recurrent states in an f16 cache (--state-cache-dtype f16). */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
-                              bool i8 = false, bool f32w = false) {
+                              bool i8 = false, bool f32w = false, bool f16 = false) {
     const RadKernelInfo* rf = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
     const RadKernelInfo* rc = find(pl, "gdn_conv_update_w4_h128_bf16");
     const RadKernelInfo* rr = find(pl, "gdn_recurrent_update_k128_v128_bf16_fp32state");
@@ -4453,6 +4454,9 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     for (int64_t n = 0; n < N; ++n)
         for (int64_t c = 0; c < COLS; ++c)
             hsidx[(size_t)(n * COLS + c)] = cidx[n] < 0 ? -1 : (int32_t)(n * COLS + c);
+    /* `f16`: the recurrent state cache at f16 (--state-cache-dtype f16), the same values. */
+    std::vector<uint16_t> hst16(f16 ? hst.size() : 0);
+    for (size_t i = 0; i < hst16.size(); ++i) hst16[i] = rad_f32_to_f16(hst[i]);
 
     /* Two of everything the ops write; the shared inputs once. */
     auto dev = [&](const void* h, size_t bytes) {
@@ -4460,7 +4464,9 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
         if (d && h) st_memcpy(d, h, bytes, hipMemcpyHostToDevice);
         return d;
     };
-    const size_t in_b = (size_t)(Td * in_w) * 2, st_b = hst.size() * 4, cs_b = hcs.size() * 2;
+    const size_t in_b = (size_t)(Td * in_w) * 2, st_b = hst.size() * (f16 ? 2 : 4),
+                 cs_b = hcs.size() * 2;
+    const void* hst_p = f16 ? (const void*)hst16.data() : (const void*)hst.data();
     const size_t o_b = (size_t)(Td * H * V) * 2, oq_b = (size_t)(Td * H * V), os_b = (size_t)(Td * H) * 4;
     void* d_in = dev(nullptr, in_b);
     void* d_ab = dev(nullptr, (size_t)(Td * 2 * H) * 2);
@@ -4478,7 +4484,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     void* d_v = dev(nullptr, (size_t)(Td * H * V) * 2);
     void* d_cs[2]; void* d_st[2]; void* d_o[2]; void* d_oq[2]; void* d_os[2];
     for (int i = 0; i < 2; ++i) {
-        d_cs[i] = dev(hcs.data(), cs_b);  d_st[i] = dev(hst.data(), st_b);
+        d_cs[i] = dev(hcs.data(), cs_b);  d_st[i] = dev(hst_p, st_b);
         d_o[i] = dev(nullptr, o_b); d_oq[i] = dev(nullptr, oq_b); d_os[i] = dev(nullptr, os_b);
     }
     if (!d_in || !d_ab || !d_cs[1] || !d_os[1]) { ok(nm, false, "hipMalloc"); return; }
@@ -4501,7 +4507,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     const RadTensor tna = T(d_nacc, RAD_I32, { N }), tcu = T(d_cu, RAD_I32, { N + 1 });
     RadTensor none; std::memset(&none, 0, sizeof(none));
     auto cs = [&](int i) { return T(d_cs[i], RAD_BF16, { CSLOTS, conv_dim, SL }); };
-    auto st = [&](int i) { return T(d_st[i], RAD_F32, { SSLOTS, H, V, K }); };
+    auto st = [&](int i) { return T(d_st[i], f16 ? RAD_F16 : RAD_F32, { SSLOTS, H, V, K }); };
     auto to = [&](int i) { return T(d_o[i], RAD_BF16, { Td, H, V }); };
     auto toq = [&](int i) { return T(d_oq[i], i8 ? RAD_I8 : RAD_F8E4M3, { Td, H * V }); };
     auto tos = [&](int i) { return T(d_os[i], RAD_F32, { Td, H }); };
@@ -4597,6 +4603,14 @@ static void gdn_conv_fold(const Plugin& pl) {
     }
     if (sel(row) || sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
     if (sel(row) || sel(nmf)) gdn_conv_fold_run(pl, nmf, "per_candidate", false, true);
+    /* The f16 state cache in the fold Flash-Next decodes with: the anchor (MTP) and plain decode,
+     * at int8 codes. */
+    const char* nm16a = "gdn_conv_recurrent_update is byte-identical to the pair at an f16 state "
+                        "and int8 codes, anchor";
+    const char* nm16p = "gdn_conv_recurrent_update is byte-identical to the pair at an f16 state "
+                        "and int8 codes, per_candidate";
+    if (sel(row) || sel(nm16a)) gdn_conv_fold_run(pl, nm16a, "anchor", true, false, true);
+    if (sel(row) || sel(nm16p)) gdn_conv_fold_run(pl, nm16p, "per_candidate", true, false, true);
 }
 
 /* gdn_conv_prep and gdn_conv_update over an f32 weight, as a GGUF stores ssm_conv1d, against the
@@ -24668,6 +24682,262 @@ static RadLaunchFn libref_row(const char* name, bool by_op = false) {
     return nullptr;
 }
 
+/* ------------------------------------------------------------------ the delta-net state at f16
+ *
+ * --state-cache-dtype f16 (GUIDE §4.4) as Qwen3.8-Flash-Next serves it at --tp 2: a rank's 8 key
+ * and 24 value heads of 128, the sigmoid output gate, int8 codes out of the recurrence (the
+ * served recipe's int8 trunk). The kernels widen the cache to f32 where they load it and round
+ * to f16 where they store it, and nothing else differs (SDT), so on the card:
+ *
+ *     the kernel over an f16 cache writes the same `o` (and codes and scales) as over that cache
+ *     widened to f32, byte for byte, and leaves in every cache element the f32 run's value
+ *     rounded to nearest-even f16 -- the anchor form's factor blocks and stamps included, which
+ *     live in the same slots.
+ *
+ * And against libref on host copies of the same operands: `o` and the cache no further from
+ * libref's f16 path, in relative L2, than the f32 run is from libref's f32 path, plus 1e-3 (the
+ * card reduces in another order, the scan feeds its WMMA bf16 operands, and a state element at an
+ * f16 rounding tie may land an ulp apart), and the f32 run within 5e-2. The recurrence runs one, four and two candidate rows over three sequences, from slots
+ * the previous step left (per_candidate reading candidate `num_accepted`, the anchor replaying
+ * one to three tokens out of the drawn factor blocks); the scan two sequences of 100 and 37 rows
+ * (partial chunks) from slots 2 and 0. `form` null is the scan. */
+static void gdn_f16_state_run(const Plugin& pl, const char* nm, const char* row,
+                              const char* form) {
+    const RadKernelInfo* r = find(pl, row);
+    const bool scan = form == nullptr, anc = !scan && !std::strcmp(form, "anchor");
+    const char* refop = scan ? "gdn_chunk_scan" : "gdn_recurrent_update";
+    const RadLaunchFn ref = libref_row(refop, true);
+    if (!r || !ref) { ok(nm, false, "row or libref's row absent"); return; }
+
+    const int64_t K = 128, V = 128, Hg = 8, H = 24, N = scan ? 2 : 3, MQ = 4, CH = 64;
+    const int32_t lens_r[3] = { 1, 4, 2 }, nacc_r[3] = { 1, 2, 3 };
+    const int32_t lens_s[2] = { 100, 37 };
+    std::vector<int32_t> cu(1, 0);
+    for (int64_t n = 0; n < N; ++n) cu.push_back(cu.back() + (scan ? lens_s[n] : lens_r[n]));
+    const int64_t Td = cu.back();
+    const int64_t COLS = scan ? 1 : (anc ? 6 : MQ), SLOTS = scan ? 3 : N * COLS;
+    const int64_t blk = H * V * K, cache = SLOTS * blk;
+
+    uint32_t seed = 0x6f16a5e7u;
+    auto rnd = [&seed]() {
+        seed = st_mix32(seed + 0x9e3779b9u);
+        return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f;
+    };
+    auto bf = [&](int64_t n, float s) {
+        std::vector<uint16_t> v((size_t)n);
+        for (auto& e : v) e = h_to_bf16(s * rnd());
+        return v;
+    };
+    /* The cache, drawn at f16 so both runs start from the same values. */
+    std::vector<uint16_t> h16((size_t)cache);
+    for (auto& e : h16) e = rad_f32_to_f16(0.1f * rnd());
+    std::vector<float> h32((size_t)cache);
+    for (int64_t i = 0; i < cache; ++i) h32[(size_t)i] = rad_f16_to_f32(h16[(size_t)i]);
+
+    std::vector<uint16_t> hq = bf(Td * Hg * K, 1.0f), hk = bf(Td * Hg * K, 1.0f),
+                          hv = bf(Td * H * V, 1.0f), hz = bf(Td * H * V, 1.0f),
+                          ha = bf(Td * H, 1.0f), hb = bf(Td * H, 1.0f), hA;
+    std::vector<float> halog((size_t)H), hdtb((size_t)H), hnw((size_t)V), hg, hbeta;
+    for (int64_t h = 0; h < H; ++h) { halog[(size_t)h] = -2.0f + 0.0625f * (float)h;
+                                      hdtb[(size_t)h]  = -1.0f + 0.0625f * (float)h; }
+    for (auto& e : hnw) e = 1.0f + 0.25f * rnd();
+    std::vector<int32_t> hsidx, hnacc;
+    if (scan) {
+        /* As gdn_conv_prep and gdn_kkt_solve leave them: unit-norm k, the gate's cumulative sum
+         * restarting each chunk, beta in (0, 1), A unit lower-triangular within a chunk. */
+        for (int64_t i = 0; i < Td * Hg; ++i) {
+            double s = 0;
+            for (int64_t j = 0; j < K; ++j) s += (double)h_bf16(hk[(size_t)(i * K + j)]) *
+                                                 h_bf16(hk[(size_t)(i * K + j)]);
+            for (int64_t j = 0; j < K; ++j)
+                hk[(size_t)(i * K + j)] =
+                    h_to_bf16((float)(h_bf16(hk[(size_t)(i * K + j)]) / std::sqrt(s)));
+        }
+        hA.assign((size_t)(Td * H * CH), 0);
+        hg.resize((size_t)(Td * H));
+        hbeta.resize((size_t)(Td * H));
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t t = cu[(size_t)n]; t < cu[(size_t)n + 1]; ++t) {
+                const int64_t i = (t - cu[(size_t)n]) % CH;
+                for (int64_t h = 0; h < H; ++h) {
+                    hg[(size_t)(t * H + h)] = -0.02f * (float)(i + 1);
+                    hbeta[(size_t)(t * H + h)] = 0.5f + 0.4f * rnd();
+                    for (int64_t j = 0; j < i; ++j)
+                        hA[(size_t)((t * H + h) * CH + j)] = h_to_bf16(0.05f * rnd());
+                    hA[(size_t)((t * H + h) * CH + i)] = h_to_bf16(1.0f);
+                }
+            }
+        hsidx = { 2, 0 };
+    } else {
+        for (int64_t i = 0; i < N * COLS; ++i) hsidx.push_back((int32_t)i);
+        hnacc.assign(nacc_r, nacc_r + N);
+    }
+
+    auto dev = [&](const void* h, size_t bytes) {
+        void* d = dalloc(bytes);
+        if (d && h) st_memcpy(d, h, bytes, hipMemcpyHostToDevice);
+        return d;
+    };
+    auto fetch = [](void* d, size_t b) {
+        std::vector<uint8_t> h(b);
+        st_memcpy(h.data(), d, b, hipMemcpyDeviceToHost);
+        return h;
+    };
+    const size_t o_b = (size_t)(Td * H * V) * 2, oq_b = (size_t)(Td * H * V),
+                 os_b = (size_t)(Td * H) * 4;
+    void* d_q = dev(hq.data(), hq.size() * 2);
+    void* d_k = dev(hk.data(), hk.size() * 2);
+    void* d_v = dev(hv.data(), hv.size() * 2);
+    void* d_z = dev(hz.data(), hz.size() * 2);
+    void* d_a = dev(ha.data(), ha.size() * 2);
+    void* d_b = dev(hb.data(), hb.size() * 2);
+    void* d_alog = dev(halog.data(), halog.size() * 4);
+    void* d_dtb = dev(hdtb.data(), hdtb.size() * 4);
+    void* d_nw = dev(hnw.data(), hnw.size() * 4);
+    void* d_A = scan ? dev(hA.data(), hA.size() * 2) : nullptr;
+    void* d_g = scan ? dev(hg.data(), hg.size() * 4) : nullptr;
+    void* d_beta = scan ? dev(hbeta.data(), hbeta.size() * 4) : nullptr;
+    void* d_sidx = dev(hsidx.data(), hsidx.size() * 4);
+    void* d_nacc = scan ? nullptr : dev(hnacc.data(), hnacc.size() * 4);
+    void* d_cu = dev(cu.data(), cu.size() * 4);
+    void* d_st[2] = { dev(h32.data(), h32.size() * 4), dev(h16.data(), h16.size() * 2) };
+    void* d_o[2] = { dev(nullptr, o_b), dev(nullptr, o_b) };
+    void* d_oq[2] = { dev(nullptr, oq_b), dev(nullptr, oq_b) };
+    void* d_os[2] = { dev(nullptr, os_b), dev(nullptr, os_b) };
+    if (!d_st[1] || !d_os[1] || !d_cu) { ok(nm, false, "hipMalloc"); return; }
+
+    std::vector<RadParam> ps;
+    if (scan)
+        ps = { PI("M", Td), PI("head_k", K), PI("head_v", V), PI("chunk", CH),
+               PF("scale", 0.088388) };
+    else
+        ps = { PI("q_len", MQ), PI("head_k", K), PI("head_v", V), PI("n_head_v", H),
+               PF("scale", 0.088388), PF("eps", 1e-6), PS("act", "sigmoid"),
+               PS("state_form", form) };
+    /* The operand list over one set of pointers: the card's, or the host copies for libref (which
+     * gets no codes: its quantiser is the standalone one's, held elsewhere). */
+    auto operands = [&](void* q, void* k, void* v, void* z, void* a, void* b, void* alog,
+                        void* dtb, void* nw, void* A, void* g, void* beta, void* st, uint32_t sdt,
+                        void* sidx, void* nacc, void* cup, void* o, void* oq, void* os) {
+        std::vector<RadTensor> ts;
+        if (scan) {
+            ts = { T(q, RAD_BF16, { Td, Hg, K }), T(k, RAD_BF16, { Td, Hg, K }),
+                   T(v, RAD_BF16, { Td, H, V }), T(A, RAD_BF16, { Td, H, CH }),
+                   T(g, RAD_F32, { Td, H }), T(beta, RAD_F32, { Td, H }),
+                   T(st, sdt, { SLOTS, H, V, K }), T(cup, RAD_I32, { N + 1 }),
+                   T(o, RAD_BF16, { Td, H, V }), T(st, sdt, { SLOTS, H, V, K }),
+                   T(sidx, RAD_I32, { N }) };
+        } else {
+            ts = { T(q, RAD_BF16, { Td, Hg, K }), T(k, RAD_BF16, { Td, Hg, K }),
+                   T(v, RAD_BF16, { Td, H, V }), T(a, RAD_BF16, { Td, H }),
+                   T(b, RAD_BF16, { Td, H }), T(alog, RAD_F32, { H }), T(dtb, RAD_F32, { H }),
+                   T(st, sdt, { SLOTS, H, V, K }), T(sidx, RAD_I32, { N, COLS }),
+                   T(nacc, RAD_I32, { N }), T(cup, RAD_I32, { N + 1 }),
+                   T(z, RAD_BF16, { Td, H, V }), T(nw, RAD_F32, { V }),
+                   T(o, RAD_BF16, { Td, H, V }) };
+            if (oq) { ts.push_back(T(oq, RAD_I8, { Td, H * V })); ts.push_back(T(os, RAD_F32, { Td, H })); }
+        }
+        return ts;
+    };
+    auto launch = [&](RadLaunchFn fn, std::vector<RadTensor> ts, bool card) {
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int rc = fn(&a, (RadStream) nullptr);
+        if (rc != RAD_OK || !card) return rc;
+        return st_stream_sync(nullptr) != hipSuccess ? -1000 : RAD_OK;
+    };
+    for (int f16 = 0; f16 < 2; ++f16) {
+        const int rc = launch(r->launch,
+                              operands(d_q, d_k, d_v, d_z, d_a, d_b, d_alog, d_dtb, d_nw, d_A, d_g,
+                                       d_beta, d_st[f16], f16 ? RAD_F16 : RAD_F32, d_sidx, d_nacc,
+                                       d_cu, d_o[f16], d_oq[f16], d_os[f16]), true);
+        if (rc != RAD_OK) {
+            ok(nm, false, std::string(f16 ? "f16" : "f32") + " rc=" + std::to_string(rc));
+            return;
+        }
+    }
+    std::string why;
+    {
+        const struct { const char* what; void* x; void* y; size_t n; } cmp[] = {
+            { "o", d_o[0], d_o[1], o_b }, { "o_q", d_oq[0], d_oq[1], scan ? 0 : oq_b },
+            { "o_scale", d_os[0], d_os[1], scan ? 0 : os_b },
+        };
+        for (const auto& c : cmp) {
+            const std::vector<uint8_t> X = fetch(c.x, c.n), Y = fetch(c.y, c.n);
+            size_t diff = 0;
+            for (size_t i = 0; i < c.n; ++i) diff += X[i] != Y[i];
+            if (diff && why.empty())
+                why = std::string(c.what) + " differs from the f32 run's in " +
+                      std::to_string(diff) + " of " + std::to_string(c.n) + " bytes";
+        }
+    }
+    const std::vector<uint8_t> S32 = fetch(d_st[0], (size_t)cache * 4);
+    const std::vector<uint8_t> S16 = fetch(d_st[1], (size_t)cache * 2);
+    const float* s32 = (const float*)S32.data();
+    const uint16_t* s16 = (const uint16_t*)S16.data();
+    int64_t st_diff = 0, moved = 0;
+    for (int64_t i = 0; i < cache; ++i) {
+        st_diff += s16[i] != rad_f32_to_f16(s32[i]);
+        moved += s16[i] != h16[(size_t)i];
+    }
+    if (why.empty() && st_diff)
+        why = std::to_string(st_diff) + " of " + std::to_string(cache) +
+              " cache elements are not the f32 run's rounded to f16";
+    /* Each sequence's state, at least: a run that stored nothing agrees with one that did not. */
+    if (why.empty() && moved < N * blk / 2) why = "the f16 cache barely moved";
+
+    /* libref over host copies of the same operands, at f16 and at f32: the card's distance from
+     * libref's f16 path is held to its distance at f32, plus 1e-3. */
+    double lo[2] = { 0, 0 }, ls[2] = { 0, 0 };
+    for (int f16 = 0; f16 < 2 && why.empty(); ++f16) {
+        std::vector<uint16_t> c16 = h16, ho((size_t)(Td * H * V), 0);
+        std::vector<float> c32 = h32;
+        const int rc = launch(ref,
+                              operands(hq.data(), hk.data(), hv.data(), hz.data(), ha.data(),
+                                       hb.data(), halog.data(), hdtb.data(), hnw.data(),
+                                       hA.data(), hg.data(), hbeta.data(),
+                                       f16 ? (void*)c16.data() : (void*)c32.data(),
+                                       f16 ? RAD_F16 : RAD_F32, hsidx.data(), hnacc.data(),
+                                       cu.data(), ho.data(), nullptr, nullptr), false);
+        if (rc != RAD_OK) { why = "libref rc=" + std::to_string(rc); break; }
+        const std::vector<uint8_t> O = fetch(d_o[f16], o_b);
+        const uint16_t* oc = (const uint16_t*)O.data();
+        double eo = 0, ro = 0, es = 0, rs = 0;
+        for (size_t i = 0; i < ho.size(); ++i) {
+            const double x = h_bf16(oc[i]), y = h_bf16(ho[i]);
+            eo += (x - y) * (x - y); ro += y * y;
+        }
+        for (int64_t i = 0; i < cache; ++i) {
+            const double x = f16 ? rad_f16_to_f32(s16[i]) : s32[i];
+            const double y = f16 ? rad_f16_to_f32(c16[(size_t)i]) : c32[(size_t)i];
+            es += (x - y) * (x - y); rs += y * y;
+        }
+        lo[f16] = std::sqrt(eo / (ro > 0 ? ro : 1));
+        ls[f16] = std::sqrt(es / (rs > 0 ? rs : 1));
+    }
+    if (why.empty() && !(lo[1] <= lo[0] + 1e-3 && ls[1] <= ls[0] + 1e-3 && lo[0] < 5e-2 &&
+                         ls[0] < 5e-2))
+        why = "too far from libref";
+    char d[256];
+    std::snprintf(d, sizeof d, "%s%sfrom libref: o relative L2 %.2g (f32 %.2g), cache %.2g "
+                  "(f32 %.2g)", why.c_str(), why.empty() ? "" : "; ", lo[1], lo[0], ls[1], ls[0]);
+    ok(nm, why.empty(), d);
+}
+
+static void gdn_f16_state(const Plugin& pl) {
+    const char* ru = "gdn_recurrent_update_k128_v128_bf16_fp32state";
+    const char* cs = "gdn_chunk_scan_k128_v128_c64_bf16";
+    const char* nmp = "gdn_recurrent_update at an f16 state is the f32 kernel through an f16 "
+                      "cache, per_candidate";
+    const char* nma = "gdn_recurrent_update at an f16 state is the f32 kernel through an f16 "
+                      "cache, anchor";
+    const char* nms = "gdn_chunk_scan at an f16 state is the f32 kernel through an f16 cache";
+    if (sel(ru) || sel(nmp)) gdn_f16_state_run(pl, nmp, ru, "per_candidate");
+    if (sel(ru) || sel(nma)) gdn_f16_state_run(pl, nma, ru, "anchor");
+    if (sel(cs) || sel(nms)) gdn_f16_state_run(pl, nms, cs, nullptr);
+}
+
 /* had_rotate in place over [rows, width] at `pitch` elements: the card's bytes equal libref's
  * everywhere, the gaps between rows included, and most of the rows moved. */
 static void had_rotate_case(const Plugin& pl, const char* row, int64_t g) {
@@ -31839,6 +32109,7 @@ static void device_phase(const Plugin& pl) {
         gdn_recurrent_anchor(pl);
         gdn_conv_fold(pl);
         gdn_conv_f32_weight(pl);
+        gdn_f16_state(pl);
         if (sel("gdn_gated_rmsnorm_h128_bf16")) {
             const RadKernelInfo* r = find(pl, "gdn_gated_rmsnorm_h128_bf16");
             if (!r) ok("gdn_gated_rmsnorm_h128_bf16", false, "row absent");

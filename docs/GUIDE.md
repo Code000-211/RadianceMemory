@@ -1168,13 +1168,19 @@ wht6`, a decode step above the row count startup names is all-reduced lossily li
 at 8 sequences and depth 3, Flash-Next's decode steps are above it.
 
 **The delta-net state at f16** (`--state-cache-dtype f16`). The `qwen35` plugins (`qwen35_fp8`,
-and `qwen35moe_fp8` and `qwen35_w8a8`, built from it) declare the recurrent state cache f32. With
-`--state-cache-dtype f16` they declare it f16; startup and the declare log say so (`GDN state cache
-f16`), and a plugin that does not serve it is refused at startup by name. **It is lossy**: the
-state is rounded wherever it is stored, so the generated text changes. It halves the state pool and
-its host checkpoints, and the state's traffic, which grows with the number of decoding sequences.
-Measured on `qwen35_fp8` only, Qwen3.8-27B MXFP4 at `--tp 2` on two R9700s (PCIe Gen5 x8, 265 W),
-against the bf16 model:
+and `qwen35moe_fp8` and `qwen35_w8a8`, built from it) and `qwen4exp_fp8` (Qwen3.8-Flash-Next)
+declare the recurrent state cache f32. With `--state-cache-dtype f16` they declare it f16; startup
+and the declare log say so (`GDN state cache f16`), and a plugin that does not serve it is refused
+at startup by name. On Flash-Next at `--tp 2` a sequence's 36 delta-net layers hold 54 MiB of
+state on each card at f32 and 27 MiB at f16 (a speculating deployment keeps two copies, the
+anchor and its replay factors, so 108 and 54 MiB); its MTP head has no delta net, and the QSA
+indexer's key tail keeps its own width. The kernels read the width off the cache: at f16 each
+computes exactly what it computes over the f32 cache, rounded where the state is stored
+(`r4d_selftest`'s `gdn_f16_state` cases, `tests/r4d_emu/test_gdn.cpp`, `rad-avx-check`).
+**It is lossy**: the state is rounded wherever it is stored, so the generated text changes. It
+halves the state pool and its host checkpoints, and the state's traffic, which grows with the
+number of decoding sequences. Measured on `qwen35_fp8` only (Flash-Next's KL is not measured
+yet), Qwen3.8-27B MXFP4 at `--tp 2` on two R9700s (PCIe Gen5 x8, 265 W), against the bf16 model:
 
 | state | mean KL, 2048 chunk | mean KL, 64 chunk | top-1, 64 chunk |
 |---|---|---|---|
@@ -2286,7 +2292,7 @@ by 0.002-0.003 nats.
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
-| `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
+| `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins and `qwen4exp_fp8` (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |

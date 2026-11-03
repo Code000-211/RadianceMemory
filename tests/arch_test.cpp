@@ -10161,6 +10161,59 @@ TEST(a_uniform_kv_recipe_on_flashnext_is_the_matching_kv_cache_dtype_byte_for_by
             }
 }
 
+/* --state-cache-dtype f16 on Flash-Next, as on qwen35_fp8: the probe says the plugin serves it,
+ * the default declares the delta-net state f32 and RadBuildCtx::state_dtype f16 declares it f16
+ * with the note startup prints. Nothing else moves: with that one group's dtype put back, the f16
+ * declare is the default's graph fingerprint, and the steps (decode, a prefill after history, a
+ * mixed step, a verify with the MTP head's passes) issue the same launches, since the kernels take
+ * the state's width off the cache. At one, two and four ranks. The default's own bytes are pinned
+ * by the fingerprint table (a_4096_budget_without_a_span_is_the_pinned_graph_and_steps). */
+TEST(flashnext_gdn_state_is_f32_unless_the_deployment_asks_f16_and_nothing_else_changes) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.state_f16_ok, 1);
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; rank += world > 1 ? world - 1 : 1) {
+            RadBuilder b[2];
+            uint64_t graph[2] = {};
+            for (int f16 = 0; f16 < 2; ++f16) {
+                b[f16].encs = { { "draft_head", u2_head() } };
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.max_tok = 4096;   /* pinned_steps' prefill */
+                ctx.state_dtype = f16 ? (uint32_t)RAD_F16 : 0;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b[f16], &meta, &ctx), RAD_OK);
+                int n = 0;
+                for (const RecKV& g : b[f16].kv_groups)
+                    if (g.name == "kv_gdn_state") {
+                        ++n;
+                        CHECK_EQ(g.d.dtype, f16 ? (uint32_t)RAD_F16 : (uint32_t)RAD_F32);
+                    }
+                CHECK_EQ(n, 1);
+                CHECK_EQ(noted(b[f16], "GDN state cache f16"), f16 == 1);
+                /* Hashed before the next declare: a recorded weight's `source` points into the
+                 * plugin's own strings, which the next declare rewrites. The f16 declare is
+                 * hashed with the state group put back at f32. */
+                RadBuilder back = b[f16];
+                for (RecKV& g : back.kv_groups)
+                    if (g.name == "kv_gdn_state") g.d.dtype = RAD_F32;
+                graph[f16] = graph_hash(back);
+            }
+            CHECK_EQ(graph[1], graph[0]);
+            /* And program_diff's view, the f16 note aside. */
+            std::erase_if(b[1].notes, [](const std::string& x) {
+                return x.find("GDN state cache f16") != std::string::npos; });
+            for (RecKV& g : b[1].kv_groups)
+                if (g.name == "kv_gdn_state") g.d.dtype = RAD_F32;
+            CHECK_EQ(program_diff(b[1], b[0]), std::string());
+            for (RecKV& g : b[1].kv_groups)
+                if (g.name == "kv_gdn_state") g.d.dtype = RAD_F16;
+            CHECK_EQ(pinned_steps(b[1], qwen4exp_fp8::step, rank, world),
+                     pinned_steps(b[0], qwen4exp_fp8::step, rank, world));
+        }
+}
+
 /* A mixed recipe on Flash-Next: fp8_v4 at layer 3 and k6_v4 at layer 7 are two groups, declared at
  * 200 and 176 E4M3 columns, each layer bound to its own and the MTP head (layer 8) to layer 7's.
  * Each layer's indexer pages its own group's fragment (K and V of a four-token page at its row),

@@ -229,6 +229,8 @@ inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }   /* v_rsq_f32 is w
 /* The device's fast exponential is not bit-exact to expf; here it is expf, so a test compares two
  * kernels that both take it, never a kernel against a host value of it. */
 inline float __expf(float x) { return std::exp(x); }
+/* the fast logarithm likewise */
+inline float __logf(float x) { return std::log(x); }
 inline unsigned __float_as_uint(float f) { unsigned u; std::memcpy(&u, &f, 4); return u; }
 inline float __int_as_float(int u) { float f; std::memcpy(&f, &u, 4); return f; }
 inline int __float_as_int(float f) { int u; std::memcpy(&u, &f, 4); return u; }
@@ -333,6 +335,12 @@ inline float __fsub_rn(float a, float b) { return a - b; }
 inline float __fmul_rn(float a, float b) { return a * b; }
 inline float __fdiv_rn(float a, float b) { return a / b; }
 inline float __fsqrt_rn(float a) { return std::sqrt(a); }
+/* The reciprocal square root, rounded once (from double); v_rsq_f32 and v_rcp_f32 below are within
+ * an ulp of these, so a test compares two kernels that both take them, never a kernel against a
+ * host value of them (as __expf) */
+inline float __frsqrt_rn(float a) { return (float)(1.0 / std::sqrt((double)a)); }
+#define __builtin_amdgcn_rcpf(x) (1.0f / (float)(x))
+struct alignas(8) ushort4 { unsigned short x, y, z, w; };
 struct alignas(8) float2 { float x, y; };
 inline float2 make_float2(float a, float b) { return float2{a, b}; }
 struct alignas(4) uchar4 { unsigned char x, y, z, w; };

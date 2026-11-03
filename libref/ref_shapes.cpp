@@ -2266,6 +2266,10 @@ namespace {
 struct GdnGeom {
     int64_t Hk, Hv, hk, hv, chunk, width, conv_dim, S, M;
     uint32_t D;
+    /* The recurrent state's width: f32, or f16 under `state_fp16` 1, the cache a deployment
+     * declares under --state-cache-dtype f16. The kernels read it off the operand, so this hint is
+     * the only way a fixture draws the f16 cache. */
+    uint32_t St;
 };
 
 static bool gdn_geom(const RadParam* p, int n_p, const char* mkey, GdnGeom* g) {
@@ -2277,6 +2281,7 @@ static bool gdn_geom(const RadParam* p, int n_p, const char* mkey, GdnGeom* g) {
     g->M = gi(p, n_p, mkey, 0);
     g->S = n_seq_of(p, n_p);
     g->D = act_dt(p, n_p);
+    g->St = gi(p, n_p, "state_fp16", 0) ? (uint32_t)RAD_F16 : (uint32_t)RAD_F32;
     if (g->hk <= 0 || g->hv <= 0 || g->chunk <= 0 || g->width <= 1 || g->M <= 0) return false;
     g->conv_dim = 2 * g->Hk * g->hk + g->Hv * g->hv;
     return true;
@@ -2301,7 +2306,7 @@ bool gdn_state(const RadParam* p, int n_p, const GdnGeom& g, Opd& o) {
         const int64_t tmax = std::min<int64_t>(16, (g.hv * g.hk - 1) / fstr);
         if (tmax < 1 || g.M > tmax) return false;
         const int64_t cols = std::max<int64_t>(g.M, 6), slots = g.S * cols;
-        o.t((uint32_t)RAD_F32, { slots, g.Hv, g.hv, g.hk });             /* state, INOUT */
+        o.t(g.St, { slots, g.Hv, g.hv, g.hk });                          /* state, INOUT */
         o.t_idx({ g.S, cols }, slots, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);  /* state_idx */
         o.t_idx({ g.S }, 0, 1, 0);                                      /* num_accepted */
         return true;
@@ -2309,7 +2314,7 @@ bool gdn_state(const RadParam* p, int n_p, const GdnGeom& g, Opd& o) {
     if (form && std::strcmp(form, "per_candidate") != 0) return false;
     const int64_t T = g.S * g.M;
     /* One state slot per candidate token (ref_ops.h's rollback contract). */
-    o.t((uint32_t)RAD_F32, { T, g.Hv, g.hv, g.hk });                     /* state, INOUT */
+    o.t(g.St, { T, g.Hv, g.hv, g.hk });                                  /* state, INOUT */
     o.t_idx({ g.S, g.M }, T, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);        /* state_idx */
     o.t_idx({ g.S }, 0, 1, 0);                              /* num_accepted: none rejected */
     return true;
@@ -2392,10 +2397,10 @@ int ref_gdn_chunk_scan_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     o.t_fill(g.D, { g.M, g.Hv, g.chunk }, (uint32_t)RAD_FILL_TRI_LOWER, g.chunk);         /* A */
     o.t_fill((uint32_t)RAD_F32, { g.M, g.Hv }, (uint32_t)RAD_FILL_GATE_CUMSUM, g.chunk);  /* g */
     o.t_fill((uint32_t)RAD_F32, { g.M, g.Hv }, (uint32_t)RAD_FILL_SIGMOID, 0);            /* beta */
-    o.t((uint32_t)RAD_F32, { g.S, g.Hv, g.hv, g.hk });               /* h0 */
+    o.t(g.St, { g.S, g.Hv, g.hv, g.hk });                            /* h0 */
     o.t_idx({ g.S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);         /* cu */
     o.t(g.D, { g.M, g.Hv, g.hv });                   /* o */
-    o.t((uint32_t)RAD_F32, { g.S, g.Hv, g.hv, g.hk });               /* ht */
+    o.t(g.St, { g.S, g.Hv, g.hv, g.hk });                            /* ht */
     o.t_idx({ g.S }, g.S, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);       /* state_idx */
     return o.finish("gdn_chunk_scan", operand, out);
 }

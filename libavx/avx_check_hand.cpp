@@ -1327,6 +1327,171 @@ bool anchor_replays_per_candidate(const Check& ck, int64_t K, int64_t V, int64_t
     return true;
 }
 
+/* ================================================================== the state at f16 */
+
+/* --state-cache-dtype f16 (GUIDE §4.4) changes the delta net's state cache and nothing else: every
+ * gdn op computes in f32 whatever the cache holds and converts only where it loads and stores it.
+ * So, held to itself:
+ *
+ *     the op over an f16 cache writes the same `o` as over that cache widened to f32, bit for bit,
+ *     and leaves in every cache element the f32 run's value rounded to nearest-even f16.
+ *
+ * The whole cache is compared, the anchor form's factor blocks and stamps (which live in the same
+ * slots) and the slots nothing names included. Flash-Next's delta net: three value heads a key
+ * head, the sigmoid output gate; heads of 32 (the anchor block then holds 15 tokens) keep it
+ * small. The recurrence in both forms over four-row steps, the anchor's replaying one and two
+ * accepted tokens; the chunk scan over two sequences of 13 and 19 rows (chunk 8: a partial chunk
+ * each) from a cache at slots 2 and 0. An implementation that read back what it stored, or
+ * computed at the cache's width, would differ. Returns false having printed the failure; true
+ * where the library does not serve the op (a library that is not libavx). */
+bool f16_state_is_the_f32_arithmetic_through_an_f16_cache(const Check& ck, const Lib& lib,
+                                                          const char* op, const char* form) {
+    const int64_t K = 32, V = 32, Hg = 2, H = 6, N = 2, QL = 4, CH = 8;
+    const bool scan = std::strcmp(op, "gdn_chunk_scan") == 0;
+    const bool anc  = form && std::strcmp(form, "anchor") == 0;
+    char what[96];
+    std::snprintf(what, sizeof what, "f16 state = f32 through an f16 cache%s%s",
+                  form ? ", " : "", form ? form : "");
+    const int64_t T = scan ? 32 : N * QL;
+    const int64_t slots = scan ? 3 : (anc ? N * 6 : N * QL);
+    const int64_t blk = H * V * K, cache = slots * blk;
+
+    /* The cache, drawn at f16 so both runs start from the same values. */
+    std::vector<uint16_t> c16((size_t)cache);
+    {
+        const auto f = hfill(160, 0.1f);
+        for (int64_t i = 0; i < cache; ++i) c16[(size_t)i] = rad_f32_to_f16(f(i));
+    }
+    std::vector<float> c32((size_t)cache);
+    for (int64_t i = 0; i < cache; ++i) c32[(size_t)i] = rad_f16_to_f32(c16[(size_t)i]);
+
+    auto draw = [](uint64_t s, int64_t n, float sigma) {
+        std::vector<float> v((size_t)n);
+        const auto f = hfill(s, sigma);
+        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = f(i);
+        return v;
+    };
+    auto tensor = [](void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
+        RadTensor t{};
+        t.data = p; t.dtype = dt; t.rank = (uint32_t)shape.size();
+        int i = 0;
+        for (int64_t x : shape) t.shape[i++] = x;
+        rad_tensor_pack(&t);
+        return t;
+    };
+    std::vector<float> q = draw(161, T * Hg * K, 1.0f), k = draw(162, T * Hg * K, 1.0f);
+    std::vector<float> v = draw(163, T * H * V, 1.0f), z = draw(166, T * H * V, 1.0f);
+    std::vector<float> o16((size_t)(T * H * V), 0.0f), o32 = o16;
+    std::vector<RadParam> p;
+    std::vector<int32_t> cu, idx, nacc;
+    /* Recurrence: a, b, A_log, dt_bias, norm_w. Scan: unit-norm k, A, the in-chunk gate cumsum. */
+    std::vector<float> a = draw(164, T * H, 1.0f), b = draw(165, T * H, 1.0f);
+    std::vector<float> alog((size_t)H), dtb((size_t)H), nw((size_t)V);
+    std::vector<float> A((size_t)(T * H * CH), 0.0f), g((size_t)(T * H)), beta((size_t)(T * H));
+    for (int64_t h = 0; h < H; ++h) { alog[(size_t)h] = -2.0f + 0.25f * (float)h;
+                                      dtb[(size_t)h]  = -1.0f + 0.25f * (float)h; }
+    for (int64_t e = 0; e < V; ++e) nw[(size_t)e] = 1.0f + 0.01f * (float)(e % 9);
+    if (scan) {
+        cu = { 0, 13, 32 };
+        idx = { 2, 0 };
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t hg = 0; hg < Hg; ++hg) {
+                float* r = &k[(size_t)((t * Hg + hg) * K)];
+                double s = 0;
+                for (int64_t j = 0; j < K; ++j) s += (double)r[j] * r[j];
+                for (int64_t j = 0; j < K; ++j) r[j] = (float)(r[j] / std::sqrt(s));
+            }
+        const auto fa = hfill(167, 0.2f);
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t t = cu[(size_t)n]; t < cu[(size_t)n + 1]; ++t) {
+                const int64_t i = (t - cu[(size_t)n]) % CH;   /* the row's place in its chunk */
+                for (int64_t h = 0; h < H; ++h) {
+                    g[(size_t)(t * H + h)] = -0.04f * (float)(i + 1) * (1.0f + 0.1f * (float)h);
+                    beta[(size_t)(t * H + h)] = 0.3f + 0.05f * (float)h;
+                    for (int64_t j = 0; j < i; ++j)
+                        A[(size_t)((t * H + h) * CH + j)] = fa((t * H + h) * CH + j);
+                    A[(size_t)((t * H + h) * CH + i)] = 1.0f;
+                }
+            }
+        p = { { "M", RAD_P_INT, T, 0, nullptr, 0 },
+              { "head_k", RAD_P_INT, K, 0, nullptr, 0 },
+              { "head_v", RAD_P_INT, V, 0, nullptr, 0 },
+              { "chunk", RAD_P_INT, CH, 0, nullptr, 0 },
+              { "scale", RAD_P_F64, 0, 0, nullptr, 0.176 } };
+    } else {
+        cu = { 0, (int32_t)QL, (int32_t)(2 * QL) };
+        if (anc) {
+            /* A non-paged sequence (one slot in each half) and a paged one; one and two replayed
+             * tokens out of the drawn factor blocks. */
+            idx = { 0, 0, 0, 1, 1, 1, 2, 3, 4, 5, 6, 7 };
+            nacc = { 1, 2 };
+        } else {
+            for (int64_t i = 0; i < N * QL; ++i) idx.push_back((int32_t)i);
+            nacc = { 1, 1 };
+        }
+        p = { { "q_len", RAD_P_INT, QL, 0, nullptr, 0 },
+              { "head_k", RAD_P_INT, K, 0, nullptr, 0 },
+              { "head_v", RAD_P_INT, V, 0, nullptr, 0 },
+              { "n_head_v", RAD_P_INT, H, 0, nullptr, 0 },
+              { "scale", RAD_P_F64, 0, 0, nullptr, 0.176 },
+              { "eps", RAD_P_F64, 0, 0, nullptr, 1e-6 },
+              { "act", RAD_P_STR, 0, 0, "sigmoid", 0 },
+              { "state_form", RAD_P_STR, 0, 0, form, 0 } };
+    }
+    const RadKernelInfo* r = lib.select(op, p.data(), (int)p.size());
+    if (!r) {
+        if (!ck.own) return true;
+        std::printf("  FAIL %s %s\n       no row of %s admits it\n", op, what, lib.info->name);
+        return false;
+    }
+    auto go = [&](void* st, uint32_t sdt, std::vector<float>& o) {
+        std::vector<RadTensor> t;
+        if (scan)
+            t = { tensor(q.data(), RAD_F32, { T, Hg, K }), tensor(k.data(), RAD_F32, { T, Hg, K }),
+                  tensor(v.data(), RAD_F32, { T, H, V }), tensor(A.data(), RAD_F32, { T, H, CH }),
+                  tensor(g.data(), RAD_F32, { T, H }), tensor(beta.data(), RAD_F32, { T, H }),
+                  tensor(st, sdt, { slots, H, V, K }), tensor(cu.data(), RAD_I32, { N + 1 }),
+                  tensor(o.data(), RAD_F32, { T, H, V }), tensor(st, sdt, { slots, H, V, K }),
+                  tensor(idx.data(), RAD_I32, { N }) };
+        else
+            t = { tensor(q.data(), RAD_F32, { T, Hg, K }), tensor(k.data(), RAD_F32, { T, Hg, K }),
+                  tensor(v.data(), RAD_F32, { T, H, V }), tensor(a.data(), RAD_F32, { T, H }),
+                  tensor(b.data(), RAD_F32, { T, H }), tensor(alog.data(), RAD_F32, { H }),
+                  tensor(dtb.data(), RAD_F32, { H }), tensor(st, sdt, { slots, H, V, K }),
+                  tensor(idx.data(), RAD_I32, { N, (int64_t)idx.size() / N }),
+                  tensor(nacc.data(), RAD_I32, { N }), tensor(cu.data(), RAD_I32, { N + 1 }),
+                  tensor(z.data(), RAD_F32, { T, H, V }), tensor(nw.data(), RAD_F32, { V }),
+                  tensor(o.data(), RAD_F32, { T, H, V }), RadTensor{}, RadTensor{} };
+        RadArgs args{};
+        args.t = t.data(); args.n_t = (int)t.size(); args.p = p.data(); args.n_p = (int)p.size();
+        args.world_size = 1;
+        return r->launch(&args, nullptr);
+    };
+    const std::vector<uint16_t> c16_in = c16;
+    const int r16 = go(c16.data(), RAD_F16, o16), r32 = go(c32.data(), RAD_F32, o32);
+    if (r16 != RAD_OK || r32 != RAD_OK) {
+        std::printf("  FAIL %s %s\n       refused: f16 %d, f32 %d\n", op, what, r16, r32);
+        return false;
+    }
+    int64_t o_diff = 0, st_diff = 0, moved = 0;
+    for (size_t i = 0; i < o16.size(); ++i)
+        o_diff += std::memcmp(&o16[i], &o32[i], sizeof(float)) != 0;
+    for (int64_t i = 0; i < cache; ++i) {
+        st_diff += c16[(size_t)i] != rad_f32_to_f16(c32[(size_t)i]);
+        moved += c16[(size_t)i] != c16_in[(size_t)i];
+    }
+    /* A run that stored nothing would agree with one that stored nothing. */
+    if (o_diff || st_diff || moved < blk) {
+        std::printf("  FAIL %s %s\n       %lld of %zu outputs and %lld of %lld cache elements "
+                    "differ (%lld moved)\n", op, what, (long long)o_diff, o16.size(),
+                    (long long)st_diff, (long long)cache, (long long)moved);
+        return false;
+    }
+    if (ck.verbose)
+        std::printf("  %-22s %-46s %s, bit for bit\n", op, what, lib.info->name);
+    return true;
+}
+
 /* ================================================================== packed stores */
 void packed_cases(std::vector<Hand>& hs) {
     /* Nearest code, ties to the even code, saturation and NaN, into e2m1, int4 and int2: the
@@ -4974,6 +5139,24 @@ bool hand_cases(const Check& ck) {
             const bool good = small ? anchor_replays_per_candidate(ck, 16, 16, 7, kSched16)
                                     : anchor_replays_per_candidate(ck, 64, 64, 3, kSched64);
             if (!good) { ok = false; ++fails; }
+        }
+    }
+    /* The f16 state on the oracle and on the library under test alike. */
+    for (const char* op : { "gdn_recurrent_update", "gdn_chunk_scan" }) {
+        if (!ck.only_op.empty() && ck.only_op != op) continue;
+        const bool rec = std::strcmp(op, "gdn_recurrent_update") == 0;
+        for (const char* form : { "per_candidate", "anchor" }) {
+            if (!rec && std::strcmp(form, "anchor") == 0) continue;
+            for (const Lib* l : { ck.ref, ck.lib }) {
+                Check c = ck;
+                c.own = l == ck.lib ? ck.own : true;   /* libref serves every gdn op */
+                ++run;
+                if (!f16_state_is_the_f32_arithmetic_through_an_f16_cache(c, *l, op,
+                                                                          rec ? form : nullptr)) {
+                    ok = false;
+                    ++fails;
+                }
+            }
         }
     }
     if (const int cf = codebook_cases(ck, &run)) {
