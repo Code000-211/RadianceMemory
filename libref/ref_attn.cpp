@@ -254,6 +254,105 @@ inline float inv_scale(const RadArgs* a, const char* k) {
 
 }  /* namespace */
 
+/* ------------------------------------------------------------------ kv_transcode */
+/* One (token, head) row from one layout into another (docs/OPS.md "`kv_transcode`"): the
+ * window-residency store's demote layout (RAD_KVQ_DEMOTE) is written from the resident one and
+ * read back into it. Decode is exact -- an E4M3 code, an int8, int4 or odd int2 level times an f16
+ * scale are all representable in f32 -- so the encode sees each layout's own values, and the
+ * encodes are the stores' own (i8h_head, k4h_group, v2h_group above, and the fp8 store's clamp to
+ * +-448 before rounding to E4M3), in the stored units: both layouts of a layer share its descales,
+ * basis and V mean, so nothing is rescaled, rotated or centred here. Shared by `kv_transcode` and
+ * the expanding `qsa_page` (ref_qsa.cpp), which must agree byte for byte: a block paged in and the
+ * same block promoted are one value. */
+namespace ref {
+
+int kvx_layout(const char* name) {
+    if (!name) return -1;
+    if (!std::strcmp(name, "fp8")) return 0;              /* RAD_KVQ_NONE */
+    if (!std::strcmp(name, "k4h_v4")) return 3;           /* RAD_KVQ_K4H */
+    if (!std::strcmp(name, "k4h_v2h")) return 4;          /* RAD_KVQ_K4HV2H */
+    if (!std::strcmp(name, "i8h")) return 5;              /* RAD_KVQ_I8H */
+    return -1;
+}
+
+int64_t kvx_row_bytes(int lay, int64_t hd) {
+    switch (lay) {
+    case 0: return 2 * hd;
+    case 3: return 18 * hd / 16;
+    case 4: return 14 * hd / 16;
+    case 5: return 2 * hd + 4;
+    default: return -1;
+    }
+}
+
+void kvx_rows(int from, int to, int64_t hd, const uint8_t* src, int64_t src_pitch, uint8_t* dst,
+              int64_t dst_pitch, int64_t rows) {
+    REF_PAR_FOR(rows * hd * 2)
+    for (int64_t r = 0; r < rows; ++r) {
+        const uint8_t* s = src + r * src_pitch;
+        uint8_t* o = dst + r * dst_pitch;
+        float x[2][REF_HD_MAX];   /* K, V */
+        for (int64_t d = 0; d < hd; ++d) {
+            switch (from) {
+            case 0:
+                x[0][d] = fp8e4m3_to_f32(s[d]);
+                x[1][d] = fp8e4m3_to_f32(s[hd + d]);
+                break;
+            case 5:
+                x[0][d] = i8h_at(s, s + 2 * hd, d);
+                x[1][d] = i8h_at(s + hd, s + 2 * hd + 2, d);
+                break;
+            default:   /* 3, 4: K int4 alike, V int4 or int2 */
+                x[0][d] = k4h_int4(s, s + k4h_ksoff(from == 4 ? 2 : 1, hd), d);
+                x[1][d] = from == 4 ? v2h_at(s, hd, d)
+                                    : k4h_int4(s + hd / 2, s + hd * 17 / 16, d);
+            }
+        }
+        switch (to) {
+        case 0:
+            for (int w = 0; w < 2; ++w)
+                for (int64_t d = 0; d < hd; ++d)
+                    o[w * hd + d] = f32_to_fp8e4m3(std::fmin(std::fmax(x[w][d], -448.0f), 448.0f));
+            break;
+        case 5:
+            i8h_head(x[0], hd, o, o + 2 * hd);
+            i8h_head(x[1], hd, o + hd, o + 2 * hd + 2);
+            break;
+        default:
+            for (int64_t g = 0; g < hd; g += 32) {
+                k4h_group(x[0] + g, o + g / 2, o + k4h_ksoff(to == 4 ? 2 : 1, hd) + (g / 32) * 2);
+                if (to == 4)
+                    v2h_group(x[1] + g, o + hd / 2 + g / 4, o + hd * 13 / 16 + (g / 32) * 2);
+                else
+                    k4h_group(x[1] + g, o + hd / 2 + g / 2, o + hd * 17 / 16 + (g / 32) * 2);
+            }
+        }
+    }
+}
+
+}  /* namespace ref */
+
+/* `x` [M, row(from)] bytes into `out` [M, row(to)], each row one token's head (the KV cache's last
+ * extent). Refused: an unknown layout, the same one twice, a head_dim off the 32-grid or past
+ * REF_HD_MAX, operands whose rows are not the layouts' widths, and a row count that differs. */
+int ref_kv_transcode(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *o = &a->t[1];
+    const int from = kvx_layout(p_str(a, "from", nullptr)), to = kvx_layout(p_str(a, "to", nullptr));
+    const int64_t hd = p_int(a, "head_dim", 0);
+    if (from < 0 || to < 0 || from == to) return RAD_E_INVAL;
+    if (hd <= 0 || hd % 32) return RAD_E_SHAPE;
+    if (hd > REF_HD_MAX) return RAD_E_UNSUPPORTED;
+    if (x->dtype != RAD_U8 || o->dtype != RAD_U8) return RAD_E_DTYPE;
+    if (x->rank != 2 || o->rank != 2 || x->shape[1] != kvx_row_bytes(from, hd) ||
+        o->shape[1] != kvx_row_bytes(to, hd) || x->shape[0] != o->shape[0] || x->shape[0] <= 0)
+        return RAD_E_SHAPE;
+    if (x->stride[1] != 1 || o->stride[1] != 1) return RAD_E_STRIDE;
+    kvx_rows(from, to, hd, (const uint8_t*)x->data, x->stride[0], (uint8_t*)o->data, o->stride[0],
+             x->shape[0]);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ attn_paged */
 /* attn_paged_tree's ninth operand, `spec_parent` (RadBatch::spec_parent, rad_drafter_tree), is
  * read here too: a row whose entry is -2 is an ordinary causal row; any other row is a node of its

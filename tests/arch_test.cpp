@@ -10676,6 +10676,98 @@ TEST(a_uniform_i8h_recipe_on_flashnext_is_one_rotated_516_byte_cache_and_its_hea
         }
 }
 
+/* A tiered recipe on Flash-Next (RAD_KVQ_DEMOTE), at one, two and four ranks. Uniform `i8h demote
+ * k4h_v2h` is the uniform i8h program but for the pager: the one `kv_attn` group at 258 columns,
+ * every pager (the two trunk layers' and the head's) expanding `store_layout` k4h_v2h into
+ * `pool_layout` i8h at head_dim 256 over the same i8h block_bytes, and the steps lint clean. Mixed,
+ * a layer with a demote layout and one without are two groups (a store slot holds one width), each
+ * pager its own: layer 3's expands, layer 7's and the head's copy bytes. A rotated fp8 layer may
+ * be tiered and its head behind it rotates, since its demoted blocks are rotated int4. */
+TEST(a_tiered_recipe_on_flashnext_keys_its_groups_by_the_pair_and_its_pagers_expand) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int d2 = (int)RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT, d4 = (int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            std::vector<int32_t> r(8, -1);
+            r[3] = r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | d2;
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 258);
+            CHECK(noted(b, "kv cache i8h: demoted blocks stored as k4h_v2h under window residency"));
+            const bool has_cache = !b.kv_groups[0].zero;
+            int pages = 0;
+            for (const auto& o : b.ops) {
+                if (o.op != "qsa_page") continue;
+                ++pages;
+                CHECK_EQ(pstr(&o, "store_layout"), std::string("k4h_v2h"));
+                CHECK_EQ(pstr(&o, "pool_layout"), std::string("i8h"));
+                CHECK_EQ(pint(&o, "head_dim"), 256ll);
+                CHECK_EQ(pint(&o, "block_bytes"), (long long)(2 * 4 * b.kv_groups[0].d.n_head_kv * 258));
+            }
+            CHECK_EQ(pages, has_cache ? 3 : 0);
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+
+            r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+            RadBuildCtx cm = with_recipe(q4_ctx(rank, world), r);
+            cm.kv_residency = 1;
+            RadBuilder m;
+            m.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&m, &meta, &cm), RAD_OK);
+            std::vector<std::string> names;
+            for (const auto& g : m.kv_groups) names.push_back(g.name);
+            CHECK(std::find(names.begin(), names.end(), "kv_attn_i8h") != names.end());
+            CHECK(std::find(names.begin(), names.end(), "kv_attn_i8h_demote_k4h_v2h") != names.end());
+            int expanding = 0, copying = 0;
+            for (const auto& o : m.ops)
+                if (o.op == "qsa_page") (pstr(&o, "store_layout") == "<absent>" ? copying : expanding)++;
+            CHECK_EQ(expanding, has_cache ? 1 : 0);
+            CHECK_EQ(copying, has_cache ? 2 : 0);
+
+            r[3] = r[7] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED | d4;
+            RadBuildCtx cf = with_recipe(q4_ctx(rank, world), r);
+            cf.kv_residency = 1;
+            RadBuilder f;
+            f.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&f, &meta, &cf), RAD_OK);
+            int rot_ops = 0;
+            for (const auto& o : f.ops) {
+                rot_ops += o.op == "had_rotate";
+                if (o.op == "qsa_page") CHECK_EQ(pstr(&o, "pool_layout"), std::string("fp8"));
+            }
+            if (!f.kv_groups[0].zero) CHECK_EQ(rot_ops, 3);   /* layers 3 and 7, and the head */
+        }
+}
+
+/* A demote layout the plugin does not serve is refused naming the layer: fp8_v4 as a demote layout
+ * (a hand-built entry; the recipe parser refuses it first), a k6_v4 resident layout, and an fp8
+ * layer without its rotation. */
+TEST(a_demote_layout_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int e : { (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | ((int)RAD_KVQ_V4 << RAD_KVQ_DEMOTE_SHIFT),
+                   (int)RAD_KVQ_K6V4 | ((int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT),
+                   (int)RAD_KVQ_NONE | ((int)RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT) }) {
+        std::vector<int32_t> r(8, -1);
+        r[3] = e;
+        r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        CHECK(has(err, "KV recipe: layer 3 asks for demote layout"));
+    }
+}
+
 /* i8h's refusals are the k4h layouts': without its rotation (a hand-built context), as every
  * layer's --kv-cache-dtype, and where libr4d has no rows for it (gqa 8, which the probe does not
  * offer). */
@@ -10898,10 +10990,66 @@ TEST(a_bf16_recipe_entry_flashnext_cannot_serve_is_refused_naming_the_layer) {
     CHECK(has(refusal(with_recipe(q4_ctx(0, 1), { -1, -1, -1, (int)RAD_KVQ_BF16 | RAD_KVQ_VMEAN,
                                                   -1, -1, -1, RAD_KVQ_NONE })),
               "layer 3 asks for bf16 with a V mean"));
+    /* Nor tiered: a demote layout on a bf16 entry (hand-built; the parser refuses it first). */
+    for (int dq : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H })
+        CHECK(has(refusal(with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, (int)RAD_KVQ_BF16 | (dq << RAD_KVQ_DEMOTE_SHIFT),
+                                        -1, -1, -1, RAD_KVQ_NONE })),
+                  "layer 3 asks for bf16 demoted to layout"));
     RadBuildCtx flag = q4_ctx(0, 1);
     flag.kv_dtype = RAD_F8E4M3;
     flag.kv_quant = RAD_KVQ_BF16;
     CHECK(has(refusal(flag), "KV cache layout 6 is not one this plugin knows"));
+}
+
+/* A bf16 layer beside a tiered rotated fp8 layer keeps its own group: the group keys stride by
+ * the layout count, so `fp8 rotated demote k4h_v4` is not bf16's key. Layer 3 bf16 (RAD_BF16 at
+ * head_dim 256, its pager copying 2-byte elements), layer 7 tiered fp8 (256 E4M3 columns, its
+ * pager and the head's expanding k4h_v4 into fp8), at one, two and four ranks. */
+TEST(a_bf16_layer_beside_a_tiered_fp8_layer_on_flashnext_keeps_its_own_group) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = RAD_KVQ_BF16;
+    r[7] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED | ((int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT);
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_bf16"));
+            CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 256);
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_fp8_demote_k4h_v4"));
+            CHECK_EQ(b.kv_groups[1].d.dtype, (uint32_t)RAD_F8E4M3);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 256);
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+            if (b.kv_groups[0].zero) continue;
+            const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+            std::vector<const RecOp*> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(&o);
+            REQUIRE_EQ(page.size(), (size_t)3);
+            CHECK_EQ(pint(page[0], "block_bytes"), (long long)(2 * 4 * nkv * 256 * 2));
+            CHECK_EQ(pstr(page[0], "store_layout"), std::string("<absent>"));
+            for (int i : { 1, 2 }) {
+                CHECK_EQ(pint(page[i], "block_bytes"), (long long)(2 * 4 * nkv * 256));
+                CHECK_EQ(pstr(page[i], "store_layout"), std::string("k4h_v4"));
+                CHECK_EQ(pstr(page[i], "pool_layout"), std::string("fp8"));
+            }
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+        }
 }
 
 /* The fp8-rounding experiment (RADIANCE_DEBUG_KV_E4M3R, rad_block_attn_gated_fp8.h) on Flash-Next

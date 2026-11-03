@@ -193,6 +193,36 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                 }
                 p.residency_window = g.decl.residency_window;
                 p.residency_blocks = ceil_div(g.decl.residency_window, p.block_size);
+                /* Tiered (RAD_KVQ_DEMOTE): the layers' recipe entries name the pair. The plugin
+                 * keys its groups by it, so a group whose layers disagree is a plugin fault; the
+                 * row width is the declared one (head_dim is half the row of the E4M3 group). */
+                int key = -1;
+                for (int l : p.layers) {
+                    if (l < 0 || (size_t)l >= cfg.kv_recipe.size() || cfg.kv_recipe[(size_t)l] < 0)
+                        continue;   /* the MTP head's layer shares its group's layout */
+                    const int k = cfg.kv_recipe[(size_t)l] & (RAD_KVQ_LAYOUT | RAD_KVQ_DEMOTE);
+                    if (key >= 0 && k != key && (RAD_KVQ_DEMOTE_OF(k) || RAD_KVQ_DEMOTE_OF(key))) {
+                        RAD_ERR("KV group '%s': layer %d's recipe entry names another resident or "
+                                "demote layout than the group's other layers; a store slot holds "
+                                "one group's block at one width", p.name.c_str(), l);
+                        return RAD_E_INVAL;
+                    }
+                    key = k;
+                }
+                if (key >= 0 && RAD_KVQ_DEMOTE_OF(key)) {
+                    const int64_t row = g.decl.head_dim * elt * 2;
+                    p.res_from     = key & RAD_KVQ_LAYOUT;
+                    p.res_to       = RAD_KVQ_DEMOTE_OF(key);
+                    p.res_head_dim = kv_layout_head_dim(p.res_from, row);
+                    const int64_t lb = p.layer_bytes_per_block();
+                    if (p.res_head_dim <= 0 || lb % row) {
+                        RAD_ERR("KV group '%s': a %lld-byte row is no %s row, so its blocks "
+                                "cannot be stored as %s", p.name.c_str(), (long long)row,
+                                kv_layout_name(p.res_from), kv_layout_name(p.res_to));
+                        return RAD_E_INVAL;
+                    }
+                    p.res_frag = lb / row * kv_layout_row_bytes(p.res_to, p.res_head_dim);
+                }
             }
         } else if (p.kind == RAD_KV_LINEAR || p.kind == RAD_KV_CONV) {
             if (p.kind == RAD_KV_CONV) {
@@ -1433,7 +1463,7 @@ void KVManager::size_residency() {
         auto& v = res_layer_off_[i];
         v.assign((size_t)top, -1);
         for (size_t j = 0; j < p.layers.size(); ++j)
-            v[(size_t)p.layers[j]] = res_off_[i] + (int64_t)j * p.layer_bytes_per_block();
+            v[(size_t)p.layers[j]] = res_off_[i] + (int64_t)j * p.residency_frag();
     }
 }
 
@@ -1479,6 +1509,7 @@ void KVManager::release_residency() {
     res_refs_.clear();
     res_slots_ = 0;
     res_origin_.assign(plans_.size(), {});
+    res_emul_.assign(plans_.size(), {});
     res_pending_.clear();
     res_demoting_.clear();
     res_cold_ = 0;
@@ -1486,14 +1517,18 @@ void KVManager::release_residency() {
 
 int64_t KVManager::residency_block_bytes(int32_t g) const {
     if (g < 0 || g >= (int32_t)plans_.size()) return 0;
-    return plans_[(size_t)g].residency() ? plans_[(size_t)g].bytes_per_block : 0;
+    return plans_[(size_t)g].residency() ? plans_[(size_t)g].residency_bytes() : 0;
 }
 
 int64_t KVManager::residency_shard_bytes() const {
     int64_t b = 0;
     for (const KVGroupPlan& p : plans_)
-        if (p.residency()) b = std::max(b, p.bytes_per_block);
+        if (p.residency()) b = std::max(b, p.residency_bytes());
     return b;
+}
+
+bool KVManager::residency_emulated(int32_t g, int32_t b) const {
+    return g >= 0 && (size_t)g < res_emul_.size() && res_emul_[(size_t)g].count(b) > 0;
 }
 
 int32_t KVManager::residency_slot(int32_t, int32_t entry) const {
@@ -1540,6 +1575,8 @@ void KVManager::slot_drop(int32_t slot) {
 }
 
 void KVManager::forget_origin(int32_t g, int32_t b) {
+    /* Written or freed: the emulation's next demotion of this block is a first one. */
+    if (g >= 0 && (size_t)g < res_emul_.size()) res_emul_[(size_t)g].erase(b);
     if (g < 0 || (size_t)g >= res_origin_.size()) return;
     auto it = res_origin_[(size_t)g].find(b);
     if (it == res_origin_[(size_t)g].end()) return;
@@ -1653,6 +1690,20 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
             ++seq_res(id).skipped;
             continue;
         }
+        /* The emulation (residency_emulate): the round trip in place, once, in the order and
+         * under the bound the demotion below takes; the entry and the block stay. */
+        if (res_emulate_) {
+            if (res_emul_.size() != plans_.size()) res_emul_.resize(plans_.size());
+            if (!res_emul_[(size_t)g].insert(b).second) continue;   /* as an entry already cold */
+            out->push_back(BlockMove{g, b, -1});
+            --left;
+            ++res_stats_.demoted;
+            res_stats_.demoted_bytes += p->residency_bytes();
+            SeqResidency& sr = seq_res(id);
+            ++sr.demoted;
+            sr.link_bytes += p->residency_bytes();
+            continue;
+        }
         /* A block promoted from a slot and untouched since (a prefix block is immutable; only the
          * partial tail is written, and a write ends the origin) still equals that slot: point the
          * entry back at it, move nothing, free the block now. The origin's reference becomes the
@@ -1695,10 +1746,10 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         out->push_back(BlockMove{g, b, slot});
         --left;
         ++res_stats_.demoted;
-        res_stats_.demoted_bytes += p->bytes_per_block;
+        res_stats_.demoted_bytes += p->residency_bytes();
         SeqResidency& sr = seq_res(id);
         ++sr.demoted;
-        sr.link_bytes += p->bytes_per_block;
+        sr.link_bytes += p->residency_bytes();
     }
     return RAD_OK;
 }
@@ -1733,14 +1784,19 @@ int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64
         s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
         --res_cold_;
         res_pending_.push_back({ g, slot });
-        if (shared && (size_t)g < res_origin_.size()) { slot_ref(slot); res_origin_[(size_t)g][fresh] = slot; }
+        /* A tiered block keeps its slot too: its pool bytes are the slot's expanded, and a
+         * second requantisation from them would round the block twice (KVGroupPlan::tiered). */
+        if ((shared || p->tiered()) && (size_t)g < res_origin_.size()) {
+            slot_ref(slot);
+            res_origin_[(size_t)g][fresh] = slot;
+        }
         out->push_back(BlockMove{g, fresh, slot});
         ++res_stats_.promoted;
         ++res_stats_.promoted_misses;
-        res_stats_.promoted_bytes += p->bytes_per_block;
+        res_stats_.promoted_bytes += p->residency_bytes();
         SeqResidency& sr = seq_res(id);
         ++sr.promoted;
-        sr.link_bytes += p->bytes_per_block;
+        sr.link_bytes += p->residency_bytes();
     }
     return RAD_OK;
 }

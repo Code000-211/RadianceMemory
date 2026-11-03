@@ -1963,6 +1963,23 @@ extern "C" int r4d_shape_kv_resolve(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* kv_transcode: every byte of a row drawn, as libref's description draws it. */
+extern "C" int r4d_shape_kv_transcode(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t hd = pi(p, n_p, "head_dim");
+    auto row = [&](const char* k) -> int64_t {
+        const char* s = rad_param_gets(p, n_p, k, "");
+        return !std::strcmp(s, "fp8") ? 2 * hd : !std::strcmp(s, "k4h_v4") ? 18 * hd / 16
+             : !std::strcmp(s, "k4h_v2h") ? 14 * hd / 16 : !std::strcmp(s, "i8h") ? 2 * hd + 4 : 0;
+    };
+    const int64_t rf = row("from"), rt = row("to");
+    if (M <= 0 || hd <= 0 || rf <= 0 || rt <= 0) return RAD_E_UNSUPPORTED;
+    RadOpdDesc x = opd((uint32_t)RAD_U8, M, rf);
+    x.fill = RAD_FILL_INDEX; x.idx_max = 256;
+    const RadOpdDesc l[] = { x, opd((uint32_t)RAD_U8, M, rt) };
+    R4D_PICK(l);
+}
+
 /* The QSA pager. A generated table draws resident ids only (a random draw cannot pair a cold entry
  * with a slot and a scratch page), so this exercises the pass-through; the selftest builds the cold
  * cases by hand. The store is four slots twice the fragment wide, so the row pitch exceeds

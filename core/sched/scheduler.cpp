@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
@@ -1629,7 +1630,11 @@ int Scheduler::res_issue(bool to_host) {
 }
 
 void Scheduler::res_reap() {
-    if (!res_inflight_ || !res_mover_.landed || !res_mover_.landed()) return;
+    if (!res_inflight_ || !res_mover_.landed) return;
+    if (res_mover_.sync)
+        while (!res_mover_.landed()) std::this_thread::sleep_for(std::chrono::microseconds(20));
+    else if (!res_mover_.landed())
+        return;
     kv_->residency_demote_landed();
     kv_->residency_complete();
     res_inflight_ = false;
@@ -2817,7 +2822,7 @@ int Scheduler::commit(StepResult& res) {
      * reap at step() alone left the first batch held for the whole decode -- on the card, one
      * sweep went out, never landed in the scheduler's view, and VRAM never came back. The poll is
      * a query of one event a rank; it never waits. */
-    if (plan_.phase == RAD_PHASE_DECODE) { res_reap(); res_sweep(); }
+    if (plan_.phase == RAD_PHASE_DECODE || res_mover_.every_step) { res_reap(); res_sweep(); }
     res.n_prefill_done = (int)last_prefill_ids_.size();
     res.n_finished     = step_finished_;
     return RAD_OK;

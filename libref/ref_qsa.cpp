@@ -230,7 +230,11 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
  * a scratch id outside the pool, or two cold positions sharing a scratch page.
  *
  * An optional fifth operand, one i64, is the pager's counter: the entries this call rewrote are
- * added to it (not stored), so a caller reads how much the window paged over many launches. */
+ * added to it (not stored), so a caller reads how much the window paged over many launches.
+ *
+ * With `store_layout` and `pool_layout` (RAD_KVQ_DEMOTE, a tiered layer) the copy expands: the
+ * slot holds the fragment's rows in the demote layout and each is decoded and re-encoded into the
+ * pool's layout (kv_transcode's codec), so the attention reads the one layout it was declared at. */
 int ref_qsa_page(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *sel = &a->t[0], *st = &a->t[1], *pl = &a->t[2], *sc = &a->t[3];
@@ -255,7 +259,23 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
     if (M <= 0 || sel->shape[1] < w || sc->shape[0] < M || sc->shape[1] < w) return RAD_E_SHAPE;
     /* `store` is this layer's view of the store (the plugin folds the layer's offset in): row s
      * is slot s, its first block_bytes are this layer's fragment. */
-    if (inner * (ebits / 8) < bb || pitch < bb || st->shape[1] < bb) return RAD_E_SHAPE;
+    if (inner * (ebits / 8) < bb || pitch < bb) return RAD_E_SHAPE;
+    /* Expanding (RAD_KVQ_DEMOTE): the store holds the fragment in `store_layout`, the pool takes
+     * it in `pool_layout`, row by row (kvx_rows, ref_attn.cpp); `block_bytes` stays the pool's
+     * fragment, and the store's is as many rows of its own width. Both words or neither. */
+    const char* sl = p_str(a, "store_layout", nullptr);
+    const char* plw = p_str(a, "pool_layout", nullptr);
+    int xf = -1, xt = -1;
+    int64_t hd = 0, rows = 0, sbb = bb;
+    if (sl || plw) {
+        xf = kvx_layout(sl); xt = kvx_layout(plw); hd = p_int(a, "head_dim", 0);
+        if (xf < 0 || xt < 0 || xf == xt) return RAD_E_INVAL;
+        if (hd <= 0 || hd % 32 || bb % kvx_row_bytes(xt, hd)) return RAD_E_SHAPE;
+        if (hd > 2048) return RAD_E_UNSUPPORTED;
+        rows = bb / kvx_row_bytes(xt, hd);
+        sbb  = rows * kvx_row_bytes(xf, hd);
+    }
+    if (st->shape[1] < sbb) return RAD_E_SHAPE;
     const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
     int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
     if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
@@ -278,7 +298,11 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
             const int64_t e = ldi(sel, so);
             if (e > -2) continue;
             const int64_t pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
-            std::memcpy(pb + pg * pitch, sb + (-2 - e) * slot_b, (size_t)bb);
+            if (xf >= 0)
+                kvx_rows(xf, xt, hd, sb + (-2 - e) * slot_b, kvx_row_bytes(xf, hd), pb + pg * pitch,
+                         kvx_row_bytes(xt, hd), rows);
+            else
+                std::memcpy(pb + pg * pitch, sb + (-2 - e) * slot_b, (size_t)bb);
             st_int(sel->dtype, sel->data, so, pg);
         }
     if (paged) *paged += n_cold;

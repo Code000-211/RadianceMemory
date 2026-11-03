@@ -74,6 +74,12 @@ struct QsaIndexer {
          * codes and their f16 scale (docs/QSA.md, "Block-key storage"), and `qsa_block_key` and
          * `qsa_score` take `key_dtype` i8. False is today's bf16 page and the same program. */
         bool        bkey_i8 = false;
+        /* A tiered group (RAD_KVQ_DEMOTE): the store holds the fragment in `page_store_layout`
+         * and the pager expands it into `page_pool_layout` at `page_head_dim` (the op's
+         * store_layout, pool_layout and head_dim). Null: the bytes are copied as they are. */
+        const char* page_store_layout = nullptr;
+        const char* page_pool_layout  = nullptr;
+        int64_t     page_head_dim     = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -312,7 +318,22 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * before this op, reads `sel` through its own liveness declaration. `M` is the decode rows,
      * the ones that own scratch pages (RadKVGroupBatch::residency_scratch). A prefill row's
      * history is promoted before its step instead, so it never names a cold block. */
-    if (c.page) {
+    if (c.page && c.page_store_layout) {
+        /* Tiered: the same op expanding the demote layout back into the pool's, so the attention
+         * reads one layout. */
+        if (c.page_block_bytes <= 0 || !c.page_pool_layout || c.page_head_dim <= 0)
+            return RAD_E_INVAL;
+        op_page = rw(b, RAD_OP(b, "qsa_page",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("topk", c.topk),
+                                     RAD_INT("blocks", c.max_blocks),
+                                     RAD_INT("seqs", g.max_seqs),
+                                     RAD_INT("block_bytes", c.page_block_bytes),
+                                     RAD_STR("store_layout", c.page_store_layout),
+                                     RAD_STR("pool_layout", c.page_pool_layout),
+                                     RAD_INT("head_dim", c.page_head_dim)),
+                          RAD_NOWEIGHTS),
+                     {w.sel}, {w.sel});
+    } else if (c.page) {
         if (c.page_block_bytes <= 0) return RAD_E_INVAL;
         op_page = rw(b, RAD_OP(b, "qsa_page",
                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("topk", c.topk),

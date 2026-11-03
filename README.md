@@ -311,6 +311,62 @@ block keys stay resident beside that: 159 MiB at bf16, 84 MiB with `--qsa-bkey-d
 group's page is whatever its declaration says, so the pool, the prefix cache and the residency store
 size it from there unchanged.
 
+### Tiered precision: the demoted middle in a narrower layout
+
+A recipe line may name a second layout for the blocks the sweep demotes (RAD_KVQ_DEMOTE,
+`abi/rad_builder.h`):
+
+```
+vmean kv_vmean.txt
+layer 3  i8h demote k4h_v2h vmean        # resident i8h, the store k4h_v2h
+layer 15 fp8 rotated demote k4h_v4       # fp8 must be rotated: the demoted block keeps its basis
+```
+
+The sink and the tail, read on almost every step, stay in the resident layout; the middle sits in
+the store in the demote layout and comes back expanded. Served: i8h or a rotated fp8 layer
+resident, k4h_v4 or k4h_v2h demoted.
+
+* **Where the requantise and the expand run.** On the card, as the op `kv_transcode`
+  (docs/OPS.md): the demotion gathers the block's layers, transcodes every (token, head) row into
+  the demote layout and copies those bytes to the slot; a promotion copies them back and expands
+  them before the scatter; the pager (`qsa_page` with `store_layout` and `pool_layout`) expands a
+  cold fragment straight into its scratch page. One codec serves all three, so attention reads one
+  layout per layer and no attention kernel changed.
+* **Basis and V mean.** The transcode decodes and encodes values in the stored units and does not
+  rotate, centre or rescale. Both layouts therefore share the layer's rotation and V mean: a k4h
+  demote layout needs a rotated layer, and `vmean` (accepted when either layout has integer V)
+  centres the resident and the demoted bytes alike.
+* **Store sizing.** A tiered layer's slot fragment is its rows at the demote width, so a slot is
+  the widest *demote* block (startup prints `stored as k4h_v2h, N KiB a block`). On Flash-Next at
+  `--tp 2` a rank's i8h block (12 layers + the head's, one KV head, 4 tokens) is 13 × 2 064 =
+  26.2 KiB in VRAM and 13 × 896 = 11.4 KiB in the store as k4h_v2h, 13 × 1 152 = 14.6 KiB as k4h_v4.
+* **Re-pointing.** A promoted tiered block keeps its origin slot even when no cache holds it, so an
+  unchanged block re-demotes by pointing back (no bytes, no second rounding). A block is rounded
+  through the demote layout once in its life; the cost is that a resident block can hold a slot.
+* **Prefix cache.** Cold entries hold demote-precision bytes, and a returning conversation is
+  promoted from them: its middle comes back at the demote precision, never better. The idle tiers
+  still take only resident blocks.
+* **The emulation** (`RADIANCE_DEBUG_KV_TIER=emulate`, with the same flags): the sweep picks exactly
+  the blocks it would demote and the mover runs the demote → expand round trip on them in place;
+  nothing moves. Residency-on output is compared with it byte for byte, both under
+  `RADIANCE_DEBUG_KV_TIER=sync` semantics (each sweep is waited for, so which step first reads a
+  demoted block does not depend on transfer timing). In the KL mode, which scores prefill chunks and
+  runs no decode step, the emulation sweeps after every step, unbounded.
+
+Measured on two R9700s (Flash-Next `--tp 2`, bf16-cache reference, residency on, KL through the
+emulation; `prep/aq/m8/kl/tier-*.json`, `prep/aq/m8/recall/tier-*.json`):
+
+| configuration | store a block (both ranks) | long.jsonl KL / p99 / top-1 | recall.jsonl KL / p99 / top-1 |
+|---|--:|--:|--:|
+| uniform i8h | 52.5 KiB | 0.0236 / 0.236 / 94.77 % | 0.0103 / 0.131 / 99.77 % |
+| i8h, demote k4h_v4 + vmean | 29.25 KiB | 0.0247 / 0.248 / 94.38 % | 0.0106 / 0.148 / 99.69 % |
+| i8h, demote k4h_v2h + vmean | 22.75 KiB | 0.0301 / 0.294 / 94.00 % | 0.0120 / 0.173 / 99.67 % |
+| uniform k4h_v2h + vmean | 22.75 KiB | 0.0833 / 0.793 / 89.90 % | 0.0214 / 0.355 / 99.61 % |
+
+A paged block moves its demote-layout fragment over PCIe: 896 B a layer and rank as k4h_v2h,
+1 152 B as k4h_v4, 2 064 B as i8h. Residency on against the emulation, 12 452 prompt tokens and 256
+greedy tokens, is byte-identical for both demote layouts (`prep/aq/m8/identity-tier.sh`).
+
 ---
 
 ## 9. Correctness: why the output does not change
@@ -421,7 +477,13 @@ long contexts on a card that cannot hold them at all.
 * **`paged_in`** is rank 0's count, per layer (one block paged across 12 layers counts 12), and not
   per session, because the card cannot attribute a row to a session.
 * **A promoted block keeps its origin slot** while it is resident, so the store can be fuller than
-  the number of cold entries.
+  the number of cold entries. A tiered block always does (§8, tiered precision).
+* **The emulation equals residency only while the store has room**: a full store leaves blocks
+  resident at full precision, which the emulation does not model. No per-block importance signal
+  yet chooses between two demote layouts.
+* **A demotion is now a dependency of the next step** (the step that reads the block through the
+  pager waits for its copy to land): a stream wait, not a host sync, which closes a window where the
+  pager could read a slot still being written.
 * **Not yet tested with a host test:** the reap at the end of a step under step-ahead issue. The host
   fixtures do not issue ahead, so only the identity run on the card covers it.
 * **The device kernel cannot refuse** the way the reference does. An entry whose slot or scratch id is
@@ -445,5 +507,6 @@ long contexts on a card that cannot hold them at all.
 | engine wiring, store, mover, counter | `core/engine.cpp`, `core/engine_bringup.cpp` |
 | the window declaration and the pager issue | `arch/common/rad_qsa.h` |
 | the pager | `libref/ref_qsa.cpp` (reference), `libr4d/r4d_qsa_page_u8.hip` (card), `libavx/avx_qsa.cpp` |
+| the demote layout's codec (`kv_transcode`, the expanding pager) | `libref/ref_attn.cpp` (`kvx_rows`), `libr4d/r4d_kvx.h`, `libavx/avx_qsa.cpp` |
 | the selection change | `libr4d/r4d_qsa_select_bf16.hip` |
 | spec and operator docs | `spec.md` §7.3 "Window residency", `docs/GUIDE.md` §4.8, `docs/OPS.md` `qsa_page`, `docs/qsa-residency-bench.md` |

@@ -5044,12 +5044,16 @@ namespace {
 struct Rig {
     std::vector<std::pair<bool, std::vector<BlockMove>>> runs;
     bool landed = false;
+    /* Polls of `landed`; with `land_after` > 0 the copies land at that poll, as a transfer that
+     * takes a while does. */
+    int64_t polls = 0, land_after = 0;
     int64_t moved(bool to_host) const {
         int64_t n = 0;
         for (const auto& r : runs) if (r.first == to_host) n += (int64_t)r.second.size();
         return n;
     }
-    void arm(Fixture& f, int64_t sweep, int64_t window = 64, int64_t sink = 32) {
+    void arm(Fixture& f, int64_t sweep, int64_t window = 64, int64_t sink = 32, bool sync = false,
+             bool every_step = false) {
         f.kv.res_group = 0;
         f.kv.res_window = window;
         f.kv.res_open = true;
@@ -5059,7 +5063,9 @@ struct Rig {
             runs.push_back({ to_host, mv });
             return RAD_OK;
         };
-        m.landed = [this] { return landed; };
+        m.landed = [this] { ++polls; return landed || (land_after > 0 && polls >= land_after); };
+        m.sync = sync;
+        m.every_step = every_step;
         f.sch.set_residency_mover(std::move(m), sweep);
     }
 };
@@ -5128,6 +5134,35 @@ TEST(the_sweep_after_a_decode_step_respects_its_bound_and_never_demotes_the_sink
     /* Every landed batch gave its blocks back. The decode steps grew the sequence by a few
      * tokens, which may have taken a block of their own. */
     CHECK(f.kv.free_blocks(0) + 2 >= free_before + cold);
+}
+
+/* RADIANCE_DEBUG_KV_TIER: under `sync` a step that finds the last sweep in flight waits for it to
+ * land (polling until it does) instead of skipping the reap, so every commit sweeps and which step
+ * first reads a demoted block does not depend on the transfer's timing; under the KL mode's
+ * emulation (`every_step`) a prefill chunk's commit sweeps too, since that mode runs no decode
+ * step. Without either, a prefill chunk sweeps nothing (the test above). */
+TEST(the_debug_sync_waits_for_each_sweep_and_the_kl_emulation_sweeps_after_prefill_steps_too) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/5, /*window=*/64, /*sink=*/32, /*sync=*/true, /*every_step=*/true);
+    rig.land_after = 3;
+    CHECK_OK(f.start());
+    (void)f.submit(320, 64);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(f.sch.plan().phase != RAD_PHASE_DECODE);
+    f.commit_plain();
+    const int64_t first = rig.moved(true);
+    CHECK(first > 0 && first <= 5);              /* the prefill chunk's commit swept */
+    for (int step = 0; step < 3; ++step) {
+        const int64_t before = rig.moved(true);
+        rig.polls = 0;
+        CHECK(f.sch.step() != nullptr);          /* reaps: waits until the copies land */
+        CHECK(rig.polls >= 3);
+        f.commit_plain();
+        CHECK(rig.moved(true) > before);         /* so the next commit sweeps again */
+    }
 }
 
 /* A prefill or mixed step reads tables densely, so a cold entry in one would be a store slot

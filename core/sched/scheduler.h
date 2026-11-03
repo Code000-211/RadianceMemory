@@ -493,6 +493,14 @@ public:
     struct ResidencyMover {
         std::function<int(const std::vector<BlockMove>&, bool to_host)> move;
         std::function<bool()> landed;
+        /* RADIANCE_DEBUG_KV_TIER (sync or emulate): a step that would poll for the last sweep's
+         * landing waits for it instead, so a sweep follows every decode step and which step first
+         * reads a block demoted does not depend on the transfer's timing -- what a tiered
+         * residency run and its emulation must share to be compared byte for byte. */
+        bool sync = false;
+        /* The KL mode's emulation: a sweep after every step, prefill too and unbounded, since the
+         * KL mode scores prefill chunks and runs no decode step a sweep could follow. */
+        bool every_step = false;
     };
     void    set_residency_mover(ResidencyMover m, int64_t sweep_blocks);
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still

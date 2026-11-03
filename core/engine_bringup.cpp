@@ -3596,11 +3596,22 @@ int Engine::configure_kv() {
                 per_group += (per_group.empty() ? "" : ", ") + p.name + " " +
                              humanb(p.bytes_per_block) + " (" + std::to_string(p.n_layers) +
                              " layers of " + humanb(p.layer_bytes_per_block()) + ")";
+                /* Tiered: what a slot and the pager's link carry instead (RAD_KVQ_DEMOTE). */
+                if (p.tiered())
+                    per_group += fmt(" stored as %s, %s a block (%s a layer paged in)",
+                                     kv_layout_name(p.res_to), humanb(p.residency_bytes()).c_str(),
+                                     humanb(p.residency_frag()).c_str());
             }
         for (size_t i = 0; i < ranks_.size(); ++i) {
             res_off[i] = slot_bytes;
             slot_bytes += rank_res[i];
         }
+        bool tiered = false;
+        for (const auto& p : ranks_[0]->kv.plans()) tiered = tiered || (p.residency() && p.tiered());
+        if (tiered && cfg_.residency_mib <= 0)
+            RAD_WARN("kv residency: --kv-recipe %s names demote layouts, which only a window-"
+                     "residency store holds; without --kv-residency-mib every block stays in its "
+                     "resident layout", cfg_.kv_recipe_path.c_str());
         if (n_groups == 0) {
             if (cfg_.residency_mib > 0)
                 RAD_WARN("kv residency: --kv-residency-mib %lld does nothing here: no KV group "

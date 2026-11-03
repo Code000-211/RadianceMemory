@@ -1775,6 +1775,20 @@ int ref_qsa_page_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("qsa_page", operand, out);
 }
 
+/* kv_transcode: every byte of a row drawn, so E4M3 NaN codes and f16 scales that are inf or NaN
+ * occur as well as ordinary ones; the codec's answers on those are defined (the stores' clamps), so
+ * every implementation must give libref's bytes on them too. The layouts come from `from`/`to`. */
+int ref_kv_transcode_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), hd = gi(p, n_p, "head_dim", 0);
+    const int64_t rf = ref::kvx_row_bytes(ref::kvx_layout(rad_param_gets(p, n_p, "from", nullptr)), hd);
+    const int64_t rt = ref::kvx_row_bytes(ref::kvx_layout(rad_param_gets(p, n_p, "to", nullptr)), hd);
+    if (M <= 0 || hd <= 0 || rf <= 0 || rt <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx_dt((uint32_t)RAD_U8, { M, rf }, 256, -1, 0);          /* x */
+    o.t((uint32_t)RAD_U8, { M, rt });                             /* out */
+    return o.finish("kv_transcode", operand, out);
+}
+
 int ref_qsa_tail_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t ratio = gi(p, n_p, "ratio", 0), ring = gi(p, n_p, "ring", ratio);

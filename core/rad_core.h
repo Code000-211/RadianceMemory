@@ -1241,7 +1241,8 @@ namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 /* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
  * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4, k4h_v2h and i8h, rotated
- * layouts, and RAD_KVQ_VMEAN where it ends in `vmean`) or -1. `vmean_file`, when given, receives
+ * layouts, RAD_KVQ_VMEAN where it ends in `vmean`, and a RAD_KVQ_DEMOTE layout where it says
+ * `demote LAYOUT`) or -1. `vmean_file`, when given, receives
  * the path a `vmean FILE` line names, as written.
  * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
  * is then left empty. */
@@ -1271,6 +1272,11 @@ const char* kv_layout_name(int kvq);
  * Rotation (RAD_KVQ_ROTATED) does not change the bits. */
 std::vector<int> kv_layouts();
 int              kv_layout_group_bits(int kvq);
+/* A (token, head) row's bytes in layout `kvq` at head_dim `hd` (abi/rad_builder.h's rows: fp8
+ * 2 * hd, i8h 2 * hd + 4, the group layouts their bits a group times hd / 256), and the head_dim
+ * a row of `row` bytes holds in that layout; -1 where there is none. */
+int64_t          kv_layout_row_bytes(int kvq, int64_t hd);
+int64_t          kv_layout_head_dim(int kvq, int64_t row);
 /* The recipe's layers, layout by layout, the rotated ones last, for the startup log: "fp8 at
  * layers 3, 7; k6_v4 at layer 11; k6_v4 rotated at layer 15". */
 std::string kv_recipe_summary(const std::vector<int32_t>& recipe);

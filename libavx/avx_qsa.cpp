@@ -606,6 +606,137 @@ AVX_KERNEL(qsa_tail_store) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the KV row codec */
+/* One (token, head) row of a KV layout decoded and re-encoded in another: kv_transcode and the
+ * expanding qsa_page (RAD_KVQ_DEMOTE). libref's kvx_rows (libref/ref_attn.cpp) is the contract and
+ * this is its scalar arithmetic in its order: exact decodes, then each layout's store encode (the
+ * i8h head scale, k4h's absmax / 7 group, k4h_v2h's variance-normalised odd levels, fp8's clamp to
+ * +-448), so every byte is libref's. Layout ids are RAD_KVQ_*: 0 fp8, 3 k4h_v4, 4 k4h_v2h, 5 i8h. */
+namespace {
+
+int kvx_layout(const char* s) {
+    if (!s) return -1;
+    return !std::strcmp(s, "fp8") ? 0 : !std::strcmp(s, "k4h_v4") ? 3
+         : !std::strcmp(s, "k4h_v2h") ? 4 : !std::strcmp(s, "i8h") ? 5 : -1;
+}
+int64_t kvx_row(int lay, int64_t hd) {
+    return lay == 0 ? 2 * hd : lay == 3 ? 18 * hd / 16 : lay == 4 ? 14 * hd / 16
+         : lay == 5 ? 2 * hd + 4 : -1;
+}
+float kvx_f16(const uint8_t* p) { uint16_t h; std::memcpy(&h, p, 2); return rad_f16_to_f32(h); }
+void kvx_put16(uint8_t* p, uint16_t h) { std::memcpy(p, &h, 2); }
+float kvx_int4(const uint8_t* codes, const uint8_t* scales, int64_t d) {
+    return (float)((((codes[d / 2] >> (4 * (d & 1))) & 0xF) ^ 8) - 8) * kvx_f16(scales + (d / 32) * 2);
+}
+void kvx_i8h(const float* x, int64_t hd, uint8_t* codes, uint8_t* scale) {
+    float amax = std::fabs(x[0]);
+    for (int64_t i = 1; i < hd; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 127.0f, 512.0f));
+    const float sc = rad_f16_to_f32(s16);
+    for (int64_t i = 0; i < hd; ++i) {
+        const float r = sc > 0.0f ? std::rint(x[i] / sc) : 0.0f;
+        codes[i] = (uint8_t)(int8_t)(int)std::fmin(std::fmax(r, -127.0f), 127.0f);
+    }
+    kvx_put16(scale, s16);
+}
+void kvx_k4h(const float* x, uint8_t* codes, uint8_t* scale) {
+    float amax = std::fabs(x[0]);
+    for (int i = 1; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 7.0f, 8188.0f));
+    const float sc = rad_f16_to_f32(s16);
+    for (int i = 0; i < 32; i += 2) {
+        int q[2];
+        for (int e = 0; e < 2; ++e) {
+            const float r = sc > 0.0f ? std::rint(x[i + e] / sc) : 0.0f;
+            q[e] = (int)std::fmin(std::fmax(r, -7.0f), 7.0f) & 0xF;
+        }
+        codes[i / 2] = (uint8_t)(q[0] | (q[1] << 4));
+    }
+    kvx_put16(scale, s16);
+}
+void kvx_v2h(const float* x, uint8_t* codes, uint8_t* scale) {
+    float p[8];
+    for (int l = 0; l < 8; ++l) {
+        const float* y = x + 4 * l;
+        p[l] = std::fma(y[3], y[3], std::fma(y[2], y[2], std::fma(y[1], y[1], y[0] * y[0])));
+    }
+    for (int m = 4; m >= 1; m >>= 1) {
+        float q[8];
+        for (int l = 0; l < 8; ++l) q[l] = p[l] + p[l ^ m];
+        std::memcpy(p, q, sizeof p);
+    }
+    const float sum = std::fmin(p[0], 3.40282347e38f), rms = std::sqrt(sum / 32.0f);
+    int c2 = 0;
+    std::memset(codes, 0, 8);
+    for (int i = 0; i < 32; ++i) {
+        const float r = rms > 0.0f ? 2.0f * std::floor(x[i] / rms) + 1.0f : 1.0f;
+        const int c = (int)std::fmin(std::fmax(r, -3.0f), 3.0f);
+        c2 += c * c;
+        codes[i / 4] = (uint8_t)(codes[i / 4] | (((c + 3) / 2) << (2 * (i & 3))));
+    }
+    kvx_put16(scale, rad_f32_to_f16(std::fmin(std::sqrt(sum / (float)c2), 21824.0f)));
+}
+/* head_dim up to 2048, libref's bound. */
+void kvx_row_copy(int from, int to, int64_t hd, const uint8_t* s, uint8_t* o) {
+    float x[2][2048];
+    for (int64_t d = 0; d < hd; ++d) {
+        if (from == 0) {
+            x[0][d] = rad_fp8e4m3_to_f32(s[d]);
+            x[1][d] = rad_fp8e4m3_to_f32(s[hd + d]);
+        } else if (from == 5) {
+            x[0][d] = (float)(int8_t)s[d] * kvx_f16(s + 2 * hd);
+            x[1][d] = (float)(int8_t)s[hd + d] * kvx_f16(s + 2 * hd + 2);
+        } else {
+            x[0][d] = kvx_int4(s, s + (from == 4 ? hd * 3 / 4 : hd), d);
+            if (from == 4) {
+                const int u = (s[hd / 2 + d / 4] >> (2 * (d & 3))) & 3;
+                x[1][d] = (float)(2 * u - 3) * kvx_f16(s + hd * 13 / 16 + (d / 32) * 2);
+            } else {
+                x[1][d] = kvx_int4(s + hd / 2, s + hd * 17 / 16, d);
+            }
+        }
+    }
+    if (to == 0) {
+        for (int w = 0; w < 2; ++w)
+            for (int64_t d = 0; d < hd; ++d)
+                o[w * hd + d] = rad_f32_to_fp8e4m3(std::fmin(std::fmax(x[w][d], -448.0f), 448.0f));
+    } else if (to == 5) {
+        kvx_i8h(x[0], hd, o, o + 2 * hd);
+        kvx_i8h(x[1], hd, o + hd, o + 2 * hd + 2);
+    } else {
+        for (int64_t g = 0; g < hd; g += 32) {
+            kvx_k4h(x[0] + g, o + g / 2, o + (to == 4 ? hd * 3 / 4 : hd) + (g / 32) * 2);
+            if (to == 4) kvx_v2h(x[1] + g, o + hd / 2 + g / 4, o + hd * 13 / 16 + (g / 32) * 2);
+            else         kvx_k4h(x[1] + g, o + hd / 2 + g / 2, o + hd * 17 / 16 + (g / 32) * 2);
+        }
+    }
+}
+
+}  // namespace
+
+/* ------------------------------------------------------------------ kv_transcode */
+/* x [M, row(from)] into out [M, row(to)], libref's ref_kv_transcode with its refusals. */
+AVX_KERNEL(kv_transcode) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *o = &a->t[1];
+    const int from = kvx_layout(p_str(a, "from", nullptr)), to = kvx_layout(p_str(a, "to", nullptr));
+    const int64_t hd = p_int(a, "head_dim", 0);
+    if (from < 0 || to < 0 || from == to) return RAD_E_INVAL;
+    if (hd <= 0 || hd % 32) return RAD_E_SHAPE;
+    if (hd > 2048) return RAD_E_UNSUPPORTED;
+    if (x->dtype != RAD_U8 || o->dtype != RAD_U8) return RAD_E_DTYPE;
+    if (x->rank != 2 || o->rank != 2 || x->shape[1] != kvx_row(from, hd) ||
+        o->shape[1] != kvx_row(to, hd) || x->shape[0] != o->shape[0] || x->shape[0] <= 0)
+        return RAD_E_SHAPE;
+    if (x->stride[1] != 1 || o->stride[1] != 1) return RAD_E_STRIDE;
+    const int64_t n = x->shape[0];
+    const uint8_t* xb = (const uint8_t*)x->data;
+    uint8_t* ob = (uint8_t*)o->data;
+    AVX_PARALLEL_FOR_IF(n * hd >= AVX_PAR_MIN && n > 1)
+    for (int64_t r = 0; r < n; ++r) kvx_row_copy(from, to, hd, xb + r * x->stride[0], ob + r * o->stride[0]);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_page */
 /* libref's ref_qsa_page (the statement of the contract is there): a cold entry (<= -2) of `sel`
  * becomes its scratch page after block_bytes at the start of its store slot (this layer's view) are copied into that
@@ -635,7 +766,22 @@ AVX_KERNEL(qsa_page) {
     if (M <= 0 || sel->shape[1] < w || sc->shape[0] < M || sc->shape[1] < w) return RAD_E_SHAPE;
     /* `store` is this layer's view of the store (the plugin folds the layer's offset in): row s
      * is slot s, its first block_bytes are this layer's fragment. */
-    if (inner * (ebits / 8) < bb || pitch < bb || st->shape[1] < bb) return RAD_E_SHAPE;
+    if (inner * (ebits / 8) < bb || pitch < bb) return RAD_E_SHAPE;
+    /* Expanding (libref's): both layout words or neither, the store's fragment as many rows of its
+     * width as `block_bytes` holds of the pool's. */
+    const char* sl = p_str(a, "store_layout", nullptr);
+    const char* pw = p_str(a, "pool_layout", nullptr);
+    int xf = -1, xt = -1;
+    int64_t hd = 0, rows = 0, sbb = bb;
+    if (sl || pw) {
+        xf = kvx_layout(sl); xt = kvx_layout(pw); hd = p_int(a, "head_dim", 0);
+        if (xf < 0 || xt < 0 || xf == xt) return RAD_E_INVAL;
+        if (hd <= 0 || hd % 32 || bb % kvx_row(xt, hd)) return RAD_E_SHAPE;
+        if (hd > 2048) return RAD_E_UNSUPPORTED;
+        rows = bb / kvx_row(xt, hd);
+        sbb = rows * kvx_row(xf, hd);
+    }
+    if (st->shape[1] < sbb) return RAD_E_SHAPE;
     const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
     /* The cold positions as (sel offset, slot, page), validated before any write. */
     int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
@@ -656,8 +802,13 @@ AVX_KERNEL(qsa_page) {
     uint8_t* pb = (uint8_t*)pl->data;
     AVX_PARALLEL_FOR_IF(n * bb >= AVX_PAR_MIN && n > 1)
     for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(pb + cold[3 * i + 2] * pitch, sb + cold[3 * i + 1] * slot_b,
-                    (size_t)bb);
+        if (xf >= 0)
+            for (int64_t r = 0; r < rows; ++r)
+                kvx_row_copy(xf, xt, hd, sb + cold[3 * i + 1] * slot_b + r * kvx_row(xf, hd),
+                             pb + cold[3 * i + 2] * pitch + r * kvx_row(xt, hd));
+        else
+            std::memcpy(pb + cold[3 * i + 2] * pitch, sb + cold[3 * i + 1] * slot_b,
+                        (size_t)bb);
         st_int_dt(sel->dtype, sel->data, cold[3 * i], cold[3 * i + 2]);
     }
     if (paged) *paged += n;   /* the optional counter operand (libref's ref_qsa_page) */

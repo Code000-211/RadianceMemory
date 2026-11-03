@@ -1258,6 +1258,43 @@ libref's bytes; avx_check's hand cases; r4d_selftest on the card). A centred lay
 the prologue with the store in it nor the gate in the sparse attention's merge, which would read V
 before or the output after the mean.
 
+**A tiered layer keeps one layout in the pool and another in the residency store**
+(`RAD_KVQ_DEMOTE`, --kv-recipe `layer N i8h demote k4h_v2h`, abi/rad_builder.h). Its cache operand
+is the resident layout, as every op on it reads it; only window residency's transfers and the pager
+see the demote layout. Demoting a block, the engine gathers its layers' fragments and turns every
+(token, head) row into the demote layout with `kv_transcode` on the card before the copy to the
+store; promoting it, the copy back is expanded by the same op before the scatter; the pager
+(`qsa_page` with `store_layout` and `pool_layout`) expands a cold block's fragment into its scratch
+page. The three are one codec, so a block paged in and the same block promoted carry the same
+bytes, and a block once demoted keeps the demote layout's precision when it comes back. The two
+layouts share the layer's descales, basis (`rotated`) and V mean, so the codec rotates, centres and
+rescales nothing. Served: i8h or a rotated fp8 layer resident, k4h_v4 or k4h_v2h demoted.
+
+### `kv_transcode`
+
+| op | params | operands |
+|---|---|---|
+| `kv_transcode` | `M`(range) `head_dim` `from` `to` | `x` → `out` |
+
+Each row of `x` is one token's K and V head in layout `from`, at its width in bytes (`fp8` 2 *
+head_dim, `i8h` 2 * head_dim + 4, `k4h_v4` 18 * head_dim / 16, `k4h_v2h` 14 * head_dim / 16); the
+same row of `out` receives it in layout `to`.
+
+- **Decode is exact**: an E4M3 code, or an int8, int4 or odd int2 level times its f16 scale, is an
+  f32, read as `attn_paged` reads it.
+- **Encode is the layout's store**, on those values in the stored units: i8h's head scale and int8
+  codes, k4h's `absmax / 7` groups, k4h_v2h's variance-normalised odd levels, fp8's clamp to ±448
+  and E4M3 to nearest even, each in its `kv_store`'s order of operations (above). So
+  `kv_transcode(a → b)` of a row is `kv_store` in b of the values a holds, byte for byte, and the
+  round trip a → b → a carries b's error and a's rounding of it, never more.
+- **Refused** (`RAD_E_INVAL` / `RAD_E_SHAPE`): an unknown layout word, `from` equal to `to`, a
+  head_dim off the 32-grid, rows not the layouts' widths, planes of different row counts, no rows.
+- libref (`ref_kv_transcode`, `kvx_rows` in libref/ref_attn.cpp) is the oracle and serves any
+  pair of the four. libr4d's `kv_transcode_u8` (a wave a row, head_dim a multiple of 128 up to 512,
+  4-byte aligned rows) and libavx's are held to its bytes: `r4d_emu_kvx` and r4d_selftest for
+  every direction the recipe serves, on cache-shaped rows and on rows of every byte drawn (E4M3
+  NaN codes, infinite and NaN f16 scales), and avx_check.
+
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first
 (`kv_resolve`, under "Sparse attention (QSA)"), and every other op reads the cache as before.
@@ -3031,7 +3068,7 @@ order, not a slow one.
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
-| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout? |
+| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` `store_layout`/opt `pool_layout`/opt `head_dim`/opt | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout? |
 
 `qsa_page` is the sixth op of the family and runs only when the attention group declares a
 residency window and the store is open (see "`qsa_page`" below).
@@ -3169,7 +3206,15 @@ the store, a scratch id outside the pool, or two cold positions sharing a scratc
   `scratch[m, j]`. A resident entry (`>= 0`) and an empty one (`-1`) pass through unchanged, so a
   row with no cold entry is a no-op. Scratch pages are valid for the step that wrote them only.
 - **Determinism:** each `(m, j)` position, and so each scratch page, has exactly one writer; no
-  atomics, no two threads write one byte, and the result does not depend on scheduling.
+  atomics, no two threads write one byte, and the result does not depend on scheduling. libr4d's
+  workgroup rewrites its entry only after every thread of it has read the entry.
+- **Expanding** (`store_layout`, `pool_layout`, `head_dim`; a tiered layer, `RAD_KVQ_DEMOTE`): the
+  slot holds the fragment as `block_bytes / row(pool_layout)` rows of `store_layout`, so the store
+  fragment is that many rows of its own width, and each is written into the scratch page as
+  `kv_transcode` from `store_layout` to `pool_layout` writes it. Both words or neither; refused
+  (`RAD_E_INVAL`, `RAD_E_SHAPE`) for one without the other, an unknown or repeated word, or a
+  `block_bytes` that is not whole rows of the pool's layout. libr4d's four waves split a
+  fragment's rows; `r4d_emu_kvx` and r4d_selftest hold it to libref.
 
 ### `qsa_select`
 

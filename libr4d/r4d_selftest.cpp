@@ -24517,9 +24517,12 @@ static void sam_attn_case(const Plugin& pl) {
  * changes the compared bytes. Row 2 holds no cold entry and must pass through whole; row 4 is all
  * cold. The selection and the pool are both compared whole, not just the rewritten positions.
  */
+/* `xs` / `xp` (with `xs_rowb`, the store layout's row): the expanding pager of a tiered layer
+ * (RAD_KVQ_DEMOTE), the store holding each fragment as rows of `xs` and the pool rows of `xp`. */
 static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t slot_pitch,
                          int64_t pool_pitch, int64_t store_skew, bool kv_shaped = false,
-                         int64_t kv_rowb = 0) {
+                         int64_t kv_rowb = 0, const char* xs = nullptr, const char* xp = nullptr,
+                         int64_t xs_rowb = 0) {
     const RadKernelInfo* r = find(pl, "qsa_page_u8");
     if (!r || !g_plugin) { ok(what, false, "row or plugin path absent"); return; }
     std::string path(g_plugin);
@@ -24556,8 +24559,10 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
     std::vector<uint8_t> store((size_t)(slots * slot_pitch + store_skew)), pool((size_t)(blocks * pool_pitch), 0xA5);
     for (size_t i = 0; i < store.size(); ++i) store[i] = (uint8_t)(st_mix32((uint32_t)i) >> 7);
 
+    /* The store's fragment: as many rows of its own layout as the pool's holds. */
+    const int64_t sbb = xs ? bb / kv_rowb * xs_rowb : bb;
     auto mk = [&](void* ds, void* dst, void* dp, void* dc, std::vector<RadTensor>& ts) {
-        RadTensor tst = T(dst, RAD_U8, { slots, bb });
+        RadTensor tst = T(dst, RAD_U8, { slots, sbb });
         tst.stride[0] = slot_pitch;
         /* The pool as the core binds a KV operand: the layer's own shape and dtype, not a byte
          * plane -- here bf16 [blocks, 1 head, 2 tokens, bb / 4] with the same byte pitch. */
@@ -24574,6 +24579,11 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
     auto with_count = [&](void* dcount, std::vector<RadTensor>& ts) { ts.push_back(T(dcount, RAD_I64, { 1 })); };
     std::vector<RadParam> ps = { PI("M", M), PI("topk", topk), PI("blocks", blocks), PI("seqs", M),
                                  PI("block_bytes", bb) };
+    if (xs) {
+        ps.push_back(PS("store_layout", xs));
+        ps.push_back(PS("pool_layout", xp));
+        ps.push_back(PI("head_dim", 256));
+    }
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.p = ps.data(); a.n_p = (int)ps.size();
@@ -24650,6 +24660,82 @@ static void qsa_page_case(const Plugin& pl) {
         qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, %s fragment, two heads on one rank",
                              l.name).c_str(), b2, 2 * 4096, b2, 0, false, l.rowb);
     }
+    /* A tiered layer's pager (RAD_KVQ_DEMOTE): the store's slots hold every byte drawn as k4h_v4 or
+     * k4h_v2h rows, expanded into an i8h or fp8 pool, one KV head a rank (four rows, a wave each)
+     * and two (eight), rank 1's view mid-slot. */
+    static const struct { const char* s; int64_t sr; const char* p; int64_t pr; } tier[] = {
+        { "k4h_v4", 288, "i8h", 516 }, { "k4h_v2h", 224, "i8h", 516 },
+        { "k4h_v4", 288, "fp8", 512 }, { "k4h_v2h", 224, "fp8", 512 } };
+    for (const auto& t : tier)
+        for (int64_t heads : { 1, 2 }) {
+            const int64_t bb = 4 * heads * t.pr, sb = 4 * heads * t.sr;
+            qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, %s slots expanded into %s, %lld "
+                                 "head(s)", t.s, t.p, (long long)heads).c_str(),
+                         bb, 2 * sb + 64, bb + 16, sb + 64, false, t.pr, t.s, t.p, t.sr);
+        }
+}
+
+/* kv_transcode (window residency's demote layout), against libref's byte for byte: every direction
+ * the recipe serves at head_dim 256, over rows of every byte drawn (E4M3 NaN codes, f16 scales that
+ * are infinite or NaN, every int4 and int2 code) at a pitch wider than the row, whose gap bytes
+ * the kernel must leave alone. */
+static void kv_transcode_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "kv_transcode_u8");
+    const char* what0 = "kv_transcode vs libref byte for byte";
+    if (!r || !g_plugin) { ok(what0, false, "row or plugin path absent"); return; }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what0, false, "reference plugin unavailable"); return; }
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "kv_transcode")) { oracle = at(i); break; }
+    if (!oracle) { ok(what0, false, "reference operation unavailable"); dlclose(ref); return; }
+    static const struct { const char* a; int64_t ar; const char* b; int64_t br; } dir[] = {
+        { "i8h", 516, "k4h_v4", 288 }, { "i8h", 516, "k4h_v2h", 224 },
+        { "fp8", 512, "k4h_v4", 288 }, { "fp8", 512, "k4h_v2h", 224 } };
+    const int64_t rows = 96, pitch = 528, hd = 256;
+    for (const auto& d : dir)
+        for (int back = 0; back < 2; ++back) {
+            const char* from = back ? d.b : d.a;
+            const char* to = back ? d.a : d.b;
+            const int64_t rf = back ? d.br : d.ar, rt = back ? d.ar : d.br;
+            const std::string what = fmt("kv_transcode vs libref byte for byte, %s -> %s", from, to);
+            std::vector<uint8_t> x((size_t)(rows * pitch)), want((size_t)(rows * pitch), 0x5c);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = (uint8_t)(st_mix32((uint32_t)(i + 77 * back)) >> 9);
+            std::vector<RadParam> ps = { PI("M", rows), PI("head_dim", hd), PS("from", from), PS("to", to) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            auto mk = [&](void* dx, void* dout) {
+                RadTensor tx = T(dx, RAD_U8, { rows, rf }), to2 = T(dout, RAD_U8, { rows, rt });
+                tx.stride[0] = pitch; to2.stride[0] = pitch;
+                return std::vector<RadTensor>{ tx, to2 };
+            };
+            std::vector<RadTensor> hts = mk(x.data(), want.data());
+            a.t = hts.data(); a.n_t = 2;
+            const int rr = oracle->launch(&a, nullptr);
+            if (rr != RAD_OK) { ok(what.c_str(), false, "reference rc=" + std::to_string(rr)); continue; }
+            void* dx = dalloc(x.size());
+            void* dout = dalloc(x.size());
+            const std::vector<uint8_t> init((size_t)(rows * pitch), 0x5c);
+            st_memcpy(dx, x.data(), x.size(), hipMemcpyHostToDevice);
+            st_memcpy(dout, init.data(), init.size(), hipMemcpyHostToDevice);
+            std::vector<RadTensor> dts = mk(dx, dout);
+            a.t = dts.data(); a.n_t = 2;
+            const int rc = r->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            if (rc != RAD_OK) { ok(what.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+            std::vector<uint8_t> got(x.size());
+            st_memcpy(got.data(), dout, got.size(), hipMemcpyDeviceToHost);
+            int64_t diff = 0;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != want[i];
+            ok(what.c_str(), diff == 0 && want != init, "bytes differing=" + std::to_string(diff));
+        }
+    dlclose(ref);
 }
 
 /* ------------------------------------------------------------------ rotated KV layers on the card
@@ -33022,6 +33108,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_page_u8")) {
         if (!g_case) std::printf("\nthe QSA pager, against libref's reference\n");
         qsa_page_case(pl);
+    }
+
+    if (sel("kv_transcode_u8")) {
+        if (!g_case) std::printf("\nthe residency demote layout's codec, against libref's reference\n");
+        kv_transcode_case(pl);
     }
 
     /* Rotated KV layers: the rotation, the k4h_v4 / k4h_v2h / i8h store and attention, and the

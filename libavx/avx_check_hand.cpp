@@ -3491,6 +3491,41 @@ Hand pool(const char* name, int64_t M, int64_t blocks, int64_t slots, int64_t pi
 
 }  /* namespace kvhand */
 
+/* ================================================================== the expanding pager
+ *
+ * `qsa_page` over a tiered layer (RAD_KVQ_DEMOTE): a store of k4h_v4 or k4h_v2h slots, two layers'
+ * fragments each, paged into an i8h or fp8 pool at Flash-Next's head_dim. The slots hold every byte
+ * drawn (int4 and int2 codes, f16 scales including infinities and NaNs), which is what the
+ * codec must agree on byte for byte; resident and empty entries pass through, and the pages the
+ * selection does not name keep 0xEE. A description cannot pair a cold entry with a slot and a
+ * scratch page, so only a hand case reaches the expansion. */
+void kvx_cases(std::vector<Hand>& hs) {
+    const int64_t hd = 256, rows = 8, layers = 2, slots = 4, blocks = 10;
+    struct L { const char* store; int64_t sr; const char* pool; int64_t pr; };
+    for (const L& l : { L{ "k4h_v4", 288, "i8h", 516 }, L{ "k4h_v2h", 224, "i8h", 516 },
+                        L{ "k4h_v4", 288, "fp8", 512 }, L{ "k4h_v2h", 224, "fp8", 512 } }) {
+        const int64_t sfrag = rows * l.sr, pfrag = rows * l.pr;
+        const std::string name = std::string("expanding ") + l.store + " slots into an " + l.pool +
+                                 " pool";
+        Hand h(name.c_str(), "qsa_page", 0.0);
+        h.dense(RAD_I32, { 2, 4 }, [](int64_t i) {
+             const int64_t v[8] = { -2 - 3, 4, -1, -2 - 0, -2 - 2, 6, -2 - 1, -1 };
+             return (float)v[i];
+         }, true)
+         .view(RAD_U8, { slots, sfrag }, { layers * sfrag, 1 }, slots * layers * sfrag,
+               [](int64_t i) { return (float)((i * 2654435761u >> 13) & 0xff); })
+         .dense(RAD_U8, { blocks, pfrag }, [](int64_t) { return (float)0xEE; }, true)
+         .dense(RAD_I32, { 2, 4 }, [](int64_t i) {
+             const int64_t v[8] = { 7, 0, 0, 8, 9, 0, 1, 0 };
+             return (float)v[i];
+         })
+         .pi("M", 2).pi("topk", 3).pi("blocks", blocks).pi("seqs", 2).pi("block_bytes", pfrag)
+         .ps("store_layout", l.store).ps("pool_layout", l.pool).pi("head_dim", hd);
+        h.expect(0, { 7, 4, -1, 8, 9, 6, 1, -1 });
+        hs.push_back(std::move(h));
+    }
+}
+
 void kv_cases(std::vector<Hand>& hs) {
     using namespace kvhand;
 
@@ -5114,6 +5149,7 @@ bool hand_cases(const Check& ck) {
     vsa_cases(hs);
     qsa_cases(hs);
     kv_cases(hs);
+    kvx_cases(hs);
     kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);

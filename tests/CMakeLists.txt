@@ -503,7 +503,8 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings, GLM's MoE decode
 # fusions, GLM's DSA scoring split by query rows, the Hadamard rotation of a rotated KV layer
 # (had_rotate), and the k4h_v4 and k4h_v2h caches' stores (r4d_model_bf16.hip) and Flash-Next's
-# paged attention over them (the gqa12 and four-rank gqa6 units), a `vmean` layer's
+# paged attention over them (the gqa12 and four-rank gqa6 units), window residency's demote-layout
+# codec (kv_transcode and the expanding qsa_page), a `vmean` layer's
 # broadcast adds and its centred store, and the delta net's recurrence, folded convolution and
 # chunked scan at an f16 state, and the QSA indexer's int8 block-key store and score, whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
@@ -529,7 +530,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip ${R4D_DIR}/r4d_had_rotate.hip
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
                 ${R4D_DIR}/r4d_attn_paged_h256_gqa12.hip ${R4D_DIR}/r4d_attn_paged_h256_gqa6_bs4.hip
-                ${R4D_DIR}/r4d_model_bf16.hip
+                ${R4D_DIR}/r4d_model_bf16.hip ${R4D_DIR}/r4d_qsa_page_u8.hip
                 ${R4D_DIR}/r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip
                 ${R4D_DIR}/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
                 ${R4D_DIR}/r4d_qsa_block_key_bf16.hip ${R4D_DIR}/r4d_qsa_score_bf16.hip)
@@ -537,7 +538,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # defines, which is not in this build: cfg_stub.cpp defines them at their axis defaults, in both
 # arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 had k4h vmean gdn bkey)
+                  dsa m2xfp4 had k4h vmean gdn bkey kvx)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -580,7 +581,7 @@ else()
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_had.cpp
                 ${R4D_EMU}/test_k4h.cpp ${R4D_EMU}/test_vmean.cpp ${R4D_EMU}/test_gdn.cpp ${R4D_EMU}/test_bkey.cpp
-                ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_kvx.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -619,7 +620,7 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 had k4h
-            vmean gdn bkey)
+            vmean gdn bkey kvx)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -631,15 +632,15 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_had r4d_emu_k4h r4d_emu_vmean
-                       r4d_emu_gdn r4d_emu_bkey
+                       r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it. had_rotate is held to libref's bytes, and needs it too, as
   # do the k4h_v4 and k4h_v2h caches' stores and attention, a `vmean` layer's adds, the gdn
-  # kernels at an f16 state, and the int8 block keys' store and score.
+  # kernels at an f16 state, the int8 block keys' store and score, and the KV transcodes.
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_had r4d_emu_k4h r4d_emu_vmean r4d_emu_gdn r4d_emu_bkey
-                       PROPERTIES
+                       r4d_emu_kvx PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.

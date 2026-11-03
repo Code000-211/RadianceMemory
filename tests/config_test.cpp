@@ -1046,10 +1046,10 @@ TEST(an_i8h_recipe_line_is_rotated_takes_a_v_mean_and_is_priced_just_over_fp8) {
 
 /* bf16 is a recipe layout too (RAD_KVQ_BF16): the layer keeps the unquantised cache, beside fp8
  * layouts in the same file, priced at 1024 bits a 32 + 32 group (twice fp8) and listed first, the
- * widest. It is neither rotated nor centred, so `rotated` and `vmean` on its line are refused with
- * the line. A recipe naming only bf16 still needs --kv-cache-dtype fp8, the recipe's flag, and
+ * widest. It is neither rotated, centred nor tiered, so `rotated`, `vmean` and `demote` on its line
+ * are refused with the line. A recipe naming only bf16 still needs --kv-cache-dtype fp8, the recipe's flag, and
  * --kv-cache-dtype bf16 stays the whole-model spelling of it. */
-TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_or_v_mean) {
+TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_v_mean_or_demote) {
     std::vector<int32_t> r;
     CHECK_EQ(kv_recipe_parse("layer 0 bf16\nlayer 1 i8h\nlayer 2 bf16  # the sensitive one\n"
                              "layer 3 fp8\n", "r.txt", &r), RAD_OK);
@@ -1077,6 +1077,12 @@ TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_or_v_
     CHECK(has(refusal("vmean m.txt\nlayer 3 bf16 vmean\n"),
               "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'vmean'"));
     CHECK(has(refusal("vmean m.txt\nlayer 3 bf16 rotated vmean\n"), "takes no 'rotated'"));
+    /* Nor a demote layout: it rounds nothing, so a tiered bf16 layer would only be a narrower
+     * layout's block in the store, and the transcode serves i8h and fp8 resident. */
+    CHECK(has(refusal("layer 3 bf16 demote k4h_v4\n"),
+              "r.txt line 1: layer 3: bf16 is the unquantised cache and takes no 'demote'"));
+    CHECK(has(refusal("layer 0 i8h\nlayer 3 bf16 demote k4h_v2h\n"),
+              "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'demote'"));
 
     const std::string path = radtest::tmp_path("bf16.kvrecipe");
     FILE* fp = std::fopen(path.c_str(), "w");
@@ -1093,6 +1099,58 @@ TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_or_v_
     });
     CHECK(has(err, "pass --kv-cache-dtype fp8"));
     unlink(path.c_str());
+}
+
+/* `demote LAYOUT` (RAD_KVQ_DEMOTE, bits 16-23 of the entry): window residency stores the layer's
+ * demoted blocks in that layout. It comes after `rotated` and before `vmean`; the demote layout is
+ * k4h_v4 or k4h_v2h, the resident one i8h or fp8, and fp8 must say `rotated`, since the demoted
+ * block keeps the layer's basis and those layouts hold rotated keys only. `vmean` needs integer V
+ * in either layout, so a rotated fp8 layer demoted to k4h takes it. The summary names the pair. */
+TEST(a_kv_recipe_line_may_name_a_demote_layout_for_the_layers_demoted_blocks) {
+    std::vector<int32_t> r;
+    std::string file;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 3 i8h demote k4h_v2h vmean\n"
+                             "layer 7 fp8 rotated demote k4h_v4 vmean\nlayer 11 i8h demote k4h_v4\n"
+                             "layer 15 i8h\n", "r.txt", &r, &file), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vm = RAD_KVQ_VMEAN;
+    const int32_t d2 = RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT, d4 = RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT;
+    REQUIRE_EQ(r.size(), (size_t)16);
+    CHECK_EQ(r[3], RAD_KVQ_I8H | rot | vm | d2);
+    CHECK_EQ(r[7], RAD_KVQ_NONE | rot | vm | d4);
+    CHECK_EQ(r[11], RAD_KVQ_I8H | rot | d4);
+    CHECK_EQ(r[15], RAD_KVQ_I8H | rot);
+    CHECK_EQ(RAD_KVQ_DEMOTE_OF(r[3]), (int)RAD_KVQ_K4HV2H);
+    CHECK_EQ(RAD_KVQ_DEMOTE_OF(r[15]), 0);
+    CHECK_EQ(r[3] & RAD_KVQ_LAYOUT, (int)RAD_KVQ_I8H);
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("i8h rotated at layer 15; i8h rotated demote k4h_v4 at layer 11; "
+                         "i8h rotated demote k4h_v2h at layer 3; fp8 rotated demote k4h_v4 at "
+                         "layer 7; V mean subtracted at layers 3, 7"));
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_I8H, 256), 516ll);
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_K4HV2H, 256), 224ll);
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_NONE, 256), 512ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_I8H, 516), 256ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K4H, 288), 256ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K4H, 290), -1ll);
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 3 i8h demote fp8_v4\n"), "a demote layout is k4h_v4 or k4h_v2h"));
+    CHECK(has(refusal("layer 3 i8h demote i8h\n"), "a demote layout is k4h_v4 or k4h_v2h"));
+    CHECK(has(refusal("layer 3 k6_v4 demote k4h_v4\n"),
+              "the resident layout of a tiered layer is i8h or fp8"));
+    CHECK(has(refusal("layer 3 fp8 demote k4h_v2h\n"),
+              "write 'layer 3 fp8 rotated demote k4h_v2h'"));
+    CHECK(has(refusal("layer 3 i8h demote\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 rotated\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h vmean demote k4h_v4\nvmean m.txt\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 demote k4h_v2h\n"), "then 'demote LAYOUT'"));
 }
 
 namespace {

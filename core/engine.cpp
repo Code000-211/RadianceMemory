@@ -2088,7 +2088,31 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             for (auto& r : ranks_) if (!r->resx.moves_landed()) return false;
             return true;
         };
-        sched_.set_residency_mover(std::move(m), kResidencySweepBlocks);
+        /* RADIANCE_DEBUG_KV_TIER: `sync` waits for each sweep to land before the next step plans,
+         * so the step at which a demoted block is first read does not depend on the transfer's
+         * timing; `emulate` also turns every demotion into the demote -> expand round trip in place
+         * (KVManager::residency_emulate), the reference a tiered recipe's residency-on output is
+         * compared with byte for byte under `sync`. In the KL mode, which scores prefill chunks
+         * and runs no decode step, the emulation sweeps after every step and unbounded. */
+        int64_t sweep = kResidencySweepBlocks;
+        if (const char* t = std::getenv("RADIANCE_DEBUG_KV_TIER"); t && *t) {
+            const bool emul = !std::strcmp(t, "emulate");
+            if (!emul && std::strcmp(t, "sync")) {
+                RAD_ERR("RADIANCE_DEBUG_KV_TIER=%s: the switch is 'sync' or 'emulate'", t);
+                return RAD_E_INVAL;
+            }
+            m.sync = true;
+            m.every_step = emul && cfg_.kld();
+            if (m.every_step) sweep = (int64_t)1 << 40;
+            for (auto& r : ranks_) r->kv.residency_emulate(emul);
+            RAD_WARN("kv residency: RADIANCE_DEBUG_KV_TIER=%s -- %s; every sweep is waited for",
+                     t, emul ? (m.every_step ? "the demote -> expand round trip in place after "
+                                               "every step (KL mode), nothing moves"
+                                             : "the demote -> expand round trip in place, nothing "
+                                               "moves")
+                             : "blocks move as ever");
+        }
+        sched_.set_residency_mover(std::move(m), sweep);
         /* The pager's count, read back when a statistics poll asks (rank 0's counter). */
         static_cast<KVBinding<KVManager>*>(kv_iface_.get())->paged_read =
             [this] { return ranks_[0]->resx.paged_in(); };

@@ -137,12 +137,28 @@ enum {
  * rotation (RadBuildCtx::kv_vmean holds the vectors). A row of attention weights sums to one, so
  * P (V - mu) + mu = P V: exact but for the rounding of the two adds, while the integer V layouts
  * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
- * k6_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged. */
+ * k6_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged.
+ *
+ * RAD_KVQ_DEMOTE (ABI 42, --kv-recipe `demote LAYOUT`): bits 16-23 hold a second layout, the one a
+ * block of this layer takes in the window-residency store (spec §7.3) when the sweep demotes it;
+ * 0 is none, the block's bytes moving as they are. The pool, the attention and the store kernel
+ * keep the first layout. A demotion requantises a block's rows into the demote layout on the card
+ * (`kv_transcode`, docs/OPS.md), and the pager (`qsa_page` with `store_layout`) and a promotion
+ * expand them back, so attention reads one layout per layer and a block brought back keeps the
+ * demote layout's precision. The two layouts share the layer's basis (RAD_KVQ_ROTATED) and V mean
+ * (RAD_KVQ_VMEAN): the transcode decodes and encodes values and never rotates or centres. Served
+ * today as i8h or fp8 (rotated) resident with k4h_v4 or k4h_v2h demoted; a RAD_KVQ_BF16 entry takes
+ * none. A plugin keys its KV groups by the pair, since a store slot holds one group's block at one
+ * width. */
 enum {
     RAD_KVQ_LAYOUT  = 0xff,
     RAD_KVQ_ROTATED = 0x100,
-    RAD_KVQ_VMEAN   = 0x200
+    RAD_KVQ_VMEAN   = 0x200,
+    RAD_KVQ_DEMOTE  = 0xff0000,
+    RAD_KVQ_DEMOTE_SHIFT = 16
 };
+/* The demote layout of a kv_recipe entry, 0 (RAD_KVQ_NONE) for none. */
+#define RAD_KVQ_DEMOTE_OF(e) (((e) & RAD_KVQ_DEMOTE) >> RAD_KVQ_DEMOTE_SHIFT)
 
 /* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
  * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */
@@ -374,8 +390,8 @@ typedef struct RadBuildCtx {
     /* ---- appended in ABI 34 (a per-layer KV recipe) */
     /* --kv-recipe: the trunk's attention layer l keeps its cache in layout kv_recipe[l], a
      * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, with RAD_KVQ_ROTATED set where that layer runs
-     * rotated (from ABI 35) and RAD_KVQ_VMEAN where it subtracts a V mean (from ABI 38, the means
-     * in kv_vmean), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
+     * rotated (from ABI 35), RAD_KVQ_VMEAN where it subtracts a V mean (from ABI 38, the means
+     * in kv_vmean) and a RAD_KVQ_DEMOTE layout for its demoted blocks (from ABI 42), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
      * there is no entry either). Null without a recipe, and then
      * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
      * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has

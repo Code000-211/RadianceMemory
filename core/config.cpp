@@ -97,7 +97,8 @@ static const Flag g_flags[] = {
                                         "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
                                         "(int8, a scale a token and head, 1.01; all rotated,\n"
                                         "Flash-Next) or bf16 (2; Flash-Next), a 'layer N\n"
-                                        "LAYOUT [rotated]' line a layer (docs/GUIDE.md); needs\n"
+                                        "LAYOUT [rotated] [demote LAYOUT] [vmean]' line a layer\n"
+                                        "(docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
@@ -571,6 +572,21 @@ int kv_layout_group_bits(int kvq) {
     return -1;
 }
 
+/* A group of 32 K and 32 V elements' bits over 512 is a row's bytes over head_dim; i8h's scale is
+ * a head's, so its row is that and not a group multiple. */
+int64_t kv_layout_row_bytes(int kvq, int64_t hd) {
+    const int bits = kv_layout_group_bits(kvq);
+    if (bits < 0 || hd <= 0 || hd % 32) return -1;
+    return kvq == RAD_KVQ_I8H ? 2 * hd + 4 : bits * hd / 256;
+}
+
+int64_t kv_layout_head_dim(int kvq, int64_t row) {
+    const int bits = kv_layout_group_bits(kvq);
+    if (bits < 0 || row <= 0) return -1;
+    const int64_t hd = kvq == RAD_KVQ_I8H ? (row - 4) / 2 : row * 256 / bits;
+    return kv_layout_row_bytes(kvq, hd) == row ? hd : -1;
+}
+
 std::vector<int> kv_layouts() {
     std::vector<int> v;
     for (const KvLayout& l : kKvLayouts) v.push_back(l.kvq);
@@ -584,12 +600,17 @@ std::vector<int> kv_layouts() {
  * RAD_KVQ_I8H): a line of any of them marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
  * (the h is the Hadamard), a k4h or i8h layer without the rotation is not a deployment anyone can ask
  * for, and rad-autoquant writes every layout as `layer N LAYOUT` from the table above.
- * `bf16` is the plain bf16 cache (RAD_KVQ_BF16) and takes neither word: it rounds nothing a
- * rotation or a mean would help with, and the bf16 rows serve neither.
+ * `bf16` is the plain bf16 cache (RAD_KVQ_BF16) and takes neither word, nor `demote`: it rounds
+ * nothing a rotation or a mean would help with, the bf16 rows serve neither, and it keeps its
+ * blocks as they are.
  * A line may also end in `vmean` (after `rotated` when both): the layer subtracts a static V mean
  * before its store and adds it to the attention output (RAD_KVQ_VMEAN), taken from the file one
  * `vmean FILE` line names, which `vmean_file` receives as written. Only a layout with integer V
  * takes it: fp8's E4M3 V has no group scale for an offset to waste.
+ * `demote LAYOUT`, after `rotated` and before `vmean` (RAD_KVQ_DEMOTE): under window residency the
+ * layer's demoted blocks are stored in that second layout (k4h_v4 or k4h_v2h, of an i8h or a
+ * rotated fp8 layer) and expanded back on the card when read, so the store holds more blocks a
+ * MiB and every paged block moves fewer bytes; `vmean` then needs integer V in either layout.
  * Layer numbers are the checkpoint's (blk.N), so a recipe reads against the model's own config.
  * Strict: a word the format does not have, a layer named twice, or a layout outside the set is a
  * refusal with its line, never a skipped line, since a recipe that loads short is a different
@@ -624,17 +645,21 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                     kw.c_str());
             return RAD_E_INVAL;
         }
-        /* After the layout: `rotated`, then `vmean`, each at most once and in that order. */
+        /* After the layout: `rotated`, then `demote LAYOUT`, then `vmean`, each at most once and
+         * in that order. */
         bool rot_word = false, vmean = false, bad = !(words >> num >> layout);
+        std::string demote;
         for (std::string w; !bad && (words >> w);) {
-            if (w == "rotated" && !rot_word && !vmean) rot_word = true;
+            if (w == "rotated" && !rot_word && demote.empty() && !vmean) rot_word = true;
+            else if (w == "demote" && demote.empty() && !vmean) bad = !(words >> demote);
             else if (w == "vmean" && !vmean) vmean = true;
             else bad = true;
         }
         if (bad) {
             RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words, or 'layer N "
-                    "LAYOUT rotated', with 'vmean' last where the layer subtracts its V mean",
-                    name, ln);
+                    "LAYOUT rotated', then 'demote LAYOUT' where window residency stores the "
+                    "layer's demoted blocks narrower, and 'vmean' last where the layer subtracts "
+                    "its V mean", name, ln);
             return RAD_E_INVAL;
         }
         char* end = nullptr;
@@ -657,7 +682,37 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                     name, ln, l, rot_word ? "rotated" : "vmean");
             return RAD_E_INVAL;
         }
-        if (vmean && q == RAD_KVQ_NONE) {
+        if (q == RAD_KVQ_BF16 && !demote.empty()) {
+            RAD_ERR("%s line %d: layer %ld: bf16 is the unquantised cache and takes no 'demote'; "
+                    "it keeps its blocks as they are, and a tiered layer is i8h or fp8", name, ln,
+                    l);
+            return RAD_E_INVAL;
+        }
+        /* The demote layout (RAD_KVQ_DEMOTE): served for an i8h or fp8 layer demoted to k4h_v4
+         * or k4h_v2h. The store holds the same values in the layer's basis, so a demote layout
+         * that only holds rotated keys needs the layer rotated: i8h is, fp8 must say `rotated`. */
+        const int dq = demote.empty() ? 0 : kv_layout_of(demote.c_str());
+        if (!demote.empty()) {
+            if (dq != RAD_KVQ_K4H && dq != RAD_KVQ_K4HV2H) {
+                RAD_ERR("%s line %d: layer %ld: 'demote %s': a demote layout is k4h_v4 or k4h_v2h",
+                        name, ln, l, demote.c_str());
+                return RAD_E_INVAL;
+            }
+            if (q != RAD_KVQ_I8H && q != RAD_KVQ_NONE) {
+                RAD_ERR("%s line %d: layer %ld: 'demote %s' under %s: the resident layout of a "
+                        "tiered layer is i8h or fp8", name, ln, l, demote.c_str(), layout.c_str());
+                return RAD_E_INVAL;
+            }
+            if (q == RAD_KVQ_NONE && !rot_word) {
+                RAD_ERR("%s line %d: layer %ld: 'demote %s' holds rotated keys only, and the "
+                        "demoted block keeps the layer's basis; write 'layer %ld fp8 rotated "
+                        "demote %s'", name, ln, l, demote.c_str(), l, demote.c_str());
+                return RAD_E_INVAL;
+            }
+        }
+        /* Whichever of the two layouts has integer V: the mean is the layer's, subtracted before
+         * its store, so the resident and the demoted bytes are both centred. */
+        if (vmean && q == RAD_KVQ_NONE && dq == 0) {
             RAD_ERR("%s line %d: layer %ld: 'vmean' is for a layout with integer V (fp8_v4, "
                     "k6_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
             return RAD_E_INVAL;
@@ -669,7 +724,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
         r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
-                       (vmean ? RAD_KVQ_VMEAN : 0);
+                       (vmean ? RAD_KVQ_VMEAN : 0) | (dq << RAD_KVQ_DEMOTE_SHIFT);
         vmean_layers += vmean;
     }
     if (r.empty()) {
@@ -696,16 +751,19 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
 std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
     std::string s;
     for (int rot : { 0, (int)RAD_KVQ_ROTATED })
-        for (int q : kv_layouts()) {
-            std::string layers;
-            for (size_t l = 0; l < recipe.size(); ++l)
-                if (recipe[l] >= 0 && (recipe[l] & ~RAD_KVQ_VMEAN) == (q | rot))
-                    layers += (layers.empty() ? "" : ", ") + std::to_string(l);
-            if (layers.empty()) continue;
-            s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
-                 (rot ? " rotated" : "") + " at layer" +
-                 (layers.find(',') != std::string::npos ? "s " : " ") + layers;
-        }
+        for (int q : kv_layouts())
+            for (int dq : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H }) {
+                const int key = q | rot | (dq << RAD_KVQ_DEMOTE_SHIFT);
+                std::string layers;
+                for (size_t l = 0; l < recipe.size(); ++l)
+                    if (recipe[l] >= 0 && (recipe[l] & ~RAD_KVQ_VMEAN) == key)
+                        layers += (layers.empty() ? "" : ", ") + std::to_string(l);
+                if (layers.empty()) continue;
+                s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
+                     (rot ? " rotated" : "") +
+                     (dq ? std::string(" demote ") + kv_layout_name(dq) : std::string()) +
+                     " at layer" + (layers.find(',') != std::string::npos ? "s " : " ") + layers;
+            }
     std::string vm;
     for (size_t l = 0; l < recipe.size(); ++l)
         if (recipe[l] >= 0 && (recipe[l] & RAD_KVQ_VMEAN))

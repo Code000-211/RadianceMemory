@@ -30,6 +30,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -151,6 +152,20 @@ struct KVGroupPlan {
     int64_t     residency_window = 0;
     int64_t     residency_blocks = 0;
     bool        residency() const { return residency_blocks > 0; }
+    /* A tiered group (--kv-recipe `demote LAYOUT`, RAD_KVQ_DEMOTE): its layers' blocks sit in the
+     * pool in layout `res_from` and in a store slot in layout `res_to` (RAD_KVQ_* ids), at head_dim
+     * `res_head_dim`; a store slot holds `res_frag` bytes of each layer instead of the pool's
+     * fragment. The transfers requantise and expand on the card (TierExec::issue_moves, the op
+     * `kv_transcode`) and the pager expands (`qsa_page`). res_to -1: untiered, the bytes move as
+     * they are. Set by plan_groups() from the recipe; every layer of the group shares the pair,
+     * since the plugin keys its groups by it. */
+    int         res_from = -1, res_to = -1;
+    int64_t     res_head_dim = 0;
+    int64_t     res_frag = 0;
+    bool        tiered() const { return res_to >= 0; }
+    /* One layer's bytes of a block in a store slot, and the whole block's. */
+    int64_t     residency_frag() const { return tiered() ? res_frag : layer_bytes_per_block(); }
+    int64_t     residency_bytes() const { return n_layers * residency_frag(); }
     /* The pager's scratch pages (spec §7.3): ordinary pool blocks the engine owns, ids
      * [0, scratch_blocks) of the group, never on its free list. A row of the step's decode batch
      * gets `scratch_pitch` = residency_blocks + 1 of them (the selection's topk plus the tail's
@@ -281,11 +296,23 @@ public:
      * engine (TierExec::paged_counter); the manager only carries the address to the batch. */
     void     set_residency_paged(int64_t* dev) { res_paged_ = dev; }
     int64_t* residency_paged() const { return res_paged_; }
+    /* RADIANCE_DEBUG_KV_TIER=emulate (Engine): the emulation the residency-on output is held to.
+     * residency_demote() then names every block the sweep would demote -- outside sink and tail,
+     * not shared, not already done -- with host_slot -1 and leaves its table entry and pool block
+     * alone; the mover runs the demote -> expand round trip on the block in place
+     * (TierExec::issue_moves). A block is round-tripped once in its life, as under residency a
+     * tiered block is requantised once (its promotion keeps its origin slot, see res_origin_): the
+     * mark goes only when the block is freed. No store slot is taken, so the two agree only while
+     * residency's store has room (a full store leaves blocks resident there). */
+    void residency_emulate(bool on) { res_emulate_ = on; }
+    bool residency_emulating() const { return res_emulate_; }
+    bool residency_emulated(int32_t group, int32_t block) const;
     /* Bytes one block of `group` occupies in its slot, this rank's part of a slot (the widest
      * residency group's block: a slot holds one block of one group, since a demotion takes a fresh
      * slot per group and entry, and one arena serves them all), and the slot's whole size (every
      * rank's part, the open store's slot once one is set). Under a per-layer recipe (--kv-recipe)
-     * the groups are layouts, so a block's bytes, and its layers' fragments, are its layout's. */
+     * the groups are layouts, so a block's bytes, and its layers' fragments, are its layout's --
+     * the demote layout's for a tiered group (KVGroupPlan::residency_bytes). */
     int64_t residency_block_bytes(int32_t group) const;
     int64_t residency_shard_bytes() const;
     int64_t residency_slot_bytes() const { return res_slot_bytes_; }
@@ -905,10 +932,15 @@ private:
     void    slot_drop(int32_t slot);
     /* Where a promoted block's bytes came from, per group: block -> slot, while the slot may still
      * hold identical bytes. Each entry owns a slot reference, so the slot cannot be reused under
-     * it. Set only when the slot has another holder (the cache): a slot this table alone held is
-     * freed at once, as before. Ended by a write into the block (ensure, rollback), by the block
+     * it. Set when the slot has another holder (the cache), or the group is tiered: re-demoting a
+     * tiered block from its expanded bytes would requantise it a second time, so its slot stays
+     * until the block is written or freed and a re-demotion points back at it. An untiered slot
+     * this table alone held is freed at once, as before. Ended by a write into the block (ensure, rollback), by the block
      * going free, or by a re-demotion, which turns the reference into the table entry's. */
     std::vector<std::unordered_map<int32_t, int32_t>> res_origin_;
+    /* The emulation's blocks already round-tripped, per group (residency_emulate). */
+    bool res_emulate_ = false;
+    std::vector<std::unordered_set<int32_t>> res_emul_;
     void forget_origin(int32_t g, int32_t b);
     /* Gives back every slot this manager holds in the store (a re-plan, which keeps the store). */
     void release_residency();

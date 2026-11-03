@@ -1003,6 +1003,8 @@ TEST(op_vocabulary) {
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "qsa_page", "dflash_conv",
+        /* Window residency's demote layout (RAD_KVQ_DEMOTE): the requantise and the expand. */
+        "kv_transcode",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -3687,7 +3689,250 @@ TEST(an_i8h_cache_of_the_wrong_shape_is_refused) {
     CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
 }
 
-/* ================================================================== the fp8-rounding experiment */
+/* ================================================================== kv_transcode: the demote layout */
+namespace {
+
+/* The row widths of abi/rad_builder.h at head_dim `hd`, and an independent reading of a row's K and
+ * V values straight from those layouts (codes times their f16 scales), the statement the op's
+ * decode is held to. */
+int64_t xrow(const char* lay, int64_t hd) {
+    return !std::strcmp(lay, "fp8") ? 2 * hd : !std::strcmp(lay, "i8h") ? 2 * hd + 4
+         : !std::strcmp(lay, "k4h_v4") ? 18 * hd / 16 : 14 * hd / 16;
+}
+float xf16(const uint8_t* p) { uint16_t h; std::memcpy(&h, p, 2); return f16_to_f32(h); }
+void xdecode(const char* lay, const uint8_t* r, int64_t hd, float* k, float* v) {
+    for (int64_t d = 0; d < hd; ++d) {
+        if (!std::strcmp(lay, "fp8")) {
+            k[d] = fp8e4m3_to_f32(r[d]); v[d] = fp8e4m3_to_f32(r[hd + d]);
+        } else if (!std::strcmp(lay, "i8h")) {
+            k[d] = (float)(int8_t)r[d] * xf16(r + 2 * hd);
+            v[d] = (float)(int8_t)r[hd + d] * xf16(r + 2 * hd + 2);
+        } else {
+            const bool v2 = !std::strcmp(lay, "k4h_v2h");
+            auto nib = [](const uint8_t* c, int64_t i) { return (((c[i / 2] >> (4 * (i & 1))) & 15) ^ 8) - 8; };
+            k[d] = (float)nib(r, d) * xf16(r + (v2 ? hd * 3 / 4 : hd) + d / 32 * 2);
+            v[d] = v2 ? (float)(2 * ((r[hd / 2 + d / 4] >> (2 * (d & 3))) & 3) - 3) *
+                            xf16(r + hd * 13 / 16 + d / 32 * 2)
+                      : (float)nib(r + hd / 2, d) * xf16(r + hd * 17 / 16 + d / 32 * 2);
+        }
+    }
+}
+
+/* M rows, one token's head each, as kv_store writes them in `lay` from f32 K and V. */
+T xstore(const std::vector<float>& k, const std::vector<float>& v, int64_t M, int64_t hd,
+         const char* lay) {
+    const int64_t row = xrow(lay, hd);
+    T tk(RAD_F32, {M, 1, hd}), tv(RAD_F32, {M, 1, hd});
+    tk.f(k); tv.f(v);
+    T sm(RAD_I32, {M});
+    for (int64_t i = 0; i < M; ++i) st_int(RAD_I32, sm.t.data, i, i);
+    T kv(RAD_F8E4M3, {M, 1, 1, row});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, M, hd, 1, 1, lay));
+    T out(RAD_U8, {M, row});
+    std::memcpy(out.mem.data(), kv.mem.data(), (size_t)(M * row));
+    return out;
+}
+
+int xcode(T& x, T& out, int64_t hd, const char* from, const char* to) {
+    A a; a.t(x).t(out).i("M", x.t.shape[0]).i("head_dim", hd).s("from", from).s("to", to);
+    return run("kv_transcode", a);
+}
+
+/* Spread values with an outlier channel and an offset in V, what a rotated layer stores. */
+void xvalues(std::mt19937& rng, int64_t n, std::vector<float>* k, std::vector<float>* v) {
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    k->resize((size_t)n); v->resize((size_t)n);
+    for (int64_t i = 0; i < n; ++i) {
+        (*k)[(size_t)i] = nd(rng) * (i % 97 == 5 ? 9.0f : 1.0f);
+        (*v)[(size_t)i] = 0.3f + 0.8f * nd(rng);
+    }
+}
+
+const char* const kResident[] = { "i8h", "fp8" };
+const char* const kDemote[]   = { "k4h_v4", "k4h_v2h" };
+
+}  /* namespace */
+
+/* Worked by hand at head_dim 32. The i8h row's K is the codes 7, -7, 3 at scale 1.0 and V is zero.
+ * Into k4h_v4 K's group absmax is 7, so its scale is 7 / 7 = 1.0 (f16 0x3c00) and the codes are the
+ * values: nibbles 7 and 9 (-7) in byte 0, 3 in byte 1. V stays scale 0, codes 0. Back into i8h the
+ * scale is f16(7 / 127) = 0x2b0e and the codes rint(x / 0.0551147) = 127, -127, 54: the expand is
+ * i8h's own encode of the k4h values, not the bytes the block started from. */
+TEST(kv_transcode_requantises_an_i8h_row_into_k4h_v4_and_expands_it_by_hand) {
+    T x(RAD_U8, {1, 68});
+    std::vector<uint8_t> r(68, 0);
+    r[0] = 7; r[1] = 0xf9; r[2] = 3; r[64] = 0x00; r[65] = 0x3c;
+    x.raw(r);
+    T d(RAD_U8, {1, 36});
+    CHECK_OK(xcode(x, d, 32, "i8h", "k4h_v4"));
+    const uint8_t* o = d.mem.data();
+    CHECK_EQ((int)o[0], 0x97); CHECK_EQ((int)o[1], 0x03);
+    for (int i = 2; i < 32; ++i) CHECK_EQ((int)o[i], 0);
+    CHECK_EQ((int)o[32], 0x00); CHECK_EQ((int)o[33], 0x3c);
+    CHECK_EQ((int)o[34], 0x00); CHECK_EQ((int)o[35], 0x00);
+    T back(RAD_U8, {1, 68});
+    CHECK_OK(xcode(d, back, 32, "k4h_v4", "i8h"));
+    const uint8_t* b = back.mem.data();
+    CHECK_EQ((int)b[0], 0x7f); CHECK_EQ((int)b[1], 0x81); CHECK_EQ((int)b[2], 54);
+    for (int i = 3; i < 64; ++i) CHECK_EQ((int)b[i], 0);
+    CHECK_EQ((int)b[64], 0x0e); CHECK_EQ((int)b[65], 0x2b);
+    CHECK_EQ((int)b[66], 0x00); CHECK_EQ((int)b[67], 0x00);
+}
+
+/* The requantise is the demote layout's own store of the resident row's values: for i8h and fp8
+ * resident, k4h_v4 and k4h_v2h demoted, every byte of the transcoded rows equals kv_store's into
+ * the demote layout of the values the resident row holds (decoded here from the layout's
+ * definition). The expand likewise is the resident layout's store of the demoted row's values. So
+ * the transcode adds no rounding of its own beyond each layout's encode. */
+TEST(kv_transcode_is_each_layouts_own_store_of_the_values_the_other_holds) {
+    const int64_t M = 6, hd = 256;
+    std::mt19937 rng(41);
+    std::vector<float> k, v;
+    xvalues(rng, M * hd, &k, &v);
+    for (const char* res : kResident)
+        for (const char* dem : kDemote) {
+            T a = xstore(k, v, M, hd, res);
+            std::vector<float> ka((size_t)(M * hd)), va((size_t)(M * hd));
+            for (int64_t m = 0; m < M; ++m)
+                xdecode(res, a.mem.data() + m * xrow(res, hd), hd, &ka[(size_t)(m * hd)],
+                        &va[(size_t)(m * hd)]);
+            T d(RAD_U8, {M, xrow(dem, hd)});
+            CHECK_OK(xcode(a, d, hd, res, dem));
+            T want = xstore(ka, va, M, hd, dem);
+            CHECK(std::memcmp(d.mem.data(), want.mem.data(), (size_t)(M * xrow(dem, hd))) == 0);
+
+            std::vector<float> kd((size_t)(M * hd)), vd((size_t)(M * hd));
+            for (int64_t m = 0; m < M; ++m)
+                xdecode(dem, d.mem.data() + m * xrow(dem, hd), hd, &kd[(size_t)(m * hd)],
+                        &vd[(size_t)(m * hd)]);
+            T back(RAD_U8, {M, xrow(res, hd)});
+            CHECK_OK(xcode(d, back, hd, dem, res));
+            T want_back = xstore(kd, vd, M, hd, res);
+            CHECK(std::memcmp(back.mem.data(), want_back.mem.data(), (size_t)(M * xrow(res, hd))) == 0);
+        }
+}
+
+/* The error a demoted block carries is the demote layout's: after i8h -> demote -> i8h the values
+ * are within 2 % (RMS, relative) of the demote layout stored straight from the originals, plus the
+ * i8h rounding on top, for both demote layouts. fp8 resident likewise within its own rounding.
+ * The round trip prints its error beside the direct one. */
+TEST(a_demoted_and_expanded_block_carries_the_demote_layouts_error) {
+    const int64_t M = 16, hd = 256;
+    std::mt19937 rng(7);
+    std::vector<float> k, v;
+    xvalues(rng, M * hd, &k, &v);
+    auto rms_err = [&](const T& rows, const char* lay) {
+        double e = 0, n = 0;
+        std::vector<float> kk((size_t)hd), vv((size_t)hd);
+        for (int64_t m = 0; m < M; ++m) {
+            xdecode(lay, rows.mem.data() + m * xrow(lay, hd), hd, kk.data(), vv.data());
+            for (int64_t d = 0; d < hd; ++d) {
+                const double a = k[(size_t)(m * hd + d)], b = v[(size_t)(m * hd + d)];
+                e += (kk[(size_t)d] - a) * (kk[(size_t)d] - a) + (vv[(size_t)d] - b) * (vv[(size_t)d] - b);
+                n += a * a + b * b;
+            }
+        }
+        return std::sqrt(e / n);
+    };
+    for (const char* res : kResident)
+        for (const char* dem : kDemote) {
+            T a = xstore(k, v, M, hd, res);
+            T d(RAD_U8, {M, xrow(dem, hd)}), back(RAD_U8, {M, xrow(res, hd)});
+            CHECK_OK(xcode(a, d, hd, res, dem));
+            CHECK_OK(xcode(d, back, hd, dem, res));
+            const double trip = rms_err(back, res), direct = rms_err(xstore(k, v, M, hd, dem), dem);
+            const double own = rms_err(a, res);
+            std::printf("    %s -> %s -> %s: %.4f, %s stored directly %.4f, %s alone %.4f\n", res, dem,
+                        res, trip, dem, direct, res, own);
+            CHECK(trip <= 1.02 * direct + own);
+            CHECK(trip >= 0.9 * direct);
+        }
+}
+
+/* Refused before anything is written: an unknown or repeated layout word, a head_dim off the
+ * 32-grid, rows that are not the layouts' widths, and two planes of different row counts. */
+TEST(kv_transcode_refuses_what_it_cannot_read) {
+    T x(RAD_U8, {2, 68}), o(RAD_U8, {2, 36});
+    std::fill(o.mem.begin(), o.mem.end(), (uint8_t)0x5a);
+    CHECK_EQ(xcode(x, o, 32, "i8h", "k6_v4"), RAD_E_INVAL);
+    CHECK_EQ(xcode(x, o, 32, "i8h", "i8h"), RAD_E_INVAL);
+    CHECK_EQ(xcode(x, o, 48, "i8h", "k4h_v4"), RAD_E_SHAPE);
+    CHECK_EQ(xcode(x, o, 32, "fp8", "k4h_v4"), RAD_E_SHAPE);
+    T o1(RAD_U8, {1, 36});
+    CHECK_EQ(xcode(x, o1, 32, "i8h", "k4h_v4"), RAD_E_SHAPE);
+    for (uint8_t b : o.mem) CHECK_EQ((int)b, 0x5a);
+}
+
+/* The pager over a tiered layer: the slot holds this layer's fragment in k4h_v2h (two heads of a
+ * 4-token block, eight rows), the pool is i8h. Each cold entry's scratch page receives exactly
+ * kv_transcode's expand of its slot's fragment -- the bytes a promotion of the same block writes --
+ * and the entry becomes the page; resident and empty entries, the other pages and the other
+ * layers' fragments are left alone. */
+TEST(qsa_page_expands_a_tiered_layers_fragment_into_the_resident_layout) {
+    const int64_t hd = 256, rows = 8, layers = 2, slots = 3, blocks = 9;
+    const int64_t rf = xrow("k4h_v2h", hd), rt = xrow("i8h", hd);
+    const int64_t sfrag = rows * rf, pfrag = rows * rt;
+    std::mt19937 rng(3);
+    std::vector<float> k, v;
+    xvalues(rng, slots * layers * rows * hd, &k, &v);
+    T i8 = xstore(k, v, slots * layers * rows, hd, "i8h");
+    T store(RAD_U8, {slots, layers * sfrag});
+    {
+        T plane(RAD_U8, {slots * layers * rows, rf});
+        CHECK_OK(xcode(i8, plane, hd, "i8h", "k4h_v2h"));
+        std::memcpy(store.mem.data(), plane.mem.data(), (size_t)(slots * layers * sfrag));
+    }
+    for (int64_t layer : { 0, 1 }) {
+        T sel(RAD_I32, {2, 3}), scratch(RAD_I32, {2, 3});
+        sel.n({ rad_kv_cold_entry(2), 4, rad_kv_cold_entry(0),  -1, rad_kv_cold_entry(1), 5 });
+        scratch.n({ 6, 0, 7,  0, 8, 0 });
+        T pool(RAD_F8E4M3, {blocks, 2, 4, rt});
+        std::fill(pool.mem.begin(), pool.mem.end(), (uint8_t)0xEE);
+        T view = store;
+        view.t.data = store.mem.data() + layer * sfrag;
+        view.t.shape[1] = sfrag;
+        A a; a.t(sel).t(view).t(pool).t(scratch);
+        a.i("M", 2).i("topk", 2).i("blocks", blocks).i("seqs", 1).i("block_bytes", pfrag)
+         .s("store_layout", "k4h_v2h").s("pool_layout", "i8h").i("head_dim", hd);
+        CHECK_OK(run("qsa_page", a));
+        const std::vector<int64_t> want = { 6, 4, 7,  -1, 8, 5 };
+        for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(sel.iat((int64_t)i), want[i]);
+        auto holds = [&](int64_t b, int64_t slot) {
+            T frag(RAD_U8, {rows, rf}), exp(RAD_U8, {rows, rt});
+            std::memcpy(frag.mem.data(), store.mem.data() + (slot * layers + layer) * sfrag, (size_t)sfrag);
+            if (xcode(frag, exp, hd, "k4h_v2h", "i8h") != RAD_OK) return false;
+            return std::memcmp(pool.mem.data() + b * pfrag, exp.mem.data(), (size_t)pfrag) == 0;
+        };
+        CHECK(holds(6, 2)); CHECK(holds(7, 0)); CHECK(holds(8, 1));
+        for (int64_t b : { 0, 1, 2, 3, 4, 5 })
+            for (int64_t i = 0; i < pfrag; ++i)
+                if (pool.mem[(size_t)(b * pfrag + i)] != 0xEE) { CHECK(false); break; }
+    }
+}
+
+/* An expanding pager is refused before any write when it names one layout word without the other,
+ * an unknown or repeated one, or a block_bytes that is not whole rows of the pool's layout. */
+TEST(qsa_page_refuses_an_expansion_it_cannot_make) {
+    const int64_t hd = 256, rt = xrow("i8h", hd);
+    T sel(RAD_I32, {1, 2}), scratch(RAD_I32, {1, 2});
+    sel.n({ rad_kv_cold_entry(0), -1 });
+    scratch.n({ 1, 0 });
+    T store(RAD_U8, {1, 4 * xrow("k4h_v4", hd)}), pool(RAD_U8, {3, 4 * rt});
+    auto go = [&](const char* sl, const char* pl, int64_t bb) {
+        A a; a.t(sel).t(store).t(pool).t(scratch);
+        a.i("M", 1).i("topk", 1).i("blocks", 3).i("seqs", 1).i("block_bytes", bb).i("head_dim", hd);
+        if (sl) a.s("store_layout", sl);
+        if (pl) a.s("pool_layout", pl);
+        return run("qsa_page", a);
+    };
+    CHECK_EQ(go("k4h_v4", nullptr, 4 * rt), RAD_E_INVAL);
+    CHECK_EQ(go(nullptr, "i8h", 4 * rt), RAD_E_INVAL);
+    CHECK_EQ(go("k4h_v4", "k4h_v4", 4 * rt), RAD_E_INVAL);
+    CHECK_EQ(go("k4h_v4", "i8h", 4 * rt - 4), RAD_E_SHAPE);
+    CHECK_EQ(sel.iat(0), (int64_t)rad_kv_cold_entry(0));
+    CHECK_OK(go("k4h_v4", "i8h", 4 * rt));
+    CHECK_EQ(sel.iat(0), 1);
+}
 
 /* kv_store at kv_dtype bf16_e4m3r stores into a bf16 cache what the fp8 store stores into an E4M3
  * one, value for value (k / k_scale rounded to E4M3, times k_scale), and the clamp's -448 for a
@@ -10955,6 +11200,7 @@ std::vector<Geo> geometries() {
                               .i("work", 8).s("dtype", "bf16")),
         G("qsa_page", "M", 4, a.i("M", R).i("topk", 3).i("blocks", 6).i("seqs", 2)
                               .i("block_bytes", 16)),
+        G("kv_transcode", "M", 3, a.i("M", R).i("head_dim", 64).s("from", "i8h").s("to", "k4h_v2h")),
         G("dflash_conv", "T", 6, a.i("T", R).i("hidden_size", 32).i("taps", 2).i("group_size", 16)
                                  .i("NG", 2).i("block_size", 4).s("dtype", "bf16")),
         G("scale_rows", "M", 3, a.i("M", R).i("n", 8).s("act", "sigmoid").s("dtype", "f32")),

@@ -602,6 +602,14 @@ std::vector<Case> build_cases() {
                         HI("block_bytes", 8) });
     add("kv_resolve", { HI("M", 3), HI("blocks", 1), HI("slots", 1), HI("sel_pitch", 513),
                         HI("block_bytes", 4096) });
+    /* Window residency's demote layout: every direction the recipe serves, at Flash-Next's head_dim
+     * and the 32-grid's smallest the vector paths must also take, over rows of every byte drawn. */
+    for (int64_t hd : { 256, 64 })
+        for (const char* res : { "i8h", "fp8" })
+            for (const char* dem : { "k4h_v4", "k4h_v2h" }) {
+                add("kv_transcode", { HI("M", 7), HI("head_dim", hd), HS("from", res), HS("to", dem) });
+                add("kv_transcode", { HI("M", 7), HI("head_dim", hd), HS("from", dem), HS("to", res) });
+            }
     /* The proportional ladder: a partial rotary (rotary_dim < head_dim) with `ladder` head, so the
      * frequency denominator is head_dim. */
     for (const char* mode : { "neox", "gptj" }) {

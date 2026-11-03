@@ -419,9 +419,13 @@ static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("rat
 static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"), INOUT("state"),
                                                 OPD("sidx") };
 static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("blocks"), P_INT("seqs"),
-                                         P_INT("block_bytes") };
+                                         P_INT("block_bytes"), P_STRO("store_layout"),
+                                         P_STRO("pool_layout"), P_INTO("head_dim") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
                                            INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
+                                             P_STR("to") };
+static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
 static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                          P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
@@ -1156,7 +1160,11 @@ static const RadOpSchema kSchemas[] = {
 { "qsa_page", ARR(pQsaPage), ARR(oQsaPage),
   "rewrites each cold entry (<= -2) of the selection to its scratch page after copying the block's "
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; resident and "
-  "empty entries pass through. A byte copy, libref's contract exactly." },
+  "empty entries pass through. A byte copy, libref's contract exactly; with store_layout and "
+  "pool_layout the fragment's rows are expanded through kv_transcode's codec." },
+{ "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
+  "each row of x, one token's K and V head in layout `from`, decoded exactly and re-encoded in "
+  "layout `to` as that layout's store encodes; libref's bytes." },
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "the blocks completing in this batch: each block's `ratio` raw keys staged contiguously, its "
   "block-key page and first-token position; slots past the count get page -1. nc is each "
@@ -1808,6 +1816,9 @@ SIMPLE("avx_qsa_tail_store", "qsa_tail_store", "attn",
 SIMPLE("avx_qsa_page", "qsa_page", "attn",
        "QSA pager: cold selection entries copied from the residency store into scratch pages",
        "i32 tables, u8 bytes", L(qsa_page)),
+SIMPLE("avx_kv_transcode", "kv_transcode", "attn",
+       "KV rows re-encoded from one cache layout into another (the residency demote layout)",
+       "u8 bytes", L(kv_transcode)),
 SIMPLE("avx_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, L(qsa_work)),
 

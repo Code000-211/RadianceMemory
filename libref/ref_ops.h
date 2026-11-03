@@ -263,6 +263,8 @@ int ref_qsa_work           (const RadArgs*, RadStream);
 /* the residency map between a streamed group's block ids and its ring slots (ref_kvstream.cpp) */
 int ref_kv_resolve         (const RadArgs*, RadStream);
 int ref_qsa_page           (const RadArgs*, RadStream);
+/* one KV layout's rows into another's, the residency store's demote layout (ref_attn.cpp) */
+int ref_kv_transcode       (const RadArgs*, RadStream);
 int ref_dflash_conv        (const RadArgs*, RadStream);
 
 /* ---- mixture of experts */
@@ -527,6 +529,7 @@ REF_SHAPE_FN(ref_qsa_tail_store);
 REF_SHAPE_FN(ref_qsa_work);
 REF_SHAPE_FN(ref_kv_resolve);
 REF_SHAPE_FN(ref_qsa_page);
+REF_SHAPE_FN(ref_kv_transcode);
 REF_SHAPE_FN(ref_dflash_conv);
 
 REF_SHAPE_FN(ref_router_topk);
@@ -570,4 +573,15 @@ REF_SHAPE_FN(ref_sample_argmax);
 REF_SHAPE_FN(ref_sample_logprobs);
 
 }  /* extern "C" */
+
+/* The row codec behind kv_transcode and the expanding qsa_page (ref_attn.cpp): a layout word
+ * (fp8, k4h_v4, k4h_v2h, i8h) to its RAD_KVQ_* id or -1, a (token, head) row's bytes at head_dim
+ * `hd` (-1 for an unknown id), and `rows` rows decoded from `from` and encoded in `to`. */
+namespace ref {
+int     kvx_layout(const char* name);
+int64_t kvx_row_bytes(int lay, int64_t hd);
+void    kvx_rows(int from, int to, int64_t hd, const uint8_t* src, int64_t src_pitch, uint8_t* dst,
+                 int64_t dst_pitch, int64_t rows);
+}  /* namespace ref */
+
 #endif /* RAD_REF_OPS_H */

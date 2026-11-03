@@ -1430,6 +1430,11 @@ static const RadParamSpec pQsaPage[] = {
     { "blocks",      RAD_P_INT, RAD_REQUIRED },
     { "seqs",        RAD_P_INT, RAD_REQUIRED },
     { "block_bytes", RAD_P_INT, RAD_REQUIRED },
+    /* A tiered layer (RAD_KVQ_DEMOTE): the store's and the pool's layout words and the head_dim the
+     * rows are at; absent, the fragment is copied as bytes. */
+    { "store_layout", RAD_P_STR, RAD_OPTIONAL },
+    { "pool_layout",  RAD_P_STR, RAD_OPTIONAL },
+    { "head_dim",     RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaPage[] = {
     { "sel",     RAD_OPD_INOUT, 0 },
@@ -1438,6 +1443,19 @@ static const RadOperandSpec oQsaPage[] = {
     { "scratch", RAD_OPD_IN,    0 },
     /* One i64 on the card the pager adds its rewritten entries to; absent, nothing is counted. */
     { "paged",   RAD_OPD_INOUT, 1 },
+};
+
+/* `kv_transcode` (docs/OPS.md): rows of one KV layout re-encoded in another, a row one token's
+ * head; window residency's requantise into the demote layout and expand out of it. */
+static const RadParamSpec pKvTranscode[] = {
+    { "M",        RAD_P_INT, RAD_REQUIRED },
+    { "head_dim", RAD_P_INT, RAD_REQUIRED },
+    { "from",     RAD_P_STR, RAD_REQUIRED },
+    { "to",       RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oKvTranscode[] = {
+    { "x",   RAD_OPD_IN,  0 },
+    { "out", RAD_OPD_OUT, 0 },
 };
 
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
@@ -3661,6 +3679,10 @@ static const RadOpSchema kSchemas[] = {
            "blocks, never a fabricated slot, so the caller must refuse the step. The maps, the "
            "epoch, the hand and the heat counters keep state across launches, so the row is not "
            "concurrent; the miss list is the row's scratch (2 * slots i32), not an operand."),
+    SCHEMA("kv_transcode", pKvTranscode, oKvTranscode,
+           "each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), "
+           "decoded exactly and re-encoded in layout `to` as that layout's store encodes, into the "
+           "same row of out; libref's kvx_rows byte for byte."),
     SCHEMA("qsa_page", pQsaPage, oQsaPage,
            "for each position of `sel` holding a cold entry (<= -2), the first `block_bytes` of "
            "`store` row -2 - entry are copied into pool block scratch[m][j] and the entry becomes "
@@ -5071,6 +5093,9 @@ static const RadConstraint cQsaTailStore[] = {
 };
 
 static const RadConstraint cQsaPage[] = { C_GE("topk", 1), C_GE("blocks", 1), C_GE("block_bytes", 1) };
+/* The codec's lane map: head_dim a multiple of 128, at most 512. */
+static const RadConstraint cKvTranscode[] = { C_DIV("head_dim", 128), C_LE("head_dim", 512),
+                                              C_GE("head_dim", 128) };
 
 /* No dtype: every operand is f32 or i32. */
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), C_GE("ratio", 1) };
@@ -9161,6 +9186,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaPage), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_page, nullptr, nullptr, nullptr,
   r4d_shape_qsa_page },
+
+/* A wave per row: window residency's demote layout written and read back on the transfer stream. */
+{ "kv_transcode_u8", "kv_transcode", "attn",
+  "re-encode KV rows from one cache layout into another (the residency store's demote layout)",
+  "fp8, k4h_v4, k4h_v2h, i8h in either direction; head_dim a multiple of 128 up to 512",
+  "u8 row planes, 4-byte aligned",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvTranscode), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_transcode, nullptr, nullptr, nullptr,
+  r4d_shape_kv_transcode },
 
 /* A four-digit radix select, one workgroup per query. Not a sort: attention is a softmax over a
  * set, and sorting 65536 scores per query per layer per step is too costly. The set is exact and

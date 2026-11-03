@@ -515,9 +515,15 @@ static const RadOperandSpec oKvResolve[] = { INOUT("sel"), OPD("nsel"), INOUT("r
  * planes ([slots, slot_bytes], [blocks, block_bytes]). `paged`, when given, is one i64 the op
  * adds its count of rewritten entries to. */
 static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("blocks"), P_INT("seqs"),
-                                         P_INT("block_bytes") };
+                                         P_INT("block_bytes"), P_STRO("store_layout"),
+                                         P_STRO("pool_layout"), P_INTO("head_dim") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
                                            INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+/* The residency store's demote layout (RAD_KVQ_DEMOTE): rows of one KV layout re-encoded in
+ * another, `x` [M, row(from)] and `out` [M, row(to)] bytes, a row one token's head. */
+static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
+                                             P_STR("to") };
+static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
 
 /* DFlash2's grouped convolution, libr4d's schema exactly. */
 static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
@@ -1540,7 +1546,12 @@ static const RadOpSchema kSchemas[] = {
   "Rewrites each cold entry (<= -2) of the selection to its scratch page, after copying the block's "
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; "
   "resident (>= 0) and empty (-1) entries pass through. `pool` is INOUT: only the scratch blocks "
-  "of cold entries are written." },
+  "of cold entries are written. With store_layout and pool_layout the fragment's rows are "
+  "expanded from the store's layout into the pool's (kv_transcode's codec) instead of copied." },
+{ "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
+  "Each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), decoded "
+  "exactly and re-encoded in layout `to` as that layout's store encodes, into the row of out. "
+  "Window residency's requantise (resident -> demote) and expand (demote -> resident)." },
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
@@ -2516,6 +2527,9 @@ SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
 SIMPLE("ref_qsa_page", "qsa_page", "attn",
        "QSA pager: cold selection entries copied from the residency store into scratch pages",
        "i32 tables, u8 bytes", ref_qsa_page),
+SIMPLE("ref_kv_transcode", "kv_transcode", "attn",
+       "KV rows re-encoded from one cache layout into another (the residency demote layout)",
+       "u8 bytes", ref_kv_transcode),
 SIMPLE("ref_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, ref_qsa_work),
 SIMPLE("ref_kv_resolve", "kv_resolve", "attn",

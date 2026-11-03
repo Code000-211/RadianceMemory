@@ -52,8 +52,14 @@ extern "C" {
  *
  * 41: a seventh kv_recipe layout, RAD_KVQ_BF16 (the layer keeps the plain bf16 cache
  * --kv-cache-dtype bf16 keeps, beside fp8-family layers; rad_builder.h), and its kv_quant_ok bit;
- * no struct moved. A plugin built at 40 would read a bf16 layer as a layout it does not know. */
-#define RAD_ABI_VERSION 41u
+ * no struct moved. A plugin built at 40 would read a bf16 layer as a layout it does not know.
+ *
+ * 42: a kv_recipe entry's fourth meaning, the demote layout under window residency
+ * (RAD_KVQ_DEMOTE, rad_builder.h; --kv-recipe `demote LAYOUT`), and the optional `store_layout`,
+ * `pool_layout` and `head_dim` of `qsa_page` with the new op `kv_transcode` (docs/OPS.md); no
+ * struct moved. A plugin built at 41 would read a tiered layer's entry as a layout it does not
+ * know and refuse it. */
+#define RAD_ABI_VERSION 42u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

@@ -131,7 +131,19 @@ public:
      * belongs after the step that wrote the blocks, a promote before the step that reads them.
      *
      * A block the manager has no slot for is refused rather than half-moved: a promotion into a
-     * block the sequence no longer holds would serve another sequence's bytes. */
+     * block the sequence no longer holds would serve another sequence's bytes.
+     *
+     * A tiered group (KVGroupPlan::tiered, RAD_KVQ_DEMOTE) is requantised on the card between the
+     * gather and the copy out (`kv_transcode` into the demote layout) and expanded between the
+     * copy in and the scatter, so the slot holds the narrower bytes and the pool only ever the
+     * resident layout. Under the emulation (KVManager::residency_emulate) a demotion names no
+     * slot (host_slot -1) and is that round trip in place: gather, both transcodes, scatter into
+     * the same blocks, no copy; an untiered group's round trip is no change and moves nothing.
+     *
+     * Every demotion, the emulation's too, makes `compute` wait for it before the steps that
+     * follow: they read the block as cold through the pager (or, emulated, its new bytes), and a
+     * pager reading a slot the copy has not finished filling would serve stale bytes. Steps
+     * issued before it already ran past the block, which it waited for. */
     static constexpr int kMoveBatch = 16;
     int  issue_moves(const std::vector<BlockMove>& moves, RadStream compute, bool to_host);
     struct MoveStats { int64_t out_blocks = 0, in_blocks = 0, out_bytes = 0, in_bytes = 0; };
@@ -191,6 +203,11 @@ private:
          * window; a follower gathers it only to verify, and scatters it on every restore. */
         bool     replicated = false;
         Resolved gather, scatter;
+        /* A tiered residency group (KVGroupPlan::tiered): `kv_transcode` into the store's layout
+         * and back, one layer's fragment of a slot `sfrag` bytes, `rows` (token, head) rows of
+         * `rf` bytes in the pool and `rt` in the store. Unresolved for any other group. */
+        Resolved to_store, to_pool;
+        int64_t  sfrag = 0, rows = 0, rf = 0, rt = 0;
     };
 
     /* Builds the staging and index buffers, events and transfer stream lazily on the first pass
@@ -290,7 +307,17 @@ private:
      * block indices it gathers with. Allocated with the rest of the device state and only when some
      * group declares a residency window, so a server that never moves a block pays nothing. */
     void*     move_stage_ = nullptr;
+    /* A tiered group's blocks in the store's layout, between the transcode and the copy. */
+    void*     move_stage2_ = nullptr;
+    /* One `kv_transcode` launch over `rows` contiguous rows of `src` into `dst`. */
+    int       run_xc(const Resolved& r, const void* src, int64_t src_row, void* dst, int64_t dst_row,
+                     int64_t rows);
+    /* Pinned, kMoveIdxCap entries used as a ring: the upload is a kernel reading host memory when
+     * the transfer stream reaches it, which is after the compute it waits for, so a batch issued
+     * later in the same sweep must not overwrite the indices of one not yet uploaded. */
+    static constexpr int64_t kMoveIdxCap = 64 * kMoveBatch;
     int32_t*  move_idx_host_ = nullptr;
+    int64_t   move_idx_off_ = 0;      /* the next free entry of move_idx_host_ */
     int32_t*  move_idx_dev_ = nullptr;
     int64_t   move_bytes_ = 0;      /* bytes one block of the widest residency group takes */
     MoveStats mv_;
