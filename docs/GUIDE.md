@@ -1132,13 +1132,28 @@ the base, measures each layer alone in each variant not beaten outright by one o
 solves for the fewest bits from those costs, and measures what it solved, tightening while the
 mixed recipe measures over the limit (the costs do not add up exactly). It writes the cheapest
 recipe measured within the limit, uniform ones included, so it is never worse than the best
-uniform layout: C + L (K - 1) runs plus at most six solved ones for C variants, K kept and L
-layers, 64 to 70 on Flash-Next. `--bits 6` instead picks the least predicted KL within an average
-budget, unmeasured. On a model whose plugin does not serve `bf16`, `i8h`, the `k4h` layouts or the V mean
+uniform layout: C + L (K - 1) runs, the noise run, at most six solved ones and three knob runs
+for C variants, K kept and L layers, 84 to 99 on Flash-Next. `--bits 6` instead picks the least
+predicted KL within an average budget, unmeasured. On a model whose plugin does not serve `bf16`, `i8h`, the `k4h` layouts or the V mean
 (`qwen35_fp8`), pass `--layouts fp8,fp8_v4,k6_v4` or the first such run stops the calibration. A
 reference whose documents are shorter than 32768 tokens is refused unless the bound is lowered.
-The flags, the cost of the runs, the noise and what is not yet searched (global knobs, a demoted
-layout) are in [TOOLS.md](TOOLS.md#rad-autoquant).
+The flags, the cost of the runs, the noise, the exact limit rules and what is not yet searched (a
+demoted layout) are in [TOOLS.md](TOOLS.md#rad-autoquant).
+
+**The noise floor.** The floor is the KL of recomputing the unquantised model in another order: on
+Flash-Next a bf16 run with prefill chunk 64 measures 0.0243 mean KL against the bf16 reference. It
+perturbs every op (GEMMs, MoE routing), not only the KV cache, so it is a scale for how much a
+recipe's KL means, not a lower bound for KV-only changes. On the card (`--tp 2`) every layer `i8h`
+measures 0.0236 and every layer `bf16` 4.9e-8, but layers 3-23 `bf16` with 27-47 `i8h` measure
+**0.0061**, far under the floor, and the reverse split 0.0239: a recipe can sit well under the floor,
+and an absolute `--max-kl` under it is an ordinary search. `rad-autoquant` measures the floor
+itself (the base once more with `--noise-flags`, default `--max-num-batched-tokens 64`), states
+every recipe's KL against it, and anchors the relative limit there (the per-layer costs are
+measured above the base, not the floor): `--max-dkl 0.01` is a mean KL of at most floor + 0.01; `--max-dnll 0.005` bounds the
+mean NLL change against the reference (nats a token), whether the model gets worse on the text.
+Then it tries the global knobs on the answer (`--qsa-bkey-dtype i8`, `--state-cache-dtype f16`)
+and keeps the setting of fewest bytes a token still within every limit; the recipe's
+`# serve with:` comment names the flags it needs.
 
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities

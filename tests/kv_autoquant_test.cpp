@@ -595,7 +595,21 @@ namespace {
  * layers' costs sum to. With `scored` positions a document the reference scores them (score_from)
  * and each run writes its .rows: the mean KL as 0.5 and 1.5 times it in alternating stretches of
  * 37 positions, so the positions are correlated and the interval has a width, and a top-1 column
- * agreeing on that share of every 100 positions. */
+ * agreeing on that share of every 100 positions.
+ *
+ * The noise floor and the knobs (#16): `flag WORD KL [DNLL]` adds KL (and an NLL change) to a run
+ * whose arguments hold the word WORD (`--max-num-batched-tokens`, the noise run's; `i8` and `f16`,
+ * the knobs' values); `refuse WORD` makes such a run exit 1, as an engine that does not serve a
+ * knob refuses it at startup. A layer's cost adds to the run's KL whatever the flags, so a recipe
+ * measures the base's 0.04 plus its layers' costs and can sit far under a noise run's 0.04 + KL,
+ * as the card measures it (the floor perturbs every op, a recipe only the cache). A cost line's
+ * fourth field is that entry's NLL
+ * change (default 0): the report's perplexity ratio is exp of the summed changes, and the .rows'
+ * candidate NLL is 1 + the change in the KL's stretches, the reference's 1. Its log carries the
+ * engine's KV report: the attention cache at 64 elements a layer and token (a layout's group
+ * bits / 2 bytes a 4-token page), the block keys at 3.00 KiB a page (1.59 KiB with
+ * `--qsa-bkey-dtype i8`) and the delta-net state at 54.00 MiB a slot (27.00 MiB with
+ * `--state-cache-dtype f16`). */
 struct Bench {
     tiny::TempDir dir{ "autoquant" };
     std::string engine = dir / "engine.sh", table = dir / "costs", calls = dir / "calls",
@@ -605,25 +619,44 @@ struct Bench {
         tiny::write_text(engine,
             "#!/bin/sh\n"
             "echo \"$*\" >> '" + calls + "'\n"
+            "args=\"$*\"\n"
             "recipe=; out=\n"
             "while [ $# -gt 0 ]; do\n"
             "  case \"$1\" in --kv-recipe) recipe=$2; shift;; --kld-out) out=$2; shift;; esac\n"
             "  shift\n"
             "done\n"
-            "r=$(awk -v t='" + table + "' 'BEGIN { while ((getline l < t) > 0) { split(l, a, \" \");\n"
+            "r=$(awk -v t='" + table + "' -v args=\"$args\" 'BEGIN { na = split(args, x, \" \");\n"
+            "    for (i = 1; i <= na; ++i) fl[x[i]] = 1;\n"
+            "    b[\"bf16\"] = 1024; b[\"i8h\"] = 516; b[\"fp8\"] = 512; b[\"fp8_v4\"] = 400;\n"
+            "    b[\"k6_v4\"] = 352; b[\"k4h_v4\"] = 288; b[\"k4h_v2h\"] = 224;\n"
+            "    while ((getline l < t) > 0) { split(l, a, \" \");\n"
             "    if (a[1] == \"fail\") f[a[2] \" \" a[3]] = 1; else if (a[1] == \"pair\") p = a[2];\n"
-            "    else if (a[1] == \"all\") u[a[2]] = a[3]; else c[a[1] \" \" a[2]] = a[3] } }\n"
+            "    else if (a[1] == \"all\") u[a[2]] = a[3];\n"
+            "    else if (a[1] == \"flag\") { if (a[2] in fl) { g += a[3]; gd += a[4] } }\n"
+            "    else if (a[1] == \"refuse\") { if (a[2] in fl) no = 1 }\n"
+            "    else { c[a[1] \" \" a[2]] = a[3]; d[a[1] \" \" a[2]] = a[4] } } }\n"
             "  $1 == \"layer\" { w = $3; for (i = 4; i <= NF; ++i) w = w \"+\" $i; k = $2 \" \" w;\n"
-            "    s += (k in c) ? c[k] : c[$2 \" \" $3]; if ($3 != \"fp8\" && $3 != \"i8h\" && $3 != \"bf16\") n++;\n"
+            "    s += (k in c) ? c[k] : c[$2 \" \" $3]; e += (k in c) ? d[k] : d[$2 \" \" $3];\n"
+            "    page += b[$3] / 2; nl2++;\n"
+            "    if ($3 != \"fp8\" && $3 != \"i8h\" && $3 != \"bf16\") n++;\n"
             "    if (f[k]) bad = 1; if (!nl++) first = w; else if (w != first) mixed = 1 }\n"
-            "  END { if (bad && mixed) { print \"stand-in: refused\" > \"/dev/stderr\"; exit 1 }\n"
+            "  END { if (no) { print \"stand-in: refused the flag\" > \"/dev/stderr\"; exit 1 }\n"
+            "        if (bad && mixed) { print \"stand-in: refused\" > \"/dev/stderr\"; exit 1 }\n"
             "        if (n > 1) s += p * (n - 1); if (!mixed && (first in u)) s = u[first]\n"
-            "        printf \"%.9f %.9f\\n\", 0.04 + s, 0.95 - 2 * s }' \"$recipe\") || exit 1\n"
+            "        s += g; e += gd\n"
+            "        printf \"%.9f %.9f %.12f %d %d %.9f\\n\", 0.04 + s, 0.95 - 2 * s, exp(e), page, nl2, e }' \"$recipe\") || exit 1\n"
             "set -- $r\n"
-            "printf '{\"all\": {\"kld\": {\"mean\": %s}, \"top1_agreement\": %s}}\\n' $1 $2 > \"$out\"\n"
-            "[ -f '" + nrows + "' ] && perl -e '($n, $m, $t) = @ARGV; for $i (0 .. $n - 1) {\n"
-            "  print pack(\"f<4\", $m * (int($i / 37) % 2 ? 1.5 : 0.5), 1, 1, $i % 100 < 100 * $t ? 1 : 0) }'"
-            " $(cat '" + nrows + "') $1 $2 > \"$out.rows\"\n"
+            "printf '{\"all\": {\"kld\": {\"mean\": %s}, \"top1_agreement\": %s, \"ppl\": {\"candidate\": %s, "
+            "\"reference\": 1, \"ratio\": %s}}}\\n' $1 $2 $3 $3 > \"$out\"\n"
+            "bkey='3.00 KiB'; state='54.00 MiB'\n"
+            "case \"$args\" in *'--qsa-bkey-dtype i8'*) bkey='1.59 KiB';; esac\n"
+            "case \"$args\" in *'--state-cache-dtype f16'*) state='27.00 MiB';; esac\n"
+            "echo \"    kv_attn        full    $5 layers  block    4 tok  page $4 B    10 blocks = 0 B  (40 tokens)\"\n"
+            "echo \"    kv_gdn_state   linear  36 layers  state $state        2 slots = 0 B\"\n"
+            "echo \"    kv_qsa_bkey    full    $5 layers  block    4 tok  page $bkey    10 blocks = 0 B  (40 tokens)\"\n"
+            "[ -f '" + nrows + "' ] && perl -e '($n, $m, $t, $d) = @ARGV; for $i (0 .. $n - 1) {\n"
+            "  $f = int($i / 37) % 2 ? 1.5 : 0.5; print pack(\"f<4\", $m * $f, 1 + $d * $f, 1, $i % 100 < 100 * $t ? 1 : 0) }'"
+            " $(cat '" + nrows + "') $1 $2 $6 > \"$out.rows\"\n"
             "exit 0\n");
         ::chmod(engine.c_str(), 0755);
         ::mkdir(ref.c_str(), 0755);
@@ -718,7 +751,7 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
 
     /* The measurements are in the recipe's comments, and every run's files in the work dir. */
     const std::string recipe = tiny::read_text(b.out);
-    CHECK(has(recipe, "# every layer fp8: mean KL 0.040000, top-1 0.9500 (the base)\n"));
+    CHECK(has(recipe, "# every layer fp8: mean KL 0.040000, top-1 0.9500, dNLL +0.0000 (the base)\n"));
     CHECK(has(recipe, "# no per-layer runs: k6_v4 rotated ("));
     CHECK(has(recipe, "#       3    4.000e-03    9.000e-03"));
     CHECK(has(recipe, "# chosen: 6.2500 bits an element"));
@@ -883,8 +916,9 @@ TEST(the_driver_writes_the_fewest_bits_within_a_kl_limit) {
                            "/m/x.rad" }, &log);
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
-    /* 10 uniform, 16 per-layer runs, 1 verified. */
-    CHECK_EQ(b.lines(b.calls), 27);
+    /* 10 uniform, the noise floor, 16 per-layer runs, 1 verified, and the knobs on the answer:
+     * each alone and both, which the stand-in prices at nothing. */
+    CHECK_EQ(b.lines(b.calls), 27 + 1 + 3);
 
     KvAssignment want;
     REQUIRE_EQ(kv_autoquant_solve_kl(cost_layers(), 0.0012, &want), RAD_OK);
@@ -892,9 +926,11 @@ TEST(the_driver_writes_the_fewest_bits_within_a_kl_limit) {
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "the fewest bits measured within a mean KL of 0.0412"));
     CHECK(has(recipe, "verify 1"));
-    CHECK(has(recipe, "# every layer k6_v4: mean KL 0.052600, top-1 0.9248\n"));
+    CHECK(has(recipe, "# every layer k6_v4: mean KL 0.052600, top-1 0.9248, +0.012600 above the "
+                      "floor, dNLL +0.0000\n"));
     CHECK(has(recipe, "# solved 1: room 0.001200 above the base, predicted mean KL 0.040800, "
-                      "measured 6.0625 bits, mean KL 0.040800, top-1 0.9484 (verify 1)\n"));
+                      "measured 6.0625 bits, mean KL 0.040800, top-1 0.9484, +0.000800 above the "
+                      "floor, dNLL +0.0000 (verify 1)\n"));
     CHECK(has(recipe, "(verify 1), the fewest bits measured within 0.0412"));
     CHECK(has(log, "within the limit"));
     CHECK(!has(log, "above the limit\n"));
@@ -971,8 +1007,9 @@ TEST(the_driver_refuses_a_kl_limit_it_cannot_serve) {
     CHECK(b.run({ "--layers", "3,7", "--max-kl", "0.03", "--", "--model", "m" }, &log) != 0);
     CHECK(has(log, "no recipe measured is within the limits: the most accurate, every layer fp8, "
                    "measures a mean KL of 0.040000, above --max-kl 0.03"));
-    /* The uniform runs, and no per-layer run: below the base the costs have nothing to give. */
-    CHECK_EQ(b.lines(b.calls), 10);
+    /* The uniform runs and the noise floor, and no per-layer run: below the base the costs have
+     * nothing to give. */
+    CHECK_EQ(b.lines(b.calls), 10 + 1);
     struct stat st{};
     CHECK(::stat(b.out.c_str(), &st) != 0);
     log.clear();
@@ -1023,10 +1060,12 @@ TEST(the_driver_takes_the_most_accurate_variant_as_its_base_and_meets_a_limit_un
     REQUIRE_EQ(rc, 0);
     CHECK(has(log, "the base, the most accurate: every layer i8h\n"));
     /* 5 uniform (i8h, fp8, fp8 rotated, k6_v4, k6_v4 rotated); the rotated ones tie with their
-     * plain layouts and are dropped; 4 layers x fp8 and k6_v4, the rest i8h. */
-    CHECK_EQ(b.lines(b.calls), 5 + 8);
+     * plain layouts and are dropped; the noise floor; 4 layers x fp8 and k6_v4, the rest i8h;
+     * the three knob runs. */
+    CHECK_EQ(b.lines(b.calls), 5 + 1 + 8 + 3);
     const std::string recipe = tiny::read_text(b.out);
-    CHECK(has(recipe, "# every layer i8h: mean KL 0.040000, top-1 0.9500 (the base)\n"));
+    CHECK(has(recipe, "# every layer i8h: mean KL 0.040000, top-1 0.9500, +0.000000 above the "
+                      "floor, dNLL +0.0000 (the base)\n"));
     CHECK(has(recipe, "# every layer fp8: mean KL 0.048000"));
     CHECK(has(recipe, "\nlayer 3 i8h\nlayer 7 k6_v4\nlayer 11 i8h\nlayer 15 i8h\n"));
     CHECK(has(recipe, "(layer 7 k6_v4), the fewest bits measured within 0.0405"));
@@ -1044,7 +1083,8 @@ TEST(the_driver_takes_the_most_accurate_variant_as_its_base_and_meets_a_limit_un
  * under every 8-bit layout's is met: here i8h costs 0.001 a layer (0.044 uniform) and fp8 more,
  * and --max-kl 0.0402 is under both. Layer 7 alone in fp8 (0.04015, the rest bf16) is the fewest
  * bits within it, written without a run of its own; 4 uniform runs (bf16, i8h, fp8, fp8 rotated,
- * the last dropped as fp8's tie) and 4 layers x i8h and fp8. */
+ * the last dropped as fp8's tie), the noise floor, 4 layers x i8h and fp8, and the three knob
+ * runs. */
 TEST(the_driver_takes_bf16_as_its_base_and_meets_a_limit_under_i8hs) {
     Bench b;
     REQUIRE(b.dir.ok());
@@ -1056,9 +1096,10 @@ TEST(the_driver_takes_bf16_as_its_base_and_meets_a_limit_under_i8hs) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
     CHECK(has(log, "the base, the most accurate: every layer bf16\n"));
-    CHECK_EQ(b.lines(b.calls), 4 + 8);
+    CHECK_EQ(b.lines(b.calls), 4 + 1 + 8 + 3);
     const std::string recipe = tiny::read_text(b.out);
-    CHECK(has(recipe, "# every layer bf16: mean KL 0.040000, top-1 0.9500 (the base)\n"));
+    CHECK(has(recipe, "# every layer bf16: mean KL 0.040000, top-1 0.9500, +0.000000 above the "
+                      "floor, dNLL +0.0000 (the base)\n"));
     CHECK(has(recipe, "# every layer i8h: mean KL 0.044000"));
     CHECK(has(recipe, "\nlayer 3 bf16\nlayer 7 fp8\nlayer 11 bf16\nlayer 15 bf16\n"));
     CHECK(has(recipe, "(layer 7 fp8), the fewest bits measured within 0.0402"));
@@ -1122,8 +1163,9 @@ TEST(the_driver_keeps_a_uniform_recipe_that_measures_cheaper_than_any_solved_one
     REQUIRE_EQ(rc, 0);
     CHECK(written(b) == std::vector<int>(4, RAD_KVQ_K6V4));
     CHECK(has(log, "screening drops fp8_v4 (0.044400 at 6.25 bits; k6_v4: 0.040500 at 5.50)"));
-    /* 10 uniform, 4 layers x k6_v4, k4h_v4, k4h_v2h; no verification. */
-    CHECK_EQ(b.lines(b.calls), 10 + 12);
+    /* 10 uniform, the noise floor, 4 layers x k6_v4, k4h_v4, k4h_v2h; no verification; the
+     * three knob runs. */
+    CHECK_EQ(b.lines(b.calls), 10 + 1 + 12 + 3);
     CHECK(has(log, "the next solution has no fewer bits than every layer k6_v4"));
     CHECK(has(tiny::read_text(b.out), "(every layer k6_v4), the fewest bits measured within 0.0412"));
 }
@@ -1211,6 +1253,381 @@ TEST(the_driver_under_strict_checks_the_limit_at_the_upper_bound_from_the_rows) 
     log.clear();
     CHECK(plain.run(strict, &log) != 0);
     CHECK(has(log, "run uniform_bf16 left no .rows of the reference's positions, which --strict needs"));
+}
+
+/* ================================================================== the noise floor and the knobs */
+
+namespace {
+
+/* The stand-in's model of the card: the noise run (the base with --max-num-batched-tokens 64)
+ * measures 0.024 above the base, as recomputing in another order does on Flash-Next, while a
+ * recipe measures the base's 0.04 plus its layers' costs, however far under the floor that is. */
+const std::string kFloor = "flag --max-num-batched-tokens 0.024\n";
+
+/* The 95 % half-width the driver finds in a stand-in run's .rows over two documents of 999
+ * scored positions: of the KL column for a run of mean KL `kl`, or of the NLL change for a run of
+ * NLL change `dnll` -- the values as the stand-in prints them (%.9f) and the f32 rows hold them. */
+double rows_half(double kl, double dnll = NAN) {
+    char printed[32];
+    std::snprintf(printed, sizeof printed, "%.9f", std::isnan(dnll) ? kl : dnll);
+    const double v = std::stod(printed);
+    std::vector<double> x;
+    for (int i = 0; i < 1998; ++i) {
+        const double f = (i / 37) % 2 ? 1.5 : 0.5;
+        x.push_back(std::isnan(dnll) ? (double)((float)v * (float)f)
+                                     : (double)(float)(1 + v * f) - 1.0);
+    }
+    KvInterval ci;
+    if (kv_autoquant_interval(x, { 999, 999 }, &ci) != RAD_OK) return NAN;
+    return ci.half;
+}
+
+}  /* namespace */
+
+/* The noise floor: the base (fp8 here: the stand-in prices it and bf16 alike, and screening keeps
+ * the fewer bits) once more with --max-num-batched-tokens 64, measuring the stand-in's floor of
+ * 0.064 where the base measures 0.04. The per-layer costs are measured above the base, never
+ * above the floor, so they are the table's; --max-dkl 0.0012 is a limit of 0.0652, which leaves
+ * 0.0252 above the base, and the answer is the solver's on the table within that room, measured
+ * under the floor. An absolute --max-kl under the floor (0.05) is an ordinary search: the room is
+ * 0.01 above the base, and the answer measures under the floor too. */
+TEST(the_driver_measures_a_noise_floor_and_meets_a_kl_limit_above_it) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, cost_table(kFloor)));
+    std::string log;
+    int rc = b.run({ "--layers", "3,7,11,15", "--max-dkl", "0.0012", "--no-knobs", "--",
+                     "--model", "/m/x.rad" }, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(log, "the base, the most accurate: every layer fp8\n"));
+    CHECK(has(log, "the noise floor: mean KL 0.064000; every layer fp8 is -0.024000 above it\n"));
+    CHECK(has(log, "every layer k6_v4: -0.011400 above the floor\n"));
+    CHECK(has(log, "not a bound for KV-only changes; costs are measured above the base)\n"));
+    /* 10 uniform, the noise run, 4 layers x fp8_v4, k6_v4, k4h_v4 and k4h_v2h (bf16 and i8h are
+     * screened out by fp8, the rotated ones by their plain layouts), 1 solved. */
+    CHECK_EQ(b.lines(b.calls), 10 + 1 + 16 + 1);
+    const std::string calls = tiny::read_text(b.calls);
+    CHECK(has(calls, "--model /m/x.rad --max-num-batched-tokens 64 --kv-cache-dtype fp8 --kv-recipe " +
+                         b.out + ".work/noise_fp8_"));
+
+    KvAssignment want;
+    REQUIRE_EQ(kv_autoquant_solve_kl(cost_layers(), 0.0252, &want), RAD_OK);
+    CHECK(written(b) == kvq_of(cost_layers(), want));
+    CHECK(0.04 + stand_in(written(b)).first < 0.064);
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "the fewest bits measured within a mean KL of 0.0012 above the noise floor\n"));
+    CHECK(has(recipe, "# noise floor, every layer fp8 with --max-num-batched-tokens 64: mean KL "
+                      "0.064000, top-1 0.9020, dNLL +0.0000\n"));
+    CHECK(has(recipe, "# each layer alone in a variant, the rest the base: mean KL above the base\n"));
+    CHECK(has(recipe, "#       3    4.000e-03    9.000e-03    5.000e-02"));
+    CHECK(has(recipe, "# solved 1: room 0.025200 above the base, predicted mean KL 0.052500, "
+                      "measured 5.2500 bits, mean KL 0.052500, top-1 0.9250, -0.011500 above the "
+                      "floor, dNLL +0.0000 (verify 1)\n"));
+    CHECK(has(recipe, "(verify 1), the fewest bits measured within floor + 0.0012\n"));
+
+    std::remove(b.calls.c_str());
+    log.clear();
+    rc = b.run({ "--layers", "3,7,11,15", "--max-kl", "0.05", "--no-knobs", "--", "--model",
+                 "/m/x.rad" }, &log);
+    REQUIRE_EQ(rc, 0);
+    CHECK(!has(log, "is under the noise floor"));
+    CHECK_EQ(b.lines(b.calls), 10 + 1 + 16 + 1);
+    REQUIRE_EQ(kv_autoquant_solve_kl(cost_layers(), 0.01, &want), RAD_OK);
+    CHECK(written(b) == kvq_of(cost_layers(), want));
+    CHECK(0.04 + stand_in(written(b)).first <= 0.05 + 1e-12);
+    CHECK(has(tiny::read_text(b.out), "# solved 1: room 0.010000 above the base"));
+}
+
+/* The card's case (Flash-Next --tp 2: layers 3-23 bf16 + 27-47 i8h measure 0.0061 where the
+ * noise floor is 0.0243 and every layer i8h 0.0236): the early layers carry the KL, so bf16 early
+ * and the narrow layout late measures far under the floor. Here bf16 is the base (0.04), the noise
+ * run 0.064, every layer i8h 0.0635, just under the floor as on the card, and i8h costs 0.011,
+ * 0.008, 0.003 and 0.0015 in layers 3, 7, 11 and 15. An absolute --max-kl of 0.046, under the
+ * floor, leaves 0.006 above the base: layers 11 and 15 in i8h (0.0045), the rest bf16, found from
+ * costs counted from the base, measured at 0.0445 -- 0.0195 under the floor -- and accepted. */
+TEST(the_driver_finds_a_recipe_under_the_noise_floor_within_an_absolute_kl_limit_below_it) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, "3 i8h 0.011\n7 i8h 0.008\n11 i8h 0.003\n15 i8h 0.0015\n" + kFloor));
+    std::string log;
+    const int rc = b.run({ "--layers", "3,7,11,15", "--max-kl", "0.046", "--layouts", "bf16,i8h",
+                           "--no-knobs", "--", "--model", "/m/x.rad" }, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(log, "the base, the most accurate: every layer bf16\n"));
+    CHECK(has(log, "the noise floor: mean KL 0.064000; every layer bf16 is -0.024000 above it\n"));
+    CHECK(has(log, "every layer i8h: -0.000500 above the floor\n"));
+    CHECK(!has(log, "is under the noise floor"));
+    /* 2 uniform, the noise run, 4 layers x i8h, 1 solved. */
+    CHECK_EQ(b.lines(b.calls), 2 + 1 + 4 + 1);
+    CHECK(written(b) == std::vector<int>({ RAD_KVQ_BF16, RAD_KVQ_BF16, RAD_KVQ_I8H, RAD_KVQ_I8H }));
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# each layer alone in a variant, the rest the base: mean KL above the base\n"));
+    CHECK(has(recipe, "#      15    1.500e-03"));
+    CHECK(has(recipe, "# solved 1: room 0.006000 above the base, predicted mean KL 0.044500, "
+                      "measured 12.0312 bits, mean KL 0.044500, top-1 0.9410, -0.019500 above the "
+                      "floor, dNLL +0.0000 (verify 1)\n"));
+    CHECK(has(recipe, "(verify 1), the fewest bits measured within 0.046\n"));
+}
+
+/* --max-dkl under --strict: the run's upper 95 % bound less the floor's lower bound is at most the
+ * limit. The noise run here measures 0.0004 above the base (0.0404; at the card's 0.024 every
+ * recipe of the table would fit either way). The intervals are about 3 % of the mean on the
+ * stand-in's rows, so the floor's lower bound is near 0.0392 and a recipe's upper bound must stay
+ * under 0.0442 where the mean rule lets its mean reach 0.0454: what is written meets that rule,
+ * takes more bits than the mean rule's answer, and the mean rule's answer would not have met it.
+ * The recipes' KL is the base's 0.04 plus their costs, not the floor's. */
+TEST(the_driver_under_strict_checks_kl_above_the_floor_at_the_upper_less_the_floors_lower_bound) {
+    Bench b({ 40000, 40000 }, 999);
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, cost_table("flag --max-num-batched-tokens 0.0004\n")));
+    const std::vector<std::string> args = { "--layers", "3,7,11,15", "--max-dkl", "0.005",
+                                            "--no-knobs", "--", "--model", "/m/x.rad" };
+    std::string log;
+    REQUIRE_EQ(b.run(args, &log), 0);
+    const auto mean = stand_in(written(b));
+    std::vector<std::string> strict = args;
+    strict.insert(strict.begin(), "--strict");
+    log.clear();
+    const int rc = b.run(strict, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    const auto got = stand_in(written(b));
+    const double floor = 0.0404, floor_lo = floor - rows_half(floor);
+    auto upper = [](double kl) { return kl + rows_half(kl); };
+    CHECK(rows_half(floor) > 1e-3);
+    CHECK(upper(0.04 + got.first) - floor_lo <= 0.005 + 1e-6);
+    CHECK(upper(0.04 + mean.first) - floor_lo > 0.005);
+    CHECK(0.04 + mean.first <= floor + 0.005 + 1e-9);
+    CHECK(got.second > mean.second);
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "within a mean KL of 0.005 above the noise floor (95% bounds)\n"));
+    CHECK(has(recipe, "# noise floor, every layer fp8 with --max-num-batched-tokens 64: mean KL "
+                      "0.040400 +- 0.00"));
+    CHECK(has(recipe, "the fewest bits measured within floor + 0.005 at the 95% bounds\n"));
+}
+
+namespace {
+
+/* Layers 7 and 15 change the NLL when narrowed (stand-in table lines with a fourth field):
+ * layer 7 by 0.004 in every narrower layout, which its tiny KL costs never show, and layer 15 by
+ * 0.00295, within a limit of 0.003 at the mean but not at its upper bound. */
+const std::string kNll = "7 fp8_v4 0.0001 0.004\n7 k6_v4 0.0002 0.004\n7 k4h_v4 0.0001 0.004\n"
+                         "7 k4h_v2h 0.09 0.004\n15 fp8_v4 0.0000 0.00295\n15 k6_v4 0.0004 0.00295\n"
+                         "15 k4h_v4 0.05 0.00295\n15 k4h_v2h 0.09 0.00295\n";
+
+/* The NLL change the stand-in gives the four layers of `written` under kNll. */
+double stand_in_dnll(const std::vector<int>& q) {
+    double d = 0;
+    if (q.size() == 4 && q[1] != RAD_KVQ_NONE && q[1] != RAD_KVQ_I8H && q[1] != RAD_KVQ_BF16) d += 0.004;
+    if (q.size() == 4 && q[3] != RAD_KVQ_NONE && q[3] != RAD_KVQ_I8H && q[3] != RAD_KVQ_BF16) d += 0.00295;
+    return d;
+}
+
+}  /* namespace */
+
+/* --max-dnll: the KL limit alone narrows layer 7, whose NLL change (0.004) the limit of 0.003
+ * refuses; with it the recipe keeps layer 7 at fp8 and measures within both. The NLL change is a
+ * check on measured recipes, as top-1 is, not a cost the solver sums, so the answer here is a
+ * single-layer run: layer 15 in k6_v4, NLL change 0.00295. Under --strict that is over the limit
+ * at its upper bound (+ about 3 %), so layer 15 stays fp8 and another layer narrows instead. The
+ * NLL change is stated for every run, with its interval. An NLL limit every recipe is over is met
+ * by nothing, and the refusal names it. */
+TEST(the_driver_keeps_an_nll_limit_at_the_mean_and_under_strict_at_the_upper_bound) {
+    Bench b({ 40000, 40000 }, 999);
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, cost_table(kNll)));
+    std::string log;
+    REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--no-knobs", "--",
+                       "--model", "/m/x.rad" }, &log), 0);
+    const std::vector<int> kl_only = written(b);
+    REQUIRE_EQ(kl_only.size(), (size_t)4);
+    CHECK(kl_only[1] != RAD_KVQ_NONE);
+
+    const std::vector<std::string> args = { "--layers", "3,7,11,15", "--max-kl", "0.046",
+                                            "--max-dnll", "0.003", "--no-knobs", "--", "--model",
+                                            "/m/x.rad" };
+    log.clear();
+    int rc = b.run(args, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    const std::vector<int> mean = written(b);
+    REQUIRE_EQ(mean.size(), (size_t)4);
+    CHECK_EQ(mean[1], RAD_KVQ_NONE);
+    CHECK(mean[3] != RAD_KVQ_NONE);
+    CHECK(stand_in_dnll(mean) <= 0.003);
+    CHECK(0.04 + stand_in(mean).first <= 0.046 + 1e-12);
+    CHECK(stand_in(mean).second < 4 * 512);
+    std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "within a mean KL of 0.046 and a mean NLL change of 0.003 nats a token\n"));
+    CHECK(has(recipe, "the fewest bits measured within 0.046 and dNLL 0.003\n"));
+    CHECK(has(recipe, ", dNLL +0.0000 +- 0.0000"));
+    char want[160];
+    std::snprintf(want, sizeof want, "rad-autoquant: layer 7 fp8_v4: 7.5625 bits, mean KL 0.040100 "
+                  "+- %.6f, top-1 0.9498 +- 0.0132, +0.000100 above the floor, dNLL +0.0040 +- "
+                  "%.4f\n", rows_half(0.0401), rows_half(0, 0.004));
+    CHECK(has(log, want));
+    if (!has(log, want)) fprintf(stderr, "    wanted '%s'\n", want);
+
+    std::vector<std::string> strict = args;
+    strict.insert(strict.begin(), "--strict");
+    log.clear();
+    rc = b.run(strict, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    const std::vector<int> got = written(b);
+    REQUIRE_EQ(got.size(), (size_t)4);
+    CHECK(0.00295 + rows_half(0, 0.00295) > 0.003);
+    CHECK_EQ(got[1], RAD_KVQ_NONE);
+    CHECK_EQ(got[3], RAD_KVQ_NONE);
+    CHECK(stand_in(got).second >= stand_in(mean).second);
+    CHECK(stand_in(got).second < 4 * 512);
+    recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "the fewest bits measured within 0.046 and dNLL 0.003 at the 95% bounds\n"));
+
+    REQUIRE(tiny::write_text(b.table, "3 bf16 0 0.01\n3 i8h 0 0.01\n3 fp8 0 0.01\n3 fp8_v4 0.004 0.01\n"
+                                      "3 k6_v4 0.009 0.01\n3 k4h_v4 0.05 0.01\n3 k4h_v2h 0.09 0.01\n"));
+    log.clear();
+    CHECK(b.run({ "--layers", "3,7", "--max-dnll", "0.005", "--no-knobs", "--", "--model",
+                  "/m/x.rad" }, &log) != 0);
+    CHECK(has(log, "no recipe measured is within the limits: the most accurate, every layer fp8, "
+                   "measures a mean KL of 0.040000 and dNLL +0.0100, above --max-dnll 0.005"));
+}
+
+/* The knobs on the answer of the first --max-kl test (6.0625 bits, 0.0408): int8 block keys add
+ * 0.0001 and stay within 0.0412, the f16 state adds 0.002 and does not, so both together are not
+ * run; the block keys are kept, for fewer bytes a token (the stand-in's attention pages, 776 bytes
+ * a 4-token page, beside block keys of 3.00 KiB, or 1.59 KiB in int8), and the serve flags say so.
+ * A knob that breaks only the NLL limit is not kept either, nor one whose run the engine refuses,
+ * which stops nothing. Both within: both kept, the state at half. --knobs restricts the search,
+ * and a knob it leaves out may be fixed in the engine's flags; --no-knobs runs none. */
+TEST(the_driver_keeps_a_knob_only_where_the_recipe_stays_within_every_limit) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, cost_table("flag i8 0.0001\nflag f16 0.002\n")));
+    const std::vector<std::string> args = { "--layers", "3,7,11,15", "--max-kl", "0.0412", "--",
+                                            "--model", "/m/x.rad" };
+    std::string log;
+    int rc = b.run(args, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    /* The first --max-kl test's 27 runs, the noise floor, and one run a knob. */
+    CHECK_EQ(b.lines(b.calls), 27 + 1 + 2);
+    std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# its cache: 0.94 KiB a token, state 54.00 MiB a sequence (rank 0's, from its log)\n"));
+    CHECK(has(recipe, "# with --qsa-bkey-dtype i8: 6.0625 bits, mean KL 0.040900, top-1 0.9482, "
+                      "+0.000900 above the floor, dNLL +0.0000, 0.59 KiB a token, state 54.00 MiB "
+                      "a sequence\n"));
+    CHECK(has(recipe, "# with --state-cache-dtype f16: 6.0625 bits, mean KL 0.042800"));
+    CHECK(has(recipe, "state 27.00 MiB a sequence, above the limits\n"));
+    CHECK(has(recipe, "# knobs: --qsa-bkey-dtype i8, the fewest bytes a token within every limit"));
+    CHECK(has(recipe, "# serve with: --kv-cache-dtype fp8 --kv-recipe " + b.out +
+                      " --qsa-bkey-dtype i8\n"));
+    CHECK(has(log, "mean KL 0.040900"));
+    CHECK(has(tiny::read_text(b.calls), "--model /m/x.rad --qsa-bkey-dtype i8 --kv-cache-dtype fp8"));
+
+    /* The engine refuses int8 block keys; the f16 state is free in KL but moves the NLL by 0.01,
+     * over --max-dnll 0.005. Neither is kept, and the recipe is still written. */
+    REQUIRE(tiny::write_text(b.table, cost_table("refuse i8\nflag f16 0 0.01\n")));
+    log.clear();
+    rc = b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--max-dnll", "0.005", "--",
+                 "--model", "/m/x.rad" }, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(log, "stand-in: refused the flag"));
+    CHECK(has(log, "with --qsa-bkey-dtype i8 the run failed: not kept"));
+    recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# with --qsa-bkey-dtype i8: the run failed, not kept\n"));
+    CHECK(has(recipe, "dNLL +0.0100, 0.94 KiB a token, state 27.00 MiB a sequence, above the limits\n"));
+    CHECK(has(recipe, "# knobs: none kept"));
+    CHECK(has(recipe, "# serve with: --kv-cache-dtype fp8 --kv-recipe " + b.out + "\n"));
+
+    /* Both free: each alone, then both, kept. */
+    REQUIRE(tiny::write_text(b.table, cost_table()));
+    std::remove(b.calls.c_str());
+    log.clear();
+    REQUIRE_EQ(b.run(args, &log), 0);
+    CHECK_EQ(b.lines(b.calls), 27 + 1 + 3);
+    recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# with --qsa-bkey-dtype i8 --state-cache-dtype f16: "));
+    CHECK(has(recipe, "# serve with: --kv-cache-dtype fp8 --kv-recipe " + b.out +
+                      " --qsa-bkey-dtype i8 --state-cache-dtype f16\n"));
+    CHECK(has(recipe, "0.59 KiB a token, state 27.00 MiB a sequence\n"));
+
+    /* --knobs state_f16: one knob run; the block keys fixed at i8 in the engine's flags are run
+     * that way throughout. Searched, the flag is refused there; --no-knobs runs no knob. */
+    std::remove(b.calls.c_str());
+    log.clear();
+    REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--knobs", "state_f16", "--",
+                       "--model", "/m/x.rad", "--qsa-bkey-dtype", "i8" }, &log), 0);
+    CHECK_EQ(b.lines(b.calls), 27 + 1 + 1);
+    CHECK(has(tiny::read_text(b.out), "--kv-recipe " + b.out + " --state-cache-dtype f16\n"));
+    std::remove(b.calls.c_str());
+    log.clear();
+    REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--no-knobs", "--",
+                       "--model", "/m/x.rad" }, &log), 0);
+    CHECK_EQ(b.lines(b.calls), 27 + 1);
+    CHECK(!has(tiny::read_text(b.out), "# knobs:"));
+
+    auto refused = [&](const std::vector<std::string>& more, const std::string& why) {
+        std::vector<std::string> a = { "--layers", "3,7" };
+        a.insert(a.end(), more.begin(), more.end());
+        std::string l;
+        CHECK(b.run(a, &l) != 0);
+        CHECK(has(l, why));
+        if (!has(l, why)) fprintf(stderr, "    wanted '%s' in:\n%s\n", why.c_str(), l.c_str());
+    };
+    std::remove(b.calls.c_str());
+    refused({ "--max-kl", "0.05", "--", "--model", "m", "--qsa-bkey-dtype", "i8" },
+            "--qsa-bkey-dtype is the knob bkey_i8, which rad-autoquant tries on the answer");
+    refused({ "--max-kl", "0.05", "--knobs", "bkey", "--", "--model", "m" },
+            "--knobs: 'bkey' is not a knob; they are bkey_i8, state_f16");
+    refused({ "--max-kl", "0.05", "--knobs", "bkey_i8", "--no-knobs", "--", "--model", "m" },
+            "--knobs and --no-knobs contradict each other");
+    refused({ "--max-dkl", "-0.01", "--", "--model", "m" }, "--max-dkl '-0.01' is not a mean KL");
+    refused({ "--max-dnll", "x", "--", "--model", "m" }, "--max-dnll 'x' is not a mean NLL change");
+    refused({ "--max-dkl", "0.01", "--noise-flags", " ", "--", "--model", "m" },
+            "--noise-flags names no engine flag");
+    refused({ "--max-dkl", "0.01", "--noise-flags", "--kld-out x", "--", "--model", "m" },
+            "--noise-flags: --kld-out is set by rad-autoquant");
+    refused({ "--bits", "6", "--max-dkl", "0.01", "--", "--model", "m" },
+            "--bits and --max-dkl ask opposite questions");
+    refused({ "--bits", "6", "--no-knobs", "--", "--model", "m" }, "go with --max-kl, --max-dkl");
+    CHECK_EQ(b.lines(b.calls), 0);
+}
+
+/* --reuse reads the noise run and the knob runs back like every other: a second search with the
+ * same flags runs nothing and writes the same recipe. The noise run is named after the base and
+ * --noise-flags (noise_fp8_HASH), so other noise flags are one run of their own, and here, where
+ * the stand-in's floor does not depend on them, the only one. The f16 state costs 0.02, past the
+ * room the answer leaves under floor + 0.0012, so both knobs together are not run. */
+TEST(the_driver_reuses_the_noise_floor_and_the_knob_runs_from_the_work_dir) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, cost_table(kFloor + "flag i8 0.0001\nflag f16 0.02\n")));
+    std::vector<std::string> args = { "--reuse", "--layers", "3,7,11,15", "--max-dkl", "0.0012",
+                                      "--", "--model", "/m/x.rad" };
+    std::string log;
+    REQUIRE_EQ(b.run(args, &log), 0);
+    const int first = b.lines(b.calls);
+    CHECK_EQ(first, 10 + 1 + 16 + 1 + 2);
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, " --qsa-bkey-dtype i8\n"));
+    log.clear();
+    REQUIRE_EQ(b.run(args, &log), 0);
+    CHECK_EQ(b.lines(b.calls), first);
+    CHECK(has(log, "rad-autoquant: noise_fp8_"));
+    CHECK(has(log, "rad-autoquant: knob_bkey_i8_"));
+    CHECK(!has(log, "rad-autoquant: knob_bkey_i8+state_f16_"));
+    CHECK_EQ(tiny::read_text(b.out), recipe);
+
+    args.insert(args.begin(), { "--noise-flags", "--max-num-batched-tokens 32" });
+    log.clear();
+    REQUIRE_EQ(b.run(args, &log), 0);
+    CHECK_EQ(b.lines(b.calls), first + 1);
+    CHECK(has(tiny::read_text(b.calls), "--max-num-batched-tokens 32 --kv-cache-dtype fp8"));
+    CHECK(has(tiny::read_text(b.out), "every layer fp8 with --max-num-batched-tokens 32: "));
 }
 
 RAD_TEST_MAIN()
