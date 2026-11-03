@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 37 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 38 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -98,7 +98,7 @@
 { "RadBufDecl", "domain", 60, 4 },
 { "RadBufDecl", "derive", 64, 8 },
 { "RadBufDecl", "kv", 72, 4 },
-{ "RadBuildCtx", "", 0, 224 },
+{ "RadBuildCtx", "", 0, 232 },
 { "RadBuildCtx", "rank", 0, 4 },
 { "RadBuildCtx", "world_size", 4, 4 },
 { "RadBuildCtx", "max_tok", 8, 8 },
@@ -134,6 +134,7 @@
 { "RadBuildCtx", "kv_residency", 200, 4 },
 { "RadBuildCtx", "kv_recipe", 208, 8 },
 { "RadBuildCtx", "n_kv_recipe", 216, 4 },
+{ "RadBuildCtx", "kv_vmean", 224, 8 },
 { "RadAudioGenBatch", "", 0, 344 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },
@@ -549,6 +550,12 @@
 { "RadKernelInfo", "opd_shape", 144, 8 },
 { "RadKernelInfo", "unrelayout", 152, 8 },
 { "RadKernelInfo", "replaces", 160, 8 },
+{ "RadKvVMean", "", 0, 40 },
+{ "RadKvVMean", "table", 0, 8 },
+{ "RadKvVMean", "n_layers", 8, 8 },
+{ "RadKvVMean", "n_head_kv", 16, 8 },
+{ "RadKvVMean", "n_head", 24, 8 },
+{ "RadKvVMean", "head_dim", 32, 8 },
 { "RadLayout", "", 0, 80 },
 { "RadLayout", "tag", 0, 8 },
 { "RadLayout", "dtype", 8, 4 },

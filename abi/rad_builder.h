@@ -110,10 +110,18 @@ enum {
  * docs/OPS.md), rotates its query before the attention and the attention output back after it.
  * The rotation is its own inverse, so the scores and the output are the unrotated ones (to the
  * rounding of the extra passes), and the layout's store and attention rows read the rotated values
- * as they read any others. RAD_KVQ_LAYOUT masks the layout out of an entry. */
+ * as they read any others. RAD_KVQ_LAYOUT masks the layout out of an entry.
+ *
+ * RAD_KVQ_VMEAN (ABI 38, --kv-recipe `vmean`): the layer subtracts a calibrated mean of V, per KV
+ * head, from V before its store, and adds it back to the attention output before the output's
+ * rotation (RadBuildCtx::kv_vmean holds the vectors). A row of attention weights sums to one, so
+ * P (V - mu) + mu = P V: exact but for the rounding of the two adds, while the integer V layouts
+ * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
+ * k6_v4, k4h_v4, k4h_v2h); K, the cache layout and the attention rows are unchanged. */
 enum {
     RAD_KVQ_LAYOUT  = 0xff,
-    RAD_KVQ_ROTATED = 0x100
+    RAD_KVQ_ROTATED = 0x100,
+    RAD_KVQ_VMEAN   = 0x200
 };
 
 /* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
@@ -346,7 +354,8 @@ typedef struct RadBuildCtx {
     /* ---- appended in ABI 34 (a per-layer KV recipe) */
     /* --kv-recipe: the trunk's attention layer l keeps its cache in layout kv_recipe[l], a
      * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, with RAD_KVQ_ROTATED set where that layer runs
-     * rotated (from ABI 35), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
+     * rotated (from ABI 35) and RAD_KVQ_VMEAN where it subtracts a V mean (from ABI 38, the means
+     * in kv_vmean), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
      * there is no entry either). Null without a recipe, and then
      * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
      * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has
@@ -360,7 +369,40 @@ typedef struct RadBuildCtx {
      * requires: tests/abi_layout_test.cpp). */
     const int32_t* kv_recipe;
     int32_t        n_kv_recipe;
+
+    /* ---- appended in ABI 38 (a static V mean per layer) */
+    /* The V means of the recipe's `vmean` layers (RAD_KVQ_VMEAN), this rank's device copy; null
+     * when no layer takes one. Read at declare only. A plugin that does not serve RAD_KVQ_VMEAN
+     * refuses the entry, naming the layer.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    const struct RadKvVMean* kv_vmean;
 } RadBuildCtx;
+
+/* ================================================================== a static V mean per layer */
+/* What a RAD_KVQ_VMEAN layer subtracts from V before its store and adds to its attention output,
+ * prepared once by the engine from the recipe's mean file (--kv-recipe `vmean FILE`, docs/GUIDE.md
+ * §4.4) and uploaded to every rank whole: it is small (24 KiB at Flash-Next), and a rank's KV
+ * heads and query heads are then a slice at an offset it already knows (Geom::kv_off and the
+ * query span), replicated KV heads included.
+ *
+ * `table` is bf16, the attention's activation dtype, [n_layers][2][(n_head_kv + n_head) *
+ * head_dim]; entry [l][r] is layer l's mean in basis r, 0 as the projection writes V and 1
+ * rotated by the normalised Hadamard over head_dim (`had_rotate`), as a rotated layer stores it.
+ * Each entry is first -mu by KV head (n_head_kv * head_dim, what the store's input gets added),
+ * then +mu by query head (n_head * head_dim, query head h taking KV head h / (n_head /
+ * n_head_kv), what the attention output gets added). Both are the one bf16 rounding of mu and
+ * its exact negation, so the subtraction and the addition cancel exactly in the attention's
+ * arithmetic. Entries of layers without RAD_KVQ_VMEAN are zero and not read. Both bases are
+ * there because the MTP head, which shares the last attention layer's cache, takes that layer's
+ * mean in its own basis. */
+typedef struct RadKvVMean {
+    const void* table;       /* device, this rank's copy, bf16 */
+    int64_t     n_layers;    /* entries: the recipe's length (RadBuildCtx::n_kv_recipe) */
+    int64_t     n_head_kv;   /* the model's, over every rank */
+    int64_t     n_head;
+    int64_t     head_dim;
+} RadKvVMean;
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:

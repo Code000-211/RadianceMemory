@@ -15,6 +15,8 @@
  *     Hadamard (`had_rotate`) before the store and the attention, and the attention output back
  *     through it before the gate, so the cache holds rotated K and V and every kernel that reads
  *     it is the unrotated one.
+ *   - Optionally centred (`vmean_sub`/`vmean_add`, --kv-recipe `vmean`): a static mean of V is
+ *     subtracted before the store and added to the attention output before its rotation back.
  *
  * The q|gate projection is [2*n_head*head_dim, n_embd] = [12288, 5120] at 27B, scale plane
  * [96, 40]. Row-sharding by head keeps whole 128-row scale blocks only because 2*head_dim = 512 is
@@ -24,6 +26,7 @@
 #define RAD_BLOCK_ATTN_GATED_FP8_H
 
 #include "rad_fp8.h"
+#include "rad_calib_vmean.h"
 
 #include <cstring>
 
@@ -36,6 +39,34 @@ namespace arch {
 inline bool kv_store_streamed_dtype(const char* kv_dtype) {
     return kv_dtype && (std::strcmp(kv_dtype, "fp8_e4m3") == 0 ||
                         std::strcmp(kv_dtype, "bf16") == 0);
+}
+
+/* Layer `l`'s V mean for this rank (RadKvVMean, abi/rad_builder.h), in the rotated basis when
+ * `rotated`: `sub` is -mu over this rank's KV heads ([kv_dim]) and `add` +mu over its query heads
+ * ([q_dim]), both slices of the one device table. A rank's KV heads start at its row span's
+ * offset when it has one (replicated heads, a smaller attention world; Geom::kv_off) and at
+ * rank * kv_dim on the plain split; its query heads at attn_rank * q_dim either way. Null with a
+ * message where the table is not this model's. */
+inline bool kv_vmean_slices(const RadKvVMean* t, int64_t l, bool rotated, const Geom& g,
+                            const void** sub, const void** add) {
+    *sub = *add = nullptr;
+    if (!t || !t->table || l < 0 || l >= t->n_layers || t->head_dim != g.head_dim ||
+        t->n_head_kv != g.n_head_kv_all || t->n_head != g.n_head_all ||
+        std::strcmp(g.dtype, "bf16")) {
+        fprintf(stderr, "radiance: KV recipe: layer %lld subtracts a V mean and the engine's "
+                        "table does not fit this model (bf16 activations, %lld KV heads of %lld, "
+                        "%lld query heads)\n", (long long)l, (long long)g.n_head_kv_all,
+                (long long)g.head_dim, (long long)g.n_head_all);
+        return false;
+    }
+    const bool spanned = g.world > g.n_head_kv_all || g.attn_world != g.world;
+    const int64_t kv0 = spanned ? g.kv_off : g.attn_rank * g.kv_dim();
+    const int64_t q0  = g.attn_rank * g.q_dim();
+    const int64_t E   = (t->n_head_kv + t->n_head) * t->head_dim;
+    const uint16_t* e = static_cast<const uint16_t*>(t->table) + (l * 2 + (rotated ? 1 : 0)) * E;
+    *sub = e + kv0;
+    *add = e + t->n_head_kv * t->head_dim + q0;
+    return true;
 }
 
 struct AttnGatedFP8 {
@@ -127,6 +158,18 @@ struct AttnGatedFP8 {
      * streamed), and the sparse attention with the gate in its merge. The two-piece prefill path
      * (takes_pieces) is not taken either. */
     bool        rotate = false;
+    /* Subtract a static V mean (RadBuildCtx::kv_vmean, kv_vmean_slices), set before declare: -mu
+     * over this rank's KV heads and +mu over its query heads, bf16 on the device, in the basis
+     * the cache holds. One `add` with its row broadcast takes `sub` off V after the rotation and
+     * before the store; one more puts `add` back on the attention output before the rotation back
+     * (and the gate). A row of attention weights sums to one, so the output is the uncentred one
+     * up to the two adds' rounding, while the integer V layouts quantise a centred V. The folds
+     * that would store V or gate the output inside another kernel are not declared here either,
+     * as for `rotate`. Both null: nothing is declared and the layer is what it was. */
+    const void* vmean_sub = nullptr;
+    const void* vmean_add = nullptr;
+    /* The calibration tap that records V's mean (rad_calib_vmean.h), or null. */
+    CalibVMean* vcal = nullptr;
 
     rad_weight w_norm = 0, w_q_norm = 0, w_k_norm = 0;
     /* The input was normed and quantised by the caller; this block declares no norm. */
@@ -146,6 +189,9 @@ struct AttnGatedFP8 {
     /* had_rotate over head_dim, in place: q, k, v before the store, the output after the attention.
      * Declared only with `rotate`. */
     rad_op     op_rot = 0;
+    /* `add` over V's rows and over the output's, with the mean's row broadcast; declared only with
+     * vmean_sub / vmean_add. */
+    rad_op     op_vsub = 0, op_vadd = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -189,6 +235,14 @@ struct AttnGatedFP8 {
      * stores the same bytes at identity, after the mirror writer. */
     void store_stage_identity(RadCtx* c, const int32_t* slot, int64_t T) const;
 
+    /* V's rows [r0, r0 + n) less the layer's mean (op_vsub), after any rotation and before the
+     * store; nothing on an uncentred layer. */
+    void centre_v(RadCtx* c, int64_t r0, int64_t n) const {
+        if (op_vsub)
+            RAD_ISSUE_N(c, op_vsub, n, brow_slice(w.v, r0, n, g.kv_dim()),
+                        praw(vmean_sub, RAD_BF16, g.kv_dim()), brow_slice(w.v, r0, n, g.kv_dim()));
+    }
+
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
     /* `own_ar` false: the caller issues the all-reduce itself (GdnFP8::step says when). */
@@ -214,7 +268,7 @@ struct AttnGatedFP8 {
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
         return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
-               !op_rot &&
+               !op_rot && !op_vsub &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
                !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
                kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
@@ -373,6 +427,26 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
             return RAD_E_UNSUPPORTED;
         }
     }
+    /* A centred layer's two adds, declared here for the same reason: V's from its projection to
+     * the store, the output's from the attention to the gate. Refused rather than run uncentred:
+     * the recipe said what the cache holds. */
+    if (vmean_sub || vmean_add) {
+        auto add = [&](int64_t n, rad_buf x) {
+            return rw(b, RAD_OP(b, "add",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
+                                     RAD_STR("dtype", g.dtype)),
+                          RAD_NOWEIGHTS),
+                      {x}, {x});
+        };
+        op_vsub = vmean_sub ? add(kv_dim, w.v) : 0;
+        op_vadd = vmean_add ? add(q_dim, w.attn.x) : 0;
+        if (!op_vsub || !op_vadd) {
+            fprintf(stderr, "radiance: KV recipe: layer %d subtracts a V mean and no kernel serves "
+                            "add over rows of %lld and %lld at %s\n", l, (long long)kv_dim,
+                    (long long)q_dim, g.dtype);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
 
     /* Declared before kv_store, which reads back the resolved `block_size`
      * (rad_block_attn_gated.h). */
@@ -431,7 +505,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
      * Resolves for E4M3 and bf16 caches. Not on a rotated layer, whose store follows a rotation. */
-    if (op_fused && !rotate && rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
+    if (op_fused && !rotate && !op_vsub && rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
                                        RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
@@ -445,7 +519,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* The fold for a streamed group: also writes the mirror and consults the residency map, whose
      * operands are added at issue. Gated on the same layouts. */
-    if (op_fused && !rotate && kv_store_streamed_dtype(g.kv_dtype) &&
+    if (op_fused && !rotate && !op_vsub && kv_store_streamed_dtype(g.kv_dtype) &&
         rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
         op_fused_stream = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store_streamed",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
@@ -512,7 +586,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * and quantiser read, so one op merges, gates, rounds and quantises (byte-identical to the
      * pair). Declared only with a selection: the dense path also uses the prefill kernel, which
      * has no merge. Not on a rotated layer, whose output is rotated back before the gate. */
-    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !rotate &&
+    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !rotate && !op_vsub &&
         rad_op_declared(b, "attn_paged_gate_quant")) {
         op_attn_gq = RAD_OP(b, "attn_paged_gate_quant",
                             RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
@@ -614,6 +688,7 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.k, T));
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.v, T));
     }
+    centre_v(c, 0, T);
     store_cache(c, kvb, slot, T);
 }
 
@@ -644,6 +719,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             qg.step(c, w.h, w.qg, T, r0, n);
             kp.step(c, w.h, w.k,  T, r0, n);
             vp.step(c, w.h, w.v,  T, r0, n);
+            if (vcal) vcal->tap(c, layer, w.v, r0, n);
             RAD_ISSUE_N(c, op_q_norm, n * g.n_head,
                         bcol_at(w.qg, r0, qgw, 0, hd, n), RAD_W(w_q_norm),
                         brow_slice(w.q, r0, n, qw));
@@ -683,6 +759,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     qg.step(c, w.h, w.qg, T);
     kp.step(c, w.h, w.k,  T);
     vp.step(c, w.h, w.v,  T);
+    if (vcal) vcal->tap(c, layer, w.v, 0, T);
 
     /* Fused or unfused prologue. The fused kernel takes the whole [q|gate] projection and splits it
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
@@ -733,6 +810,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.k, T));
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.v, T));
     }
+    /* A centred layer's V, in the basis it is stored in (neither fold is declared on it). */
+    centre_v(c, 0, T);
     if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
@@ -891,7 +970,11 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     /* Every attention launch of this layer is issued: start the next layer's stage copy, which
      * crosses the link under the out projection and the next layer's projections. */
     if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
-    /* A rotated layer's output back, before the gate reads it (never `gated`: see declare). */
+    /* A centred layer's mean back on the output, in the cache's basis, so before the rotation;
+     * then a rotated layer's output back, before the gate reads it (never `gated`: see declare). */
+    if (op_vadd)
+        RAD_ISSUE_N(c, op_vadd, T, brows(w.attn.x, T), praw(vmean_add, RAD_BF16, g.q_dim()),
+                    brows(w.attn.x, T));
     if (op_rot) RAD_ISSUE_N(c, op_rot, T * g.n_head, brows(w.attn.x, T));
     if (gated) {
         /* the sparse attention gated and quantised in its merge */

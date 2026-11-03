@@ -1004,6 +1004,207 @@ TEST(a_k4h_v2h_recipe_line_is_rotated_and_priced_at_fourteen_thirty_seconds_of_f
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v2h'"));
 }
 
+namespace {
+
+/* A V mean file for `layers` of a model with `heads` KV heads of `dim`: head h of layer l holds
+ * l + h / 8 + d / 1024 at dim d, so every value says where it came from. */
+std::string vmean_text(const std::vector<int>& layers, int heads, int dim) {
+    std::string t = "# a calibration run's means\nkv_vmean 1 head_dim " + std::to_string(dim) +
+                    " kv_heads " + std::to_string(heads) + " rows 4096\n";
+    char buf[64];
+    for (int l : layers)
+        for (int h = 0; h < heads; ++h) {
+            t += "layer " + std::to_string(l) + " head " + std::to_string(h);
+            for (int d = 0; d < dim; ++d) {
+                std::snprintf(buf, sizeof buf, " %.9g", l + h / 8.0 + d / 1024.0);
+                t += buf;
+            }
+            t += "\n";
+        }
+    return t;
+}
+
+void write_file(const std::string& path, const std::string& text) {
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    CHECK_EQ(std::fwrite(text.data(), 1, text.size(), fp), text.size());
+    std::fclose(fp);
+}
+
+}  /* namespace */
+
+/* A recipe line may end in `vmean` (after `rotated`): that layer subtracts a static V mean
+ * (RAD_KVQ_VMEAN beside its layout and rotation), read from the file the recipe's `vmean FILE`
+ * line names, beside the recipe unless the path is absolute. The file's values are kept as
+ * written, by layer and KV head, and the startup summary lists the centred layers. */
+TEST(a_kv_recipe_layer_ending_in_vmean_takes_its_mean_from_the_file_the_recipe_names) {
+    const std::string dir = radtest::tmp_path("vmean.d");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/flash15.kvmean", vmean_text({ 3, 7, 11, 15 }, 2, 8));
+    write_file(dir + "/r.kvrecipe", "vmean flash15.kvmean   # beside the recipe\n"
+                                    "layer 3 fp8\n"
+                                    "layer 7 k6_v4 vmean\n"
+                                    "layer 11 fp8_v4 rotated vmean\n"
+                                    "layer 15 k4h_v2h vmean\n");
+    Config c;
+    const std::string rp = dir + "/r.kvrecipe";
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }, &c), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vm = RAD_KVQ_VMEAN;
+    REQUIRE_EQ(c.kv_recipe.size(), (size_t)16);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)RAD_KVQ_NONE);
+    CHECK_EQ(c.kv_recipe[7], (int32_t)(RAD_KVQ_K6V4 | vm));
+    CHECK_EQ(c.kv_recipe[11], (int32_t)(RAD_KVQ_V4 | rot | vm));
+    CHECK_EQ(c.kv_recipe[15], (int32_t)(RAD_KVQ_K4HV2H | rot | vm));
+    CHECK_EQ(c.kv_vmean.head_dim, 8);
+    CHECK_EQ(c.kv_vmean.n_head_kv, 2);
+    CHECK_EQ(c.kv_vmean.rows, 4096LL);
+    CHECK_EQ(c.kv_vmean.path, dir + "/flash15.kvmean");
+    REQUIRE_EQ(c.kv_vmean.layer.size(), (size_t)4);
+    CHECK_EQ(c.kv_vmean.layer.at(11)[8 + 3], (float)(11 + 1 / 8.0 + 3 / 1024.0));
+    CHECK_EQ(kv_recipe_summary(c.kv_recipe),
+             std::string("fp8 at layer 3; k6_v4 at layer 7; fp8_v4 rotated at layer 11; k4h_v2h "
+                         "rotated at layer 15; V mean subtracted at layers 7, 11, 15"));
+
+    /* An absolute path is taken as written. */
+    write_file(dir + "/flash7.kvmean", vmean_text({ 7 }, 2, 8));
+    write_file(dir + "/abs.kvrecipe", "vmean " + dir + "/flash7.kvmean\nlayer 7 k4h_v4 vmean\n");
+    Config d;
+    const std::string ap = dir + "/abs.kvrecipe";
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", ap.c_str() }, &d), RAD_OK);
+    CHECK_EQ(d.kv_recipe[7], (int32_t)(RAD_KVQ_K4H | rot | vm));
+    /* Without a `vmean` line or word nothing is read and nothing is kept. */
+    Config e;
+    CHECK_EQ(kv_recipe_parse("layer 3 k6_v4\n", "r.txt", &e.kv_recipe), RAD_OK);
+    CHECK(e.kv_vmean.layer.empty());
+}
+
+/* A V mean that loads wrong is a deployment nobody measured, so the recipe and the file are
+ * refused with the file, the line and the layer named: `vmean` on fp8, or out of order; a `vmean`
+ * word with no file line and a file line no layer reads; and in the file a bad header, a line of
+ * the wrong width, a value that is not a finite number, a head outside the header's, a (layer,
+ * head) twice, a layer missing a head, a `vmean` layer the file does not hold, and a layer the
+ * recipe does not name. The engine refuses the file for a model of other heads or head_dim. */
+TEST(a_malformed_or_mismatched_v_mean_is_refused_by_name) {
+    auto recipe = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        std::string file;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out, &file); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(recipe("vmean m.txt\nlayer 3 fp8 vmean\n"),
+              "line 2: layer 3: 'vmean' is for a layout with integer V"));
+    CHECK(has(recipe("vmean m.txt\nlayer 3 k6_v4 vmean rotated\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("vmean m.txt\nlayer 3 k6_v4 vmean vmean\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("layer 3 k6_v4 vmean\n"),
+              "1 layer(s) say 'vmean' and no 'vmean FILE' line names their means"));
+    CHECK(has(recipe("vmean m.txt\nlayer 3 k6_v4\n"), "'vmean m.txt' and no layer says 'vmean'"));
+    CHECK(has(recipe("vmean\nlayer 3 k6_v4 vmean\n"), "line 1: 'vmean FILE' names the V mean file"));
+
+    auto file = [&](const std::string& text) {
+        KvVMean out;
+        out.head_dim = 7;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_vmean_parse(text, "m.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.layer.empty());
+        CHECK_EQ(out.head_dim, 0);
+        CHECK(has(err, "m.txt"));
+        return err;
+    };
+    const std::string hdr = "kv_vmean 1 head_dim 2 kv_heads 2 rows 9\n";
+    CHECK(has(file("layer 3 head 0 1 2\n"), "line 1: the first line is 'kv_vmean 1 head_dim D"));
+    CHECK(has(file("kv_vmean 2 head_dim 2 kv_heads 2 rows 9\n"), "line 1: the first line is"));
+    CHECK(has(file(""), "no 'kv_vmean 1 head_dim D kv_heads H rows R' line"));
+    CHECK(has(file(hdr + "layer 3 head 0 1\n"), "line 2: layer 3 head 0 has 1 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 2 3\n"), "has 3 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 nan\n"), "'nan' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 1e999\n"), "'1e999' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 2x\n"), "'2x' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 2 1 2\n"), "line 2: layer 3: head 2 is outside the file's 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 2\nlayer 3 head 1 1 2\nlayer 3 head 0 1 2\n"),
+              "line 4: layer 3 head 0 is listed twice"));
+    CHECK(has(file(hdr + "layer 3 head 1 1 2\n"), "layer 3 has no line for head 0"));
+    CHECK(has(file(hdr + "layer -1 head 0 1 2\n"), "line 2: a line is 'layer L head H'"));
+
+    /* Through the flag: the file's layers against the recipe's. */
+    const std::string dir = radtest::tmp_path("vmean.bad");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/m.kvmean", vmean_text({ 3, 9 }, 2, 8));
+    auto flag = [&](const std::string& text) {
+        write_file(dir + "/r.kvrecipe", text);
+        const std::string rp = dir + "/r.kvrecipe";
+        int rc = RAD_OK;
+        const std::string err = stderr_of(
+            [&] { rc = parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        return err;
+    };
+    CHECK(has(flag("vmean m.kvmean\nlayer 3 k6_v4 vmean\nlayer 7 k6_v4 vmean\nlayer 9 fp8\n"),
+              "layer 7 says 'vmean' and " + dir + "/m.kvmean has no V mean for it"));
+    CHECK(has(flag("vmean m.kvmean\nlayer 3 k6_v4 vmean\n"),
+              "holds layer 9, which the recipe does not name"));
+    CHECK(has(flag("vmean gone.kvmean\nlayer 3 k6_v4 vmean\n"),
+              "cannot read its V mean file '" + dir + "/gone.kvmean'"));
+
+    /* Against the model, at startup. */
+    KvVMean v;
+    REQUIRE_EQ(kv_vmean_parse(vmean_text({ 3 }, 2, 8), "m.txt", &v), RAD_OK);
+    std::vector<int32_t> r(4, -1);
+    r[3] = RAD_KVQ_K6V4 | RAD_KVQ_VMEAN;
+    std::vector<uint16_t> t = { 1 };
+    std::string err = stderr_of([&] { CHECK_EQ(kv_vmean_table(v, r, 16, 2, 4, &t), RAD_E_INVAL); });
+    CHECK(has(err, "m.txt holds 2 KV heads of 8 and this model has 2 of 16"));
+    CHECK(t.empty());
+    err = stderr_of([&] { CHECK_EQ(kv_vmean_table(v, r, 8, 4, 8, &t), RAD_E_INVAL); });
+    CHECK(has(err, "this model has 4 of 8"));
+    r[1] = RAD_KVQ_V4 | RAD_KVQ_VMEAN;
+    err = stderr_of([&] { CHECK_EQ(kv_vmean_table(v, r, 8, 2, 4, &t), RAD_E_INVAL); });
+    CHECK(has(err, "m.txt has no V mean for layer 1"));
+}
+
+/* The table the engine uploads (RadKvVMean): per layer and basis, -mu by KV head then +mu by query
+ * head, query head h taking KV head h / gqa; the plain basis is the file's values, the rotated one
+ * H mu / sqrt(D) in had_rotate's (Sylvester) order; both the one bf16 rounding of mu, the
+ * subtraction its exact negation; a layer without `vmean` is zero. Small enough to check by hand:
+ * D = 4, two KV heads, four query heads. */
+TEST(the_v_mean_table_holds_minus_mu_by_kv_head_and_mu_by_query_head_in_both_bases) {
+    KvVMean v;
+    REQUIRE_EQ(kv_vmean_parse("kv_vmean 1 head_dim 4 kv_heads 2 rows 1\n"
+                              "layer 1 head 0 1 2 3 4\nlayer 1 head 1 0.5 0 0 -0.5\n"
+                              "layer 0 head 0 9 9 9 9\nlayer 0 head 1 9 9 9 9\n",
+                              "m.txt", &v),
+             RAD_OK);
+    std::vector<int32_t> r = { RAD_KVQ_K6V4, RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VMEAN };
+    std::vector<uint16_t> t;
+    REQUIRE_EQ(kv_vmean_table(v, r, 4, 2, 4, &t), RAD_OK);
+    const size_t E = (2 + 4) * 4;
+    REQUIRE_EQ(t.size(), 2 * 2 * E);
+    auto f = [](uint16_t b) {
+        const uint32_t u = (uint32_t)b << 16;
+        float x;
+        std::memcpy(&x, &u, 4);
+        return x;
+    };
+    for (size_t i = 0; i < 2 * E; ++i) CHECK_EQ(t[i], (uint16_t)0);   /* layer 0: no vmean */
+    const float plain[2][4] = { { 1, 2, 3, 4 }, { 0.5f, 0, 0, -0.5f } };
+    /* H4 / 2 over (1, 2, 3, 4): (10, -2, -4, 0) / 2; over (0.5, 0, 0, -0.5): (0, 1, 1, 0) / 2. */
+    const float rotd[2][4] = { { 5, -1, -2, 0 }, { 0, 0.5f, 0.5f, 0 } };
+    for (int b = 0; b < 2; ++b) {
+        const uint16_t* e = t.data() + (2 + b) * E;
+        const float (*mu)[4] = b ? rotd : plain;
+        for (int k = 0; k < 2; ++k)
+            for (int d = 0; d < 4; ++d) {
+                CHECK_EQ(f(e[k * 4 + d]), -mu[k][d]);
+                CHECK_EQ((uint16_t)(e[k * 4 + d] ^ 0x8000u), e[8 + 2 * k * 4 + d]);
+            }
+        for (int h = 0; h < 4; ++h)
+            for (int d = 0; d < 4; ++d) CHECK_EQ(f(e[8 + h * 4 + d]), mu[h / 2][d]);
+    }
+}
+
 /* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
  * rounded up to the group's page at startup. The mode flag is gone, and a launch line that still
  * passes it is refused by name rather than silently served without streaming. */

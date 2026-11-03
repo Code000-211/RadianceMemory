@@ -896,6 +896,14 @@ k = int((np.sqrt(8 * t.size + 1) - 1) / 2)
 H = np.zeros((k, k), np.float32); H[np.triu_indices(k)] = t; H = H + np.triu(H, 1).T
 ```
 
+**The V means.** On `qwen4exp_fp8` the same run, `--calib-corpus` or `--kld-record` beside
+`--calib-dir`, also records each trunk attention layer's mean of V per KV head, as the V
+projection writes it (before a rotated layer's rotation), into `DIR/kv_vmean.txt`: the file a KV
+recipe's `vmean FILE` line names (GUIDE.md §4.4 gives the format and what it is for). Each rank
+sums its own KV heads' rows in f64 on the host, one copy back a layer and step, and the rank whose
+heads complete the set writes the file once every layer has seen the corpus's tokens. Record it
+over long documents with a bf16 cache, and not over the documents the KL mode will score.
+
 ## rad-autoquant
 
 ```

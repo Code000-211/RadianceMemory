@@ -1028,6 +1028,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
         cvec_views_[(size_t) rank].dir)
         bc.cvec = &cvec_views_[(size_t) rank];
+    /* The recipe's V means, this rank's copy; a plugin reads them at declare only. */
+    if (rank >= 0 && rank < (int) kv_vmean_views_.size() && kv_vmean_views_[(size_t) rank].table)
+        bc.kv_vmean = &kv_vmean_views_[(size_t) rank];
     return bc;
 }
 
@@ -1206,6 +1209,16 @@ int Engine::declare() {
                     kv_layout_name(q), plugins_.arch_plugin.c_str());
             return RAD_E_UNSUPPORTED;
         }
+        /* The `vmean` layers' table, against this model's heads; uploaded per rank at declare.
+         * Whether the plugin serves RAD_KVQ_VMEAN is its own to say, naming the layer. */
+        kv_vmean_table_.clear();
+        if (!cfg_.kv_vmean.layer.empty()) {
+            RAD_TRY(kv_vmean_table(cfg_.kv_vmean, cfg_.kv_recipe, meta_.head_dim,
+                                   meta_.n_head_kv ? meta_.n_head_kv : meta_.n_head, meta_.n_head,
+                                   &kv_vmean_table_));
+            RAD_INFO("kv recipe %s: V means from %s (%lld tokens)", cfg_.kv_recipe_path.c_str(),
+                     cfg_.kv_vmean.path.c_str(), cfg_.kv_vmean.rows);
+        }
     }
     /* The row split is a graph only the plugin can declare, and it splits over ranks. A plugin
      * that does not say it serves it (RadArchProbe::tp_attn_rows_ok), or a single rank, would
@@ -1364,6 +1377,7 @@ int Engine::declare() {
             return RAD_E_INVAL;
         }
     }
+    kv_vmean_views_.assign(ranks_.size(), RadKvVMean{});
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
@@ -1416,6 +1430,31 @@ int Engine::declare() {
                     return;
                 }
                 cvec_views_[(size_t)ri] = control_vector_view(cvec_, d);
+            }
+            /* This rank's copy of the V mean table likewise; once, as a later declare reuses it. */
+            if (!kv_vmean_table_.empty() && !kv_vmean_views_[(size_t)ri].table) {
+                const int64_t bytes = (int64_t)kv_vmean_table_.size() * 2;
+                void* d = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+                RadStream s = nullptr;
+                int rc = d && rad_stream_create(&s, 0) >= 0 ? 0 : -1;
+                if (rc == 0) {
+                    rc = rad_memcpy_async(d, kv_vmean_table_.data(), bytes, s);
+                    rad_stream_sync(s);
+                    rad_stream_destroy(s);
+                }
+                if (rc < 0) {
+                    RAD_ERR("rank %d: could not put the KV recipe's V means on the card: %s", ri,
+                            rad_dev_last_error());
+                    if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+                    st[(size_t)ri] = RAD_E_DEVICE;
+                    return;
+                }
+                RadKvVMean& v = kv_vmean_views_[(size_t)ri];
+                v.table     = d;
+                v.n_layers  = (int64_t)cfg_.kv_recipe.size();
+                v.n_head_kv = cfg_.kv_vmean.n_head_kv;
+                v.n_head    = meta_.n_head;
+                v.head_dim  = cfg_.kv_vmean.head_dim;
             }
             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
             LoraDeclare ld;

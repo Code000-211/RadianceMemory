@@ -783,6 +783,17 @@ struct Request {
 /* --p2p: whether the collectives use the cards' peer access. */
 enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
+/* A KV recipe's V means (--kv-recipe `vmean FILE`, docs/GUIDE.md §4.4): per listed layer the mean
+ * of V over a calibration corpus, KV head by KV head, in the basis the V projection writes
+ * (kv_vmean_parse gives the file format). `layer[l]` is n_head_kv * head_dim floats. */
+struct KvVMean {
+    std::string path;
+    int64_t     head_dim  = 0;
+    int64_t     n_head_kv = 0;
+    long long   rows      = 0;     /* tokens the means were taken over, for provenance */
+    std::map<int, std::vector<float>> layer;
+};
+
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
@@ -860,10 +871,14 @@ struct Config {
      * checked at parse, so a malformed file stops the start before the model is opened; the plugin
      * then checks it against the model's layers (RadBuildCtx::kv_recipe). `kv_recipe` is indexed
      * by layer, a RAD_KVQ_* (with RAD_KVQ_ROTATED for a `rotated` line or a k4h layout) or -1 where the file names
-     * no such layer, and empty without a recipe.
+     * no such layer, and empty without a recipe. RAD_KVQ_VMEAN marks a `vmean` layer.
      * A recipe narrows the fp8 cache, so it needs --kv-cache-dtype fp8. */
     std::string kv_recipe_path;
     std::vector<int32_t> kv_recipe;
+    /* The recipe's `vmean FILE`, read at parse when a layer says `vmean` (RAD_KVQ_VMEAN): each
+     * listed layer's V mean by KV head, as the projection writes V (unrotated). Empty (no layers)
+     * without one. Checked against the model's heads and head_dim at startup (kv_vmean_table). */
+    KvVMean kv_vmean;
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
     /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
@@ -1222,10 +1237,26 @@ namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 /* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
  * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4 and k4h_v2h, rotated
- * layouts) or -1.
+ * layouts, and RAD_KVQ_VMEAN where it ends in `vmean`) or -1. `vmean_file`, when given, receives
+ * the path a `vmean FILE` line names, as written.
  * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
  * is then left empty. */
-int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out);
+int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out,
+                     std::string* vmean_file = nullptr);
+/* A recipe's V mean file (`vmean FILE`) into KvVMean. The text format, a line a (layer, KV head):
+ *
+ *     kv_vmean 1 head_dim D kv_heads H rows R
+ *     layer L head h  v_0 v_1 ... v_{D-1}
+ *
+ * `#` starts a comment. Refused with the file and the line named: a missing or wrong header, a
+ * line of other than D values, a value that is not a finite number, a head outside 0..H-1, a
+ * (layer, head) twice, or a layer missing one of its heads. */
+int  kv_vmean_parse(const std::string& text, const char* name, KvVMean* out);
+/* The RadKvVMean table (abi/rad_builder.h) for `recipe`'s RAD_KVQ_VMEAN layers, bf16 bits, from
+ * `vm` for a model of `n_head` query heads over `n_head_kv` KV heads of `head_dim`. Refused, the
+ * file named, where its head_dim or KV heads are not the model's or a vmean layer has no entry. */
+int  kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_t head_dim,
+                    int64_t n_head_kv, int64_t n_head, std::vector<uint16_t>* out);
 /* A recipe's RAD_KVQ_* by its name in the file (fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h), and back; -1 / null for
  * anything else. */
 int         kv_layout_of(const char* name);

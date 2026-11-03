@@ -9454,8 +9454,9 @@ TEST(a_rotated_kv_recipe_entry_is_refused_where_its_layer_or_layout_would_be) {
     std::vector<int32_t> gdn = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
     gdn[2] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED;
     CHECK(has(refusal(gdn), "layer 2 keeps no attention cache"));
-    CHECK(has(refusal(q35_recipe(RAD_KVQ_NONE, RAD_KVQ_ROTATED | 0x200)),
-              "layer 7 asks for layout 512"));
+    /* 0x400: past RAD_KVQ_VMEAN (0x200, ABI 38), the first bit the ABI does not define. */
+    CHECK(has(refusal(q35_recipe(RAD_KVQ_NONE, RAD_KVQ_ROTATED | 0x400)),
+              "layer 7 asks for layout 1024"));
 }
 
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob
@@ -10558,6 +10559,279 @@ TEST(a_k4h_v2h_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
                                         { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
                                           (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED })),
               "layer 7 asks for k4h_v2h"));
+}
+
+namespace {
+
+/* A V mean table as the engine hands it over (RadKvVMean, abi/rad_builder.h), here on the host:
+ * the plugin records the pointers and never reads them. Flash-Next's fixture is 8 layers of 24
+ * query heads over 2 KV heads of 256, so an entry is (2 + 24) * 256 bf16 and a layer has two, the
+ * plain basis and the rotated one. */
+struct VMeanFix {
+    static constexpr int64_t kE = (2 + 24) * 256;
+    std::vector<uint16_t> t;
+    RadKvVMean v{};
+    VMeanFix() : t((size_t)(8 * 2 * kE), 0) {
+        v.table = t.data();
+        v.n_layers = 8;
+        v.n_head_kv = 2;
+        v.n_head = 24;
+        v.head_dim = 256;
+    }
+    /* Where layer l's entry in basis r starts, in elements. */
+    static int64_t entry(int l, int r) { return (l * 2 + r) * kE; }
+    /* This rank's first KV head and first query head, in elements: the KV heads split over two
+     * ranks and are replicated over a pair at four; the query heads split evenly. */
+    static int64_t kv0(int rank, int world) { return (world == 4 ? rank / 2 : world == 2 ? rank : 0) * 256; }
+    static int64_t q0(int rank, int world) { return rank * (24 / world) * 256; }
+};
+
+/* What a pass does around `layer`'s cache, as around_layer says it (the rotations by buffer, the
+ * store and the attention), with the adds whose broadcast row lies in `fx`'s table named by the
+ * buffer they change, `sub:v` and `add:out`; each such row's element offset into the table goes to
+ * `offs`. */
+std::vector<std::string> around_centred(const RadBuilder& b, const RadCtx& c, int layer,
+                                        const VMeanFix& fx, std::vector<int64_t>* offs) {
+    std::vector<std::string> seq;
+    const char* lo = reinterpret_cast<const char*>(fx.t.data());
+    const char* hi = lo + fx.t.size() * 2;
+    auto ends = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    auto name_of = [&](const RadOperand& d) {
+        return d.handle >= 1 && d.handle <= b.bufs.size() ? b.bufs[d.handle - 1].name
+                                                           : std::string("?");
+    };
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_rotate") {
+            const std::string nm = name_of(i.opd.at(0));
+            seq.push_back(ends(nm, "attn_q") ? "rot:q" : ends(nm, "attn_k") ? "rot:k"
+                        : ends(nm, "attn_v") ? "rot:v" : ends(nm, "attn_out") ? "rot:out"
+                        : "rot:" + nm);
+            continue;
+        }
+        if (o->op == "add" && i.opd.size() >= 3 && i.opd[1].kind == RAD_OPK_RAW) {
+            const char* r = static_cast<const char*>(i.opd[1].raw);
+            if (r < lo || r >= hi) continue;
+            const std::string nm = name_of(i.opd.at(0));
+            seq.push_back(ends(nm, "attn_v") ? "sub:v" : ends(nm, "attn_out") ? "add:out"
+                                                                                : "add:" + nm);
+            offs->push_back((int64_t)(r - lo) / 2);
+            continue;
+        }
+        if (o->op != "kv_store" && o->op.rfind("attn_paged", 0) != 0) continue;
+        for (const RadOperand& d : i.opd)
+            if (d.kind == RAD_OPK_KV && d.offset == layer) { seq.push_back(o->op); break; }
+    }
+    return seq;
+}
+
+/* Two programs' ops, in order, leaving out a centred layer's two adds (an `add` over a buffer
+ * named attn_v or attn_out alone) and the folds a centred layer does not declare (the prologue with
+ * the store in it, the gate in the sparse attention's merge): what remains must be the same ops
+ * with the same parameters. */
+std::string ops_but_centring_diff(const RadBuilder& a, const RadBuilder& b) {
+    auto keep = [](const RadBuilder& rb, const RecOp& o) {
+        if (o.op == "attn_paged_gate_quant" || o.op == "qk_norm_rope_gate_kv_store" ||
+            o.op == "qk_norm_rope_gate_kv_store_streamed")
+            return false;
+        if (o.op != "add" || o.reads.size() != 1) return true;
+        const rad_buf h = o.reads[0];
+        const std::string nm = h >= 1 && h <= rb.bufs.size() ? rb.bufs[h - 1].name : "";
+        const bool centring = (nm.size() >= 6 && nm.compare(nm.size() - 6, 6, "attn_v") == 0) ||
+                              (nm.size() >= 8 && nm.compare(nm.size() - 8, 8, "attn_out") == 0);
+        return !centring;
+    };
+    std::vector<const RecOp*> x, y;
+    for (const auto& o : a.ops) if (keep(a, o)) x.push_back(&o);
+    for (const auto& o : b.ops) if (keep(b, o)) y.push_back(&o);
+    if (x.size() != y.size()) return "op count";
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i]->op != y[i]->op || x[i]->p.size() != y[i]->p.size()) return "op " + x[i]->op;
+        for (size_t j = 0; j < x[i]->p.size(); ++j) {
+            const RecParam& p = x[i]->p[j];
+            const RecParam& q = y[i]->p[j];
+            if (p.key != q.key || p.ival != q.ival || p.ihi != q.ihi || p.dval != q.dval ||
+                p.sval != q.sval)
+                return "op " + x[i]->op + ", parameter " + p.key;
+        }
+    }
+    return "";
+}
+
+}  /* namespace */
+
+/* A `vmean` recipe layer on Flash-Next (RAD_KVQ_VMEAN), layer 3 in fp8_v4 plain and in k4h_v4
+ * (rotated), layer 7 k6_v4 as it was, at one, two and four ranks: the layer declares two bf16 adds,
+ * over V's rows (kv_dim wide) and over the output's (q_dim), and every other op is the uncentred
+ * recipe's, with the same groups. In a pass the add takes -mu off V after the rotations and before
+ * the store, and puts mu back on the output after the attention and before the rotation back; the
+ * rows it broadcasts are this rank's slices of layer 3's entry in the layer's own basis (its KV
+ * heads at the rank's KV offset, replicated at four ranks, and its query heads). On the sparse
+ * decode the gate is the separate op, not the merge's, and layer 7 keeps its fold. */
+TEST(a_vmean_kv_recipe_layer_on_flashnext_centres_v_before_its_store_and_the_output_after) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VMeanFix fx;
+    for (int q : { (int)RAD_KVQ_V4, (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                const bool rot = (q & RAD_KVQ_ROTATED) != 0;
+                std::vector<int32_t> plain(8, -1), cen(8, -1);
+                plain[3] = q;
+                cen[3] = q | RAD_KVQ_VMEAN;
+                plain[7] = cen[7] = RAD_KVQ_K6V4;
+                RadBuildCtx pc = with_recipe(q4_ctx(rank, world), plain);
+                RadBuildCtx cc = with_recipe(q4_ctx(rank, world), cen);
+                pc.kv_residency = cc.kv_residency = 1;
+                cc.kv_vmean = &fx.v;
+                RadBuilder a, b;
+                a.encs = b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &cc), RAD_OK);
+                CHECK_EQ(ops_but_centring_diff(a, b), std::string());
+                REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+                for (size_t i = 0; i < a.kv_groups.size(); ++i)
+                    CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d,
+                                       sizeof a.kv_groups[i].d));
+                CHECK(a.binds == b.binds);
+                const int64_t kv_dim = (world == 4 ? 1 : 2 / world) * 256;
+                const int64_t q_dim = 24 / world * 256;
+                std::vector<long long> widths;
+                for (const auto& o : b.ops)
+                    if (o.op == "add" && o.reads.size() == 1) widths.push_back(pint(&o, "n"));
+                CHECK(std::count(widths.begin(), widths.end(), (long long)kv_dim) == 1);
+                CHECK(std::count(widths.begin(), widths.end(), (long long)q_dim) == 1);
+
+                const int64_t base = VMeanFix::entry(3, rot ? 1 : 0);
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    std::vector<int64_t> offs;
+                    const std::vector<std::string> seq = around_centred(b, *v[0], 3, fx, &offs);
+                    std::vector<std::string> head = { "sub:v", "kv_store" };
+                    if (rot) head.insert(head.begin(), { "rot:q", "rot:k", "rot:v" });
+                    REQUIRE(seq.size() >= head.size() + 2);
+                    CHECK(std::vector<std::string>(seq.begin(), seq.begin() + head.size()) == head);
+                    for (size_t j = head.size(); j + 1 + rot < seq.size(); ++j)
+                        CHECK_EQ(seq[j], std::string("attn_paged"));
+                    CHECK_EQ(seq[seq.size() - 1 - rot], std::string("add:out"));
+                    if (rot) CHECK_EQ(seq.back(), std::string("rot:out"));
+                    REQUIRE_EQ(offs.size(), (size_t)2);
+                    CHECK_EQ(offs[0], base + VMeanFix::kv0(rank, world));
+                    CHECK_EQ(offs[1], base + 2 * 256 + VMeanFix::q0(rank, world));
+                    /* The decode kit takes the sparse path, where layer 7 still gates in its
+                     * merge and layer 3 does not. */
+                    if (k->b.n_seq == 4) {
+                        bool merged7 = false;
+                        std::vector<int64_t> o7;
+                        for (const std::string& e : around_centred(b, *v[0], 7, fx, &o7))
+                            merged7 = merged7 || e == "attn_paged_gate_quant";
+                        CHECK(merged7);
+                    }
+                }
+            }
+}
+
+/* The MTP head shares the last attention layer's cache, so behind a `vmean` layer 7 it centres V
+ * on layer 7's mean, in its own basis: rotated behind k4h_v4 (whose group holds rotated K and V
+ * only), plain behind a rotated k6_v4 layer (the head is unrotated there). Its history pass after a
+ * verify issues the two adds with layer 7's slices, and the steps lint clean. */
+TEST(the_mtp_head_behind_a_vmean_layer_on_flashnext_takes_that_layers_mean) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VMeanFix fx;
+    for (int q : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K6V4 })
+        for (int world : { 1, 2 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> r(8, -1);
+                r[3] = RAD_KVQ_NONE;
+                r[7] = q | RAD_KVQ_ROTATED | RAD_KVQ_VMEAN;
+                RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+                ctx.kv_vmean = &fx.v;
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                const auto ver = kit(b, std::vector<int>(4, 4), {});
+                const auto his = history_pass(b, *ver);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank,
+                                          world);
+                CHECK_PASSES(b, v);
+                const bool head_rot = q == RAD_KVQ_K4H;
+                std::vector<int64_t> offs;
+                const std::vector<std::string> seq = around_centred(b, *v[1], 8, fx, &offs);
+                REQUIRE(!offs.empty());
+                CHECK_EQ(offs[0], VMeanFix::entry(7, head_rot ? 1 : 0) + VMeanFix::kv0(rank, world));
+                CHECK(std::find(seq.begin(), seq.end(), "sub:v") < std::find(seq.begin(), seq.end(),
+                                                                               "kv_store"));
+                /* The trunk's layer 7 in the verify, rotated in both cases. */
+                std::vector<int64_t> o7;
+                (void)around_centred(b, *v[0], 7, fx, &o7);
+                REQUIRE(!o7.empty());
+                CHECK_EQ(o7[0], VMeanFix::entry(7, 1) + VMeanFix::kv0(rank, world));
+            }
+}
+
+/* Without a `vmean` layer nothing of the mean reaches the program: the same recipe declares the
+ * same program byte for byte with the engine's table handed over or not, at one, two and four
+ * ranks, so a recipe that does not ask for it is what it was. */
+TEST(without_a_vmean_layer_the_flashnext_program_is_unchanged_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VMeanFix fx;
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED;
+    r[7] = RAD_KVQ_V4;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx pc = with_recipe(q4_ctx(rank, world), r);
+            RadBuildCtx tc = pc;
+            tc.kv_vmean = &fx.v;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &tc), RAD_OK);
+            CHECK_EQ(program_diff(a, b), std::string());
+        }
+}
+
+/* What cannot be centred is refused naming the layer: a mean on fp8 (no integer V; a hand-built
+ * entry, the recipe parser never makes one), a `vmean` layer without the engine's table, a table
+ * of another geometry, and the mean on qwen35_fp8, which does not serve it. */
+TEST(a_vmean_layer_that_cannot_be_centred_is_refused_naming_the_layer) {
+    MetaKV mk = q4_small();
+    VMeanFix fx;
+    auto refusal = [&](const std::vector<int32_t>& r, const RadKvVMean* t) {
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        ctx.kv_vmean = t;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    const int32_t vm = RAD_KVQ_VMEAN;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_NONE | vm, -1, -1, -1, RAD_KVQ_V4 }, &fx.v),
+              "layer 3 subtracts a V mean, which only a layout with integer V takes"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_V4 | vm, -1, -1, -1, RAD_KVQ_V4 }, nullptr),
+              "layer 3 subtracts a V mean, which the engine did not hand over"));
+    VMeanFix narrow;
+    narrow.v.head_dim = 128;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_V4, -1, -1, -1, RAD_KVQ_V4 | vm }, &narrow.v),
+              "layer 7 subtracts a V mean and the engine's table does not fit this model"));
+
+    MetaKV q35 = q35fp8_meta();
+    const std::vector<int32_t> r35 = q35_recipe(RAD_KVQ_V4 | vm, RAD_KVQ_V4);
+    const RadBuildCtx ctx = with_recipe(build_ctx(), r35);
+    RadBuilder b;
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, q35.meta(), &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(has(err, "layer 3 subtracts a V mean, which this plugin does not serve"));
 }
 
 /* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked

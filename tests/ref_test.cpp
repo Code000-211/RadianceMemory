@@ -26,6 +26,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <cstdlib>
 #include <cstring>
@@ -3747,6 +3748,117 @@ TEST(a_k4h_v2h_cache_of_the_wrong_shape_is_refused) {
              .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
              .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k4h_v2h");
     CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
+/* ================================================================== a static V mean (vmean) */
+namespace {
+
+/* attend_k4h's prefill at `layout` (k4h_v4, k4h_v2h, or bf16 for an unquantised cache), centred as
+ * a recipe's `vmean` layer runs it when `mu` is given ([nkv * hd], the plain basis): after the
+ * rotations V gets -mu (rotated with it on a rotated layer) added with `add`'s row broadcast, the
+ * store and the attention run as ever, and the output gets mu, by query head, before its rotation
+ * back. Both rows are the bf16 rounding of mu and its negation, as the engine's table holds them. */
+std::vector<float> attend_centred(const char* layout, const std::vector<float>& q,
+                                  const std::vector<float>& k, const std::vector<float>& v,
+                                  int64_t Tn, bool rotated, const std::vector<float>* mu) {
+    const bool b16 = std::strcmp(layout, "bf16") == 0;
+    const int64_t r16 = b16 ? 32 : std::strcmp(layout, "k4h_v2h") == 0 ? 14 : 18;
+    const int64_t hd = 256, nh = 4, nkv = 2, bs = 16;
+    T tq(RAD_BF16, {Tn, nh, hd}), tk(RAD_BF16, {Tn, nkv, hd}), tv(RAD_BF16, {Tn, nkv, hd});
+    tq.f(q); tk.f(k); tv.f(v);
+    if (rotated) {
+        CHECK_OK(had_rotate(tq, hd, hd));
+        CHECK_OK(had_rotate(tk, hd, hd));
+        CHECK_OK(had_rotate(tv, hd, hd));
+    }
+    T sub(RAD_BF16, {nkv * hd}), add(RAD_BF16, {nh * hd});
+    if (mu) {
+        T m(RAD_F32, {nkv, hd});
+        m.f(*mu);
+        if (rotated) CHECK_OK(had_rotate(m, hd, hd));
+        std::vector<float> sv((size_t)(nkv * hd)), av((size_t)(nh * hd));
+        for (int64_t i = 0; i < nkv * hd; ++i)
+            sv[(size_t)i] = -rad_bf16_to_f32(rad_f32_to_bf16(m.at(i)));
+        for (int64_t h = 0; h < nh; ++h)
+            for (int64_t d = 0; d < hd; ++d)
+                av[(size_t)(h * hd + d)] = -sv[(size_t)((h / (nh / nkv)) * hd + d)];
+        sub.f(sv);
+        add.f(av);
+        A as; as.t(tv).t(sub).t(tv).i("M", Tn).i("n", nkv * hd).s("dtype", "bf16");
+        CHECK_OK(run("add", as));
+    }
+    T sm(RAD_I32, {Tn});
+    std::vector<int64_t> slots;
+    for (int64_t t = 0; t < Tn; ++t) slots.push_back(t);
+    sm.n(slots);
+    T kv(b16 ? RAD_BF16 : RAD_F8E4M3, {1, nkv, bs, r16 * hd / 16});
+    A st; st.t(tk).t(tv).t(sm).t(kv)
+             .i("M", Tn).i("head_dim", hd).i("n_head_kv", nkv).i("block_size", bs)
+             .s("kv_dtype", layout);
+    CHECK_OK(run("kv_store", st));
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T out(RAD_BF16, {Tn, nh, hd});
+    A at; at.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "bf16").s("kv_dtype", layout);
+    CHECK_OK(run("attn_paged", at));
+    if (mu) {
+        A aa; aa.t(out).t(add).t(out).i("M", Tn).i("n", nh * hd).s("dtype", "bf16");
+        CHECK_OK(run("add", aa));
+    }
+    if (rotated) CHECK_OK(had_rotate(out, hd, hd));
+    std::vector<float> o((size_t)(Tn * nh * hd));
+    for (size_t i = 0; i < o.size(); ++i) o[i] = out.at((int64_t)i);
+    return o;
+}
+
+}  /* namespace */
+
+/* The ticket's identity, P (V - mu) + mu = P V, on the reference: V carries a per-channel offset
+ * as Flash-Next's does (the mean's norm 0.8 of V's RMS), and over an unquantised bf16 cache the
+ * centred path, plain and rotated, is the uncentred one within bf16's rounding of the exact
+ * attention: a row of attention weights sums to one, so the mean comes back whole. Then the
+ * reason for it: over the integer V layouts the centred path's error against the exact attention
+ * is well under the uncentred one's, k4h_v4 and k4h_v2h alike, the mean taken from other tokens
+ * than the ones attended (as a calibration's is). */
+TEST(subtracting_a_v_mean_before_the_store_and_adding_it_after_the_attention_is_exact_and_helps) {
+    const int64_t Tn = 16, hd = 256, nh = 4, nkv = 2;   /* one 16-slot block */
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> off((size_t)(nkv * hd));
+    for (auto& x : off) x = 0.8f * nd(rng);
+    auto draw = [&](int64_t n) {
+        std::vector<float> q((size_t)(n * nh * hd)), k((size_t)(n * nkv * hd)),
+                           v((size_t)(n * nkv * hd));
+        for (auto& x : q) x = nd(rng);
+        for (auto& x : k) x = 0.3f * nd(rng);
+        for (size_t i = 0; i < v.size(); ++i) v[i] = off[i % (size_t)(nkv * hd)] + 0.6f * nd(rng);
+        for (auto* w : { &q, &k, &v })
+            for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+        return std::make_tuple(q, k, v);
+    };
+    /* The mean from a calibration draw, applied to another. */
+    const auto [cq, ck, cv] = draw(64);
+    std::vector<float> mu((size_t)(nkv * hd), 0.0f);
+    for (size_t i = 0; i < cv.size(); ++i) mu[i % mu.size()] += cv[i] / 64.0f;
+    const auto [q, k, v] = draw(Tn);
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+
+    for (bool rot : { false, true }) {
+        const double e_plain = rel_l2(attend_centred("bf16", q, k, v, Tn, rot, nullptr), exact);
+        const double e_cent = rel_l2(attend_centred("bf16", q, k, v, Tn, rot, &mu), exact);
+        std::printf("    bf16 cache%s: plain vs exact %.3g, centred vs exact %.3g\n",
+                    rot ? ", rotated" : "", e_plain, e_cent);
+        CHECK(e_cent < 8e-3);
+    }
+    for (const char* layout : { "k4h_v4", "k4h_v2h" }) {
+        const double e_plain = rel_l2(attend_centred(layout, q, k, v, Tn, true, nullptr), exact);
+        const double e_cent = rel_l2(attend_centred(layout, q, k, v, Tn, true, &mu), exact);
+        std::printf("    %s: plain vs exact %.3g, centred vs exact %.3g\n", layout, e_plain,
+                    e_cent);
+        CHECK(e_cent < 0.8 * e_plain);
+    }
 }
 
 TEST(op_attn_dense) {

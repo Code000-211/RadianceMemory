@@ -141,6 +141,11 @@ struct Model {
     std::vector<int> kvq;
     /* Each trunk layer's RAD_KVQ_ROTATED (a `rotated` recipe line): AttnGatedFP8::rotate. */
     std::vector<char> kvrot;
+    /* Each trunk layer's RAD_KVQ_VMEAN (a `vmean` recipe line): AttnGatedFP8::vmean_sub/add from
+     * RadBuildCtx::kv_vmean. */
+    std::vector<char> kvmean;
+    /* The V means' calibration tap under --calib-dir (rad_calib_vmean.h). */
+    CalibVMean vcal;
     /* PLE lives on exactly one layer; -1 when the checkpoint has none or this build does not
      * declare that layer. */
     PleLayer    ple;
@@ -689,7 +694,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * (RAD_KVQ_K4H in abi/rad_builder.h): an entry without the rotation, or the layout as
          * every layer's kv_quant, is refused rather than store unrotated keys in four bits.
          * k4h_v2h (int4 K, variance-normalised int2 V, 14 * head_dim / 16 bytes; RAD_KVQ_K4HV2H)
-         * likewise. */
+         * likewise.
+         *
+         * `vmean` (RAD_KVQ_VMEAN) centres a layer's V on a static mean before an integer V
+         * layout stores it (AttnGatedFP8::vmean_sub); it needs the engine's table and a layout
+         * with integer V, and is refused, naming the layer, otherwise. */
         auto kvq_name = [](int q) -> const char* {
             return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4"
                  : q == RAD_KVQ_K4H ? "k4h_v4" : q == RAD_KVQ_K4HV2H ? "k4h_v2h" : nullptr;
@@ -698,6 +707,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const bool f8 = fd.dtype == RAD_F8E4M3;
         std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
         std::vector<char> rot_of((size_t)g.n_layer, 0);
+        std::vector<char> vmean_of((size_t)g.n_layer, 0);
         if (ctx->kv_recipe) {
             if (!f8) {
                 fprintf(stderr, "radiance: a KV recipe chooses layouts of the fp8 cache, and this "
@@ -708,7 +718,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (ctx->kv_recipe[l] < 0) continue;
                 /* The layout, and apart from it whether the layer runs rotated, which any layout
                  * can: the rotation is an op of its own beside the layout's rows. */
-                const int q = ctx->kv_recipe[l] & ~RAD_KVQ_ROTATED;
+                const int q = ctx->kv_recipe[l] & ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN);
                 if (l >= g.n_layer || !is_full_attention(l, interval)) {
                     fprintf(stderr, "radiance: KV recipe: layer %lld keeps no attention cache in "
                                     "this model (%lld layers, full attention every %lld from "
@@ -727,8 +737,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             kvq_name(q));
                     return RAD_E_UNSUPPORTED;
                 }
+                const bool vm = (ctx->kv_recipe[l] & RAD_KVQ_VMEAN) != 0;
+                if (vm && (q == RAD_KVQ_NONE || !ctx->kv_vmean)) {
+                    fprintf(stderr, "radiance: KV recipe: layer %lld subtracts a V mean, which "
+                                    "%s\n", (long long)l,
+                            q == RAD_KVQ_NONE ? "only a layout with integer V takes"
+                                              : "the engine did not hand over (kv_vmean)");
+                    return RAD_E_UNSUPPORTED;
+                }
                 kvq_of[(size_t)l] = q;
                 rot_of[(size_t)l] = (ctx->kv_recipe[l] & RAD_KVQ_ROTATED) != 0;
+                vmean_of[(size_t)l] = vm;
             }
             for (int64_t l = 0; l < g.n_layer; ++l)
                 if (is_full_attention(l, interval) &&
@@ -799,15 +818,33 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* `kv_full`, `g` and the indexer's config keep the last attention layer's group, which the
          * MTP head shares; each trunk layer takes its own beside its attention block. */
         int last_q = RAD_KVQ_NONE;
+        int64_t last_l = -1;
         for (int64_t l = g.n_layer - 1; l >= 0; --l)
-            if (is_full_attention(l, interval)) { last_q = kvq_of[(size_t)l]; break; }
+            if (is_full_attention(l, interval)) { last_q = kvq_of[(size_t)l]; last_l = l; break; }
         if (n_layouts == 0) last_q = RAD_KVQ_NONE;
+        const bool last_vmean = last_l >= 0 && vmean_of[(size_t)last_l];
         m.kvq     = std::move(kvq_of);
         m.kvrot   = std::move(rot_of);
+        m.kvmean  = std::move(vmean_of);
         m.kv_full = m.kv_q[last_q];
         /* A k4h_v4 or k4h_v2h group holds rotated K and V only, so the MTP head behind such a
          * layer rotates as the trunk's layers in it do; any other group keeps the head unrotated. */
         m.mtp.attn.rotate = kvq_rotated(last_q);
+        /* The head shares the last attention layer's cache, so it centres V on that layer's mean,
+         * in the head's own basis. An attention-zero rank stores nothing to centre. */
+        if (last_vmean && !g.attn_zero &&
+            !kv_vmean_slices(ctx->kv_vmean, last_l, m.mtp.attn.rotate, g, &m.mtp.attn.vmean_sub,
+                             &m.mtp.attn.vmean_add))
+            return RAD_E_UNSUPPORTED;
+        /* The calibration tap: the trunk's attention layers, this rank's KV heads. */
+        {
+            std::vector<int> attn_layers;
+            for (int64_t l = 0; l < g.n_layer; ++l)
+                if (is_full_attention(l, interval)) attn_layers.push_back((int)l);
+            const bool spanned = g.world > g.n_head_kv_all || g.attn_world != g.world;
+            const int64_t kv_first = (spanned ? g.kv_off : g.attn_rank * g.kv_dim()) / g.head_dim;
+            RAD_ARCH_TRY(m.vcal.begin(ctx, g, attn_layers, kv_first));
+        }
         /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
          * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
         m.qsacfg.page = ctx->kv_residency != 0 && !g.attn_zero;
@@ -1236,6 +1273,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (g.attn_zero && kv) RAD_ARCH_TRY(rad_kv_group_zero(b, kv));
             lay.attn.ar_out_take = lay.hc_mix.ar_take();
             lay.attn.rotate = m.kvrot[(size_t)l] != 0;
+            if (m.kvmean[(size_t)l] && !g.attn_zero &&
+                !kv_vmean_slices(ctx->kv_vmean, l, lay.attn.rotate, g, &lay.attn.vmean_sub,
+                                 &lay.attn.vmean_add))
+                return RAD_E_UNSUPPORTED;
+            if (m.vcal.on) lay.attn.vcal = &m.vcal;
             RAD_ARCH_TRY(lay.attn.declare(b, nm, ga, (int)l, kv, m.n_rot, aw, as,
                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));
             /* The indexer, after the attention block so its ops sit where the sparse attention

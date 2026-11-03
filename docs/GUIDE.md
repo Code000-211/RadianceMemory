@@ -1011,6 +1011,64 @@ is stored (and after the rotation the channels are near even anyway), and keeps 
 rotated values do not need. The exact rule is libref's `kv_store` (OPS.md). Its KL, its speed, and
 whether the per-channel half of KVarN would pay here, are not measured yet.
 
+**A V mean per layer: `vmean`.** On Flash-Next V carries a large per-channel offset (the norm of
+its mean is 0.53 to 0.89 of V's RMS, layer by layer), and a symmetric group scale spends its range
+on it. A line ending in `vmean` (`layer 7 k4h_v4 vmean`, `layer 11 fp8_v4 rotated vmean`) makes
+that layer subtract a static mean of V, per KV head, before its store and add it back to the
+attention output before the output's rotation. Each row of attention weights sums to one, so
+`P (V - mu) + mu = P V`: the layer computes the same attention but for the rounding of the two
+adds, while the cache quantises a centred V. K, the layout, its pages and its kernels do not change.
+The means come from the file a `vmean FILE` line of the recipe names (beside the recipe unless the
+path is absolute), so a recipe and its means travel together:
+
+```
+vmean flashnext.kvmean
+layer 3  k6_v4 vmean
+layer 7  k4h_v4 vmean
+layer 11 fp8          # fp8's V is E4M3, with no group scale to spare: no vmean
+...
+```
+
+Only a layout with integer V takes it (`fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`). A mean from other
+documents is nearly as good as a document's own, so one calibration serves every request; record
+it with the calibration mode (TOOLS.md), over long documents and a bf16 cache:
+
+```
+radiance --model M.rad <serve flags> --kv-cache-dtype bf16 \
+    --calib-corpus LONG.jsonl --calib-dir DIR          # writes DIR/kv_vmean.txt
+```
+
+The file is text, one line a layer and KV head, the mean as the V projection writes it, so one
+file serves rotated and unrotated recipes alike (the engine rotates it for a rotated layer at
+load):
+
+```
+kv_vmean 1 head_dim 256 kv_heads 2 rows 126945
+layer 3 head 0  0.257125914 0.17772831 ...           # head_dim values
+```
+
+The recipe is refused, the file and line named, for `vmean` on `fp8`, a `vmean` word with no
+`vmean FILE` line or the other way round, and in the file a wrong header, a line of other than
+head_dim values, a value that is not a finite number, a head outside the header's or twice, a layer
+missing a head, a `vmean` layer the file lacks, or a layer the recipe does not name; startup refuses
+a file whose head_dim or KV heads are not the model's. Only `qwen4exp_fp8` serves it (`qwen35_fp8`
+refuses the line naming the layer), and the MTP head behind a `vmean` last layer takes that
+layer's mean. A centred layer gives up the gate folded into the sparse attention's merge, as a
+rotated one does. Measured on Flash-Next at `--tp 2` against the bf16-cache reference (the KL
+mode over 4 documents of 32K tokens, 16380 scored positions; the means calibrated on four other
+documents of 127K tokens; `fp8` scores 0.0262, 0.267, 94.4 %):
+
+| every attention layer | bits | mean KL | with vmean | p99 KL | with vmean | top-1 | with vmean |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `fp8_v4` | 6.25 | 0.0368 | 0.0342 | 0.397 | 0.340 | 93.4 % | 93.4 % |
+| `fp8_v4 rotated` | 6.25 | 0.0364 | 0.0320 | 0.379 | 0.356 | 93.4 % | 94.0 % |
+| `k6_v4` | 5.5 | 0.0344 | 0.0321 | 0.338 | 0.331 | 93.7 % | 93.6 % |
+| `k4h_v4` | 4.5 | 0.0437 | 0.0394 | 0.432 | 0.395 | 93.1 % | 93.2 % |
+| `k4h_v2h` | 3.5 | 0.1372 | 0.0833 | 1.276 | 0.793 | 87.7 % | 89.9 % |
+
+The KL above `fp8`'s falls by a quarter to a half; `k4h_v2h`'s halves. Speed is not measured (two
+elementwise adds a layer, and the sparse decode's gate as its own op).
+
 **A measured recipe.** `rad-autoquant` writes the recipe from the KL mode: it measures each layer
 in each layout against a bf16-cache reference over long documents and picks, per layer, the
 layouts of least total KL within an average bit budget (`--bits 6`: between `k4h_v2h`'s 3.5 and
@@ -2183,7 +2241,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
-| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
@@ -2316,8 +2374,8 @@ flags are refused on it, and so are the pixel bands.
 | `--kld-record DIR` | run `--kld-corpus` through prefill and write this model's log-probabilities at every scored position to `DIR`: the reference a quantised model is measured against |
 | `--kld-ref DIR` | score this model against the reference in `DIR`: mean, median, 99/99.9/99.99th percentile KL divergence and top-1 agreement |
 | `--kld-corpus FILE` | JSONL, one `{"prompt", "score_from"?, "source"?}` a line; `--kld-record` only |
-| `--calib-corpus FILE` | instead of serving, run a JSONL corpus (`{"prompt"}` a line) through prefill once, every token, and record the calibration statistics the model keeps: the whole Hessian of each linear's input (docs/TOOLS.md) |
-| `--calib-dir DIR` | where `--calib-corpus` writes them, one safetensors file per input; beside `--kld-record`, that run records them over the KL corpus too |
+| `--calib-corpus FILE` | instead of serving, run a JSONL corpus (`{"prompt"}` a line) through prefill once, every token, and record the calibration statistics the model keeps: the whole Hessian of each linear's input, and on `qwen4exp_fp8` each attention layer's V mean (docs/TOOLS.md) |
+| `--calib-dir DIR` | where `--calib-corpus` writes them, one safetensors file per input (the V means: `kv_vmean.txt`); beside `--kld-record`, that run records them over the KL corpus too |
 | `--calib-layers LO:HI` | record layers `LO`..`HI-1` only (default every layer), for a model whose statistics do not fit in host memory in one run |
 | `--kld-top N` | `--kld-record` keeps each position's `N` most likely tokens exactly and the mass of the rest instead of the whole vocabulary, for a corpus too large for full rows; 0 (default) keeps the whole vocabulary |
 | `--kld-out FILE` | the `--kld-ref` report as JSON, and every position's numbers in `FILE.rows` |

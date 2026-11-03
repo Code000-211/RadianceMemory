@@ -675,6 +675,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* The layout, and apart from it whether the layer runs rotated, which any layout
              * can: the rotation is an op of its own beside the layout's rows. */
             const int q = ctx->kv_recipe[l] & ~RAD_KVQ_ROTATED;
+            /* A V mean (RAD_KVQ_VMEAN) is Flash-Next's (qwen4exp_fp8) for now. */
+            if (q & RAD_KVQ_VMEAN) {
+                fprintf(stderr, "radiance: KV recipe: layer %lld subtracts a V mean, which this "
+                                "plugin does not serve\n", (long long)l);
+                return RAD_E_UNSUPPORTED;
+            }
             if (l >= m.n_main || !is_full_attention(l, interval)) {
                 fprintf(stderr, "radiance: KV recipe: layer %lld keeps no attention cache in this "
                                 "model (%lld layers, full attention every %lld from %lld)\n",

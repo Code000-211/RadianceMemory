@@ -411,6 +411,18 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", T).pi("head_dim", HD).pi("gqa", 1).pi("causal", 1).ps("dtype", "f32");
         hs.push_back(std::move(d));
     }
+    /* ---- `add`'s one broadcast, a row of n down every row: a `vmean` KV layer takes its V mean
+     * off V's rows (kv_dim wide) and puts it back on the attention output's (q_dim), bf16 both
+     * (--kv-recipe vmean, docs/OPS.md). Exact: one rounding of an f32 sum. -------------------- */
+    for (int64_t n : { 256, 3072 }) {
+        Hand h(n == 256 ? "row broadcast, V less its mean" : "row broadcast, output plus its mean",
+               "add", 0.0);
+        h.dense(RAD_BF16, { 7, n }, hfill(40, 2.0f))
+         .dense(RAD_BF16, { n }, hfill(41, 1.5f))
+         .dense(RAD_BF16, { 7, n }, hfill(42), true)
+         .pi("M", 7).pi("n", n).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
     /* ---- the GDN decode convolution read past offset zero ---------------------------------- */
     {
         const int64_t S = 2, QL = 3, HG = 2, H = 2, K = 16, V = 16, WID = 4;

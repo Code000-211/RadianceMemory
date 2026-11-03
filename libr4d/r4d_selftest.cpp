@@ -24723,6 +24723,59 @@ static void had_rotate_case(const Plugin& pl, const char* row, int64_t g) {
     }
 }
 
+/* add_bf16's row broadcast as a `vmean` KV layer issues it (--kv-recipe vmean): -mu by KV head onto
+ * V's rows (kv_dim 512, 256) and +mu by query head onto the attention output's (q_dim 6144, 3072,
+ * 1536), in place, at a decode's rows, a verify's, a prefill chunk's and a whole step's. The card's
+ * bytes equal libref's add over the same operands, and the mean moved most of them. */
+static void vmean_add_case(const Plugin& pl) {
+    const char* row = "add_bf16";
+    if (!sel(row)) return;
+    const RadKernelInfo* r = find(pl, row);
+    const RadLaunchFn ref = libref_row("add", true);
+    if (!r || !ref) { ok(row, false, "row or libref's add absent"); return; }
+    std::mt19937 rng(20261104);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int64_t n : { 256, 512, 1536, 3072, 6144 })
+        for (int64_t M : { 1, 4, 37, 2048 }) {
+            std::vector<float> off((size_t)n);
+            for (auto& o : off) o = 0.8f * nd(rng);
+            std::vector<uint16_t> in((size_t)(M * n)), mu((size_t)n);
+            for (int64_t i = 0; i < M; ++i)
+                for (int64_t j = 0; j < n; ++j)
+                    in[(size_t)(i * n + j)] = rad_f32_to_bf16(off[(size_t)j] + 0.6f * nd(rng));
+            const bool sub = n <= 512;   /* V's widths take -mu */
+            for (int64_t j = 0; j < n; ++j)
+                mu[(size_t)j] = rad_f32_to_bf16((sub ? -1.f : 1.f) * off[(size_t)j]);
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+            std::vector<uint16_t> want = in;
+            RadTensor ht[3] = { T(want.data(), RAD_BF16, { M, n }), T(mu.data(), RAD_BF16, { n }),
+                                T(want.data(), RAD_BF16, { M, n }) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ht; a.n_t = 3; a.p = ps.data(); a.n_p = (int)ps.size();
+            const int rr = ref(&a, nullptr);
+            void* dx = dalloc(in.size() * 2);
+            void* dm = dalloc(mu.size() * 2);
+            st_memcpy(dx, in.data(), in.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dm, mu.data(), mu.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, n }), T(dm, RAD_BF16, { n }),
+                                          T(dx, RAD_BF16, { M, n }) };
+            run_case(r, ts, ps);
+            std::vector<uint16_t> got(in.size());
+            st_memcpy(got.data(), dx, got.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0, moved = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                diff += got[i] != want[i];
+                moved += got[i] != in[i];
+            }
+            ok(fmt("%s vs libref byte for byte, %s the mean, %lld rows of %lld in place", row,
+                   sub ? "V less" : "the output plus", (long long)M, (long long)n).c_str(),
+               rr == RAD_OK && diff == 0 && moved >= M * n / 2,
+               fmt("libref rc=%d, %lld elements differ, %lld moved", rr, (long long)diff,
+                   (long long)moved));
+            dfree_all();
+        }
+}
 
 /* A k4h layout: its kv_dtype, a token's row at head_dim 256, where the scales start, V in two bits. */
 struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2; };
@@ -32363,6 +32416,8 @@ static void device_phase(const Plugin& pl) {
     /* Rotated KV layers: the rotation, and the k4h_v4 / k4h_v2h store and attention. */
     had_rotate_case(pl, "had_rotate_g128_bf16", 128);
     had_rotate_case(pl, "had_rotate_g256_bf16", 256);
+    /* A `vmean` layer's adds: the broadcast row over V and over the output. */
+    vmean_add_case(pl);
     for (const K4hLayout* L : { &kK4hv4L, &kK4hv2hL }) {
         k4h_store_case(pl, *L);
         k4h_attn_case(pl, *L);

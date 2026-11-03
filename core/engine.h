@@ -647,6 +647,12 @@ private:
      * POST /admin/control-vector). Atomic: the server's admin thread writes it while
      * request threads read it; nothing about the graph changes with it. */
     std::atomic<bool>              cvec_default_{false};
+    /* ---- the recipe's V means (--kv-recipe `vmean`). `kv_vmean_table_` is the RadKvVMean table
+     * (bf16 bits, abi/rad_builder.h) built at bringup, empty without a `vmean` layer;
+     * `kv_vmean_views_` is, per rank, its copy on the rank's card, uploaded at the rank's first
+     * declare and freed with the engine (the view's `table` is the allocation). */
+    std::vector<uint16_t>          kv_vmean_table_;
+    std::vector<RadKvVMean>        kv_vmean_views_;
     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
     bool        report_printed_ = false;
     /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in

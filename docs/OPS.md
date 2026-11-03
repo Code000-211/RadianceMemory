@@ -1223,6 +1223,20 @@ rotation has already evened the channels, and rotated values are centred. libref
 the k4h_v4 kernels with V's codes widened from two bits; `r4d_emu_k4h` holds them to libref as it
 holds k4h_v4's. rad-kbench describes the store's operands, not the attention's.
 
+**A `vmean` layer stores V less a static mean** (`RAD_KVQ_VMEAN`, --kv-recipe `vmean`): the
+layer issues `add` with its one broadcast form, a row of n elements down every row, twice. Before
+the store (after the rotation on a rotated layer) it adds -mu by KV head to V's rows, n = kv_dim;
+after the attention and before the rotation back it adds +mu to the output's rows, query head h
+taking KV head h / gqa, n = q_dim. Both rows are the one bf16 rounding of mu and its exact
+negation, from the engine's table (`RadKvVMean`, abi/rad_builder.h), in the basis the cache holds.
+A row of attention weights sums to one, so the output is the uncentred one but for the two adds'
+rounding; the store and attention rows read the centred cache as any other. No row is new:
+libref's `add` is the oracle, and libr4d's `add_bf16` and libavx's `add` are held to it byte for
+byte at those widths (`r4d_emu_vmean`, which also holds libr4d's k4h stores of a centred V to
+libref's bytes; avx_check's hand cases; r4d_selftest on the card). A centred layer declares neither
+the prologue with the store in it nor the gate in the sparse attention's merge, which would read V
+before or the output after the mean.
+
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first
 (`kv_resolve`, under "Sparse attention (QSA)"), and every other op reads the cache as before.
