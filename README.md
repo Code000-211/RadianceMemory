@@ -354,18 +354,36 @@ resident, k4h_v4 or k4h_v2h demoted.
   runs no decode step, the emulation sweeps after every step, unbounded.
 
 Measured on two R9700s (Flash-Next `--tp 2`, bf16-cache reference, residency on, KL through the
-emulation; `prep/aq/m8/kl/tier-*.json`, `prep/aq/m8/recall/tier-*.json`):
+emulation; `prep/aq/m8/{kl,recall,mr}/fix-*.json`, all taken after the fix of the
+sweep's shared index buffer, below).
+Three corpora: `long.jsonl` (4 documents of ~34K tokens, every position past ~30K scored), `recall.jsonl`
+(a ~2 000-token passage repeated ~26K tokens later, only the repeat scored) and `mr.jsonl` (four
+conversations of four turns, each pasting ~6 000 tokens of a file and answered by the model itself at
+bf16, then a fifth turn asking about the first file; only that last answer, 256 tokens, is scored):
 
-| configuration | store a block (both ranks) | long.jsonl KL / p99 / top-1 | recall.jsonl KL / p99 / top-1 |
-|---|--:|--:|--:|
-| uniform i8h | 52.5 KiB | 0.0236 / 0.236 / 94.77 % | 0.0103 / 0.131 / 99.77 % |
-| i8h, demote k4h_v4 + vmean | 29.25 KiB | 0.0247 / 0.248 / 94.38 % | 0.0106 / 0.148 / 99.69 % |
-| i8h, demote k4h_v2h + vmean | 22.75 KiB | 0.0301 / 0.294 / 94.00 % | 0.0120 / 0.173 / 99.67 % |
-| uniform k4h_v2h + vmean | 22.75 KiB | 0.0833 / 0.793 / 89.90 % | 0.0214 / 0.355 / 99.61 % |
+| configuration | store a block (both ranks) | long KL / top-1 / ΔNLL | recall KL / top-1 | multi-round KL / top-1 / ΔNLL |
+|---|--:|--:|--:|--:|
+| uniform i8h | 52.5 KiB | 0.0236 / 94.77 % / −0.0024 | 0.0103 / 99.77 % | 0.0032 / 98.63 % / −0.0016 |
+| i8h, demote k4h_v4 + vmean | 29.25 KiB | 0.0284 / 93.91 % / +0.0012 | 0.0151 / 99.62 % | 0.0047 / 98.43 % / −0.0003 |
+| i8h, demote k4h_v2h + vmean | 22.75 KiB | 0.0408 / 93.00 % / +0.0028 | 0.0183 / 99.62 % | 0.0063 / 97.55 % / **+0.0043** |
+| uniform k4h_v2h + vmean | 22.75 KiB | 0.0833 / 89.90 % / **+0.0132** | 0.0214 / 99.61 % | 0.0177 / 96.27 % / **+0.0190** |
+
+For scale, the bf16 model itself computed in another prefill order measures 0.0243 (long) and 0.0033
+(multi-round). A `k4h_v4` middle stays within that noise everywhere; a `k4h_v2h` middle costs less than
+half of what `k4h_v2h` everywhere costs, but on the multi-round corpus its NLL change is significant
+(+0.0043, 95 % from +0.0004 to +0.0111; uniform: +0.0190). ΔNLL intervals are block bootstraps.
 
 A paged block moves its demote-layout fragment over PCIe: 896 B a layer and rank as k4h_v2h,
 1 152 B as k4h_v4, 2 064 B as i8h. Residency on against the emulation, 12 452 prompt tokens and 256
 greedy tokens, is byte-identical for both demote layouts (`prep/aq/m8/identity-tier.sh`).
+
+**The shared index buffer.** Before this, every batch of a sweep gathered its blocks through one
+pinned index buffer that the transfer stream read only when it got past compute, so a batch could
+gather the last batch's blocks: residency output was then timing-dependent, tiered or not. Each batch
+now owns an entry of a ring of 64, with a stream sync when it wraps; two KL runs of a tiered recipe
+are byte-identical. **Open:** with a tiered recipe, int8 block keys (`--qsa-bkey-dtype i8`) and the MTP
+drafter together, residency on and the emulation diverge (identical with `--num-speculative-tokens
+0`); the drafter's acceptance falls from about 0.68 to 0.10 once blocks really move, also untiered.
 
 ---
 
