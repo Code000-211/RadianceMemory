@@ -12465,6 +12465,65 @@ TEST(gdn_recurrent_anchor_fits_a_small_heads_block) {
     CHECK_EQ(anchor_against_per_candidate(16, 16, 8, one).status, RAD_E_SHAPE);
 }
 
+/* Why window residency must keep the drafts, not only the verified text, byte for byte. The same
+ * four tokens, all accepted, run as two steps of two or as four of one. With an f32 state the
+ * anchor replays them exactly, so the last token's `o` does not depend on the split; with an f16
+ * state (--state-cache-dtype f16) the anchor is rounded each time it is published and a replayed
+ * token reads f16 factors where the step that ran it read f32, so the split -- which is how many
+ * drafts each step accepted -- changes `o`, and so the text. A residency run whose drafts differ
+ * (a cold block read as absent by the head) diverged only under an f16 state. */
+namespace {
+std::vector<uint8_t> anchor_last_o(uint32_t sdt, const std::vector<int>& split) {
+    const int64_t K = 64, V = 64, H = 1, NT = 4;
+    uint32_t rs = 91;
+    auto rnd = [&rs]() { rs = rs * 1664525u + 1013904223u; return (float)((int)(rs >> 9) % 2001 - 1000) / 1000.0f; };
+    std::vector<float> qv(NT * K), kv(NT * K), vv(NT * V), avv(NT), bvv(NT), zv(NT * V), sv(V * K);
+    for (auto* p : { &qv, &kv, &vv, &avv, &bvv, &zv, &sv }) for (auto& x : *p) x = rnd();
+    for (auto& x : sv) x *= 0.1f;
+    T alog(RAD_F32, {H}); alog.f({-2.0f});
+    T dtb(RAD_F32, {H}); dtb.f({-1.0f});
+    T nw(RAD_F32, {V}); nw.f(std::vector<float>((size_t)V, 1.0f));
+    T st(sdt, {6, H, V, K});
+    for (int64_t i = 0; i < V * K; ++i) st_dt(sdt, st.t.data, 2 * V * K + i, sv[(size_t)i]);
+    T idx(RAD_I32, {1, 6}); idx.n({0, 1, 2, 3, 4, 5});   /* one window, never shifting */
+    std::vector<uint8_t> last;
+    int64_t t0 = 0, prev = 1;
+    for (const int ql : split) {
+        auto sub = [&](const std::vector<float>& x, int64_t w) {
+            return std::vector<float>(x.begin() + t0 * w, x.begin() + (t0 + ql) * w);
+        };
+        T q(RAD_BF16, {ql, 1, K}); q.f(sub(qv, K));
+        T k(RAD_BF16, {ql, 1, K}); k.f(sub(kv, K));
+        T v(RAD_BF16, {ql, H, V}); v.f(sub(vv, V));
+        T av(RAD_BF16, {ql, H}); av.f(sub(avv, 1));
+        T bv(RAD_BF16, {ql, H}); bv.f(sub(bvv, 1));
+        T z(RAD_BF16, {ql, H, V}); z.f(sub(zv, V));
+        T na(RAD_I32, {1}); na.n({prev});               /* every token of the step before */
+        T cu(RAD_I32, {2}); cu.n({0, ql});
+        T o(RAD_F32, {ql, H, V});
+        A a; a.t(q).t(k).t(v).t(av).t(bv).t(alog).t(dtb).t(st).t(idx).t(na).t(cu).t(z).t(nw)
+              .t(o).tnull().tnull().i("q_len", ql).i("head_k", K).i("head_v", V)
+              .i("n_head_v", H).d("scale", 0.125).d("eps", 1e-6).s("act", "silu")
+              .s("state_form", "anchor");
+        if (run("gdn_recurrent_update", a) < 0) return {};
+        last.assign(o.mem.begin() + (ql - 1) * V * 4, o.mem.begin() + ql * V * 4);
+        t0 += ql;
+        prev = ql;
+    }
+    return last;
+}
+}  /* namespace */
+
+TEST(gdn_anchor_text_is_independent_of_acceptance_at_f32_and_not_at_f16) {
+    const std::vector<uint8_t> a32 = anchor_last_o(RAD_F32, { 2, 2 }),
+                               b32 = anchor_last_o(RAD_F32, { 1, 1, 1, 1 }),
+                               a16 = anchor_last_o(RAD_F16, { 2, 2 }),
+                               b16 = anchor_last_o(RAD_F16, { 1, 1, 1, 1 });
+    REQUIRE(!a32.empty() && !b32.empty() && !a16.empty() && !b16.empty());
+    CHECK(a32 == b32);
+    CHECK(a16 != b16);
+}
+
 /* ================================================================== integer and packed stores
  * ref_common.h st_dt, through ops that store what they read. */
 

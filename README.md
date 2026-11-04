@@ -415,6 +415,7 @@ The checks:
 | no leaks | slots and blocks across demote, promote, preempt, rollback, fork, eviction, trim, expiry, re-plan | `mem_test` |
 | scheduler | sweep bound, sink and tail never demoted, dense steps see pool ids only, no livelock on a full pool | `sched_test` |
 | drafts page too | the MTP head's draft passes stage their rows as decode rows, so its `qsa_page` runs and it never reads a cold block as absent | `sched_test` |
+| why drafts must match too | under `--state-cache-dtype f16` the anchor state is rounded once a step, so the text depends on how many drafts each step accepts (f32 does not): residency that changes a draft changes the text there | `ref_test` |
 
 ---
 
