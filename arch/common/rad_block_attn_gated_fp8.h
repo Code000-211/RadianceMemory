@@ -17,6 +17,9 @@
  *     it is the unrotated one.
  *   - Optionally centred (`vmean_sub`/`vmean_add`, --kv-recipe `vmean`): a static mean of V is
  *     subtracted before the store and added to the attention output before its rotation back.
+ *   - Optionally predicted (`vpred_map`, --kv-recipe `vpred`): V less an affine map of the K-hat
+ *     the cache holds is stored, and a second attention with the keys as values gives P K-hat,
+ *     whose map is added to the output before its rotation back.
  *   - An experiment, RADIANCE_DEBUG_KV_E4M3R (kv_e4m3r_debug below): on a bf16 cache the store
  *     rounds every value through E4M3 as the fp8 cache's store does (kv_store at kv_dtype
  *     bf16_e4m3r), and the bf16 attention reads it.
@@ -30,6 +33,7 @@
 
 #include "rad_fp8.h"
 #include "rad_calib_vmean.h"
+#include "rad_calib_vpred.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +71,24 @@ inline bool kv_e4m3r_debug() {
     /* Read at each declare (startup only), not cached, so a test can set it. */
     const char* e = std::getenv("RADIANCE_DEBUG_KV_E4M3R");
     return e && *e && std::strcmp(e, "0") != 0;
+}
+
+/* Layer `l`'s K-to-V maps for this rank (RadKvVPred, abi/rad_builder.h): this rank's KV heads'
+ * [n_head_kv][head_dim + 1][head_dim] f32, a slice of the device table at the rank's first KV head
+ * (Geom::kv_off on a spanned split, rank * kv_dim otherwise, as kv_vmean_slices). Null with a
+ * message where the table is not this model's or names no entry for the layer. */
+inline const void* kv_vpred_slice(const RadKvVPred* t, int64_t l, const Geom& g) {
+    if (!t || !t->table || !t->entry || l < 0 || l >= t->n_layers || t->entry[l] < 0 ||
+        t->head_dim != g.head_dim || t->n_head_kv != g.n_head_kv_all) {
+        fprintf(stderr, "radiance: KV recipe: layer %lld predicts V from K and the engine's maps do "
+                        "not fit this model (%lld KV heads of %lld) or name no map for it\n",
+                (long long)l, (long long)g.n_head_kv_all, (long long)g.head_dim);
+        return nullptr;
+    }
+    const bool spanned = g.world > g.n_head_kv_all || g.attn_world != g.world;
+    const int64_t kv0 = (spanned ? g.kv_off : g.attn_rank * g.kv_dim()) / g.head_dim;
+    const int64_t per = (g.head_dim + 1) * g.head_dim;
+    return static_cast<const float*>(t->table) + (t->entry[l] * t->n_head_kv + kv0) * per;
 }
 
 /* Layer `l`'s V mean for this rank (RadKvVMean, abi/rad_builder.h), in the rotated basis when
@@ -198,6 +220,18 @@ struct AttnGatedFP8 {
     const void* vmean_add = nullptr;
     /* The calibration tap that records V's mean (rad_calib_vmean.h), or null. */
     CalibVMean* vcal = nullptr;
+    /* Predict V from K (RadBuildCtx::kv_vpred, kv_vpred_slice), set before declare: this rank's KV
+     * heads' maps, f32 on the device, rotated (a vpred layer is a k4h layer, always rotated).
+     * `kv_vpred` (docs/OPS.md) takes K-hat A + b off V after the rotation and before the store,
+     * K-hat being K through the k4h store's rounding, the K the cache holds; a second attention
+     * over the cache at kv_dtype `<layout>_pk` (op_attn_pk) reads the keys as values into `pk`,
+     * P K-hat; and kv_vpred adds (P K-hat) A + b to the output before the rotation back. A row of
+     * attention weights sums to one, so the output is the unpredicted one up to roundings, while
+     * the integer V layout quantises the residual. Not with vmean_sub (the bias is the mean's
+     * place). Null: nothing is declared and the layer is what it was. */
+    const void* vpred_map = nullptr;
+    /* The calibration tap that fits the maps (rad_calib_vpred.h), or null. */
+    CalibVPred* pcal = nullptr;
 
     rad_weight w_norm = 0, w_q_norm = 0, w_k_norm = 0;
     /* The input was normed and quantised by the caller; this block declares no norm. */
@@ -220,6 +254,12 @@ struct AttnGatedFP8 {
     /* `add` over V's rows and over the output's, with the mean's row broadcast; declared only with
      * vmean_sub / vmean_add. */
     rad_op     op_vsub = 0, op_vadd = 0;
+    /* kv_vpred over V's rows (k4h K-hat, minus) and over the output's (P K-hat, plus), and the
+     * P K-hat attention into `pk` ([max_tok, q_dim]); declared only with vpred_map. kv_pk_dtype
+     * holds the attention's kv_dtype string, `<layout>_pk`, for the op's parameter. */
+    rad_op      op_vpsub = 0, op_vpadd = 0, op_attn_pk = 0;
+    rad_buf     pk = 0;
+    std::string kv_pk_dtype;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -270,6 +310,14 @@ struct AttnGatedFP8 {
             RAD_ISSUE_N(c, op_vsub, n, brow_slice(w.v, r0, n, g.kv_dim()),
                         praw(vmean_sub, RAD_BF16, g.kv_dim()), brow_slice(w.v, r0, n, g.kv_dim()));
     }
+    /* V's rows [0, T) less their prediction from the K-hat of the same rows (op_vpsub), after the
+     * rotation and before the store; nothing on a layer without vpred. */
+    void predict_v(RadCtx* c, int64_t T) const {
+        if (op_vpsub)
+            RAD_ISSUE_N(c, op_vpsub, T, brows(w.k, T),
+                        praw(vpred_map, RAD_F32, g.n_head_kv * (g.head_dim + 1) * g.head_dim),
+                        brows(w.v, T), brows(w.v, T));
+    }
 
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
@@ -296,7 +344,7 @@ struct AttnGatedFP8 {
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
         return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
-               !op_rot && !op_vsub &&
+               !op_rot && !op_vsub && !op_vpsub &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
                !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
                kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
@@ -475,6 +523,34 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
             return RAD_E_UNSUPPORTED;
         }
     }
+    /* A predicted layer's two maps, declared here for the same reason, and refused rather than
+     * run unpredicted: the recipe said the cache holds residuals. Its P K-hat attention follows
+     * op_attn below. */
+    if (vpred_map) {
+        if (!rotate || vmean_sub || vmean_add) {
+            fprintf(stderr, "radiance: KV recipe: layer %d predicts V from K, which takes a "
+                            "rotated k4h layer without a V mean\n", l);
+            return RAD_E_UNSUPPORTED;
+        }
+        auto vp_op = [&](int64_t heads, int64_t gqa, const char* kq, int64_t sign, rad_buf x,
+                         rad_buf y) {
+            return rw(b, RAD_OP(b, "kv_vpred",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                     RAD_INT("n_head", heads), RAD_INT("gqa", gqa),
+                                     RAD_STR("k_quant", kq), RAD_INT("sign", sign),
+                                     RAD_STR("dtype", g.dtype)),
+                          RAD_NOWEIGHTS),
+                      {x, y}, {y});
+        };
+        pk = decl_b(b, nm.f("blk.%d.attn_pk", l), g.act_dtype, {g.max_tok, q_dim});
+        op_vpsub = pk ? vp_op(g.n_head_kv, 1, "k4h", -1, w.k, w.v) : 0;
+        op_vpadd = pk ? vp_op(g.n_head, g.gqa(), "none", 1, pk, w.attn.x) : 0;
+        if (!op_vpsub || !op_vpadd) {
+            fprintf(stderr, "radiance: KV recipe: layer %d predicts V from K and no kernel serves "
+                            "kv_vpred at head_dim %lld, %s\n", l, (long long)g.head_dim, g.dtype);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
 
     /* Declared before kv_store, which reads back the resolved `block_size`
      * (rad_block_attn_gated.h). */
@@ -500,6 +576,32 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         rad_op_reads(b, op_attn, rd,
                      (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
         rad_op_writes(b, op_attn, &w.attn.x, 1);
+    }
+    /* A predicted layer's P K-hat: the same attention over the same cache and selection, at the
+     * layout's `_pk` kv_dtype (the keys read as values), into `pk`. Its scores and weights are
+     * op_attn's, so P K-hat pairs with P (V - K-hat A - b) row for row. */
+    if (vpred_map) {
+        kv_pk_dtype = std::string(g.kv_dtype ? g.kv_dtype : "") + "_pk";
+        op_attn_pk = decl_attn(b, g, "attn_paged",
+                         RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                    RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                    RAD_INT("window", 0),
+                                    RAD_INT("n_head", g.n_head),
+                                    RAD_INT("block_size", kv_block > 0 ? kv_block : (int64_t)RAD_KV_BLOCK),
+                                    RAD_INT("max_seqs", (qsa_sel && qsa_sequ) ? qsa_rows()
+                                                                              : g.max_seqs),
+                                    RAD_INT("max_ctx", g.max_ctx),
+                                    RAD_STR("q_dtype", g.dtype),
+                                    RAD_STR("kv_dtype", kv_pk_dtype.c_str())),
+                         RAD_NOWEIGHTS);
+        if (!op_attn_pk) {
+            fprintf(stderr, "radiance: KV recipe: layer %d predicts V from K and no kernel serves "
+                            "attn_paged at kv_dtype %s\n", l, kv_pk_dtype.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, qsa_nsel };
+        rad_op_reads(b, op_attn_pk, rd, (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
+        rad_op_writes(b, op_attn_pk, &pk, 1);
     }
 
     /* The resolve belongs here rather than in the indexer: it must follow this layer's store,
@@ -541,7 +643,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
      * Resolves for E4M3 and bf16 caches. Not on a rotated layer, whose store follows a rotation. */
-    if (op_fused && !rotate && !op_vsub && !e4m3r && kv_fused_dtype(g.kv_dtype) &&
+    if (op_fused && !rotate && !op_vsub && !op_vpsub && !e4m3r && kv_fused_dtype(g.kv_dtype) &&
         rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
@@ -556,7 +658,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* The fold for a streamed group: also writes the mirror and consults the residency map, whose
      * operands are added at issue. Gated on the same layouts. */
-    if (op_fused && !rotate && !op_vsub && !e4m3r && kv_store_streamed_dtype(g.kv_dtype) &&
+    if (op_fused && !rotate && !op_vsub && !op_vpsub && !e4m3r && kv_store_streamed_dtype(g.kv_dtype) &&
         rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
         op_fused_stream = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store_streamed",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
@@ -623,7 +725,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * and quantiser read, so one op merges, gates, rounds and quantises (byte-identical to the
      * pair). Declared only with a selection: the dense path also uses the prefill kernel, which
      * has no merge. Not on a rotated layer, whose output is rotated back before the gate. */
-    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !rotate && !op_vsub &&
+    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !rotate && !op_vsub && !op_vpsub &&
         kv_fused_dtype(g.kv_dtype) && rad_op_declared(b, "attn_paged_gate_quant")) {
         op_attn_gq = RAD_OP(b, "attn_paged_gate_quant",
                             RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
@@ -726,6 +828,7 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.v, T));
     }
     centre_v(c, 0, T);
+    predict_v(c, T);
     store_cache(c, kvb, slot, T);
 }
 
@@ -765,6 +868,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.k, r0, n, kvw));
             RAD_ISSUE_N(c, op_rope_q, n, brow_slice(w.q, r0, n, qw), praw(pos, RAD_I32, n));
             RAD_ISSUE_N(c, op_rope_k, n, brow_slice(w.k, r0, n, kvw), praw(pos, RAD_I32, n));
+            if (pcal) pcal->tap(c, layer, w.k, w.v, r0, n);
             RAD_ISSUE_N(c, op_kv_store, n,
                         brow_slice(w.k, r0, n, kvw), brow_slice(w.v, r0, n, kvw),
                         praw(slot + r0, RAD_I32, n), kv_cache(kv, layer));
@@ -840,6 +944,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
     }
 
+    /* The K-to-V fit's tap: K after its norm and rope, V after its projection, both unrotated. */
+    if (pcal) pcal->tap(c, layer, w.k, w.v, 0, T);
     /* A rotated layer's q, k and v, after the rope (which pairs channels the rotation mixes) and
      * before the store. Neither fold above is declared on such a layer. */
     if (op_rot) {
@@ -847,8 +953,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.k, T));
         RAD_ISSUE_N(c, op_rot, T * g.n_head_kv, brows(w.v, T));
     }
-    /* A centred layer's V, in the basis it is stored in (neither fold is declared on it). */
+    /* A centred layer's V, in the basis it is stored in (neither fold is declared on it); a
+     * predicted layer's V less its prediction, likewise. */
     centre_v(c, 0, T);
+    predict_v(c, T);
     if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
@@ -949,6 +1057,16 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(qsa_sequ, off, rows, 1),
                         RAD_NONE, RAD_NONE, RAD_NONE,
                         brow_slice(w.attn.x, off, rows, qw));
+            /* P K-hat over the same, resolved selection (resolved once: a second resolve would
+             * read ring slots as block ids). */
+            if (op_attn_pk)
+                RAD_ISSUE_N(c, op_attn_pk, 1,
+                            brow_slice(w.q, off, rows, qw),
+                            kv_cache(kv, layer),
+                            brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                            brow_slice(qsa_sequ, off, rows, 1),
+                            RAD_NONE, RAD_NONE, RAD_NONE,
+                            brow_slice(pk, off, rows, qw));
         }
     } else {
         /* Below qsa_exact_to the dense path reads block ids straight from the table and never
@@ -981,26 +1099,32 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
             batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode) {
             const int64_t P = batch->n_seq - D;
-            RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode,
-                        brows(w.q, DT), kv_cache(kv, layer),
-                        praw2(table, RAD_I32, D, pitch), praw(used, RAD_I32, D),
-                        RAD_NONE, RAD_NONE, praw(batch->cu_seqlens, RAD_I32, D + 1),
-                        brows(w.attn.x, DT));
-            RAD_ISSUE_N(c, op_attn, g.max_tok,
-                        brows(w.q, T), kv_cache(kv, layer),
-                        praw2(table ? table + D * pitch : nullptr, RAD_I32, P, pitch),
-                        praw(used ? used + D : nullptr, RAD_I32, P),
-                        RAD_NONE, RAD_NONE, praw(batch->cu_seqlens + D, RAD_I32, P + 1),
-                        brows(w.attn.x, T));
+            /* The output pass, then a predicted layer's P K-hat pass at the same bands. */
+            for (int pass = 0; pass < (op_attn_pk ? 2 : 1); ++pass) {
+                const rad_op op = pass ? op_attn_pk : op_attn;
+                const rad_buf ob = pass ? pk : w.attn.x;
+                RAD_ISSUE_N(c, op, batch->max_q_len_decode,
+                            brows(w.q, DT), kv_cache(kv, layer),
+                            praw2(table, RAD_I32, D, pitch), praw(used, RAD_I32, D),
+                            RAD_NONE, RAD_NONE, praw(batch->cu_seqlens, RAD_I32, D + 1),
+                            brows(ob, DT));
+                RAD_ISSUE_N(c, op, g.max_tok,
+                            brows(w.q, T), kv_cache(kv, layer),
+                            praw2(table ? table + D * pitch : nullptr, RAD_I32, P, pitch),
+                            praw(used ? used + D : nullptr, RAD_I32, P),
+                            RAD_NONE, RAD_NONE, praw(batch->cu_seqlens + D, RAD_I32, P + 1),
+                            brows(ob, T));
+            }
         } else {
-            RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                        brows(w.q, T), kv_cache(kv, layer),
-                        praw2(table, RAD_I32, batch->n_seq, pitch),
-                        praw(used, RAD_I32, batch->n_seq),
-                        RAD_NONE, RAD_NONE,
-                        /* cu_seqlens: verify rows may be of different lengths. */
-                        praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
-                        brows(w.attn.x, T));
+            for (int pass = 0; pass < (op_attn_pk ? 2 : 1); ++pass)
+                RAD_ISSUE_N(c, pass ? op_attn_pk : op_attn, batch->max_q_len,
+                            brows(w.q, T), kv_cache(kv, layer),
+                            praw2(table, RAD_I32, batch->n_seq, pitch),
+                            praw(used, RAD_I32, batch->n_seq),
+                            RAD_NONE, RAD_NONE,
+                            /* cu_seqlens: verify rows may be of different lengths. */
+                            praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                            brows(pass ? pk : w.attn.x, T));
         }
     }
 
@@ -1012,6 +1136,11 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     if (op_vadd)
         RAD_ISSUE_N(c, op_vadd, T, brows(w.attn.x, T), praw(vmean_add, RAD_BF16, g.q_dim()),
                     brows(w.attn.x, T));
+    /* A predicted layer's (P K-hat) A + b back, likewise before the rotation. */
+    if (op_vpadd)
+        RAD_ISSUE_N(c, op_vpadd, T, brows(pk, T),
+                    praw(vpred_map, RAD_F32, g.n_head_kv * (g.head_dim + 1) * g.head_dim),
+                    brows(w.attn.x, T), brows(w.attn.x, T));
     if (op_rot) RAD_ISSUE_N(c, op_rot, T * g.n_head, brows(w.attn.x, T));
     if (gated) {
         /* the sparse attention gated and quantised in its merge */

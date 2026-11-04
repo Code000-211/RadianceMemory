@@ -16,6 +16,7 @@
 #include "diag/diag.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <regex>
@@ -1391,6 +1392,223 @@ TEST(the_v_mean_table_holds_minus_mu_by_kv_head_and_mu_by_query_head_in_both_bas
             }
         for (int h = 0; h < 4; ++h)
             for (int d = 0; d < 4; ++d) CHECK_EQ(f(e[8 + h * 4 + d]), mu[h / 2][d]);
+    }
+}
+
+/* A `vpred FILE` text: per layer and KV head the bias line, then the rows (in reverse order, which
+ * the format allows), each value telling its layer, head, row and column apart. */
+std::string vpred_text(const std::vector<int>& layers, int heads, int dim) {
+    std::string t = "# a calibration run's maps\nkv_vpred 1 head_dim " + std::to_string(dim) +
+                    " kv_heads " + std::to_string(heads) + " rows 2048\n";
+    char buf[64];
+    for (int l : layers)
+        for (int h = 0; h < heads; ++h) {
+            t += "layer " + std::to_string(l) + " head " + std::to_string(h) + " bias";
+            for (int d = 0; d < dim; ++d) {
+                std::snprintf(buf, sizeof buf, " %.9g", -(l + h / 8.0 + d / 1024.0));
+                t += buf;
+            }
+            t += "\n";
+            for (int i = dim - 1; i >= 0; --i) {
+                t += "layer " + std::to_string(l) + " head " + std::to_string(h) + " row " +
+                     std::to_string(i);
+                for (int d = 0; d < dim; ++d) {
+                    std::snprintf(buf, sizeof buf, " %.9g", l + h / 8.0 + i / 64.0 + d / 4096.0);
+                    t += buf;
+                }
+                t += "\n";
+            }
+        }
+    return t;
+}
+
+/* `vpred FILE` and a layer ending in `vpred` (RAD_KVQ_VPRED): the map file beside the recipe, read
+ * whole, each (layer, head)'s rows and bias where the format says; only the marked layers carry
+ * the bit, k4h layers are rotated as always, and the summary names the predicted layers. Without
+ * a `vpred` word nothing is read: the recipe is what it was. */
+TEST(a_kv_recipe_layer_ending_in_vpred_takes_its_maps_from_the_file_the_recipe_names) {
+    const std::string dir = radtest::tmp_path("vpred.d");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/flash.kvpred", vpred_text({ 3, 7, 11 }, 2, 8));
+    write_file(dir + "/r.kvrecipe", "vpred flash.kvpred   # beside the recipe\n"
+                                    "layer 3 k4h_v4 vpred\n"
+                                    "layer 7 k4h_v2h rotated vpred\n"
+                                    "layer 11 i8h\n");
+    Config c;
+    const std::string rp = dir + "/r.kvrecipe";
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }, &c), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vp = RAD_KVQ_VPRED;
+    REQUIRE_EQ(c.kv_recipe.size(), (size_t)12);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)(RAD_KVQ_K4H | rot | vp));
+    CHECK_EQ(c.kv_recipe[7], (int32_t)(RAD_KVQ_K4HV2H | rot | vp));
+    CHECK_EQ(c.kv_recipe[11], (int32_t)(RAD_KVQ_I8H | rot));
+    CHECK(c.kv_vmean.layer.empty());
+    CHECK_EQ(c.kv_vpred.head_dim, 8);
+    CHECK_EQ(c.kv_vpred.n_head_kv, 2);
+    CHECK_EQ(c.kv_vpred.rows, 2048LL);
+    CHECK_EQ(c.kv_vpred.path, dir + "/flash.kvpred");
+    REQUIRE_EQ(c.kv_vpred.layer.size(), (size_t)3);
+    /* Layer 7, head 1: row 5 column 2, then the bias's column 6. */
+    const std::vector<float>& m7 = c.kv_vpred.layer.at(7);
+    REQUIRE_EQ(m7.size(), (size_t)(2 * 9 * 8));
+    CHECK_EQ(m7[(1 * 9 + 5) * 8 + 2], (float)(7 + 1 / 8.0 + 5 / 64.0 + 2 / 4096.0));
+    CHECK_EQ(m7[(1 * 9 + 8) * 8 + 6], (float)-(7 + 1 / 8.0 + 6 / 1024.0));
+    CHECK_EQ(kv_recipe_summary(c.kv_recipe),
+             std::string("i8h rotated at layer 11; k4h_v4 rotated at layer 3; k4h_v2h rotated at "
+                         "layer 7; V predicted from K at layers 3, 7"));
+    /* Without a `vpred` line or word nothing is read and nothing is kept. */
+    Config e;
+    std::string pf = "x";
+    CHECK_EQ(kv_recipe_parse("layer 3 k4h_v4\n", "r.txt", &e.kv_recipe, nullptr, &pf), RAD_OK);
+    CHECK(pf.empty());
+    CHECK_EQ(e.kv_recipe[3], (int32_t)(RAD_KVQ_K4H | rot));
+    CHECK(e.kv_vpred.layer.empty());
+}
+
+/* A map that loads wrong is a deployment nobody measured, so the recipe and the file are refused
+ * with the file, the line and the layer named: `vpred` on a layout other than k4h_v4 / k4h_v2h, on
+ * a tiered layer, beside `vmean`, out of order or twice; a `vpred` word with no file line and a
+ * file line no layer reads; in the file a bad header, a line of the wrong width or kind, a value
+ * that is not a finite number, a head or row outside the header's, a bias or row twice, a head
+ * missing its bias or a row; a `vpred` layer the file does not hold and a layer the recipe does
+ * not name; and at startup a file of other heads or head_dim. */
+TEST(a_malformed_or_mismatched_vpred_map_is_refused_by_name) {
+    auto recipe = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        std::string vm, vp;
+        int rc = RAD_OK;
+        const std::string err =
+            stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out, &vm, &vp); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    for (const char* lay : { "fp8", "fp8_v4", "k6_v4", "i8h", "bf16" })
+        CHECK(has(recipe(std::string("vpred p.txt\nlayer 3 ") + lay + " vpred\n"),
+                  std::string(lay) == "bf16" ? "takes no 'vpred'"
+                                             : "line 2: layer 3: 'vpred' predicts V from the int4 K"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 i8h demote k4h_v4 vpred\n"), "'vpred' predicts V"));
+    CHECK(has(recipe("vpred p.txt\nvmean m.txt\nlayer 3 k4h_v4 vmean vpred\n"),
+              "line 3: 'vmean' and 'vpred' are one or the other"));
+    CHECK(has(recipe("vpred p.txt\nvmean m.txt\nlayer 3 k4h_v4 vpred vmean\n"),
+              "'vmean' and 'vpred' are one or the other"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 k4h_v4 vpred rotated\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 k4h_v4 vpred vpred\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("layer 3 k4h_v4 vpred\n"),
+              "1 layer(s) say 'vpred' and no 'vpred FILE' line names their maps"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 k4h_v4\n"), "'vpred p.txt' and no layer says 'vpred'"));
+    CHECK(has(recipe("vpred\nlayer 3 k4h_v4 vpred\n"),
+              "line 1: 'vpred FILE' names the K-to-V map file"));
+
+    auto file = [&](const std::string& text) {
+        KvVPred out;
+        out.head_dim = 7;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_vpred_parse(text, "p.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.layer.empty());
+        CHECK_EQ(out.head_dim, 0);
+        CHECK(has(err, "p.txt"));
+        return err;
+    };
+    const std::string hdr = "kv_vpred 1 head_dim 2 kv_heads 1 rows 9\n";
+    const std::string head0 = "layer 3 head 0 bias 1 2\nlayer 3 head 0 row 0 1 2\n";
+    CHECK(has(file("layer 3 head 0 bias 1 2\n"), "line 1: the first line is 'kv_vpred 1 head_dim D"));
+    CHECK(has(file("kv_vmean 1 head_dim 2 kv_heads 1 rows 9\n"), "line 1: the first line is"));
+    CHECK(has(file(""), "no 'kv_vpred 1 head_dim D kv_heads H rows R' line"));
+    CHECK(has(file(hdr + "layer 3 head 0 bias 1\n"), "line 2: layer 3 head 0 has 1 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 1 1 2 3\n"), "has 3 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 1 1 nan\n"), "'nan' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 bias 1 1e999\n"), "'1e999' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 mean 1 2\n"), "line 2: a line is 'layer L head H bias'"));
+    CHECK(has(file(hdr + "layer 3 head 1 bias 1 2\n"), "line 2: layer 3: head 1 is outside the file's 1"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 2 1 2\n"), "line 2: layer 3 head 0: row 2 is outside 0..1"));
+    CHECK(has(file(hdr + head0 + "layer 3 head 0 row 0 1 2\n"),
+              "line 4: layer 3 head 0: its row 0 is listed twice"));
+    CHECK(has(file(hdr + head0 + "layer 3 head 0 bias 1 2\n"), "its bias is listed twice"));
+    CHECK(has(file(hdr + head0), "layer 3 head 0 has no row 1"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 0 1 2\nlayer 3 head 0 row 1 1 2\n"),
+              "layer 3 head 0 has no bias"));
+
+    /* Through the flag: the file's layers against the recipe's. */
+    const std::string dir = radtest::tmp_path("vpred.bad");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/p.kvpred", vpred_text({ 3, 9 }, 2, 8));
+    auto flag = [&](const std::string& text) {
+        write_file(dir + "/r.kvrecipe", text);
+        const std::string rp = dir + "/r.kvrecipe";
+        int rc = RAD_OK;
+        const std::string err = stderr_of(
+            [&] { rc = parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        return err;
+    };
+    CHECK(has(flag("vpred p.kvpred\nlayer 3 k4h_v4 vpred\nlayer 7 k4h_v4 vpred\nlayer 9 fp8\n"),
+              "layer 7 says 'vpred' and " + dir + "/p.kvpred has no maps for it"));
+    CHECK(has(flag("vpred p.kvpred\nlayer 3 k4h_v4 vpred\n"),
+              "holds layer 9, which the recipe does not name"));
+    CHECK(has(flag("vpred gone.kvpred\nlayer 3 k4h_v4 vpred\n"),
+              "cannot read its K-to-V map file '" + dir + "/gone.kvpred'"));
+
+    /* Against the model, at startup. */
+    KvVPred v;
+    REQUIRE_EQ(kv_vpred_parse(vpred_text({ 3 }, 2, 8), "p.txt", &v), RAD_OK);
+    std::vector<int32_t> r(4, -1);
+    r[3] = RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+    std::vector<float> t = { 1 };
+    std::vector<int32_t> en = { 1 };
+    std::string err = stderr_of([&] { CHECK_EQ(kv_vpred_table(v, r, 16, 2, &t, &en), RAD_E_INVAL); });
+    CHECK(has(err, "p.txt holds 2 KV heads of 8 and this model has 2 of 16"));
+    CHECK(t.empty());
+    CHECK(en.empty());
+    err = stderr_of([&] { CHECK_EQ(kv_vpred_table(v, r, 8, 4, &t, &en), RAD_E_INVAL); });
+    CHECK(has(err, "this model has 4 of 8"));
+    r[1] = RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+    err = stderr_of([&] { CHECK_EQ(kv_vpred_table(v, r, 8, 2, &t, &en), RAD_E_INVAL); });
+    CHECK(has(err, "p.txt has no maps for layer 1"));
+}
+
+/* The table the engine uploads (RadKvVPred) holds each vpred layer's maps in the rotated basis a
+ * k4h layer stores: with k' = k H and v' = v H (H the normalised Sylvester Hadamard, symmetric and
+ * its own inverse) a map v ~ k A + b becomes v' ~ k' (H A H) + b H. Checked as that identity in
+ * f64 at D = 4: for a K vector, k' A' + b' is (k A + b) H to f32 rounding, for every head. A layer
+ * without `vpred` has no entry (-1) and takes no room. */
+TEST(the_vpred_table_holds_each_layers_maps_rotated_into_the_stored_basis) {
+    KvVPred v;
+    REQUIRE_EQ(kv_vpred_parse(vpred_text({ 0, 2 }, 2, 4), "p.txt", &v), RAD_OK);
+    std::vector<int32_t> r = { RAD_KVQ_K4H | RAD_KVQ_ROTATED, RAD_KVQ_I8H | RAD_KVQ_ROTATED,
+                               RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED };
+    std::vector<float> t;
+    std::vector<int32_t> en;
+    REQUIRE_EQ(kv_vpred_table(v, r, 4, 2, &t, &en), RAD_OK);
+    REQUIRE_EQ(en.size(), (size_t)3);
+    CHECK_EQ(en[0], -1);
+    CHECK_EQ(en[1], -1);
+    CHECK_EQ(en[2], 0);
+    REQUIRE_EQ(t.size(), (size_t)(2 * 5 * 4));
+    const int D = 4;
+    auto had = [&](std::vector<double> x) {   /* x H, H = H4 / 2 */
+        const double s[4][4] = { { 1, 1, 1, 1 }, { 1, -1, 1, -1 }, { 1, 1, -1, -1 }, { 1, -1, -1, 1 } };
+        std::vector<double> y(4, 0.0);
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i) y[(size_t)j] += x[(size_t)i] * s[i][j] / 2.0;
+        return y;
+    };
+    const std::vector<double> k = { 0.5, -1.25, 2.0, 0.75 };
+    for (int h = 0; h < 2; ++h) {
+        const float* src = v.layer.at(2).data() + h * (D + 1) * D;
+        const float* rot = t.data() + h * (D + 1) * D;
+        std::vector<double> pred(4, 0.0), kr = had(k), predr(4, 0.0);
+        for (int j = 0; j < D; ++j) {
+            pred[(size_t)j] = src[D * D + j];
+            predr[(size_t)j] = rot[D * D + j];
+            for (int i = 0; i < D; ++i) {
+                pred[(size_t)j] += k[(size_t)i] * src[i * D + j];
+                predr[(size_t)j] += kr[(size_t)i] * rot[i * D + j];
+            }
+        }
+        const std::vector<double> want = had(pred);
+        for (int j = 0; j < D; ++j) CHECK(std::fabs(predr[(size_t)j] - want[(size_t)j]) < 1e-5);
     }
 }
 

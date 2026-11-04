@@ -538,7 +538,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # defines, which is not in this build: cfg_stub.cpp defines them at their axis defaults, in both
 # arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 had k4h vmean gdn bkey kvx)
+                  dsa m2xfp4 had k4h vmean gdn bkey kvx vpred)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -581,7 +581,7 @@ else()
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_had.cpp
                 ${R4D_EMU}/test_k4h.cpp ${R4D_EMU}/test_vmean.cpp ${R4D_EMU}/test_gdn.cpp ${R4D_EMU}/test_bkey.cpp
-                ${R4D_EMU}/test_kvx.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_kvx.cpp ${R4D_EMU}/test_vpred.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -598,7 +598,7 @@ else()
         list(APPEND objs ${dir}/${stem}.o)
       endif()
     endforeach()
-    # test_lora, test_kda, test_had, test_k4h, test_vmean and test_gdn open libref with dlopen to
+    # test_lora, test_kda, test_had, test_k4h, test_vmean, test_gdn and test_vpred open libref with dlopen to
     # hold the emulated kernels to it.
     set(dl "")
     foreach(l ${CMAKE_DL_LIBS})
@@ -620,12 +620,13 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 had
-            vmean gdn bkey kvx)
+            vmean gdn bkey kvx vpred)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The packed caches' cases, one test a layout: together they take about 110 s here, too close to
   # the per-test limit to stay one test.
-  foreach(l k4h_v4 k4h_v2h i8h k5_v4)
+  # k4h_v4_pk and k4h_v2h_pk: a `vpred` layer's P K-hat attention over the two k4h caches.
+  foreach(l k4h_v4 k4h_v2h i8h k5_v4 k4h_v4_pk k4h_v2h_pk)
     add_test(NAME r4d_emu_k4h_${l} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_k4h --layout ${l})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -637,8 +638,8 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_had r4d_emu_k4h_k4h_v4 r4d_emu_k4h_k4h_v2h
-                       r4d_emu_k4h_i8h r4d_emu_k4h_k5_v4 r4d_emu_vmean
-                       r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx
+                       r4d_emu_k4h_i8h r4d_emu_k4h_k5_v4 r4d_emu_k4h_k4h_v4_pk r4d_emu_k4h_k4h_v2h_pk
+                       r4d_emu_vmean r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx r4d_emu_vpred
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
@@ -646,7 +647,8 @@ if(R4D_EMU_BUILT)
   # do the k4h_v4 and k4h_v2h caches' stores and attention, a `vmean` layer's adds, the gdn
   # kernels at an f16 state, the int8 block keys' store and score, and the KV transcodes.
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_had r4d_emu_k4h_k4h_v4 r4d_emu_k4h_k4h_v2h
-                       r4d_emu_k4h_i8h r4d_emu_k4h_k5_v4 r4d_emu_vmean r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx PROPERTIES
+                       r4d_emu_k4h_i8h r4d_emu_k4h_k5_v4 r4d_emu_k4h_k4h_v4_pk r4d_emu_k4h_k4h_v2h_pk
+                       r4d_emu_vmean r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx r4d_emu_vpred PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.

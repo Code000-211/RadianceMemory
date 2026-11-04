@@ -166,6 +166,16 @@ inline int kv_k4h(const RadArgs* a) {
     return !s ? 0 : std::strcmp(s, "k4h_v4") == 0 ? 1 : std::strcmp(s, "k4h_v2h") == 0 ? 2
                   : std::strcmp(s, "i8h") == 0 ? 3 : std::strcmp(s, "k5_v4") == 0 ? 4 : 0;
 }
+/* attn_paged's `kv_dtype` k4h_v4_pk / k4h_v2h_pk (a `vpred` layer's second attention, docs/OPS.md
+ * "`kv_vpred`"): the cache of k4h_v4 / k4h_v2h, read with K's codes and scales in V's place, so the
+ * output is P K-hat, the attention weights times the stored keys. Only the attention takes the
+ * names; `pk` says whether it was one. */
+inline int kv_k4h_attn(const RadArgs* a, bool* pk) {
+    const char* s = p_str(a, "kv_dtype", nullptr);
+    *pk = s && (std::strcmp(s, "k4h_v4_pk") == 0 || std::strcmp(s, "k4h_v2h_pk") == 0);
+    if (*pk) return std::strcmp(s, "k4h_v4_pk") == 0 ? 1 : 2;
+    return kv_k4h(a);
+}
 inline int64_t k4h_row(int k4h, int64_t hd) {
     return k4h == 3 ? 2 * hd + 4 : (k4h == 2 ? 14 : k4h == 4 ? 20 : 18) * hd / 16;
 }
@@ -401,6 +411,59 @@ int ref_kv_transcode(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ kv_vpred */
+/* V predicted from the same layer's K (docs/OPS.md "`kv_vpred`", --kv-recipe `vpred`): out = y +
+ * sign * (xq A_m + b_m) for each row's head h, m = h / gqa, where `map` [n_head / gqa, head_dim + 1,
+ * head_dim] f32 holds A_m's head_dim rows then b_m, and xq is x's head as k4h_v4's store would
+ * leave it when `k_quant` is "k4h" (each group of 32 through k4h_group and back: the K-hat the cache
+ * holds and the attention reads, k_scale 1), else x itself. Per output element, in f32: acc = b_m[j],
+ * then acc = fma(xq[i], A_m[i][j], acc) for i ascending; out = round(y + (sign < 0 ? -acc : acc))
+ * to out's dtype, one rounding. Every implementation keeps this order, so the bytes agree.
+ *
+ * The store side issues it with x = k, y = out = v, k_quant "k4h", gqa 1, sign -1 (V less its
+ * prediction); the output side with x = P K-hat (the `_pk` attention), y = out = the attention
+ * output, k_quant "none", gqa the layer's, sign +1. A row of attention weights sums to one, so the
+ * bias added once is the bias the stored values lost, and the output is the unpredicted one but
+ * for roundings. */
+int ref_kv_vpred(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *mp = &a->t[1], *y = &a->t[2], *o = &a->t[3];
+    const int64_t hd = p_int(a, "head_dim", 0), nh = p_int(a, "n_head", 0);
+    const int64_t gqa = p_int(a, "gqa", 1), sign = p_int(a, "sign", 1);
+    const char* kq = p_str(a, "k_quant", "none");
+    const bool k4 = kq && std::strcmp(kq, "k4h") == 0;
+    if (!kq || (!k4 && std::strcmp(kq, "none"))) return RAD_E_INVAL;
+    if (sign != 1 && sign != -1) return RAD_E_INVAL;
+    if (hd <= 0 || nh <= 0 || gqa <= 0 || nh % gqa || (k4 && hd % 32)) return RAD_E_SHAPE;
+    if (hd > REF_HD_MAX) return RAD_E_UNSUPPORTED;
+    if (mp->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t w = nh * hd, M = numel(x) / w;
+    if (M <= 0 || numel(x) != M * w || numel(y) < M * w || numel(o) < M * w ||
+        numel(mp) < (nh / gqa) * (hd + 1) * hd)
+        return RAD_E_SHAPE;
+    const int64_t x_rs = row_stride(x, w), y_rs = row_stride(y, w), o_rs = row_stride(o, w);
+    const float* A = (const float*)mp->data;
+    REF_PAR_FOR(M * nh * hd * hd)
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t h = 0; h < nh; ++h) {
+            float xq[REF_HD_MAX];
+            for (int64_t i = 0; i < hd; ++i) xq[i] = ldt(x, r * x_rs + h * hd + i);
+            if (k4)
+                for (int64_t g = 0; g < hd; g += 32) {
+                    uint8_t codes[16], sc[2];
+                    k4h_group(xq + g, codes, sc);
+                    for (int i = 0; i < 32; ++i) xq[g + i] = k4h_int4(codes, sc, i);
+                }
+            const float* Am = A + (h / gqa) * (hd + 1) * hd;
+            for (int64_t j = 0; j < hd; ++j) {
+                float acc = Am[hd * hd + j];
+                for (int64_t i = 0; i < hd; ++i) acc = std::fma(xq[i], Am[i * hd + j], acc);
+                stt(o, r * o_rs + h * hd + j, ldt(y, r * y_rs + h * hd + j) + (sign < 0 ? -acc : acc));
+            }
+        }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ attn_paged */
 /* attn_paged_tree's ninth operand, `spec_parent` (RadBatch::spec_parent, rad_drafter_tree), is
  * read here too: a row whose entry is -2 is an ordinary causal row; any other row is a node of its
@@ -447,7 +510,8 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
     if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
     /* k4h_v4 / k4h_v2h / k5_v4 / i8h: a byte row of 18 / 14 / 20 * head_dim / 16 or 2 * head_dim + 4 a token,
      * its groups whole. */
-    const int k4h = kv_k4h(a);
+    bool pk = false;
+    const int k4h = kv_k4h_attn(a, &pk);
     if (k4h && (kv->rank != 4 || kv->dtype != RAD_F8E4M3 || head_dim % 32 ||
                 kv->shape[3] != k4h_row(k4h, head_dim) || kv->stride[3] != 1))
         return RAD_E_SHAPE;
@@ -605,7 +669,11 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
             };
             const uint8_t* const kb8 = (const uint8_t*)kvd;
             const int64_t kso = k4h_ksoff(k4h, head_dim);
-            if (k4h == 1) {
+            if (pk) {
+                /* The values are the keys: P K-hat (kv_k4h_attn). */
+                auto kat = [&](int64_t b, int64_t d) { return k4h_int4(kb8 + b, kb8 + b + kso, d); };
+                unit(kat, kat);
+            } else if (k4h == 1) {
                 unit([&](int64_t b, int64_t d) { return k4h_int4(kb8 + b, kb8 + b + kso, d); },
                      [&](int64_t b, int64_t d) {
                          return k4h_int4(kb8 + b + head_dim / 2, kb8 + b + head_dim * 17 / 16, d);

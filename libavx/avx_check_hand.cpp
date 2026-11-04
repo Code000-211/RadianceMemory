@@ -423,6 +423,22 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", 7).pi("n", n).ps("dtype", "bf16");
         hs.push_back(std::move(h));
     }
+    /* ---- kv_vpred, a `vpred` KV layer's two sides (--kv-recipe vpred, docs/OPS.md): V less the
+     * prediction from its k4h K-hat over two KV heads, and the prediction from P K-hat back on
+     * twelve query heads over one map. Exact: libref's fma order, one rounding. ------------- */
+    for (int which = 0; which < 2; ++which) {
+        const int64_t HD = 256, NH = which == 0 ? 2 : 12, GQ = which == 0 ? 1 : 12, M = 3;
+        Hand h(which == 0 ? "V less its prediction from the k4h K-hat"
+                          : "output plus the prediction from P K-hat", "kv_vpred", 0.0);
+        h.dense(RAD_BF16, { M, NH * HD }, hfill(50 + which, 3.0f))
+         .dense(RAD_F32, { NH / GQ, HD + 1, HD }, hfill(52 + which, 0.1f))
+         .dense(RAD_BF16, { M, NH * HD }, hfill(54 + which, 2.0f))
+         .dense(RAD_BF16, { M, NH * HD }, hfill(56), true)
+         .pi("M", M).pi("head_dim", HD).pi("n_head", NH).pi("gqa", GQ)
+         .ps("k_quant", which == 0 ? "k4h" : "none").pi("sign", which == 0 ? -1 : 1)
+         .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
     /* ---- the GDN decode convolution read past offset zero ---------------------------------- */
     {
         const int64_t S = 2, QL = 3, HG = 2, H = 2, K = 16, V = 16, WID = 4;

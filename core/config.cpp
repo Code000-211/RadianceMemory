@@ -98,7 +98,7 @@ static const Flag g_flags[] = {
                                         "(int8, a scale a token and head, 1.01; all rotated,\n"
                                         "Flash-Next), k5_v4 (int5 K, int4 V, 0.63; Flash-Next)\n"
                                         "or bf16 (2; Flash-Next), a 'layer N\n"
-                                        "LAYOUT [rotated] [demote LAYOUT] [vmean]' line a layer\n"
+                                        "LAYOUT [rotated] [demote LAYOUT] [vmean|vpred]' line a layer\n"
                                         "(docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
@@ -629,14 +629,15 @@ std::vector<int> kv_layouts() {
  * deployment from the one its author measured. Which layers keep an attention cache only the
  * plugin knows, so that check is the plugin's (RadBuildCtx::kv_recipe). */
 int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out,
-                    std::string* vmean_file) {
+                    std::string* vmean_file, std::string* vpred_file) {
     /* Past any model in this tree by far; it bounds the array the engine hands the plugin. */
     constexpr long kMaxLayer = 4096;
     out->clear();
     if (vmean_file) vmean_file->clear();
+    if (vpred_file) vpred_file->clear();
     std::vector<int32_t> r;
-    std::string file;
-    int vmean_layers = 0;
+    std::string file, pfile;
+    int vmean_layers = 0, vpred_layers = 0;
     std::istringstream in(text);
     std::string line;
     for (int ln = 1; std::getline(in, line); ++ln) {
@@ -652,6 +653,13 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
             }
             continue;
         }
+        if (kw == "vpred") {
+            if (!(words >> pfile) || (words >> extra)) {
+                RAD_ERR("%s line %d: 'vpred FILE' names the K-to-V map file, two words", name, ln);
+                return RAD_E_INVAL;
+            }
+            continue;
+        }
         if (kw != "layer") {
             RAD_ERR("%s line %d: '%s' is not a recipe line; each is 'layer N LAYOUT'", name, ln,
                     kw.c_str());
@@ -659,19 +667,25 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         /* After the layout: `rotated`, then `demote LAYOUT`, then `vmean`, each at most once and
          * in that order. */
-        bool rot_word = false, vmean = false, bad = !(words >> num >> layout);
+        bool rot_word = false, vmean = false, vpred = false, bad = !(words >> num >> layout);
         std::string demote;
         for (std::string w; !bad && (words >> w);) {
-            if (w == "rotated" && !rot_word && demote.empty() && !vmean) rot_word = true;
-            else if (w == "demote" && demote.empty() && !vmean) bad = !(words >> demote);
-            else if (w == "vmean" && !vmean) vmean = true;
+            if (w == "rotated" && !rot_word && demote.empty() && !vmean && !vpred) rot_word = true;
+            else if (w == "demote" && demote.empty() && !vmean && !vpred) bad = !(words >> demote);
+            else if (w == "vmean" && !vmean && !vpred) vmean = true;
+            else if (w == "vpred" && !vpred && !vmean) vpred = true;
+            else if ((w == "vpred" && vmean) || (w == "vmean" && vpred)) {
+                RAD_ERR("%s line %d: 'vmean' and 'vpred' are one or the other: the prediction's "
+                        "bias takes the mean's place", name, ln);
+                return RAD_E_INVAL;
+            }
             else bad = true;
         }
         if (bad) {
             RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words, or 'layer N "
                     "LAYOUT rotated', then 'demote LAYOUT' where window residency stores the "
-                    "layer's demoted blocks narrower, and 'vmean' last where the layer subtracts "
-                    "its V mean", name, ln);
+                    "layer's demoted blocks narrower, and 'vmean' (or 'vpred') last where the "
+                    "layer subtracts its V mean (or its prediction of V from K)", name, ln);
             return RAD_E_INVAL;
         }
         char* end = nullptr;
@@ -688,10 +702,10 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                     "k5_v4, k4h_v4, k4h_v2h or i8h", name, ln, l, layout.c_str());
             return RAD_E_INVAL;
         }
-        if (q == RAD_KVQ_BF16 && (rot_word || vmean)) {
+        if (q == RAD_KVQ_BF16 && (rot_word || vmean || vpred)) {
             RAD_ERR("%s line %d: layer %ld: bf16 is the unquantised cache and takes no '%s'; a "
                     "rotation or a V mean only helps a layout that rounds to a narrower code",
-                    name, ln, l, rot_word ? "rotated" : "vmean");
+                    name, ln, l, rot_word ? "rotated" : vmean ? "vmean" : "vpred");
             return RAD_E_INVAL;
         }
         if (q == RAD_KVQ_BF16 && !demote.empty()) {
@@ -729,6 +743,15 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                     "k6_v4, k5_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
             return RAD_E_INVAL;
         }
+        /* `vpred` (RAD_KVQ_VPRED): V less its prediction from the K-hat the cache holds, which the
+         * store, the P K-hat attention and kv_vpred know for k4h's int4 K only. A tiered layer's
+         * K would change at its demotion, so no `demote` either (k4h is no tiered layout). */
+        if (vpred && ((q != RAD_KVQ_K4H && q != RAD_KVQ_K4HV2H) || dq != 0)) {
+            RAD_ERR("%s line %d: layer %ld: 'vpred' predicts V from the int4 K of k4h_v4 or "
+                    "k4h_v2h, and a tiered layer's K would change when it is demoted", name, ln,
+                    l);
+            return RAD_E_INVAL;
+        }
         if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);
         if (r[(size_t)l] >= 0) {
             RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
@@ -736,8 +759,10 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
         r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
-                       (vmean ? RAD_KVQ_VMEAN : 0) | (dq << RAD_KVQ_DEMOTE_SHIFT);
+                       (vmean ? RAD_KVQ_VMEAN : 0) | (vpred ? RAD_KVQ_VPRED : 0) |
+                       (dq << RAD_KVQ_DEMOTE_SHIFT);
         vmean_layers += vmean;
+        vpred_layers += vpred;
     }
     if (r.empty()) {
         RAD_ERR("%s names no layer; each attention layer needs a 'layer N LAYOUT' line", name);
@@ -755,8 +780,19 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                 name, file.c_str());
         return RAD_E_INVAL;
     }
+    if (vpred_layers && pfile.empty()) {
+        RAD_ERR("%s: %d layer(s) say 'vpred' and no 'vpred FILE' line names their maps", name,
+                vpred_layers);
+        return RAD_E_INVAL;
+    }
+    if (!vpred_layers && !pfile.empty()) {
+        RAD_ERR("%s: 'vpred %s' and no layer says 'vpred'; mark the layers that predict V from K",
+                name, pfile.c_str());
+        return RAD_E_INVAL;
+    }
     *out = std::move(r);
     if (vmean_file) *vmean_file = file;
+    if (vpred_file) *vpred_file = pfile;
     return RAD_OK;
 }
 
@@ -768,7 +804,7 @@ std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
                 const int key = q | rot | (dq << RAD_KVQ_DEMOTE_SHIFT);
                 std::string layers;
                 for (size_t l = 0; l < recipe.size(); ++l)
-                    if (recipe[l] >= 0 && (recipe[l] & ~RAD_KVQ_VMEAN) == key)
+                    if (recipe[l] >= 0 && (recipe[l] & ~(RAD_KVQ_VMEAN | RAD_KVQ_VPRED)) == key)
                         layers += (layers.empty() ? "" : ", ") + std::to_string(l);
                 if (layers.empty()) continue;
                 s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
@@ -782,6 +818,12 @@ std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
             vm += (vm.empty() ? "" : ", ") + std::to_string(l);
     if (!vm.empty())
         s += "; V mean subtracted at layer" + std::string(vm.find(',') != std::string::npos ? "s " : " ") + vm;
+    std::string vp;
+    for (size_t l = 0; l < recipe.size(); ++l)
+        if (recipe[l] >= 0 && (recipe[l] & RAD_KVQ_VPRED))
+            vp += (vp.empty() ? "" : ", ") + std::to_string(l);
+    if (!vp.empty())
+        s += "; V predicted from K at layer" + std::string(vp.find(',') != std::string::npos ? "s " : " ") + vp;
     return s;
 }
 
@@ -928,6 +970,170 @@ int kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_
     return RAD_OK;
 }
 
+/* The map file. Text, as the mean file is, so a calibration's result can be read, diffed and
+ * checked; %.9g values read back exactly into f32. A file holds every attention layer the
+ * calibration saw; a recipe takes the ones it marks. */
+int kv_vpred_parse(const std::string& text, const char* name, KvVPred* out) {
+    *out = KvVPred{};
+    KvVPred v;
+    bool header = false;
+    std::map<int, std::vector<char>> seen;   /* per layer: [head][D + 1] lines present */
+    std::istringstream in(text);
+    std::string line;
+    for (int ln = 1; std::getline(in, line); ++ln) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::istringstream words(line);
+        std::string kw;
+        if (!(words >> kw)) continue;
+        if (!header) {
+            std::string ver, k1, k2, k3, extra;
+            long long d = 0, h = 0, rows = 0;
+            if (kw != "kv_vpred" || !(words >> ver >> k1 >> d >> k2 >> h >> k3 >> rows) ||
+                ver != "1" || k1 != "head_dim" || k2 != "kv_heads" || k3 != "rows" ||
+                (words >> extra) || d <= 0 || d > 4096 || h <= 0 || h > 1024 || rows < 0) {
+                RAD_ERR("%s line %d: the first line is 'kv_vpred 1 head_dim D kv_heads H rows R'",
+                        name, ln);
+                return RAD_E_INVAL;
+            }
+            v.head_dim = d;
+            v.n_head_kv = h;
+            v.rows = rows;
+            header = true;
+            continue;
+        }
+        const int64_t D = v.head_dim;
+        long long l = -1, h = -1, i = -1;
+        std::string hw, what;
+        if (kw != "layer" || !(words >> l >> hw >> h >> what) || hw != "head" || l < 0 ||
+            l >= 4096 || (what != "bias" && what != "row") || (what == "row" && !(words >> i))) {
+            RAD_ERR("%s line %d: a line is 'layer L head H bias' or 'layer L head H row I' and its "
+                    "%lld values", name, ln, (long long)D);
+            return RAD_E_INVAL;
+        }
+        if (h < 0 || h >= v.n_head_kv) {
+            RAD_ERR("%s line %d: layer %lld: head %lld is outside the file's %lld KV heads", name,
+                    ln, l, h, (long long)v.n_head_kv);
+            return RAD_E_INVAL;
+        }
+        if (what == "row" && (i < 0 || i >= D)) {
+            RAD_ERR("%s line %d: layer %lld head %lld: row %lld is outside 0..%lld", name, ln, l, h,
+                    i, (long long)(D - 1));
+            return RAD_E_INVAL;
+        }
+        const int64_t slot = what == "bias" ? D : i;
+        std::vector<char>& hs = seen[(int)l];
+        hs.resize((size_t)(v.n_head_kv * (D + 1)), 0);
+        if (hs[(size_t)(h * (D + 1) + slot)]) {
+            RAD_ERR("%s line %d: layer %lld head %lld: its %s%s is listed twice", name, ln, l, h,
+                    what.c_str(), what == "row" ? (" " + std::to_string(i)).c_str() : "");
+            return RAD_E_INVAL;
+        }
+        hs[(size_t)(h * (D + 1) + slot)] = 1;
+        std::vector<float>& m = v.layer[(int)l];
+        m.resize((size_t)(v.n_head_kv * (D + 1) * D), 0.0f);
+        int64_t n = 0;
+        for (std::string w; words >> w; ++n) {
+            char* end = nullptr;
+            const float x = std::strtof(w.c_str(), &end);
+            if (!end || *end || !std::isfinite(x)) {
+                RAD_ERR("%s line %d: layer %lld head %lld: '%s' is not a finite number", name, ln,
+                        l, h, w.c_str());
+                return RAD_E_INVAL;
+            }
+            if (n < D) m[(size_t)((h * (D + 1) + slot) * D + n)] = x;
+        }
+        if (n != D) {
+            RAD_ERR("%s line %d: layer %lld head %lld has %lld values; head_dim is %lld", name, ln,
+                    l, h, (long long)n, (long long)D);
+            return RAD_E_INVAL;
+        }
+    }
+    if (!header) {
+        RAD_ERR("%s: no 'kv_vpred 1 head_dim D kv_heads H rows R' line", name);
+        return RAD_E_INVAL;
+    }
+    for (const auto& [l, hs] : seen)
+        for (size_t k = 0; k < hs.size(); ++k)
+            if (!hs[k]) {
+                const int64_t D = v.head_dim, h = (int64_t)k / (D + 1), sl = (int64_t)k % (D + 1);
+                RAD_ERR("%s: layer %d head %lld has no %s%s; a layer lists every KV head's bias and "
+                        "%lld rows", name, l, (long long)h, sl == D ? "bias" : "row ",
+                        sl == D ? "" : std::to_string(sl).c_str(), (long long)D);
+                return RAD_E_INVAL;
+            }
+    v.path = name;
+    *out = std::move(v);
+    return RAD_OK;
+}
+
+int kv_vpred_table(const KvVPred& vp, const std::vector<int32_t>& recipe, int64_t head_dim,
+                   int64_t n_head_kv, std::vector<float>* table, std::vector<int32_t>* entry) {
+    table->clear();
+    entry->clear();
+    const char* name = vp.path.c_str();
+    if (vp.head_dim != head_dim || vp.n_head_kv != n_head_kv) {
+        RAD_ERR("%s holds %lld KV heads of %lld and this model has %lld of %lld; it was "
+                "calibrated on another model", name, (long long)vp.n_head_kv,
+                (long long)vp.head_dim, (long long)n_head_kv, (long long)head_dim);
+        return RAD_E_INVAL;
+    }
+    if (head_dim <= 0 || (head_dim & (head_dim - 1))) {
+        RAD_ERR("%s: head_dim %lld is not a power of two, so no Hadamard rotates it", name,
+                (long long)head_dim);
+        return RAD_E_INVAL;
+    }
+    const int64_t D = head_dim, E = n_head_kv * (D + 1) * D;
+    const double inv = 1.0 / std::sqrt((double)D);
+    /* x H for a row vector x: the Sylvester transform (libref's fwht order), then 1 / sqrt(D). */
+    auto rot = [&](std::vector<double>& x) {
+        for (int64_t h = 1; h < D; h <<= 1)
+            for (int64_t i = 0; i < D; i += 2 * h)
+                for (int64_t j = i; j < i + h; ++j) {
+                    const double a = x[(size_t)j], b = x[(size_t)(j + h)];
+                    x[(size_t)j] = a + b;
+                    x[(size_t)(j + h)] = a - b;
+                }
+        for (double& e : x) e *= inv;
+    };
+    std::vector<float> t;
+    std::vector<int32_t> en(recipe.size(), -1);
+    int32_t n = 0;
+    for (size_t l = 0; l < recipe.size(); ++l) {
+        if (recipe[l] < 0 || !(recipe[l] & RAD_KVQ_VPRED)) continue;
+        const auto it = vp.layer.find((int)l);
+        if (it == vp.layer.end()) {
+            RAD_ERR("%s has no maps for layer %zu, which the recipe marks 'vpred'", name, l);
+            return RAD_E_INVAL;
+        }
+        en[l] = n++;
+        t.resize((size_t)(n * E));
+        float* e = t.data() + (size_t)(en[l]) * (size_t)E;
+        for (int64_t k = 0; k < n_head_kv; ++k) {
+            const float* src = it->second.data() + k * (D + 1) * D;
+            /* A rotated layer stores k' = k H and v' = v H (H symmetric and its own inverse), so
+             * v' ~ k' (H A H) + b H: each row of A times H, then each column of the result. */
+            std::vector<std::vector<double>> a((size_t)D, std::vector<double>((size_t)D));
+            for (int64_t i = 0; i < D; ++i) {
+                for (int64_t j = 0; j < D; ++j) a[(size_t)i][(size_t)j] = src[i * D + j];
+                rot(a[(size_t)i]);
+            }
+            std::vector<double> col((size_t)D);
+            for (int64_t j = 0; j < D; ++j) {
+                for (int64_t i = 0; i < D; ++i) col[(size_t)i] = a[(size_t)i][(size_t)j];
+                rot(col);
+                for (int64_t i = 0; i < D; ++i) e[(k * (D + 1) + i) * D + j] = (float)col[(size_t)i];
+            }
+            std::vector<double> b(src + D * D, src + (D + 1) * D);
+            rot(b);
+            for (int64_t j = 0; j < D; ++j) e[(k * (D + 1) + D) * D + j] = (float)b[(size_t)j];
+        }
+    }
+    *table = std::move(t);
+    *entry = std::move(en);
+    return RAD_OK;
+}
+
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
@@ -1040,11 +1246,41 @@ int config_parse(int argc, char** argv, Config* c) {
             const std::string text((std::istreambuf_iterator<char>(f)),
                                    std::istreambuf_iterator<char>());
             const std::string name = std::string("--kv-recipe ") + v;
-            std::string vfile;
-            const int rc = kv_recipe_parse(text, name.c_str(), &c->kv_recipe, &vfile);
+            std::string vfile, pfile;
+            const int rc = kv_recipe_parse(text, name.c_str(), &c->kv_recipe, &vfile, &pfile);
             if (rc != RAD_OK) return rc;
             c->kv_recipe_path = v;
             c->kv_vmean = KvVMean{};
+            c->kv_vpred = KvVPred{};
+            if (!pfile.empty()) {
+                /* Beside the recipe unless absolute, as the mean file. */
+                const std::string rp(v);
+                const size_t slash = rp.find_last_of('/');
+                const std::string ppath = pfile[0] == '/' || slash == std::string::npos
+                                              ? pfile : rp.substr(0, slash + 1) + pfile;
+                std::ifstream pf(ppath, std::ios::binary);
+                if (!pf) {
+                    RAD_ERR("%s: cannot read its K-to-V map file '%s'", name.c_str(), ppath.c_str());
+                    return RAD_E_INVAL;
+                }
+                const std::string pt((std::istreambuf_iterator<char>(pf)),
+                                     std::istreambuf_iterator<char>());
+                const int pr = kv_vpred_parse(pt, ppath.c_str(), &c->kv_vpred);
+                if (pr != RAD_OK) return pr;
+                for (size_t l = 0; l < c->kv_recipe.size(); ++l)
+                    if (c->kv_recipe[l] >= 0 && (c->kv_recipe[l] & RAD_KVQ_VPRED) &&
+                        !c->kv_vpred.layer.count((int)l)) {
+                        RAD_ERR("%s: layer %zu says 'vpred' and %s has no maps for it",
+                                name.c_str(), l, ppath.c_str());
+                        return RAD_E_INVAL;
+                    }
+                for (const auto& [l, mp] : c->kv_vpred.layer)
+                    if ((size_t)l >= c->kv_recipe.size() || c->kv_recipe[(size_t)l] < 0) {
+                        RAD_ERR("%s: %s holds layer %d, which the recipe does not name; a map "
+                                "file from another model's recipe", name.c_str(), ppath.c_str(), l);
+                        return RAD_E_INVAL;
+                    }
+            }
             if (!vfile.empty()) {
                 /* Beside the recipe unless absolute, so a recipe and its means move together. */
                 const std::string rp(v);

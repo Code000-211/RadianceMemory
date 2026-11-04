@@ -1916,6 +1916,8 @@ static void attn_decode_scratch_band_case(const Plugin& pl) {
                            : !std::strcmp(kvs, "k4hv4") ? 18 * hd / 16
                            : !std::strcmp(kvs, "k4hv2h") ? 14 * hd / 16
                            : !std::strcmp(kvs, "k5v4") ? 20 * hd / 16
+                           : !std::strcmp(kvs, "k4hv4pk") ? 18 * hd / 16
+                           : !std::strcmp(kvs, "k4hv2hpk") ? 14 * hd / 16
                            : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 2 * hd;
         const int64_t bs = std::strstr(r->name, "_bs4_") ? 4 : 16;
         const int64_t max_seqs = 32, max_ctx = 200000, mb = (max_ctx + bs - 1) / bs;
@@ -25140,12 +25142,19 @@ static void vmean_add_case(const Plugin& pl) {
 
 /* A packed layout held to libref: its kv_dtype, a token's row at head_dim 256, where the scales
  * start, V in two bits, i8h's int8 codes under one scale a head, and k5_v4's int5 K (rotated or
- * not; the kernels read either alike). */
-struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2, i8, k5; };
+ * not; the kernels read either alike). `pk` is a `vpred` layer's second attention over the layout
+ * (kv_dtype `attn`, k4h_v4_pk / k4h_v2h_pk): the cache stored at kv_dtype, read with K in V's
+ * place, so the output is P K-hat. */
+struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2, i8, k5;
+                   bool pk = false; const char* attn = nullptr; };
 static const K4hLayout kK4hv4L  = { "k4h_v4",  "k4hv4",  18 * 256 / 16, 256,         false, false, false };
 static const K4hLayout kK4hv2hL = { "k4h_v2h", "k4hv2h", 14 * 256 / 16, 3 * 256 / 4, true,  false, false };
 static const K4hLayout kI8hL    = { "i8h",     "i8h",    2 * 256 + 4,   2 * 256,     false, true,  false };
 static const K4hLayout kK5v4L   = { "k5_v4",   "k5v4",   20 * 256 / 16, 9 * 256 / 8, false, false, true };
+static const K4hLayout kK4hv4PkL  = { "k4h_v4",  "k4hv4pk",  18 * 256 / 16, 256,         false, false,
+                                      false, true, "k4h_v4_pk" };
+static const K4hLayout kK4hv2hPkL = { "k4h_v2h", "k4hv2hpk", 14 * 256 / 16, 3 * 256 / 4, true,  false,
+                                      false, true, "k4h_v2h_pk" };
 
 /* One kv_store launch (host or device pointers alike), k and v [T, kvh * 256] at pitch `ld`. */
 static int k4h_store(RadLaunchFn fn, const K4hLayout& L, const void* k, const void* v, int64_t T_,
@@ -25417,9 +25426,17 @@ static void k4h_attn_one(const Plugin& pl, const K4hLayout& L, const char* rowna
                 for (int kh = 0; kh < kvh; ++kh) {
                     const int d = dim[(size_t)(j * kvh + kh)];
                     const int e = (int)(rng() % 5) - 2;
+                    /* P K-hat (L.pk): K is the output, so outside the target's group it holds
+                     * whole codes times 2^-4..2^-2 (one of them +-7, the group's scale a power
+                     * of two): at most 1.75, a score of 14 against the target's 224, still
+                     * decisive, and the target's K-hat row comes out exactly. */
+                    const int ek = (int)(rng() % 3) - 4;
                     for (int x = 0; x < HD; ++x) {
                         const size_t at = ((size_t)j * kvh + kh) * HD + (size_t)x;
-                        kt[at] = rad_f32_to_bf16(x == d ? 28.0f : 0.0f);
+                        const bool kgrp = d >= 0 && x / 32 == d / 32;
+                        const int ck = x % 32 == 0 ? (rng() & 1 ? 1 : -1) * 7 : code(rng);
+                        kt[at] = rad_f32_to_bf16(x == d ? 28.0f
+                                                 : L.pk && !kgrp ? std::ldexp((float)ck, ek) : 0.0f);
                         const int cv = L.v2 ? (rng() & 1 ? 1 : -1) * (x % 2 ? 1 : 3)
                                      : x % (L.i8 ? 256 : 32) == 0
                                          ? (rng() & 1 ? 1 : -1) * (L.i8 ? 127 : 7) : code(rng);
@@ -25462,7 +25479,7 @@ static void k4h_attn_one(const Plugin& pl, const K4hLayout& L, const char* rowna
         t[7] = T(out, RAD_BF16, { rows, nh, HD });
         p = { PI("q_len", c.decode ? verify_max : maxq + 3), PI("head_dim", HD), PI("gqa", gqa),
               PI("block_size", BS), PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
-              PS("kv_dtype", L.kv_dtype), PF("scale", 1.0 / 16.0), PI("n_head", nh),
+              PS("kv_dtype", L.attn ? L.attn : L.kv_dtype), PF("scale", 1.0 / 16.0), PI("n_head", nh),
               PI("max_seqs", n_seq), PI("max_ctx", maxctx) };
         if (c.splits > 0) p.push_back(PI("splits", c.splits));
     };
@@ -25585,6 +25602,76 @@ static void k4h_attn_case(const Plugin& pl, const K4hLayout& L) {
             for (const K4hCase& c : cases) k4h_attn_one(pl, L, pre.c_str(), g.gqa, g.vq, g.hook, c, rng);
         }
     }
+}
+
+/* kv_vpred_bf16 (a `vpred` layer, docs/OPS.md): the card's bytes equal libref's for the store's
+ * side (k4h K-hat of one and two KV heads, V less the prediction, in place, with the quantiser's
+ * edges: a zero group, ties, past the cap, an infinity and a NaN in K) and the output's (P K-hat
+ * over 24, 12 and 6 query heads sharing one map a KV head, plus, in place), at a decode's rows, a
+ * verify's and a prefill chunk's. */
+static void kv_vpred_case(const Plugin& pl) {
+    const char* row = "kv_vpred_bf16";
+    if (!sel(row)) return;
+    const RadKernelInfo* r = find(pl, row);
+    const RadLaunchFn ref = libref_row("ref_kv_vpred");
+    if (!r || !ref) { ok(row, false, "row or libref's kv_vpred absent"); return; }
+    struct C { const char* name; int64_t nh, gqa; bool k4; };
+    const C cases[] = { { "V less its prediction, two KV heads", 2, 1, true },
+                        { "V less its prediction, one KV head", 1, 1, true },
+                        { "the output plus its prediction, 24 heads over 2", 24, 12, false },
+                        { "the output plus its prediction, 12 heads over 1", 12, 12, false },
+                        { "the output plus its prediction, 6 heads over 1", 6, 6, false } };
+    std::mt19937 rng(20261120);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int64_t hd = 256;
+    for (const C& c : cases)
+        for (int64_t M : { 1, 4, 37 }) {
+            const int64_t w = c.nh * hd, nm = c.nh / c.gqa;
+            std::vector<uint16_t> x((size_t)(M * w)), y((size_t)(M * w));
+            std::vector<float> mp((size_t)(nm * (hd + 1) * hd));
+            for (auto& e : x) e = rad_f32_to_bf16(nd(rng) * 2.0f);
+            for (auto& e : y) e = rad_f32_to_bf16(nd(rng));
+            for (auto& e : mp) e = 0.1f * nd(rng);
+            if (c.k4 && M >= 4) {
+                for (int i = 0; i < 32; ++i) x[(size_t)i] = 0;                         /* zero */
+                for (int i = 0; i < 32; ++i) x[(size_t)(32 + i)] = rad_f32_to_bf16(i < 4 ? 0.125f * (2 * i + 1) : 0.f);
+                x[32 + 4] = rad_f32_to_bf16(1.75f);                                     /* ties */
+                for (int i = 0; i < 32; ++i) x[(size_t)(64 + i)] = rad_f32_to_bf16((i & 1 ? -1.f : 1.f) * 1e5f);
+                x[(size_t)(w + 3)] = 0x7f80;                                            /* inf */
+                x[(size_t)(w + 40)] = 0x7fc0;                                           /* NaN */
+            }
+            std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head", c.nh),
+                                         PI("gqa", c.gqa), PS("k_quant", c.k4 ? "k4h" : "none"),
+                                         PI("sign", c.k4 ? -1 : 1), PS("dtype", "bf16") };
+            std::vector<uint16_t> want = y;
+            RadTensor ht[4] = { T(x.data(), RAD_BF16, { M, w }), T(mp.data(), RAD_F32, { nm, hd + 1, hd }),
+                                T(want.data(), RAD_BF16, { M, w }), T(want.data(), RAD_BF16, { M, w }) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ht; a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size();
+            const int rr = ref(&a, nullptr);
+            void* dx = dalloc(x.size() * 2);
+            void* dm = dalloc(mp.size() * 4);
+            void* dy = dalloc(y.size() * 2);
+            st_memcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dm, mp.data(), mp.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(dy, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, w }), T(dm, RAD_F32, { nm, hd + 1, hd }),
+                                          T(dy, RAD_BF16, { M, w }), T(dy, RAD_BF16, { M, w }) };
+            run_case(r, ts, ps);
+            std::vector<uint16_t> got(y.size());
+            st_memcpy(got.data(), dy, got.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0, moved = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                diff += got[i] != want[i];
+                moved += want[i] != y[i];
+            }
+            ok(fmt("%s vs libref byte for byte, %s, %lld rows", row, c.name, (long long)M).c_str(),
+               rr == RAD_OK && diff == 0 && moved >= M * w / 2,
+               fmt("libref rc=%d, %lld elements differ, %lld moved", rr, (long long)diff,
+                   (long long)moved));
+            dfree_all();
+        }
 }
 
 /* qsa_select, against a host sort of the same scores.
@@ -33131,6 +33218,9 @@ static void device_phase(const Plugin& pl) {
         k4h_store_case(pl, *L);
         k4h_attn_case(pl, *L);
     }
+    /* A `vpred` layer: P K-hat over both k4h caches, and kv_vpred's two sides. */
+    for (const K4hLayout* L : { &kK4hv4PkL, &kK4hv2hPkL }) k4h_attn_case(pl, *L);
+    kv_vpred_case(pl);
     e4m3r_store_case(pl);
 
     if (sel("qsa_select_i32")) {

@@ -653,6 +653,13 @@ private:
      * declare and freed with the engine (the view's `table` is the allocation). */
     std::vector<uint16_t>          kv_vmean_table_;
     std::vector<RadKvVMean>        kv_vmean_views_;
+    /* ---- the recipe's maps from K to V (--kv-recipe `vpred`), the same way: `kv_vpred_table_` the
+     * RadKvVPred table (f32, rotated) and `kv_vpred_entry_` each layer's entry in it, built at
+     * bringup and empty without a `vpred` layer; `kv_vpred_views_` per rank, `table` its card's
+     * copy (the allocation, freed with the engine) and `entry` kv_vpred_entry_'s data. */
+    std::vector<float>             kv_vpred_table_;
+    std::vector<int32_t>           kv_vpred_entry_;
+    std::vector<RadKvVPred>        kv_vpred_views_;
     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
     bool        report_printed_ = false;
     /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in

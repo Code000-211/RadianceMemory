@@ -681,6 +681,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "plugin does not serve\n", (long long)l);
                 return RAD_E_UNSUPPORTED;
             }
+            /* So is V predicted from K (RAD_KVQ_VPRED). */
+            if (q & RAD_KVQ_VPRED) {
+                fprintf(stderr, "radiance: KV recipe: layer %lld predicts V from K, which this "
+                                "plugin does not serve\n", (long long)l);
+                return RAD_E_UNSUPPORTED;
+            }
             if (l >= m.n_main || !is_full_attention(l, interval)) {
                 fprintf(stderr, "radiance: KV recipe: layer %lld keeps no attention cache in this "
                                 "model (%lld layers, full attention every %lld from %lld)\n",

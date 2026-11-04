@@ -83,6 +83,15 @@ Engine::~Engine() {
         kv_vmean_views_[(size_t) r->index].table = nullptr;
     }
     kv_vmean_views_.clear();
+    /* The K-to-V map tables, the same way. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= kv_vpred_views_.size()) continue;
+        const void* d = kv_vpred_views_[(size_t) r->index].table;
+        if (!d || rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        kv_vpred_views_[(size_t) r->index].table = nullptr;
+    }
+    kv_vpred_views_.clear();
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();

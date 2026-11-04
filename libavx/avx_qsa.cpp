@@ -737,6 +737,53 @@ AVX_KERNEL(kv_transcode) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ kv_vpred */
+/* libref's ref_kv_vpred, its refusals and its order: per (row, head) xq is the head of x, through
+ * k4h_v4's K store and back with k_quant "k4h" (kvx_k4h, kvx_int4: libref's encode and decode);
+ * then per output column acc = b[j], acc = fma(xq[i], A[i][j], acc) for i ascending, and out =
+ * y +- acc rounded once. Scalar fma in libref's order, so the bytes are libref's; rows split across
+ * threads. */
+AVX_KERNEL(kv_vpred) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *mp = &a->t[1], *y = &a->t[2], *o = &a->t[3];
+    const int64_t hd = p_int(a, "head_dim", 0), nh = p_int(a, "n_head", 0);
+    const int64_t gqa = p_int(a, "gqa", 1), sign = p_int(a, "sign", 1);
+    const char* kq = p_str(a, "k_quant", "none");
+    const bool k4 = kq && std::strcmp(kq, "k4h") == 0;
+    if (!kq || (!k4 && std::strcmp(kq, "none"))) return RAD_E_INVAL;
+    if (sign != 1 && sign != -1) return RAD_E_INVAL;
+    if (hd <= 0 || nh <= 0 || gqa <= 0 || nh % gqa || (k4 && hd % 32)) return RAD_E_SHAPE;
+    if (hd > 2048) return RAD_E_UNSUPPORTED;
+    if (mp->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t w = nh * hd, M = numel(x) / w;
+    if (M <= 0 || numel(x) != M * w || numel(y) < M * w || numel(o) < M * w ||
+        numel(mp) < (nh / gqa) * (hd + 1) * hd)
+        return RAD_E_SHAPE;
+    const int64_t x_rs = row_stride(x, w), y_rs = row_stride(y, w), o_rs = row_stride(o, w);
+    const float* A = (const float*)mp->data;
+    AVX_PARALLEL_FOR_IF(M * nh * hd * hd >= AVX_PAR_MIN && M * nh > 1)
+    for (int64_t rh = 0; rh < M * nh; ++rh) {
+        const int64_t r = rh / nh, h = rh % nh;
+        float xq[2048], yr[2048];
+        widen(x, r * x_rs + h * hd, 1, hd, xq);
+        widen(y, r * y_rs + h * hd, 1, hd, yr);
+        if (k4)
+            for (int64_t g = 0; g < hd; g += 32) {
+                uint8_t codes[16], sc[2];
+                kvx_k4h(xq + g, codes, sc);
+                for (int i = 0; i < 32; ++i) xq[g + i] = kvx_int4(codes, sc, i);
+            }
+        const float* Am = A + (h / gqa) * (hd + 1) * hd;
+        for (int64_t j = 0; j < hd; ++j) {
+            float acc = Am[hd * hd + j];
+            for (int64_t i = 0; i < hd; ++i) acc = std::fma(xq[i], Am[i * hd + j], acc);
+            yr[j] = yr[j] + (sign < 0 ? -acc : acc);
+        }
+        narrow(o, r * o_rs + h * hd, 1, hd, yr);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_page */
 /* libref's ref_qsa_page (the statement of the contract is there): a cold entry (<= -2) of `sel`
  * becomes its scratch page after block_bytes at the start of its store slot (this layer's view) are copied into that

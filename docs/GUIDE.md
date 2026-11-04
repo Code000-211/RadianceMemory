@@ -1017,6 +1017,38 @@ is stored (and after the rotation the channels are near even anyway), and keeps 
 rotated values do not need. The exact rule is libref's `kv_store` (OPS.md). Its KL, its speed, and
 whether the per-channel half of KVarN would pay here, are not measured yet.
 
+**V predicted from K: `vpred`.** On Flash-Next an affine map from a layer's K to its V, fitted
+on calibration, explains about half of centred V's variance out of sample. A k4h_v4 or k4h_v2h line
+ending in `vpred` (`layer 7 k4h_v2h vpred`) stores V less K-hat A + b, K-hat being the key as the
+cache holds it, and its attention runs once more over the same cache with the keys as values
+(P K-hat) and adds (P K-hat) A + b to the output: exact but for roundings, at no extra bits. It
+costs a second attention pass and two head_dim x head_dim maps a token on the layer. The maps come
+from the file a `vpred FILE` line names (beside the recipe unless absolute):
+
+```
+vpred flashnext.kvpred
+layer 3  k4h_v4 vpred
+layer 7  k4h_v2h vpred
+```
+
+Fit them with the calibration mode and `RADIANCE_CALIB_VPRED=1` (off by default: the sums cost
+head_dim^2 a token and head on the host), over long documents and a bf16 cache; it writes
+`DIR/kv_vpred.txt` beside `kv_vmean.txt`:
+
+```
+RADIANCE_CALIB_VPRED=1 radiance --model M.rad <serve flags> --kv-cache-dtype bf16 \
+    --calib-corpus LONG.jsonl --calib-dir DIR          # writes DIR/kv_vpred.txt
+```
+
+The file is text, unrotated (the engine rotates it at load): a header `kv_vpred 1 head_dim D
+kv_heads H rows R`, then per layer and KV head `layer L head h bias b_0 ... b_{D-1}` and D lines
+`layer L head h row i a_i0 ... a_i(D-1)`. The fit is ridge least squares on K as computed (lambda
+1e-4 times the mean K variance). Refused, named: `vpred` on any other layout, beside `vmean` (the
+bias takes the mean's place) or a `demote`, a `vpred` word without its file line or the reverse,
+and in the file what the `vmean` file is refused for plus a row outside 0..D-1 and a head missing
+its bias or a row. Only `qwen4exp_fp8` serves it; the MTP head behind a `vpred` last layer takes
+that layer's maps. Not measured yet.
+
 **A V mean per layer: `vmean`.** On Flash-Next V carries a large per-channel offset (the norm of
 its mean is 0.53 to 0.89 of V's RMS, layer by layer), and a symmetric group scale spends its range
 on it. A line ending in `vmean` (`layer 7 k4h_v4 vmean`, `layer 11 fp8_v4 rotated vmean`) makes

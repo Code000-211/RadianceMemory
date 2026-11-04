@@ -62,8 +62,14 @@ extern "C" {
  *
  * 43: an eighth kv_recipe layout, RAD_KVQ_K5V4 (k5_v4: int5 K, int4 V, f16 scales a group of 32;
  * rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built at 42 would read a k5_v4
- * layer as a layout it does not know and refuse it. */
-#define RAD_ABI_VERSION 43u
+ * layer as a layout it does not know and refuse it.
+ *
+ * 44: V predicted from the same layer's K (--kv-recipe `vpred`): a kv_recipe entry's fifth
+ * meaning, RAD_KVQ_VPRED, RadBuildCtx gained kv_vpred (past qsa_bkey_dtype), RadKvVPred
+ * (rad_builder.h) is new, and with it the op `kv_vpred` and attn_paged's kv_dtype k4h_v4_pk /
+ * k4h_v2h_pk (docs/OPS.md). A plugin built at 43 would read a vpred layer's entry as a layout it
+ * does not know and refuse it. */
+#define RAD_ABI_VERSION 44u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

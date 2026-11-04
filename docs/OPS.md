@@ -1308,6 +1308,44 @@ same row of `out` receives it in layout `to`.
   every direction the recipe serves, on cache-shaped rows and on rows of every byte drawn (E4M3
   NaN codes, infinite and NaN f16 scales), and avx_check.
 
+**A `vpred` layer stores V less its prediction from K** (`RAD_KVQ_VPRED`, --kv-recipe `vpred`,
+k4h_v4 and k4h_v2h only). Before the store (after the rotation) `kv_vpred` takes K-hat A + b off
+V's rows, K-hat being K through the k4h store's own rounding, so the prediction is made from the
+key the cache holds. After the attention a second `attn_paged` over the same cache, selection and
+bands, at `kv_dtype` `k4h_v4_pk` / `k4h_v2h_pk`, reads K's int4 codes and scales in V's place and
+so writes P K-hat; `kv_vpred` adds (P K-hat) A + b to the output before the rotation back. A row of
+P sums to one, so the output is the unpredicted one but for roundings. The `_pk` names are read by
+the attention only (libref's `ref_attn_paged`, and libr4d's k4h attention rows at those
+kv_dtypes: the same kernels with the `O_PK` bit, `attn_{prefill,decode}_h256_gqa12_k4hv4pk`,
+`..._k4hv2hpk` and their `_gqa6_bs4_` twins); no store takes them. libavx has no k4h attention
+rows, so none at `_pk` either. Held to libref in the emulator by `r4d_emu_k4h --layout k4h_v4_pk`
+/ `k4h_v2h_pk`, as the layouts' rows are.
+
+### `kv_vpred`
+
+| op | params | operands |
+|---|---|---|
+| `kv_vpred` | `M`(range) `head_dim` `n_head` `gqa` `k_quant` `sign` `dtype` | `x`, `map`, `y` → `out` |
+
+V predicted from the same layer's K. `x`, `y` and `out` are `[M, n_head * head_dim]` rows (out may
+be y), `map` is `[n_head / gqa, head_dim + 1, head_dim]` f32: per map A's head_dim rows (row i the
+weights of x's dim i into the output's dims), then the bias b. Row r's head h takes map `h / gqa`:
+
+- `xq` is x's head, or with `k_quant` `k4h` that head through k4h_v4's K store and back (each
+  group of 32: scale `f16(fmin(absmax / 7, 8188))` with fmax dropping a NaN, code `clamp(rint(x /
+  scale), -7, 7)`, 0 at a zero scale, value code times scale) -- the K-hat the cache holds;
+- per output column j, in f32: `acc = b[j]`, then `acc = fma(xq[i], A[i][j], acc)` for i
+  ascending; `out = round(y + (sign < 0 ? -acc : acc))` to out's dtype, one rounding.
+
+Every implementation keeps that order, so the bytes agree. `sign` is +1 or -1; refused
+(`RAD_E_INVAL` / `RAD_E_SHAPE` / `RAD_E_DTYPE`): another `k_quant` or `sign`, query heads that do not
+share the maps evenly, `k4h` off the 32-grid, a map not f32 or too short. The store side is
+`k_quant k4h, gqa 1, sign -1` over the rank's KV heads with x = k and y = out = v; the output side
+`k_quant none`, the rank's gqa, `sign +1` over its query heads with x = P K-hat. libref
+(`ref_kv_vpred`) is the oracle; libr4d's `kv_vpred_bf16` (a workgroup a row and head, head_dim a
+multiple of 32 up to 512) and libavx's are held to its bytes (`r4d_emu_vpred`, r4d_selftest,
+avx_check).
+
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first
 (`kv_resolve`, under "Sparse attention (QSA)"), and every other op reads the cache as before.

@@ -494,6 +494,10 @@ G8_V4_ENTRIES(i8h, 516, O_V4 | O_K4 | O_I8)
  * decode: k6_v4's kernels with one high bit a K dim. No gated-merge entry: an unrotated k5_v4
  * layer takes the separate gate (the gq op does not resolve at its kv_dtype). */
 G8_V4_ENTRIES(k5v4, 320, O_V4 | O_K6 | O_K5)
+/* P K-hat over the k4h_v4 and k4h_v2h caches (kv_dtype k4h_v4_pk / k4h_v2h_pk): the same kernels
+ * with V's tile read from K's codes and scales (O_PK), a `vpred` layer's second attention. */
+G8_V4_ENTRIES(k4hv4pk, 288, O_V4 | O_K4 | O_PK)
+G8_V4_ENTRIES(k4hv2hpk, 224, O_V4 | O_K4 | O_V2 | O_PK)
 #undef G8_V4_ENTRIES
 #undef G8_V4_GQ_ENTRY
 #endif

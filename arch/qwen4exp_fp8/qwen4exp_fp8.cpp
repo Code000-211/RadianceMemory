@@ -165,6 +165,12 @@ struct Model {
     std::vector<char> kvmean;
     /* The V means' calibration tap under --calib-dir (rad_calib_vmean.h). */
     CalibVMean vcal;
+    /* Each trunk layer's RAD_KVQ_VPRED (a `vpred` recipe line): AttnGatedFP8::vpred_map from
+     * RadBuildCtx::kv_vpred. */
+    std::vector<char> kvpred;
+    /* The K-to-V maps' calibration tap under --calib-dir and RADIANCE_CALIB_VPRED
+     * (rad_calib_vpred.h). */
+    CalibVPred pcal;
     /* PLE lives on exactly one layer; -1 when the checkpoint has none or this build does not
      * declare that layer. */
     PleLayer    ple;
@@ -725,6 +731,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * layout stores it (AttnGatedFP8::vmean_sub); it needs the engine's table and a layout
          * with integer V, and is refused, naming the layer, otherwise.
          *
+         * `vpred` (RAD_KVQ_VPRED) stores V less its prediction from the layer's K-hat and adds the
+         * prediction from P K-hat back to the output (AttnGatedFP8::vpred_map); it needs the
+         * engine's maps and a k4h_v4 or k4h_v2h layer without a V mean or a demote layout, and is
+         * refused, naming the layer, otherwise.
+         *
          * `bf16` (RAD_KVQ_BF16) is the cache --kv-cache-dtype bf16 declares, for that layer: its
          * group is RAD_BF16 at head_dim and its ops band on kv_dtype "bf16", so the block takes
          * the bf16 store, attention, prologue fold, streamed store and gate-in-merge rows exactly
@@ -744,6 +755,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
         std::vector<char> rot_of((size_t)g.n_layer, 0);
         std::vector<char> vmean_of((size_t)g.n_layer, 0);
+        std::vector<char> vpred_of((size_t)g.n_layer, 0);
         if (ctx->kv_recipe) {
             if (!f8) {
                 fprintf(stderr, "radiance: a KV recipe chooses layouts of the fp8 cache, and this "
@@ -754,7 +766,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (ctx->kv_recipe[l] < 0) continue;
                 /* The layout, and apart from it whether the layer runs rotated, which any layout
                  * can: the rotation is an op of its own beside the layout's rows. */
-                const int q = ctx->kv_recipe[l] & ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN | RAD_KVQ_DEMOTE);
+                const int q = ctx->kv_recipe[l] &
+                              ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN | RAD_KVQ_VPRED | RAD_KVQ_DEMOTE);
                 /* Its demote layout (RAD_KVQ_DEMOTE): k4h_v4 or k4h_v2h of an i8h or rotated fp8
                  * layer, which the pager expands (arch/common/rad_qsa.h). Both share the layer's
                  * basis and V mean, so the rotation and the centring below are the layer's. */
@@ -805,9 +818,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                               : "the engine did not hand over (kv_vmean)");
                     return RAD_E_UNSUPPORTED;
                 }
+                const bool vp = (ctx->kv_recipe[l] & RAD_KVQ_VPRED) != 0;
+                if (vp && ((q != RAD_KVQ_K4H && q != RAD_KVQ_K4HV2H) || dq || vm ||
+                           !ctx->kv_vpred)) {
+                    fprintf(stderr, "radiance: KV recipe: layer %lld predicts V from K, which "
+                                    "%s\n", (long long)l,
+                            !ctx->kv_vpred ? "the engine did not hand over (kv_vpred)"
+                                           : "only a k4h_v4 or k4h_v2h layer without a V mean or "
+                                             "a demote layout takes");
+                    return RAD_E_UNSUPPORTED;
+                }
                 kvq_of[(size_t)l] = kv_key(q, dq);
                 rot_of[(size_t)l] = (ctx->kv_recipe[l] & RAD_KVQ_ROTATED) != 0;
                 vmean_of[(size_t)l] = vm;
+                vpred_of[(size_t)l] = vp;
             }
             for (int64_t l = 0; l < g.n_layer; ++l)
                 if (is_full_attention(l, interval) &&
@@ -907,7 +931,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const bool last_vmean = last_l >= 0 && vmean_of[(size_t)last_l];
         m.kvq     = std::move(kvq_of);
         m.kvrot   = std::move(rot_of);
+        const bool last_vpred = last_l >= 0 && vpred_of[(size_t)last_l];
         m.kvmean  = std::move(vmean_of);
+        m.kvpred  = std::move(vpred_of);
         m.kv_full = m.kv_q[last_q];
         /* A k4h_v4, k4h_v2h or i8h group holds rotated K and V only, so the MTP head behind such a
          * layer rotates as the trunk's layers in it do; any other group keeps the head unrotated.
@@ -920,6 +946,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             !kv_vmean_slices(ctx->kv_vmean, last_l, m.mtp.attn.rotate, g, &m.mtp.attn.vmean_sub,
                              &m.mtp.attn.vmean_add))
             return RAD_E_UNSUPPORTED;
+        /* Its V likewise less the last attention layer's prediction, whose maps it takes. */
+        if (last_vpred && !g.attn_zero &&
+            !(m.mtp.attn.vpred_map = kv_vpred_slice(ctx->kv_vpred, last_l, g)))
+            return RAD_E_UNSUPPORTED;
         /* The calibration tap: the trunk's attention layers, this rank's KV heads. */
         {
             std::vector<int> attn_layers;
@@ -928,6 +958,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const bool spanned = g.world > g.n_head_kv_all || g.attn_world != g.world;
             const int64_t kv_first = (spanned ? g.kv_off : g.attn_rank * g.kv_dim()) / g.head_dim;
             RAD_ARCH_TRY(m.vcal.begin(ctx, g, attn_layers, kv_first));
+            RAD_ARCH_TRY(m.pcal.begin(ctx, g, attn_layers, kv_first));
         }
         /* The pager (arch/common/rad_qsa.h) when the deployment asked for the residency store; not
          * on a rank with no attention cache. A page is `ratio` tokens, K and V, of one layer. */
@@ -1381,6 +1412,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                  &lay.attn.vmean_add))
                 return RAD_E_UNSUPPORTED;
             if (m.vcal.on) lay.attn.vcal = &m.vcal;
+            if (m.kvpred[(size_t)l] && !g.attn_zero &&
+                !(lay.attn.vpred_map = kv_vpred_slice(ctx->kv_vpred, l, g)))
+                return RAD_E_UNSUPPORTED;
+            if (m.pcal.on) lay.attn.pcal = &m.pcal;
             RAD_ARCH_TRY(lay.attn.declare(b, nm, ga, (int)l, kv, m.n_rot, aw, as,
                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));
             /* The indexer, after the attention block so its ops sit where the sparse attention

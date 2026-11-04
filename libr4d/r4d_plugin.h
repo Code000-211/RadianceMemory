@@ -429,6 +429,24 @@ int     r4d_rad_attn_prefill_h256_gqa6_k4hv2h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv2h_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_k4hv2h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_k4hv2h_scratch(const RadArgs*);
+/* P K-hat over the k4h_v4 / k4h_v2h caches (kv_dtype k4h_v4_pk / k4h_v2h_pk, O_PK), the same four
+ * each: a `vpred` layer's second attention. */
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv2hpk_scratch(const RadArgs*);
 /* The i8h cache (int8 K and V, one f16 scale a token and head, stored rotated), the same four. */
 int     r4d_rad_attn_prefill_h256_gqa12_i8h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_prefill_h256_gqa12_i8h_scratch(const RadArgs*);
@@ -898,6 +916,8 @@ int r4d_rad_kv_store_k4hv4  (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k4hv2h (const RadArgs*, RadStream);
 int r4d_rad_kv_store_i8h    (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k5v4   (const RadArgs*, RadStream);
+/* kv_vpred (r4d_model_bf16.hip): a `vpred` layer's V less its prediction from K, and back. */
+int r4d_rad_kv_vpred_bf16   (const RadArgs*, RadStream);
 int r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_cols(const RadArgs*, RadStream);
@@ -1037,6 +1057,7 @@ int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_page           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_transcode        (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_kv_vpred            (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);

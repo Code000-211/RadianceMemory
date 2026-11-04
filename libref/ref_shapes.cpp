@@ -1391,7 +1391,8 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
      * is held to this reference over stored caches instead (tests/r4d_emu/test_k4h.cpp). */
     const char* kvs = gs(p, n_p, "kv_dtype");
     if (kvs && (!std::strcmp(kvs, "k4h_v4") || !std::strcmp(kvs, "k4h_v2h") ||
-                !std::strcmp(kvs, "i8h") || !std::strcmp(kvs, "k5_v4")))
+                !std::strcmp(kvs, "i8h") || !std::strcmp(kvs, "k5_v4") ||
+                !std::strcmp(kvs, "k4h_v4_pk") || !std::strcmp(kvs, "k4h_v2h_pk")))
         return RAD_E_UNSUPPORTED;
     /* `q_dtype` and `kv_dtype` are read separately: the engine issues fp8 caches beside bf16
      * queries. */
@@ -1788,6 +1789,21 @@ int ref_kv_transcode_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     o.t_idx_dt((uint32_t)RAD_U8, { M, rf }, 256, -1, 0);          /* x */
     o.t((uint32_t)RAD_U8, { M, rt });                             /* out */
     return o.finish("kv_transcode", operand, out);
+}
+
+/* kv_vpred: x, y and out [M, n_head * head_dim] of `dtype`, the map [n_head / gqa, head_dim + 1,
+ * head_dim] f32, all standard normals; k4h's quantiser takes any finite group. */
+int ref_kv_vpred_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), hd = gi(p, n_p, "head_dim", 0);
+    const int64_t nh = gi(p, n_p, "n_head", 0), gqa = gi(p, n_p, "gqa", 1);
+    if (M <= 0 || hd <= 0 || nh <= 0 || gqa <= 0 || nh % gqa || hd % 32) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, nh * hd });                               /* x */
+    o.t((uint32_t)RAD_F32, { nh / gqa, hd + 1, hd });     /* map */
+    o.t(D, { M, nh * hd });                               /* y */
+    o.t(D, { M, nh * hd });                               /* out */
+    return o.finish("kv_vpred", operand, out);
 }
 
 int ref_qsa_tail_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
