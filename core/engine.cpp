@@ -498,6 +498,15 @@ int Engine::prepare_release(const RadBatch* b) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    /* Importance-tiered demotion: blocks handed out for this step start at no selections, zeroed on
+     * rank 0's stream ahead of the step (KVManager::take_count_clears; nothing without a split
+     * group). A block is handed out free, so no earlier pass still counts into it. */
+    if (const auto cl = ranks_[0]->kv.take_count_clears(); !cl.empty())
+        if (ranks_[0]->resx.count_clear(cl, ranks_[0]->ctx.stream()) < 0) {
+            RAD_ERR("kv residency: zeroing the selection counts of %zu fresh block(s) failed: %s",
+                    cl.size(), rad_dev_last_error());
+            return RAD_E_DEVICE;
+        }
     /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
      * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
      * parked, so no allocation races the read. */
@@ -821,6 +830,17 @@ int Engine::step_loop() {
         }
 
         if (t_on) phase_mark(PH_SAVE);
+        /* The selection counts to host behind the step's pass and ahead of the sampled ids' copy,
+         * which the drafter's issue or the collect enqueues next: the collect's wait, even the early
+         * one on the ids alone, then covers it, so the commit's sweep reads this step's counts
+         * (TierExec::count_snapshot; nothing without a split group). The drafter's passes count
+         * into the next step's copy. A step issued ahead adds to the card's counts, not to this
+         * copy, which the next step's issue overwrites only after this commit. */
+        if (ranks_[0]->resx.count_snapshot(ranks_[0]->ctx.stream()) < 0) {
+            RAD_ERR("step %d: copying the selection counts to the host failed: %s", b->step,
+                    rad_dev_last_error());
+            return fail_loop(RAD_E_DEVICE);
+        }
         /* Queue the drafter's passes behind the step before waiting: the card computes acceptance
          * itself and every pass reads it there (sched/advance.h), so one wait covers the whole
          * step. */
@@ -830,6 +850,7 @@ int Engine::step_loop() {
         /* Behind the step's last resolve and before its end event, so collect_step's wait covers it. */
         st = stream_probe_issue(b);
         if (st < 0) return fail_loop(st);
+
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
@@ -2146,6 +2167,20 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    /* Importance-tiered demotion: how the run split its demoted blocks, the numbers a KL run has no
+     * /stats poll for. Only with a split group. */
+    for (const auto& p : ranks_[0]->kv.plans())
+        if (p.residency() && p.split()) {
+            const auto& st = ranks_[0]->kv.residency_stats();
+            RAD_INFO("kv residency: %lld blocks demoted, %lld (%.1f %%) in %s and %lld in %s; %s "
+                     "over the link out, %s a block on average (rank 0's part)",
+                     (long long)st.demoted, (long long)(st.demoted - st.demoted_narrow),
+                     st.demoted ? 100.0 * (double)(st.demoted - st.demoted_narrow) / (double)st.demoted : 0.0,
+                     kv_layout_name(p.res_to), (long long)st.demoted_narrow, kv_layout_name(p.res_to2),
+                     humanb(st.demoted_bytes).c_str(),
+                     humanb(st.demoted ? st.demoted_bytes / st.demoted : 0).c_str());
+            break;
+        }
     xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);

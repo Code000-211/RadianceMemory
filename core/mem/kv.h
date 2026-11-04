@@ -26,6 +26,7 @@
 #include "rad_core.h"
 #include "rad_runtime.h"   /* rad_kv_cold_entry: the cold block-table entry */
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <string>
@@ -166,6 +167,17 @@ struct KVGroupPlan {
     /* One layer's bytes of a block in a store slot, and the whole block's. */
     int64_t     residency_frag() const { return tiered() ? res_frag : layer_bytes_per_block(); }
     int64_t     residency_bytes() const { return n_layers * residency_frag(); }
+    /* Two demote layouts (`demote WIDE NARROW`, RAD_KVQ_DEMOTE2): `res_to` is the wide one, which
+     * sizes the slot, and `res_to2` the narrow one, whose `res_frag2` bytes a layer sit at the
+     * front of that layer's fragment in the slot, so the slot's layout (layer offsets, the pager's
+     * view) is the wide one's either way. Each demoted block takes one of the two by its selection
+     * count (KVManager::residency_pick). -1: one demote layout. */
+    int         res_to2 = -1;
+    int64_t     res_frag2 = 0;
+    bool        split() const { return res_to2 >= 0; }
+    /* The bytes a block moves over the link, and holds of its slot, in demote layout `lay` (0 the
+     * first, 1 the second). */
+    int64_t     residency_bytes(int lay) const { return lay && split() ? n_layers * res_frag2 : residency_bytes(); }
     /* The pager's scratch pages (spec §7.3): ordinary pool blocks the engine owns, ids
      * [0, scratch_blocks) of the group, never on its free list. A row of the step's decode batch
      * gets `scratch_pitch` = residency_blocks + 1 of them (the selection's topk plus the tail's
@@ -246,6 +258,10 @@ struct BlockMove {
     int32_t group = -1;
     int32_t block = -1;
     int32_t host_slot = -1;   /* the arena slot holding (or about to hold) this block */
+    /* A group with two demote layouts (KVGroupPlan::split): which one the slot holds, 0 the wide
+     * and 1 the narrow. Chosen by rank 0's manager at the block's first demotion and carried to
+     * every rank, so all ranks store and expand a block the same way. 0 for any other group. */
+    int32_t layout = 0;
 };
 
 /* A state slot that still holds the previous tenant's state and must be zeroed before first use.
@@ -296,6 +312,49 @@ public:
      * engine (TierExec::paged_counter); the manager only carries the address to the batch. */
     void     set_residency_paged(int64_t* dev) { res_paged_ = dev; }
     int64_t* residency_paged() const { return res_paged_; }
+    /* ---- importance-tiered demotion (a group with two demote layouts, KVGroupPlan::split) ----
+     *
+     * The counter: `qsa_count` adds, on rank 0's card, one per query whose full QSA selection kept
+     * a pool block (RadKVGroupBatch::residency_count, `dev`, n u32). The engine zeroes a block's
+     * word when it is handed out (take_count_clears) and copies the array after every step to
+     * `host`, which residency_demote() reads: a count is the selections a block received while
+     * resident, from its hand-out to its demotion -- the residency window is the window. Set on
+     * rank 0's manager only; another rank's batch carries no counter and takes the layouts the
+     * moves name. */
+    void set_residency_count(int32_t group, uint32_t* dev, const uint32_t* host, int64_t n);
+    uint32_t*       residency_count(int32_t group) const;
+    int64_t         residency_count_blocks(int32_t group) const;
+    /* Pool blocks of a counted group handed out since the last call, as (group, block): the engine
+     * zeroes their counter words before the step that may select them. */
+    std::vector<std::pair<int32_t, int32_t>> take_count_clears();
+    /* --kv-demote-split: the fraction of a split group's demoted blocks given the wide layout. */
+    void set_residency_split(double f) { res_split_ = f; }
+    /* The layout a split group's block takes at its first demotion, 0 wide or 1 narrow, from its
+     * score (residency_score): wide when fewer than split * (n + 1) of the last n <=
+     * kPickCohort scores this group decided are >= it, so the most-selected fraction of the blocks
+     * demoted just before it is wide, and ties go narrow. Records the score among the last ones.
+     * A short look back because the scores drift with position (a sweep after a long prompt
+     * demotes thousands of blocks oldest first, and against the last 512 the newer ones ranked
+     * low: 26 % wide at a split of 0.5); 64 is one sweep's bound. Deterministic in the order of
+     * the calls, which is the sweep's, so the emulation and the residency run choose the same. */
+    static constexpr int64_t kPickCohort = 64;
+    int  residency_pick(int32_t group, double score);
+    /* A block's selections over what a uniform choice would have given it: `count` over
+     * ln(now / max(end, window)), the sum of 1/q over the positions q in [max(end, window), now)
+     * that could have selected it (a query at q keeps topk of its q / ratio blocks, and only a
+     * query past the window, topk * ratio = residency_window tokens, chooses at all; the constant
+     * topk * ratio * layers drops out of a ranking). `end` is the block's last token + 1 and `now`
+     * the sequence's length. Raw counts would rank a block by its age: an older block was exposed
+     * to more queries, and to queries that kept a larger share of a shorter history. 0 when no
+     * query could have chosen it. */
+    static double residency_score(uint32_t count, int64_t end, int64_t window, int64_t now);
+    /* The layout a store slot holds (BlockMove::layout), as the demotion that filled it chose. */
+    int  residency_slot_layout(int32_t slot) const;
+    /* Device, this rank's [slots] u8 table of the same, which TierExec writes with each slot's
+     * bytes and the pager reads (RadKVGroupBatch::residency_slot_layout); null without a split
+     * group. */
+    void           set_residency_slot_table(const uint8_t* dev) { res_slot_dev_ = dev; }
+    const uint8_t* residency_slot_table() const { return res_slot_dev_; }
     /* RADIANCE_DEBUG_KV_TIER=emulate (Engine): the emulation the residency-on output is held to.
      * residency_demote() then names every block the sweep would demote -- outside sink and tail,
      * not shared, not already done -- with host_slot -1 and leaves its table entry and pool block
@@ -412,6 +471,7 @@ public:
         int64_t freed_blocks = 0, freed_bytes = 0; /* pool blocks given back by landed demotions: VRAM freed */
         int64_t promoted_misses = 0;               /* a promotion a step needed: the link traffic */
         int64_t repointed = 0;                     /* demotions that moved no bytes: the entry went back to its origin slot */
+        int64_t demoted_narrow = 0;                /* of `demoted`, those stored in a split group's narrow layout */
     };
     const ResidencyStats& residency_stats() const { return res_stats_; }
     /* The same counters per sequence (= per session: the scheduler keys both by request id). A
@@ -912,6 +972,21 @@ private:
      * reference (resident), so a preempt, a rollback and a free_sequence leak neither. */
     HostArena* res_arena_ = nullptr;
     int64_t*   res_paged_ = nullptr;
+    /* Importance-tiered demotion (set_residency_count, residency_pick): per group the counter's
+     * device array, its host copy and length; the last decided counts; the blocks to zero; each
+     * slot's layout; this rank's device slot table. */
+    struct ResCount { uint32_t* dev = nullptr; const uint32_t* host = nullptr; int64_t n = 0; };
+    std::vector<ResCount> res_count_;
+    std::vector<std::deque<double>> res_cohort_;
+    std::vector<std::pair<int32_t, int32_t>> res_count_clears_;
+    std::vector<uint8_t> res_slot_lay_;
+    const uint8_t* res_slot_dev_ = nullptr;
+    double     res_split_ = 0.5;
+    /* residency_pick() of the block at table entry `i` of `s` (pool block `b`), scored from its
+     * count in the host copy, for a split group; 0 otherwise. RADIANCE_DEBUG_KV_SPLIT=hash scores
+     * by a hash of (sequence, entry) instead: the same split without the selection signal, the
+     * control a measurement of the signal needs. */
+    int pick_of(int32_t g, int32_t b, int64_t i, const Seq& s);
     int64_t    res_rank_off_ = 0;
     int64_t    res_slot_bytes_ = 0;                   /* the whole shared slot */
     std::vector<int64_t> res_off_;                    /* per group: its bytes' offset in a slot */

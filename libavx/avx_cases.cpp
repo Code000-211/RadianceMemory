@@ -602,6 +602,10 @@ std::vector<Case> build_cases() {
                         HI("block_bytes", 8) });
     add("kv_resolve", { HI("M", 3), HI("blocks", 1), HI("slots", 1), HI("sel_pitch", 513),
                         HI("block_bytes", 4096) });
+    /* Importance-tiered demotion's selection counter: full and short rows, the partial page on and
+     * off a block boundary (libref's description draws both). */
+    add("qsa_count", { HI("M", 9), HI("topk", 5), HI("ratio", 4) });
+    add("qsa_count", { HI("M", 33), HI("topk", 16), HI("ratio", 4) });
     /* Window residency's demote layout: every direction the recipe serves, at Flash-Next's head_dim
      * and the 32-grid's smallest the vector paths must also take, over rows of every byte drawn. */
     for (int64_t hd : { 256, 64 })

@@ -2000,7 +2000,20 @@ extern "C" int r4d_shape_qsa_page(const RadParam* p, int n_p, int operand, RadOp
         store, pool,
         opd_idx(M, k + 1, M * (k + 1)),       /* scratch: ids inside the pool */
         opd((uint32_t)RAD_I64, 1),            /* paged: the counter */
+        opd_none(),                           /* slot_layout: only with store_layout2 */
     };
+    R4D_PICK(l);
+}
+
+/* The selection counter: entries drawn inside the counter, nsel over [0, topk + 1], so full and
+ * short rows both occur. */
+extern "C" int r4d_shape_qsa_count(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), k = pi(p, n_p, "topk"), r = pi(p, n_p, "ratio");
+    if (M <= 0 || k <= 0 || r <= 0) return RAD_E_UNSUPPORTED;
+    RadOpdDesc cnt = opd((uint32_t)RAD_U32, 64);
+    cnt.fill = RAD_FILL_INDEX; cnt.idx_max = 1 << 16;
+    const RadOpdDesc l[] = { opd_idx(M, k + 1, 64), opd_idx(M, 0, k + 2), opd_idx(M, 0, 1 << 20), cnt,
+                             opd_none() };
     R4D_PICK(l);
 }
 

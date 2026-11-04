@@ -165,6 +165,23 @@ public:
     int64_t* paged_counter();
     int64_t  paged_in();
 
+    /* ---------------- importance-tiered demotion (KVGroupPlan::split) ----------------
+     *
+     * slot_table(): this rank's [slots] u8 table of which demote layout each store slot holds
+     * (RadKVGroupBatch::residency_slot_layout), zeroed, allocated by the first call like the
+     * pager's counter. issue_moves() writes a split group's slot byte on the transfer stream right
+     * behind the slot's bytes, so the pager, which waits for the demotion, reads the two together.
+     *
+     * count_buffer(): the selection counter of split group `g`, `n` u32 on the card (zeroed) and
+     * its pinned host copy (`*host`), allocated by the first call; the leader's only.
+     * count_snapshot() enqueues the copy of every counter to its host copy on `s` (rank 0's compute
+     * stream, behind the step, so the step's collect waits for it); count_clear() zeroes the named
+     * blocks' words on `s`, runs of adjacent ids one memset, before the step that may select them. */
+    uint8_t*  slot_table(int64_t slots);
+    uint32_t* count_buffer(int32_t g, int64_t n, const uint32_t** host);
+    int       count_snapshot(RadStream s);
+    int       count_clear(const std::vector<std::pair<int32_t, int32_t>>& blocks, RadStream s);
+
 
     /* ---------------- RADIANCE_DEBUG_TIER_VERIFY, the replicated window ----------------
      *
@@ -208,6 +225,10 @@ private:
          * `rf` bytes in the pool and `rt` in the store. Unresolved for any other group. */
         Resolved to_store, to_pool;
         int64_t  sfrag = 0, rows = 0, rf = 0, rt = 0;
+        /* Two demote layouts (KVGroupPlan::split): the narrow one's transcodes, its row and its
+         * per-layer bytes, which a slot holds at the front of each `sfrag`. */
+        Resolved to_store2, to_pool2;
+        int64_t  sfrag2 = 0, rt2 = 0;
     };
 
     /* Builds the staging and index buffers, events and transfer stream lazily on the first pass
@@ -286,6 +307,10 @@ private:
     bool      moved_ = false;         /* a move was recorded on ev_move_ */
     int64_t*  paged_dev_ = nullptr;   /* paged_counter(), device */
     int64_t*  paged_host_ = nullptr;  /* its readback target, pinned */
+    uint8_t*  slot_dev_ = nullptr;    /* slot_table(), device */
+    uint8_t*  lay_host_ = nullptr;    /* pinned {0, 1}: the bytes the slot table is written from */
+    struct Count { int32_t g = -1; int64_t n = 0; uint32_t* dev = nullptr; uint32_t* host = nullptr; };
+    std::vector<Count> counts_;       /* count_buffer()s */
     bool      copy_out_ = false;
     /* Transfer stream. Each stream costs a hardware queue, and a fourth queue costs this card 65% of
      * its decode step, so the tier borrows the expert mover's maintenance stream

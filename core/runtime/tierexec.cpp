@@ -84,6 +84,25 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
                 close();
                 return RAD_E_UNSUPPORTED;
             }
+            /* The second demote layout (KVGroupPlan::split): its own pair of transcodes. */
+            if (p->split()) {
+                gi.sfrag2 = p->res_frag2;
+                gi.rt2 = kv_layout_row_bytes(p->res_to2, p->res_head_dim);
+                x.set_s("from", kv_layout_name(p->res_from));
+                x.set_s("to", kv_layout_name(p->res_to2));
+                gi.to_store2 = reg->resolve("kv_transcode", x, RAD_DOMAIN_DEVICE);
+                x.set_s("from", kv_layout_name(p->res_to2));
+                x.set_s("to", kv_layout_name(p->res_from));
+                gi.to_pool2 = reg->resolve("kv_transcode", x, RAD_DOMAIN_DEVICE);
+                if (!gi.to_store2 || !gi.to_pool2) {
+                    RAD_WARN("kv residency: no device kv_transcode between %s and %s at head_dim "
+                             "%lld for group %d, so its blocks cannot take the second demote "
+                             "layout", kv_layout_name(p->res_from), kv_layout_name(p->res_to2),
+                             (long long)p->res_head_dim, (int)g);
+                    close();
+                    return RAD_E_UNSUPPORTED;
+                }
+            }
         }
         gi_.push_back(gi);
     }
@@ -218,6 +237,14 @@ void TierExec::close() {
     release_device();
     if (paged_dev_)  { (void)rad_dev_set(device_); rad_dev_free(paged_dev_, RAD_MEM_DEVICE); paged_dev_ = nullptr; }
     if (paged_host_) { rad_dev_free(paged_host_, RAD_MEM_HOST_PINNED); paged_host_ = nullptr; }
+    if (slot_dev_)   { (void)rad_dev_set(device_); rad_dev_free(slot_dev_, RAD_MEM_DEVICE); slot_dev_ = nullptr; }
+    if (lay_host_)   { rad_dev_free(lay_host_, RAD_MEM_HOST_PINNED); lay_host_ = nullptr; }
+    for (Count& c : counts_) {
+        (void)rad_dev_set(device_);
+        if (c.dev)  rad_dev_free(c.dev, RAD_MEM_DEVICE);
+        if (c.host) rad_dev_free(c.host, RAD_MEM_HOST_PINNED);
+    }
+    counts_.clear();
     copy_out_ = false;
     gi_.clear();
     order_.clear();
@@ -614,12 +641,29 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
     if (to_host ? !gi->gather.row : !gi->scatter.row) return RAD_E_NOKERNEL;
     const bool tiered = gi->to_store && gi->to_pool && move_stage2_;
     if (emul && !tiered) return RAD_OK;            /* a round trip through the same bytes */
+    /* Two demote layouts (KVGroupPlan::split): the batch with its wide blocks first, a stable
+     * partition, so each layout's blocks are one run of the stage and take one transcode. Any
+     * other group names layout 0 only, and its order is the caller's. */
+    const bool split = tiered && gi->to_store2 && gi->to_pool2;
+    std::vector<BlockMove> mv(moves);
+    if (split)
+        std::stable_partition(mv.begin(), mv.end(), [](const BlockMove& m) { return m.layout == 0; });
+    int64_t n0 = 0;
+    for (const BlockMove& m : mv) {
+        if (m.layout != 0 && (!split || m.layout != 1)) return RAD_E_INVAL;
+        n0 += m.layout == 0;
+    }
+    if (split && !emul && !slot_dev_) return RAD_E_STATE;   /* the pager could not tell the layouts apart */
 
-    const int64_t n = (int64_t)moves.size();
+    const int64_t n = (int64_t)mv.size();
     const int64_t blk = gi->n_layers * gi->frag;
-    /* What a slot holds of the group's block: the demote layout's rows when tiered. */
+    /* What a slot holds of the group's block: the demote layout's rows when tiered; a narrow
+     * block (split) the narrow rows at the front of each layer's fragment. */
     const int64_t sblk = tiered ? gi->n_layers * gi->sfrag : blk;
-    const int64_t rows = n * gi->n_layers * gi->rows;   /* every staged row, tiered */
+    const int64_t nblk = split ? gi->n_layers * gi->sfrag2 : sblk;
+    const int64_t rb = gi->n_layers * gi->rows;          /* a block's rows, tiered */
+    /* Block i's bytes in the second stage: the wide run, then the narrow one packed. */
+    auto off2 = [&](int64_t i) { return i < n0 ? i * sblk : n0 * sblk + (i - n0) * nblk; };
     if (blk > move_bytes_) return RAD_E_INVAL;
 
     /* Both directions after everything compute had been given when this was issued. A demotion
@@ -642,7 +686,7 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
     }
     int32_t* idx_host = move_idx_host_ + move_idx_off_;
     move_idx_off_ += n;
-    for (int64_t i = 0; i < n; ++i) idx_host[i] = moves[(size_t)i].block;
+    for (int64_t i = 0; i < n; ++i) idx_host[i] = mv[(size_t)i].block;
     TIER_TRY(rad_memcpy_async(move_idx_dev_, idx_host, n * (int64_t)sizeof(int32_t), stream_),
              "the residency block-index upload");
 
@@ -652,13 +696,22 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
                               blk, /*stage_off=*/0),
                      "the residency gather out of the pool");
         /* The staged blocks are back to back, each its layers' fragments, so the stage is one
-         * plane of rows in either layout. */
-        if (tiered)
-            TIER_TRY(run_xc(gi->to_store, move_stage_, gi->rf, move_stage2_, gi->rt, rows),
+         * plane of rows in either layout: a run per layout. */
+        if (tiered && n0 > 0)
+            TIER_TRY(run_xc(gi->to_store, move_stage_, gi->rf, move_stage2_, gi->rt, n0 * rb),
                      "the residency requantise into the demote layout");
+        if (split && n > n0)
+            TIER_TRY(run_xc(gi->to_store2, (char*)move_stage_ + n0 * blk, gi->rf,
+                            (char*)move_stage2_ + off2(n0), gi->rt2, (n - n0) * rb),
+                     "the residency requantise into the second demote layout");
         if (emul) {
-            TIER_TRY(run_xc(gi->to_pool, move_stage2_, gi->rt, move_stage_, gi->rf, rows),
-                     "the emulated expand back into the resident layout");
+            if (n0 > 0)
+                TIER_TRY(run_xc(gi->to_pool, move_stage2_, gi->rt, move_stage_, gi->rf, n0 * rb),
+                         "the emulated expand back into the resident layout");
+            if (split && n > n0)
+                TIER_TRY(run_xc(gi->to_pool2, (char*)move_stage2_ + off2(n0), gi->rt2,
+                                (char*)move_stage_ + n0 * blk, gi->rf, (n - n0) * rb),
+                         "the emulated expand back from the second demote layout");
             for (int64_t l = 0; l < gi->n_layers; ++l)
                 TIER_TRY(run_rows(gi->scatter, /*scatter=*/true, *gi, l, move_stage_,
                                   move_idx_dev_, n, blk, /*stage_off=*/0),
@@ -666,13 +719,24 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
         } else {
             const char* out = tiered ? (const char*)move_stage2_ : (const char*)move_stage_;
             for (int64_t i = 0; i < n; ++i) {
-                void* host = kv_->residency_slot_ptr(g, moves[(size_t)i].host_slot);
+                const int32_t slot = mv[(size_t)i].host_slot;
+                void* host = kv_->residency_slot_ptr(g, slot);
                 if (!host) return RAD_E_STATE;
-                TIER_TRY(rad_memcpy_async(host, out + i * sblk, sblk, stream_),
-                         "the residency copy to host memory");
+                if (i < n0)
+                    TIER_TRY(rad_memcpy_async(host, out + off2(i), sblk, stream_),
+                             "the residency copy to host memory");
+                else      /* each layer's narrow rows at the front of its fragment in the slot */
+                    TIER_TRY(rad_memcpy_2d_async(host, gi->sfrag, out + off2(i), gi->sfrag2,
+                                                 gi->sfrag2, gi->n_layers, stream_),
+                             "the residency copy to host memory");
+                /* The slot's layout byte, behind its bytes on the same stream (slot_table). */
+                if (split)
+                    TIER_TRY(rad_memcpy_async(slot_dev_ + slot, lay_host_ + (i < n0 ? 0 : 1), 1,
+                                              stream_),
+                             "the residency slot's layout");
+                mv_.out_bytes += i < n0 ? sblk : nblk;
             }
             mv_.out_blocks += n;
-            mv_.out_bytes  += n * sblk;
         }
         /* The steps after this read the demoted blocks through the pager (or the emulation's new
          * bytes in place), so they wait for it (see the header). */
@@ -684,14 +748,24 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
     } else {
         char* in = tiered ? (char*)move_stage2_ : (char*)move_stage_;
         for (int64_t i = 0; i < n; ++i) {
-            const void* host = kv_->residency_slot_ptr(g, moves[(size_t)i].host_slot);
+            const void* host = kv_->residency_slot_ptr(g, mv[(size_t)i].host_slot);
             if (!host) return RAD_E_STATE;
-            TIER_TRY(rad_memcpy_async(in + i * sblk, host, sblk, stream_),
-                     "the residency copy out of host memory");
+            if (i < n0)
+                TIER_TRY(rad_memcpy_async(in + off2(i), host, sblk, stream_),
+                         "the residency copy out of host memory");
+            else
+                TIER_TRY(rad_memcpy_2d_async(in + off2(i), gi->sfrag2, host, gi->sfrag,
+                                             gi->sfrag2, gi->n_layers, stream_),
+                         "the residency copy out of host memory");
+            mv_.in_bytes += i < n0 ? sblk : nblk;
         }
-        if (tiered)
-            TIER_TRY(run_xc(gi->to_pool, move_stage2_, gi->rt, move_stage_, gi->rf, rows),
+        if (tiered && n0 > 0)
+            TIER_TRY(run_xc(gi->to_pool, move_stage2_, gi->rt, move_stage_, gi->rf, n0 * rb),
                      "the residency expand into the resident layout");
+        if (split && n > n0)
+            TIER_TRY(run_xc(gi->to_pool2, (char*)move_stage2_ + off2(n0), gi->rt2,
+                            (char*)move_stage_ + n0 * blk, gi->rf, (n - n0) * rb),
+                     "the residency expand from the second demote layout");
         for (int64_t l = 0; l < gi->n_layers; ++l)
             TIER_TRY(run_rows(gi->scatter, /*scatter=*/true, *gi, l, move_stage_, move_idx_dev_, n,
                               blk, /*stage_off=*/0),
@@ -703,7 +777,6 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
                      "ordering the step after the residency restore");
         }
         mv_.in_blocks += n;
-        mv_.in_bytes  += n * sblk;
     }
     /* Last, so the event covers the whole batch on the transfer stream, in either direction. */
     TIER_TRY(rad_event_record(ev_move_, stream_), "marking the residency move");
@@ -735,6 +808,76 @@ int64_t* TierExec::paged_counter() {
         paged_dev_ = nullptr; paged_host_ = nullptr;
     }
     return paged_dev_;
+}
+
+/* A zeroed device allocation, on a stream of its own as paged_counter()'s. */
+static void* zeroed_device(int64_t bytes) {
+    void* p = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+    RadStream zs = nullptr;
+    const bool ok = p && rad_stream_create(&zs, 0) == RAD_OK &&
+                    rad_memset_async(p, 0, bytes, zs) == RAD_OK && rad_stream_sync(zs) == RAD_OK;
+    if (zs) rad_stream_destroy(zs);
+    if (!ok && p) { rad_dev_free(p, RAD_MEM_DEVICE); p = nullptr; }
+    return p;
+}
+
+uint8_t* TierExec::slot_table(int64_t slots) {
+    if (slot_dev_) return slot_dev_;
+    if (slots <= 0 || rad_dev_set(device_) != RAD_OK) return nullptr;
+    slot_dev_ = (uint8_t*)zeroed_device(slots);
+    lay_host_ = (uint8_t*)rad_dev_alloc(2, RAD_MEM_HOST_PINNED);
+    if (!slot_dev_ || !lay_host_) {
+        if (slot_dev_) rad_dev_free(slot_dev_, RAD_MEM_DEVICE);
+        if (lay_host_) rad_dev_free(lay_host_, RAD_MEM_HOST_PINNED);
+        slot_dev_ = nullptr; lay_host_ = nullptr;
+        return nullptr;
+    }
+    lay_host_[0] = 0; lay_host_[1] = 1;
+    return slot_dev_;
+}
+
+uint32_t* TierExec::count_buffer(int32_t g, int64_t n, const uint32_t** host) {
+    for (const Count& c : counts_)
+        if (c.g == g) { if (host) *host = c.host; return c.dev; }
+    if (n <= 0 || rad_dev_set(device_) != RAD_OK) return nullptr;
+    Count c;
+    c.g = g; c.n = n;
+    c.dev = (uint32_t*)zeroed_device(n * (int64_t)sizeof(uint32_t));
+    c.host = (uint32_t*)rad_dev_alloc(n * (int64_t)sizeof(uint32_t), RAD_MEM_HOST_PINNED);
+    if (!c.dev || !c.host) {
+        if (c.dev)  rad_dev_free(c.dev, RAD_MEM_DEVICE);
+        if (c.host) rad_dev_free(c.host, RAD_MEM_HOST_PINNED);
+        return nullptr;
+    }
+    std::memset(c.host, 0, (size_t)n * sizeof(uint32_t));
+    counts_.push_back(c);
+    if (host) *host = c.host;
+    return c.dev;
+}
+
+int TierExec::count_snapshot(RadStream s) {
+    for (const Count& c : counts_)
+        if (rad_memcpy_async(c.host, c.dev, c.n * (int64_t)sizeof(uint32_t), s) != RAD_OK)
+            return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
+int TierExec::count_clear(const std::vector<std::pair<int32_t, int32_t>>& blocks, RadStream s) {
+    if (blocks.empty() || counts_.empty()) return RAD_OK;
+    std::vector<std::pair<int32_t, int32_t>> b(blocks);
+    std::sort(b.begin(), b.end());
+    for (size_t i = 0; i < b.size();) {
+        size_t j = i + 1;
+        while (j < b.size() && b[j].first == b[i].first && b[j].second <= b[j - 1].second + 1) ++j;
+        const Count* c = nullptr;
+        for (const Count& x : counts_) if (x.g == b[i].first) c = &x;
+        const int64_t lo = b[i].second, hi = b[j - 1].second + 1;
+        if (c && lo >= 0 && hi <= c->n &&
+            rad_memset_async(c->dev + lo, 0, (hi - lo) * (int64_t)sizeof(uint32_t), s) != RAD_OK)
+            return RAD_E_DEVICE;
+        i = j;
+    }
+    return RAD_OK;
 }
 
 int64_t TierExec::paged_in() {

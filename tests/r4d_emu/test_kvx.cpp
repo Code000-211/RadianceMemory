@@ -21,7 +21,12 @@
  * counter compared with libref's. The four waves of the pager's workgroup split a fragment's rows,
  * so a fragment of four rows leaves no wave idle and one of eight gives each two. The fp8 pool's
  * encode has no cross-lane step, so with it the emulator runs each wave to its end before the next
- * starts: the case that found the pager rewriting its entry before the later waves had read it. */
+ * starts: the case that found the pager rewriting its entry before the later waves had read it.
+ *
+ * Importance-tiered demotion (RAD_KVQ_DEMOTE2): qsa_page with store_layout2 over a store whose
+ * slots hold k4h_v4 or k4h_v2h by the slot table, and qsa_count over selections past the budget
+ * (full rows with and without the partial page, short rows, cold and empty entries, many rows
+ * naming the same blocks), each held to libref's bytes and counts. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "rad_runtime.h"
@@ -38,6 +43,7 @@
 
 extern "C" int r4d_rad_kv_transcode(const RadArgs* a, RadStream stream);
 extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream);
+extern "C" int r4d_rad_qsa_count(const RadArgs* a, RadStream stream);
 
 namespace {
 
@@ -219,6 +225,132 @@ void check_page(RadLaunchFn ref, RadLaunchFn ref_page, std::mt19937& rng, const 
     }
 }
 
+/* The pager over two demote layouts: slots 0, 2 and 4 hold k4h_v4 rows, 1 and 3 k4h_v2h ones at the
+ * front of a k4h_v4-wide fragment (the rest of it filler the pager must not read), as libref's
+ * requantise writes them; the slot table picks each cold entry's. */
+void check_page2(RadLaunchFn ref, RadLaunchFn ref_page, std::mt19937& rng, const char* res, int64_t rows) {
+    const int64_t hd = 256, slots = 5, blocks = 12;
+    const int64_t rw = row_of("k4h_v4", hd), rt = row_of(res, hd);
+    const int64_t sfrag = rows * rw, pfrag = rows * rt;
+    const uint8_t lay[slots] = { 0, 1, 0, 1, 0 };
+    std::vector<uint8_t> store((size_t)(slots * sfrag), 0x3C);
+    for (int64_t s = 0; s < slots; ++s) {
+        const char* dem = lay[s] ? "k4h_v2h" : "k4h_v4";
+        /* Requantised at the resident row's pitch, then packed at the demote layout's. */
+        std::vector<uint8_t> resident((size_t)(rows * rt)), d((size_t)(rows * rt));
+        cache_rows(rng, res, hd, rows, rt, resident.data());
+        if (transcode(ref, resident.data(), d.data(), rows, rt, hd, res, dem) != RAD_OK) {
+            fail("qsa_page fixture: libref would not requantise");
+            return;
+        }
+        for (int64_t r = 0; r < rows; ++r)
+            std::memcpy(store.data() + s * sfrag + r * row_of(dem, hd), d.data() + r * rt,
+                        (size_t)row_of(dem, hd));
+    }
+    const int32_t sel0[] = { rad_kv_cold_entry(3), 4, -1, rad_kv_cold_entry(0),
+                             rad_kv_cold_entry(1), 6, rad_kv_cold_entry(4), -1 };
+    const int32_t scr[] = { 7, 0, 0, 8, 9, 0, 10, 0 };
+    std::vector<int32_t> sw(sel0, sel0 + 8), se(sel0, sel0 + 8), sc(scr, scr + 8);
+    std::vector<uint8_t> pw((size_t)(blocks * pfrag), 0xEE), pe = pw;
+    std::vector<uint8_t> table(lay, lay + slots);
+    int64_t cw = 0, ce = 0;
+    auto go = [&](RadLaunchFn fn, std::vector<int32_t>& sel, std::vector<uint8_t>& pool, int64_t* ctr) {
+        RadTensor t[6] = {
+            plane(sel.data(), RAD_I32, 2, 4, 4),
+            plane(store.data(), RAD_U8, slots, sfrag, sfrag),
+            plane(pool.data(), RAD_U8, blocks, pfrag, pfrag),
+            plane(sc.data(), RAD_I32, 2, 4, 4),
+            {}, {} };
+        t[4].data = ctr; t[4].dtype = RAD_I64; t[4].rank = 1; t[4].shape[0] = 1; t[4].stride[0] = 1;
+        t[5].data = table.data(); t[5].dtype = RAD_U8; t[5].rank = 1; t[5].shape[0] = slots; t[5].stride[0] = 1;
+        RadParam p[9]{};
+        p[0] = { "M", RAD_P_INT, 2, 0, nullptr, 0.0 };
+        p[1] = { "topk", RAD_P_INT, 3, 0, nullptr, 0.0 };
+        p[2] = { "blocks", RAD_P_INT, blocks, 0, nullptr, 0.0 };
+        p[3] = { "seqs", RAD_P_INT, 2, 0, nullptr, 0.0 };
+        p[4] = { "block_bytes", RAD_P_INT, pfrag, 0, nullptr, 0.0 };
+        p[5] = { "store_layout", RAD_P_STR, 0, 0, "k4h_v4", 0.0 };
+        p[6] = { "pool_layout", RAD_P_STR, 0, 0, res, 0.0 };
+        p[7] = { "head_dim", RAD_P_INT, hd, 0, nullptr, 0.0 };
+        p[8] = { "store_layout2", RAD_P_STR, 0, 0, "k4h_v2h", 0.0 };
+        RadArgs a{};
+        a.t = t; a.n_t = 6; a.p = p; a.n_p = 9;
+        return fn(&a, nullptr);
+    };
+    const int rr = go(ref_page, sw, pw, &cw), re = go(r4d_rad_qsa_page, se, pe, &ce);
+    const std::string name = std::string("qsa_page k4h_v4 and k4h_v2h slots -> ") + res + ", " +
+                             std::to_string(rows) + " rows";
+    if (rr != RAD_OK || re != RAD_OK) {
+        fail(name + ": libref " + std::to_string(rr) + ", emulated " + std::to_string(re));
+        return;
+    }
+    int64_t diff = 0, written = 0;
+    for (size_t i = 0; i < pw.size(); ++i) { diff += pw[i] != pe[i]; written += pe[i] != 0xEE; }
+    if (diff) fail(name + ": " + std::to_string(diff) + " pool bytes differ from libref");
+    if (sw != se) fail(name + ": the selection differs from libref's");
+    if (cw != ce || ce != 4) fail(name + ": the counter is " + std::to_string(ce));
+    if (written < 3 * pfrag) fail(name + ": the pages were barely written");
+    std::printf("  %-58s %s\n", name.c_str(), diff || sw != se ? "DIFFERS" : "libref's bytes");
+}
+
+/* qsa_count against libref's counts at Flash-Next's topk (512) over 64 rows, every row counted and
+ * with `cu` (decode sequences of one to four rows and an empty one: only each one's first row). */
+void check_count(std::mt19937& rng, bool with_cu) {
+    const RadLaunchFn ref = load_libref("qsa_count");
+    if (!ref) { fail("libref's qsa_count is not loadable"); return; }
+    const int64_t M = 64, topk = 512, w = topk + 1, ratio = 4, blocks = 1500;
+    std::vector<int32_t> sel((size_t)(M * w)), ns((size_t)M), po((size_t)M);
+    std::vector<uint32_t> base((size_t)blocks);
+    for (uint32_t& c : base) c = (uint32_t)(rng() % 500);
+    for (int64_t m = 0; m < M; ++m) {
+        po[(size_t)m] = (int32_t)(4000 + 5 * m);
+        const bool part = (po[(size_t)m] + 1) % ratio != 0;
+        const int64_t k = m % 4 == 1 ? topk - 3 : topk;
+        for (int64_t j = 0; j < w; ++j) {
+            int32_t e = (int32_t)(rng() % 700);
+            if (rng() % 50 == 0) e = rad_kv_cold_entry((int32_t)(rng() % 9));
+            if (rng() % 70 == 0) e = -1;
+            if (j >= k + (part ? 1 : 0)) e = -1;
+            sel[(size_t)(m * w + j)] = e;
+        }
+        ns[(size_t)m] = (int32_t)(k + (part ? 1 : 0));
+    }
+    std::vector<int32_t> cu = { 0 };
+    while (cu.back() < M) {
+        cu.push_back(std::min<int32_t>((int32_t)M, cu.back() + 1 + (int32_t)(rng() % 4)));
+        if (cu.size() == 5) cu.push_back(cu.back());                  /* an empty sequence */
+    }
+    std::vector<uint32_t> want = base, got = base;
+    auto go = [&](RadLaunchFn fn, std::vector<uint32_t>& cnt) {
+        RadTensor t[5] = { plane(sel.data(), RAD_I32, M, w, w), {}, {}, {}, {} };
+        const std::pair<void*, int64_t> v[4] = { { ns.data(), M }, { po.data(), M }, { cnt.data(), blocks },
+                                                 { cu.data(), (int64_t)cu.size() } };
+        for (int i = 0; i < (with_cu ? 4 : 3); ++i) {
+            t[1 + i].data = v[i].first; t[1 + i].dtype = i == 2 ? RAD_U32 : RAD_I32;
+            t[1 + i].rank = 1; t[1 + i].shape[0] = v[i].second; t[1 + i].stride[0] = 1;
+        }
+        RadParam p[3]{};
+        p[0] = { "M", RAD_P_INT, M, 0, nullptr, 0.0 };
+        p[1] = { "topk", RAD_P_INT, topk, 0, nullptr, 0.0 };
+        p[2] = { "ratio", RAD_P_INT, ratio, 0, nullptr, 0.0 };
+        RadArgs a{};
+        a.t = t; a.n_t = with_cu ? 5 : 4; a.p = p; a.n_p = 3;
+        return fn(&a, nullptr);
+    };
+    const int rr = go(ref, want), re = go(r4d_rad_qsa_count, got);
+    if (rr != RAD_OK || re != RAD_OK) {
+        fail("qsa_count: libref " + std::to_string(rr) + ", emulated " + std::to_string(re));
+        return;
+    }
+    int64_t diff = 0, added = 0;
+    for (int64_t b = 0; b < blocks; ++b) { diff += got[(size_t)b] != want[(size_t)b]; added += want[(size_t)b] - base[(size_t)b]; }
+    if (diff) fail("qsa_count: " + std::to_string(diff) + " counters differ from libref");
+    if (added < (with_cu ? 8 : 30) * topk) fail("qsa_count: libref counted too little for the case to mean anything");
+    std::printf("  %-58s %s (%lld counted)\n", with_cu ? "qsa_count, 64 rows at topk 512, first rows of cu"
+                                                    : "qsa_count, 64 rows at topk 512",
+                diff ? "DIFFERS" : "libref's counts", (long long)added);
+}
+
 }  // namespace
 
 int main() {
@@ -256,6 +388,10 @@ int main() {
     for (const char* res : kResident)
         for (const char* dem : kDemote)
             for (int64_t rows : { 4, 8 }) check_page(ref, ref_page, rng, res, dem, rows);
+    for (const char* res : kResident)
+        for (int64_t rows : { 4, 8 }) check_page2(ref, ref_page, rng, res, rows);
+    check_count(rng, false);
+    check_count(rng, true);
     /* Refused, as libref refuses: the same layout twice, a head_dim off the lane map. */
     {
         std::vector<uint8_t> x(4096), o(4096);

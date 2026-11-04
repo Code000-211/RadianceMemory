@@ -420,9 +420,14 @@ static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"),
                                                 OPD("sidx") };
 static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("blocks"), P_INT("seqs"),
                                          P_INT("block_bytes"), P_STRO("store_layout"),
-                                         P_STRO("pool_layout"), P_INTO("head_dim") };
+                                         P_STRO("pool_layout"), P_INTO("head_dim"),
+                                         P_STRO("store_layout2") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
-                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged"),
+                                           OPD_O("slot_layout") };
+static const RadParamSpec pQsaCount[] = { P_INT("M"), P_INT("topk"), P_INT("ratio") };
+static const RadOperandSpec oQsaCount[] = { OPD("sel"), OPD("nsel"), OPD("pos"), INOUT("count"),
+                                            OPD_O("cu") };
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
                                              P_STR("to") };
 static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
@@ -1161,7 +1166,11 @@ static const RadOpSchema kSchemas[] = {
   "rewrites each cold entry (<= -2) of the selection to its scratch page after copying the block's "
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; resident and "
   "empty entries pass through. A byte copy, libref's contract exactly; with store_layout and "
-  "pool_layout the fragment's rows are expanded through kv_transcode's codec." },
+  "pool_layout the fragment's rows are expanded through kv_transcode's codec, and with "
+  "store_layout2 from the layout slot_layout names for the entry's slot." },
+{ "qsa_count", ARR(pQsaCount), ARR(oQsaCount),
+  "for each row of sel whose selection is full (nsel less the partial page equals topk), adds one "
+  "to count[e] for each of its first topk entries e >= 0; libref's counts." },
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "each row of x, one token's K and V head in layout `from`, decoded exactly and re-encoded in "
   "layout `to` as that layout's store encodes; libref's bytes." },
@@ -1816,6 +1825,9 @@ SIMPLE("avx_qsa_tail_store", "qsa_tail_store", "attn",
 SIMPLE("avx_qsa_page", "qsa_page", "attn",
        "QSA pager: cold selection entries copied from the residency store into scratch pages",
        "i32 tables, u8 bytes", L(qsa_page)),
+SIMPLE("avx_qsa_count", "qsa_count", "attn",
+       "QSA selection counter: full selections add one to each block they kept",
+       "i32 tables, u32 counts", L(qsa_count)),
 SIMPLE("avx_kv_transcode", "kv_transcode", "attn",
        "KV rows re-encoded from one cache layout into another (the residency demote layout)",
        "u8 bytes", L(kv_transcode)),

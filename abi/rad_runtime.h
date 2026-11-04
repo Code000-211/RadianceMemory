@@ -104,6 +104,20 @@ typedef struct RadKVGroupBatch {
     /* Slots in the residency store, so the pager can bound a cold entry's slot and see the store
      * as the plane it is ([slots, residency_slot_bytes]); 0 when the store is closed. */
     int64_t        residency_slots;
+    /* ---- importance-tiered demotion (ABI 43): a group with two demote layouts
+     * (RAD_KVQ_DEMOTE2). Null/0 for every other group, and on every rank but 0.
+     *
+     * The selection counter, device: [residency_count_blocks] u32 indexed by pool block id.
+     * `qsa_count` adds one to a block's entry for each query whose full selection (topk complete
+     * blocks) kept it, summed over the group's QSA layers. The engine zeroes a block's entry when
+     * it hands the block out and reads the array back after every step; rank 0's decides each
+     * demoted block's layout for every rank (the transfers carry it). */
+    uint32_t*      residency_count;
+    int64_t        residency_count_blocks;
+    /* Device, [residency_slots] u8: which demote layout store slot `s` holds, 0 the first (wide)
+     * and anything else the second; written with the slot's bytes on the transfer stream. The pager
+     * reads it beside `qsa_page`'s `store_layout2`. Null with one demote layout. */
+    const uint8_t* residency_slot_layout;
 } RadKVGroupBatch;
 
 /* The cold block-table entry: the block's bytes are in residency-store slot `slot` (>= 0). Its own

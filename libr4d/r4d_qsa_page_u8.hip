@@ -26,6 +26,13 @@
 // path's requantise into the demote layout before a block's copy to the store, and its expand after
 // a promotion's copy back (core/runtime/tierexec.cpp).
 //
+// With `store_layout2` as well (RAD_KVQ_DEMOTE2) each slot holds one of two demote layouts, the
+// second where the `slot_layout` table's byte for it is not 0; the workgroup reads that byte and
+// expands from its slot's own layout.
+//
+// `qsa_count` (docs/OPS.md) is importance-tiered demotion's selection counter, a thread a selection
+// entry: a full row (topk complete blocks) adds one to each of its pool ids' counters.
+//
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
@@ -33,6 +40,7 @@
 #include "r4d_emit.h"
 #include "r4d_kvx.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include <hip/hip_runtime.h>
@@ -47,7 +55,8 @@ __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
     const uint8_t* __restrict__ store, uint8_t* __restrict__ pool,
     int w, int64_t block_bytes, int64_t slots, int64_t blocks,
     int64_t sel_ld, int64_t sc_ld, int64_t slot_pitch, int64_t pool_pitch, int wide,
-    int64_t* __restrict__ paged, int xf, int xt, uint32_t hd) {
+    int64_t* __restrict__ paged, int xf, int xt, uint32_t hd, int xf2,
+    const uint8_t* __restrict__ slot_layout) {
 
     const int j = (int)blockIdx.x, m = (int)blockIdx.y;
     int32_t* const so = sel + (size_t)m * sel_ld + j;
@@ -60,11 +69,13 @@ __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
     const uint8_t* src = store + (size_t)slot * slot_pitch;
     uint8_t*       dst = pool  + (size_t)pg * pool_pitch;
     if (xf >= 0) {
-        /* Expanding: a wave a row, every lane of it through the row's reductions. */
-        const int64_t rf = r4d_kvx::row_bytes(xf, hd), rt = r4d_kvx::row_bytes(xt, hd);
+        /* Expanding: a wave a row, every lane of it through the row's reductions, from the slot's
+         * own layout (one read of its byte, the same for the whole workgroup). */
+        const int from = xf2 >= 0 && slot_layout[slot] ? xf2 : xf;
+        const int64_t rf = r4d_kvx::row_bytes(from, hd), rt = r4d_kvx::row_bytes(xt, hd);
         const uint32_t wv = threadIdx.x / 32u, lane = threadIdx.x % 32u;
         for (int64_t r = wv; r < block_bytes / rt; r += kThreads / 32)
-            r4d_kvx::row(xf, xt, src + r * rf, dst + r * rt, hd, lane);
+            r4d_kvx::row(from, xt, src + r * rf, dst + r * rt, hd, lane);
     } else if (wide) {
         /* Both planes, both pitches and the length are 16-byte multiples: one 16-byte move a lane. */
         for (int64_t i = (int64_t)threadIdx.x; i < block_bytes / 16; i += kThreads)
@@ -95,7 +106,8 @@ __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
 static int r4d_qsa_page_u8_emit(long sel, long scratch, long store, long pool, int M, int w,
                                long long bb, long long slots, long long blocks, long long sel_ld,
                                long long sc_ld, long long slot_pitch, long long pool_pitch,
-                               long paged, int xf, int xt, int hd, RadStream stream) {
+                               long paged, int xf, int xt, int hd, int xf2, long slot_layout,
+                               RadStream stream) {
     if (!sel || !scratch || !store || !pool) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || w <= 0 || bb <= 0 || slots <= 0 || blocks <= 0) return R4D_NO(RAD_E_SHAPE);
     const int wide = xf < 0 && ((((uintptr_t)store | (uintptr_t)pool) |
@@ -104,7 +116,33 @@ static int r4d_qsa_page_u8_emit(long sel, long scratch, long store, long pool, i
                     (int32_t*)sel, (const int32_t*)scratch, (const uint8_t*)store,
                     (uint8_t*)pool, w, (int64_t)bb, (int64_t)slots, (int64_t)blocks,
                     (int64_t)sel_ld, (int64_t)sc_ld, (int64_t)slot_pitch, (int64_t)pool_pitch,
-                    wide, (int64_t*)paged, xf, xt, (uint32_t)hd);
+                    wide, (int64_t*)paged, xf, xt, (uint32_t)hd, xf2,
+                    (const uint8_t*)slot_layout);
+}
+
+// A thread an entry (m, j < topk): a full row adds one to its pool id's counter.
+__global__ __launch_bounds__(256) void qsa_count_kernel(
+    const int32_t* __restrict__ sel, const int32_t* __restrict__ nsel, const int32_t* __restrict__ pos,
+    uint32_t* __restrict__ count, int64_t M, int topk, int ratio, int64_t sel_ld, int64_t ns_ld,
+    int64_t po_ld, int64_t n, const int32_t* __restrict__ cu, int64_t n_cu) {
+    const int64_t i = (int64_t)blockIdx.x * 256 + threadIdx.x;
+    if (i >= M * topk) return;
+    const int64_t m = i / topk, j = i % topk;
+    /* With `cu`, only a row opening a (non-empty) sequence: binary search of the row offsets. */
+    if (cu) {
+        int64_t lo = 0, hi = n_cu - 2;       /* the last s with cu[s] <= m */
+        if (hi < 0 || cu[0] > m) return;
+        while (lo < hi) {
+            const int64_t mid = (lo + hi + 1) / 2;
+            if (cu[mid] <= m) lo = mid; else hi = mid - 1;
+        }
+        if (cu[lo] != m || cu[lo + 1] <= m) return;
+    }
+    const int32_t p = pos[m * po_ld];
+    if (nsel[m * ns_ld] - ((p + 1) % ratio != 0 ? 1 : 0) != topk) return;
+    const int32_t e = sel[m * sel_ld + j];
+    /* An add per counted entry: a sum, so the order the threads run in does not change it. */
+    if (e >= 0 && e < n) atomicAdd(count + e, 1u);
 }
 
 // A wave a row: x [M][row(from)] -> out [M][row(to)], row pitches in bytes.
@@ -147,7 +185,34 @@ extern "C" int r4d_rad_kv_transcode(const RadArgs* a, RadStream stream) {
 
 // ============================================================== the plugin ABI entry point
 
-enum { QP_SEL = 0, QP_STORE = 1, QP_POOL = 2, QP_SCRATCH = 3, QP_PAGED = 4 };
+enum { QP_SEL = 0, QP_STORE = 1, QP_POOL = 2, QP_SCRATCH = 3, QP_PAGED = 4, QP_SLOTS = 5 };
+
+//   sel [M][>= topk + 1] i32, nsel [M] i32, pos [M] i32, count [n] u32 added to in place.
+extern "C" int r4d_rad_qsa_count(const RadArgs* a, RadStream stream) {
+    const RadTensor* se = r4d_opt(a, 0);
+    const RadTensor* ns = r4d_opt(a, 1);
+    const RadTensor* po = r4d_opt(a, 2);
+    const RadTensor* ct = r4d_opt(a, 3);
+    if (!se || !ns || !po || !ct) return R4D_NO(RAD_E_INVAL);
+    if (se->dtype != RAD_I32 || ns->dtype != RAD_I32 || po->dtype != RAD_I32 || ct->dtype != RAD_U32)
+        return R4D_NO(RAD_E_DTYPE);
+    const long long topk = r4d_geti_or(a, "topk", 0), ratio = r4d_geti_or(a, "ratio", 0);
+    if (topk <= 0 || ratio <= 0 || se->rank != 2 || ct->rank != 1) return R4D_NO(RAD_E_SHAPE);
+    const long long M = se->shape[0], sp = r4d_row_pitch(se);
+    if (M <= 0 || se->shape[1] < topk + 1 || ns->shape[0] < M || po->shape[0] < M ||
+        ct->shape[0] <= 0)
+        return R4D_NO(RAD_E_SHAPE);
+    if (sp < 0 || ct->stride[0] != 1) return R4D_NO(RAD_E_STRIDE);
+    const RadTensor* cu = r4d_opt(a, 4);
+    if (cu && (cu->dtype != RAD_I32 || cu->stride[0] != 1)) return R4D_NO(RAD_E_DTYPE);
+    const long long cells = M * topk;
+    return R4D_EMIT(stream, qsa_count_kernel, dim3((unsigned)((cells + 255) / 256)), dim3(256), 0,
+                    (const int32_t*)r4d_addr(se), (const int32_t*)r4d_addr(ns),
+                    (const int32_t*)r4d_addr(po), (uint32_t*)r4d_addr(ct), (int64_t)M, (int)topk,
+                    (int)ratio, (int64_t)sp, (int64_t)ns->stride[0], (int64_t)po->stride[0],
+                    (int64_t)ct->shape[0], cu ? (const int32_t*)r4d_addr(cu) : nullptr,
+                    cu ? (int64_t)cu->shape[0] : 0ll);
+}
 
 extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream) {
     const RadTensor* se = r4d_opt(a, QP_SEL);
@@ -182,7 +247,8 @@ extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream) {
      * width as the pool's `block_bytes` holds of the pool's. */
     const char* sl = r4d_gets(a, "store_layout");
     const char* pw = r4d_gets(a, "pool_layout");
-    int xf = -1, xt = -1;
+    const char* sl2 = r4d_gets(a, "store_layout2");
+    int xf = -1, xt = -1, xf2 = -1;
     long long hd = 0, sbb = bb;
     if (sl || pw) {
         xf = kvx_layout(sl); xt = kvx_layout(pw); hd = r4d_geti_or(a, "head_dim", 0);
@@ -195,6 +261,15 @@ extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream) {
              (uint64_t)(st->stride[0] | pitch)) & 3u)
             return R4D_NO(RAD_E_STRIDE);
     }
+    /* The second demote layout, with the slot table it is picked by (libref's refusals). */
+    const RadTensor* sly = r4d_opt(a, QP_SLOTS);
+    if (sl2) {
+        xf2 = kvx_layout(sl2);
+        if (xf < 0 || xf2 < 0 || xf2 == xf || xf2 == xt || !sly) return R4D_NO(RAD_E_INVAL);
+        if (sly->dtype != RAD_U8) return R4D_NO(RAD_E_DTYPE);
+        if (sly->shape[0] < st->shape[0] || sly->stride[0] != 1) return R4D_NO(RAD_E_SHAPE);
+        sbb = std::max(sbb, bb / r4d_kvx::row_bytes(xt, hd) * r4d_kvx::row_bytes(xf2, hd));
+    }
     if (st->shape[1] < sbb || inner * (ebits / 8) < bb || pitch < bb) return R4D_NO(RAD_E_SHAPE);
     const long long sp = r4d_row_pitch(se), cp = r4d_row_pitch(sc);
     if (sp < 0 || cp < 0 || st->stride[0] < sbb) return R4D_NO(RAD_E_STRIDE);
@@ -203,5 +278,6 @@ extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream) {
     if (pg && pg->dtype != RAD_I64) return R4D_NO(RAD_E_DTYPE);
     return r4d_qsa_page_u8_emit(r4d_addr(se), r4d_addr(sc), r4d_addr(st), r4d_addr(pl), (int)M,
                                 (int)w, bb, st->shape[0], pl->shape[0], sp, cp, st->stride[0],
-                                pitch, r4d_addr(pg), xf, xt, (int)hd, stream);
+                                pitch, r4d_addr(pg), xf, xt, (int)hd, xf2,
+                                sl2 ? r4d_addr(sly) : 0, stream);
 }

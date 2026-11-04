@@ -1435,6 +1435,9 @@ static const RadParamSpec pQsaPage[] = {
     { "store_layout", RAD_P_STR, RAD_OPTIONAL },
     { "pool_layout",  RAD_P_STR, RAD_OPTIONAL },
     { "head_dim",     RAD_P_INT, RAD_OPTIONAL },
+    /* Two demote layouts (RAD_KVQ_DEMOTE2): the second, which a slot holds where `slot_layout`
+     * says not 0. */
+    { "store_layout2", RAD_P_STR, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaPage[] = {
     { "sel",     RAD_OPD_INOUT, 0 },
@@ -1443,6 +1446,24 @@ static const RadOperandSpec oQsaPage[] = {
     { "scratch", RAD_OPD_IN,    0 },
     /* One i64 on the card the pager adds its rewritten entries to; absent, nothing is counted. */
     { "paged",   RAD_OPD_INOUT, 1 },
+    /* [slots] u8, which demote layout each slot holds; with `store_layout2` only. */
+    { "slot_layout", RAD_OPD_IN, 1 },
+};
+
+/* `qsa_count` (docs/OPS.md): importance-tiered demotion's selection counter. A full row of `sel`
+ * adds one to `count` [blocks] u32 at each of its first `topk` pool ids. */
+static const RadParamSpec pQsaCount[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "topk",  RAD_P_INT, RAD_REQUIRED },
+    { "ratio", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaCount[] = {
+    { "sel",   RAD_OPD_IN,    0 },
+    { "nsel",  RAD_OPD_IN,    0 },
+    { "pos",   RAD_OPD_IN,    0 },
+    { "count", RAD_OPD_INOUT, 0 },
+    /* The decode sequences' row offsets: only a row opening its sequence counts. */
+    { "cu",    RAD_OPD_IN,    1 },
 };
 
 /* `kv_transcode` (docs/OPS.md): rows of one KV layout re-encoded in another, a row one token's
@@ -3690,7 +3711,14 @@ static const RadOpSchema kSchemas[] = {
            "(its offset already folded in, row pitch = slot bytes), because a device kernel may "
            "not read the host offset table. `pool` is INOUT and only scratch blocks of cold "
            "entries are written. A device kernel cannot refuse: an entry whose slot or scratch id "
-           "is out of range is left as it was."),
+           "is out of range is left as it was. With store_layout2 the slot's layout is "
+           "slot_layout[slot] (0 the first)."),
+    SCHEMA("qsa_count", pQsaCount, oQsaCount,
+           "for each row m of `sel` whose selection is full -- nsel[m] less the partial page, "
+           "present when (pos[m] + 1) % ratio != 0, equals topk -- adds one to count[e] for each "
+           "of its first topk entries e >= 0; with `cu`, only a row that opens its sequence. An "
+           "add, so the counts sum over layers and steps; an id past the counter is skipped "
+           "(libref refuses it)."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "
@@ -5093,6 +5121,7 @@ static const RadConstraint cQsaTailStore[] = {
 };
 
 static const RadConstraint cQsaPage[] = { C_GE("topk", 1), C_GE("blocks", 1), C_GE("block_bytes", 1) };
+static const RadConstraint cQsaCount[] = { C_GE("topk", 1), C_GE("ratio", 1) };
 /* The codec's lane map: head_dim a multiple of 128, at most 512. */
 static const RadConstraint cKvTranscode[] = { C_DIV("head_dim", 128), C_LE("head_dim", 512),
                                               C_GE("head_dim", 128) };
@@ -9186,6 +9215,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaPage), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_page, nullptr, nullptr, nullptr,
   r4d_shape_qsa_page },
+
+/* A thread a selection entry, an atomic add a counted block. */
+{ "qsa_count_u32", "qsa_count", "attn",
+  "count, per pool block, the queries whose full QSA selection kept it",
+  "any M and topk",
+  "an i32 selection, nsel and position; the u32 counter added to in place",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaCount), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_count, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_count },
 
 /* A wave per row: window residency's demote layout written and read back on the transfer stream. */
 { "kv_transcode_u8", "kv_transcode", "attn",

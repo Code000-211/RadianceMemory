@@ -80,6 +80,15 @@ struct QsaIndexer {
         const char* page_store_layout = nullptr;
         const char* page_pool_layout  = nullptr;
         int64_t     page_head_dim     = 0;
+        /* Two demote layouts (RAD_KVQ_DEMOTE2): the second, narrower one, which a store slot holds
+         * where the batch's slot table says so (`qsa_page`'s store_layout2 and slot_layout). Set,
+         * the indexer also counts its selections (`qsa_count` into the batch's
+         * residency_count), which is how the engine picks each demoted block's layout. */
+        const char* page_store_layout2 = nullptr;
+        /* Count this indexer's selections with `qsa_count` (needs page_store_layout2): the trunk's
+         * layers. Not the MTP head's, whose passes read drafted tokens, which two runs that agree
+         * on every committed token need not share. */
+        bool        count = false;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -132,6 +141,7 @@ struct QsaIndexer {
      * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0, op_page = 0;
+    rad_op      op_count = 0;
 
     bool on() const { return op_rope != 0; }
 
@@ -148,6 +158,10 @@ struct QsaIndexer {
      * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
     bool store_keys(RadCtx* c, const RadBatch* batch) const;
+    /* `qsa_count` over the step's `T` selection rows into the batch's counter, when both exist
+     * (two demote layouts, and the rank that counts): every prefill row, and of a decode
+     * sequence's rows only the first, the committed token's -- the rest verify drafts. */
+    void count(RadCtx* c, const RadBatch* batch, const RadKVGroupBatch* atb, int64_t T) const;
 };
 
 inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -318,7 +332,30 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * before this op, reads `sel` through its own liveness declaration. `M` is the decode rows,
      * the ones that own scratch pages (RadKVGroupBatch::residency_scratch). A prefill row's
      * history is promoted before its step instead, so it never names a cold block. */
-    if (c.page && c.page_store_layout) {
+    if (c.page && c.page_store_layout && c.page_store_layout2) {
+        /* Two demote layouts: the pager also reads the slot table, and the selection is counted
+         * (`qsa_count`, between the select and the pager, which turns cold entries into scratch
+         * ids). Declared only here, so every other program is today's. */
+        if (c.page_block_bytes <= 0 || !c.page_pool_layout || c.page_head_dim <= 0)
+            return RAD_E_INVAL;
+        op_page = rw(b, RAD_OP(b, "qsa_page",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("topk", c.topk),
+                                     RAD_INT("blocks", c.max_blocks),
+                                     RAD_INT("seqs", g.max_seqs),
+                                     RAD_INT("block_bytes", c.page_block_bytes),
+                                     RAD_STR("store_layout", c.page_store_layout),
+                                     RAD_STR("pool_layout", c.page_pool_layout),
+                                     RAD_INT("head_dim", c.page_head_dim),
+                                     RAD_STR("store_layout2", c.page_store_layout2)),
+                          RAD_NOWEIGHTS),
+                     {w.sel}, {w.sel});
+        if (c.count)
+            op_count = rw(b, RAD_OP(b, "qsa_count",
+                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("topk", c.topk),
+                                          RAD_INT("ratio", c.ratio)),
+                               RAD_NOWEIGHTS),
+                          {w.sel, w.nsel}, {});
+    } else if (c.page && c.page_store_layout) {
         /* Tiered: the same op expanding the demote layout back into the pool's, so the attention
          * reads one layout. */
         if (c.page_block_bytes <= 0 || !c.page_pool_layout || c.page_head_dim <= 0)
@@ -392,6 +429,21 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
                 kv_cache(c.kv_tail, layer),
                 praw2(tlb->state_index, RAD_I32, S, tw));
     return true;
+}
+
+inline void QsaIndexer::count(RadCtx* c_, const RadBatch* batch, const RadKVGroupBatch* atb,
+                              int64_t T) const {
+    if (!op_count || !atb->residency_count || atb->residency_count_blocks <= 0) return;
+    const RadOperand cnt = praw(atb->residency_count, RAD_U32, atb->residency_count_blocks);
+    const int64_t nd = batch->n_tok_decode < T ? batch->n_tok_decode : T;
+    if (nd > 0)
+        RAD_ISSUE_N(c_, op_count, nd,
+                    brows(w.sel, nd), brows(w.nsel, nd), praw(batch->positions, RAD_I32, nd), cnt,
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq_decode + 1));
+    if (T > nd)
+        RAD_ISSUE_N(c_, op_count, T - nd,
+                    brow_slice(w.sel, nd, T - nd, c.topk + 1), brow_slice(w.nsel, nd, T - nd, 1),
+                    praw(batch->positions + nd, RAD_I32, T - nd), cnt);
 }
 
 inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
@@ -479,6 +531,8 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
             if (w0 + PR >= T) break;
             w0 = w0 + PR + PR <= T ? w0 + PR : T - PR;
         }
+        /* Counted once over the whole step, so a row two windows share counts once. */
+        count(c_, batch, atb, T);
         return;
     }
     RAD_ISSUE_N(c_, op_score, T,
@@ -492,6 +546,7 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 brows(w.nc, S), praw(batch->positions, RAD_I32, T),
                 praw(batch->cu_seqlens, RAD_I32, S + 1),
                 brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+    count(c_, batch, atb, T);
 
     /* The pager, on the decode rows (they come first, RadBatch::n_seq_decode, and own the scratch
      * pages). Only with the store open this step: the declare asked for the op, the batch says
@@ -500,19 +555,24 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * its history was promoted before the step. */
     if (op_page && atb->residency_store && atb->residency_slots > 0 && atb->residency_layer_off &&
         atb->residency_scratch &&
-        batch->n_tok_decode > 0)
-        RAD_ISSUE_N(c_, op_page, batch->n_tok_decode,
-                    brows(w.sel, batch->n_tok_decode),
-                    /* The store as this layer's fragments see it: the offset is folded in here, on the
-                     * host, because the offset table is host memory a device kernel cannot read.
-                     * Slot s of this layer starts at store + s * slot_bytes (the operand's extent). */
-                    praw2((char*)atb->residency_store + atb->residency_layer_off[layer], RAD_U8,
-                          atb->residency_slots, atb->residency_slot_bytes),
-                    kv_cache(c.kv_attn, layer),
-                    praw2(atb->residency_scratch, RAD_I32, batch->n_tok_decode,
-                          atb->residency_scratch_pitch),
-                    /* The optional counter (null: not counted; a null operand is an absent one). */
-                    praw(atb->residency_paged, RAD_I64, 1));
+        batch->n_tok_decode > 0) {
+        /* The store as this layer's fragments see it: the offset is folded in here, on the host,
+         * because the offset table is host memory a device kernel cannot read. Slot s of this
+         * layer starts at store + s * slot_bytes (the operand's extent). */
+        const RadOperand store = praw2((char*)atb->residency_store + atb->residency_layer_off[layer],
+                                       RAD_U8, atb->residency_slots, atb->residency_slot_bytes);
+        const RadOperand scratch = praw2(atb->residency_scratch, RAD_I32, batch->n_tok_decode,
+                                         atb->residency_scratch_pitch);
+        /* The optional counter (null: not counted; a null operand is an absent one), and with two
+         * demote layouts the table of which one each slot holds. */
+        if (c.page_store_layout2)
+            RAD_ISSUE_N(c_, op_page, batch->n_tok_decode, brows(w.sel, batch->n_tok_decode), store,
+                        kv_cache(c.kv_attn, layer), scratch, praw(atb->residency_paged, RAD_I64, 1),
+                        praw(atb->residency_slot_layout, RAD_U8, atb->residency_slots));
+        else
+            RAD_ISSUE_N(c_, op_page, batch->n_tok_decode, brows(w.sel, batch->n_tok_decode), store,
+                        kv_cache(c.kv_attn, layer), scratch, praw(atb->residency_paged, RAD_I64, 1));
+    }
 
     /* RADIANCE_DEBUG_QSA: prints the first few selections (nc, nsel, sequ, leading sel and score
      * entries) to tell a divergence from intended dropping (`nc` above `topk`). Synchronises the

@@ -878,6 +878,9 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 b.residency_scratch_pitch = g.scratch_pitch;
                 b.residency_paged         = pg.paged;
                 b.residency_slots         = pg.slots;
+                b.residency_count         = pg.count;
+                b.residency_count_blocks  = pg.count_blocks;
+                b.residency_slot_layout   = pg.slot_layout;
             } else {
                 b.residency_store = nullptr;
                 b.residency_slot_bytes = 0;
@@ -886,6 +889,9 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 b.residency_scratch_pitch = 0;
                 b.residency_paged = nullptr;
                 b.residency_slots = 0;
+                b.residency_count = nullptr;
+                b.residency_count_blocks = 0;
+                b.residency_slot_layout = nullptr;
             }
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }

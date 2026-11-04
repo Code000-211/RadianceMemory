@@ -153,6 +153,11 @@ static const Flag g_flags[] = {
     "                                    declares that window, and the rest of its cache then costs\n"
     "                                    link traffic instead of VRAM. 0 is off: every block stays"
     "                                    resident" },
+    { "--kv-demote-split",    "F",      "under a --kv-recipe with two demote layouts ('demote\n"
+    "                                    k4h_v4 k4h_v2h'), the fraction of demoted blocks stored\n"
+    "                                    in the wide one: those the QSA selection kept most often\n"
+    "                                    among the blocks demoted around them (default 0.5;\n"
+    "                                    0 all narrow, 1 all wide)" },
     { "--kv-residency-sink-tokens", "N", "tokens at the start of a conversation kept resident\n"
     "                                    when --kv-residency-mib is on (default 512): a sparse\n"
     "                                    consumer scores them every step, so they are cheaper in\n"
@@ -645,21 +650,25 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                     kw.c_str());
             return RAD_E_INVAL;
         }
-        /* After the layout: `rotated`, then `demote LAYOUT`, then `vmean`, each at most once and
-         * in that order. */
-        bool rot_word = false, vmean = false, bad = !(words >> num >> layout);
-        std::string demote;
+        /* After the layout: `rotated`, then `demote LAYOUT [LAYOUT2]`, then `vmean`, each at most
+         * once and in that order. A layout word straight after the demote layout is the second
+         * demote layout (RAD_KVQ_DEMOTE2). */
+        bool rot_word = false, vmean = false, bad = !(words >> num >> layout), after = false;
+        std::string demote, demote2;
         for (std::string w; !bad && (words >> w);) {
-            if (w == "rotated" && !rot_word && demote.empty() && !vmean) rot_word = true;
-            else if (w == "demote" && demote.empty() && !vmean) bad = !(words >> demote);
+            const bool second = after && kv_layout_of(w.c_str()) >= 0;
+            after = false;
+            if (second) demote2 = w;
+            else if (w == "rotated" && !rot_word && demote.empty() && !vmean) rot_word = true;
+            else if (w == "demote" && demote.empty() && !vmean) after = !(bad = !(words >> demote));
             else if (w == "vmean" && !vmean) vmean = true;
             else bad = true;
         }
         if (bad) {
             RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words, or 'layer N "
-                    "LAYOUT rotated', then 'demote LAYOUT' where window residency stores the "
-                    "layer's demoted blocks narrower, and 'vmean' last where the layer subtracts "
-                    "its V mean", name, ln);
+                    "LAYOUT rotated', then 'demote LAYOUT' (or 'demote WIDE NARROW') where window "
+                    "residency stores the layer's demoted blocks narrower, and 'vmean' last where "
+                    "the layer subtracts its V mean", name, ln);
             return RAD_E_INVAL;
         }
         char* end = nullptr;
@@ -710,6 +719,16 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                 return RAD_E_INVAL;
             }
         }
+        /* The second demote layout (RAD_KVQ_DEMOTE2): the narrower of the two, for the demoted
+         * blocks the QSA selection kept least (--kv-demote-split). A slot is sized by the first,
+         * so the first must be the wider: served as `demote k4h_v4 k4h_v2h`. */
+        const int dq2 = demote2.empty() ? 0 : kv_layout_of(demote2.c_str());
+        if (!demote2.empty() && (dq != RAD_KVQ_K4H || dq2 != RAD_KVQ_K4HV2H)) {
+            RAD_ERR("%s line %d: layer %ld: 'demote %s %s': two demote layouts are the wider one "
+                    "first and the narrower second, 'demote k4h_v4 k4h_v2h'", name, ln, l,
+                    demote.c_str(), demote2.c_str());
+            return RAD_E_INVAL;
+        }
         /* Whichever of the two layouts has integer V: the mean is the layer's, subtracted before
          * its store, so the resident and the demoted bytes are both centred. */
         if (vmean && q == RAD_KVQ_NONE && dq == 0) {
@@ -724,7 +743,8 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
         r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
-                       (vmean ? RAD_KVQ_VMEAN : 0) | (dq << RAD_KVQ_DEMOTE_SHIFT);
+                       (vmean ? RAD_KVQ_VMEAN : 0) | (dq << RAD_KVQ_DEMOTE_SHIFT) |
+                       (dq2 << RAD_KVQ_DEMOTE2_SHIFT);
         vmean_layers += vmean;
     }
     if (r.empty()) {
@@ -752,8 +772,13 @@ std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
     std::string s;
     for (int rot : { 0, (int)RAD_KVQ_ROTATED })
         for (int q : kv_layouts())
-            for (int dq : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H }) {
-                const int key = q | rot | (dq << RAD_KVQ_DEMOTE_SHIFT);
+            for (int dqp : { 0, 1, 2, 3 }) {
+                /* none, k4h_v4, k4h_v2h, and k4h_v4 with k4h_v2h second (RAD_KVQ_DEMOTE2) */
+                const int dq = dqp == 0 ? (int)RAD_KVQ_NONE : dqp == 2 ? (int)RAD_KVQ_K4HV2H
+                                                                       : (int)RAD_KVQ_K4H;
+                const int dq2 = dqp == 3 ? (int)RAD_KVQ_K4HV2H : 0;
+                const int key = q | rot | (dq << RAD_KVQ_DEMOTE_SHIFT) |
+                                (dq2 << RAD_KVQ_DEMOTE2_SHIFT);
                 std::string layers;
                 for (size_t l = 0; l < recipe.size(); ++l)
                     if (recipe[l] >= 0 && (recipe[l] & ~RAD_KVQ_VMEAN) == key)
@@ -762,6 +787,7 @@ std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
                 s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
                      (rot ? " rotated" : "") +
                      (dq ? std::string(" demote ") + kv_layout_name(dq) : std::string()) +
+                     (dq2 ? std::string(" ") + kv_layout_name(dq2) : std::string()) +
                      " at layer" + (layers.find(',') != std::string::npos ? "s " : " ") + layers;
             }
     std::string vm;
@@ -1138,6 +1164,16 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--kv-residency-mib"))     { if (!num(0, INT32_MAX, &c->residency_mib)) return RAD_E_INVAL; }
+        else if (S("--kv-demote-split")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* e = nullptr;
+            const double d = std::strtod(v, &e);
+            if (!e || *e || e == v || !(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--kv-demote-split takes a fraction from 0 to 1, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->kv_demote_split = d;
+        }
         else if (S("--kv-residency-sink-tokens")) {
             if (!num(0, INT32_MAX, &c->residency_sink_tokens)) return RAD_E_INVAL;
         }
@@ -1844,6 +1880,7 @@ const ShowRow kShow[] = {
     { "--kv-residency-mib",   [](const Config& c) {
           return c.residency_mib ? num(c.residency_mib) : std::string("0 (off)"); } },
     { "--kv-residency-sink-tokens", [](const Config& c) { return num(c.residency_sink_tokens); } },
+    { "--kv-demote-split",    [](const Config& c) { return fnum(c.kv_demote_split); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

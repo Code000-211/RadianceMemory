@@ -107,7 +107,7 @@ int         avx_par_force(int threads);
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
-    X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           X(qsa_page)           X(kv_transcode)       \
+    X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           X(qsa_page)           X(kv_transcode)       X(qsa_count)          \
     X(sam_attn)             \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \

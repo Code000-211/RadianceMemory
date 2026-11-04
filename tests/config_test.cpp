@@ -529,6 +529,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--kv-residency-mib", { "256" } }, { "--kv-residency-sink-tokens", { "512" } },
+        { "--kv-demote-split", { "0.25" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
@@ -1151,6 +1152,59 @@ TEST(a_kv_recipe_line_may_name_a_demote_layout_for_the_layers_demoted_blocks) {
     CHECK(has(refusal("layer 3 i8h demote k4h_v4 rotated\n"), "then 'demote LAYOUT'"));
     CHECK(has(refusal("layer 3 i8h vmean demote k4h_v4\nvmean m.txt\n"), "then 'demote LAYOUT'"));
     CHECK(has(refusal("layer 3 i8h demote k4h_v4 demote k4h_v2h\n"), "then 'demote LAYOUT'"));
+}
+
+/* `demote WIDE NARROW` (RAD_KVQ_DEMOTE2, bits 24-30): two demote layouts, the wide one first (a
+ * store slot is its width) and the narrow one for the demoted blocks the selection kept least.
+ * Served as k4h_v4 then k4h_v2h, before `vmean`; the other order, the same layout twice or a third
+ * word are refused with the line. The summary names the three layouts; --kv-demote-split takes a
+ * fraction from 0 to 1 (default 0.5) and refuses anything else. A line with one demote layout
+ * keeps bits 24-30 clear, the entry it had at ABI 42. */
+TEST(a_kv_recipe_line_may_name_two_demote_layouts_the_wide_one_first) {
+    std::vector<int32_t> r;
+    std::string file;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 3 i8h demote k4h_v4 k4h_v2h vmean\n"
+                             "layer 7 fp8 rotated demote k4h_v4 k4h_v2h\nlayer 11 i8h demote k4h_v4\n",
+                             "r.txt", &r, &file), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vm = RAD_KVQ_VMEAN;
+    const int32_t d4 = RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT;
+    const int32_t n2 = RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE2_SHIFT;
+    REQUIRE_EQ(r.size(), (size_t)12);
+    CHECK_EQ(r[3], RAD_KVQ_I8H | rot | vm | d4 | n2);
+    CHECK_EQ(r[7], RAD_KVQ_NONE | rot | d4 | n2);
+    CHECK_EQ(r[11], RAD_KVQ_I8H | rot | d4);
+    CHECK(r[3] > 0);
+    CHECK_EQ(RAD_KVQ_DEMOTE_OF(r[3]), (int)RAD_KVQ_K4H);
+    CHECK_EQ(RAD_KVQ_DEMOTE2_OF(r[3]), (int)RAD_KVQ_K4HV2H);
+    CHECK_EQ(RAD_KVQ_DEMOTE2_OF(r[11]), 0);
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("i8h rotated demote k4h_v4 at layer 11; i8h rotated demote k4h_v4 "
+                         "k4h_v2h at layer 3; fp8 rotated demote k4h_v4 k4h_v2h at layer 7; V mean "
+                         "subtracted at layer 3"));
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 3 i8h demote k4h_v2h k4h_v4\n"), "'demote k4h_v4 k4h_v2h'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 k4h_v4\n"), "'demote k4h_v4 k4h_v2h'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 i8h\n"), "'demote k4h_v4 k4h_v2h'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 k4h_v2h k4h_v2h\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 vmean k4h_v2h\nvmean m.txt\n"), "then 'demote LAYOUT'"));
+
+    Config c;
+    CHECK_EQ(parse({ "--kv-demote-split", "0.25" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_demote_split, 0.25);
+    CHECK_EQ(Config{}.kv_demote_split, 0.5);
+    for (const char* bad : { "1.5", "-0.1", "half", "" }) {
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = parse_fresh({ "--kv-demote-split", bad }); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(has(err, "--kv-demote-split takes a fraction from 0 to 1"));
+    }
 }
 
 namespace {

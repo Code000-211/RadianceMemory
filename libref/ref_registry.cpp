@@ -516,9 +516,15 @@ static const RadOperandSpec oKvResolve[] = { INOUT("sel"), OPD("nsel"), INOUT("r
  * adds its count of rewritten entries to. */
 static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("blocks"), P_INT("seqs"),
                                          P_INT("block_bytes"), P_STRO("store_layout"),
-                                         P_STRO("pool_layout"), P_INTO("head_dim") };
+                                         P_STRO("pool_layout"), P_INTO("head_dim"),
+                                         P_STRO("store_layout2") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
-                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged"),
+                                           OPD_O("slot_layout") };
+/* Importance-tiered demotion's counter (RAD_KVQ_DEMOTE2): `count` [blocks] u32, added to. */
+static const RadParamSpec pQsaCount[] = { P_INT("M"), P_INT("topk"), P_INT("ratio") };
+static const RadOperandSpec oQsaCount[] = { OPD("sel"), OPD("nsel"), OPD("pos"), INOUT("count"),
+                                            OPD_O("cu") };
 /* The residency store's demote layout (RAD_KVQ_DEMOTE): rows of one KV layout re-encoded in
  * another, `x` [M, row(from)] and `out` [M, row(to)] bytes, a row one token's head. */
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
@@ -1547,7 +1553,13 @@ static const RadOpSchema kSchemas[] = {
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; "
   "resident (>= 0) and empty (-1) entries pass through. `pool` is INOUT: only the scratch blocks "
   "of cold entries are written. With store_layout and pool_layout the fragment's rows are "
-  "expanded from the store's layout into the pool's (kv_transcode's codec) instead of copied." },
+  "expanded from the store's layout into the pool's (kv_transcode's codec) instead of copied; with "
+  "store_layout2 too, from the layout slot_layout names for the entry's slot (0 the first)." },
+{ "qsa_count", ARR(pQsaCount), ARR(oQsaCount),
+  "For each row of sel whose selection is full (nsel less the partial page, present when "
+  "(pos + 1) % ratio != 0, equals topk), adds one to count[e] for each of its first topk entries "
+  "e >= 0; with cu, only a row that opens its sequence (a decode sequence's first). The selection "
+  "counter importance-tiered demotion picks each block's layout by." },
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "Each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), decoded "
   "exactly and re-encoded in layout `to` as that layout's store encodes, into the row of out. "
@@ -2527,6 +2539,9 @@ SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
 SIMPLE("ref_qsa_page", "qsa_page", "attn",
        "QSA pager: cold selection entries copied from the residency store into scratch pages",
        "i32 tables, u8 bytes", ref_qsa_page),
+SIMPLE("ref_qsa_count", "qsa_count", "attn",
+       "QSA selection counter: full selections add one to each block they kept",
+       "i32 tables, u32 counts", ref_qsa_count),
 SIMPLE("ref_kv_transcode", "kv_transcode", "attn",
        "KV rows re-encoded from one cache layout into another (the residency demote layout)",
        "u8 bytes", ref_kv_transcode),

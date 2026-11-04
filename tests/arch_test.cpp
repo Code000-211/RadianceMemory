@@ -10746,6 +10746,137 @@ TEST(a_tiered_recipe_on_flashnext_keys_its_groups_by_the_pair_and_its_pagers_exp
         }
 }
 
+/* Two demote layouts on Flash-Next (`i8h demote k4h_v4 k4h_v2h`, RAD_KVQ_DEMOTE2), at one, two and
+ * four ranks: still the one 258-column `kv_attn` group, every pager expanding `store_layout` k4h_v4
+ * with `store_layout2` k4h_v2h into i8h, and a `qsa_count` beside each trunk layer's (the MTP head
+ * reads drafted tokens and counts nothing). A step whose batch carries the counter (rank 0's) issues
+ * the count after its layer's select and before its pager: over the decode rows with the decode
+ * sequences' offsets (only each one's first row counts), and over the prefill rows without; the
+ * pager takes the slot table as its sixth operand; a batch without
+ * the counter (another rank, or the store closed) issues no count; both lint clean. A layer beside
+ * it with one demote layout is a group of its own, whose pager has no second word and no count. */
+TEST(two_demote_layouts_on_flashnext_count_the_selection_and_page_by_the_slot_table) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int d4 = (int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT;
+    const int n2 = (int)RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE2_SHIFT;
+    static char store[1 << 16];
+    static const int64_t layer_off[64] = {};
+    static const int32_t scratch[64 * 513] = {};
+    static int64_t paged_counter = 0;
+    static uint32_t counts[4096];
+    static uint8_t table[16];
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            std::vector<int32_t> r(8, -1);
+            r[3] = r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | d4 | n2;
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 258);
+            CHECK(noted(b, "kv cache i8h: demoted blocks stored as k4h_v4, or k4h_v2h where the QSA "
+                           "selection kept them least"));
+            const bool has_cache = !b.kv_groups[0].zero;
+            int pages = 0, counts_declared = 0;
+            for (const auto& o : b.ops) {
+                if (o.op == "qsa_count") {
+                    ++counts_declared;
+                    CHECK_EQ(pint(&o, "topk"), pint(find_op(b, "qsa_select"), "topk"));
+                    CHECK_EQ(pint(&o, "ratio"), pint(find_op(b, "qsa_select"), "ratio"));
+                }
+                if (o.op != "qsa_page") continue;
+                ++pages;
+                CHECK_EQ(pstr(&o, "store_layout"), std::string("k4h_v4"));
+                CHECK_EQ(pstr(&o, "store_layout2"), std::string("k4h_v2h"));
+                CHECK_EQ(pstr(&o, "pool_layout"), std::string("i8h"));
+            }
+            CHECK_EQ(pages, has_cache ? 3 : 0);
+            CHECK_EQ(counts_declared, has_cache ? 2 : 0);
+            for (int counted = 0; counted < 2; ++counted)
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000),
+                                       kit(b, { 1, 4 }, { 6 }, 300) }) {
+                    for (auto& gb : k->kv) {
+                        gb.residency_store = store;
+                        gb.residency_slot_bytes = 4096;
+                        gb.residency_slots = 16;
+                        gb.residency_layer_off = layer_off;
+                        gb.residency_scratch = scratch;
+                        gb.residency_scratch_pitch = 513;
+                        gb.residency_paged = &paged_counter;
+                        gb.residency_slot_layout = table;
+                        gb.residency_count = counted ? counts : nullptr;
+                        gb.residency_count_blocks = counted ? 4096 : 0;
+                    }
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    const auto cn = issues_of(b, *v[0], "qsa_count");
+                    const int64_t nd = k->b.n_tok_decode, T = k->b.n_tok;
+                    const size_t per_layer = (nd > 0 ? 1 : 0) + (T > nd ? 1 : 0);
+                    CHECK_EQ(cn.size(), counted && has_cache ? 2 * per_layer : 0);
+                    int64_t rows = 0;
+                    for (const RecIssue* i : cn) {
+                        rows += i->n;
+                        CHECK(i->opd.size() >= 4 && i->opd[3].raw == (void*)counts);
+                        CHECK_EQ(i->opd[3].rows, 4096ll);
+                        /* The decode launch carries the decode sequences' offsets, the other none. */
+                        const bool dec = i->opd.size() == 5;
+                        CHECK_EQ(i->n, dec ? nd : T - nd);
+                        if (dec) {
+                            CHECK(i->opd[4].raw == (const void*)k->b.cu_seqlens);
+                            CHECK_EQ(i->opd[4].rows, k->b.n_seq_decode + 1);
+                        }
+                    }
+                    CHECK_EQ(rows, counted && has_cache ? 2 * T : 0);
+                    for (const RecIssue* i : issues_of(b, *v[0], "qsa_page"))
+                        CHECK(i->opd.size() == 6 && i->opd[5].raw == (void*)table);
+                    /* select, then its count(s), then the pager, layer by layer. */
+                    std::string prev;
+                    for (const auto& i : v[0]->issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o) continue;
+                        if (o->op == "qsa_count") CHECK(prev == "qsa_select" || prev == "qsa_count");
+                        if (o->op == "qsa_page" && counted) CHECK_EQ(prev, std::string("qsa_count"));
+                        if (o->op == "qsa_select" || o->op == "qsa_count" || o->op == "qsa_page")
+                            prev = o->op;
+                    }
+                }
+
+            r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | d4;
+            RadBuildCtx cm = with_recipe(q4_ctx(rank, world), r);
+            cm.kv_residency = 1;
+            RadBuilder m;
+            m.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&m, &meta, &cm), RAD_OK);
+            std::vector<std::string> names;
+            for (const auto& g : m.kv_groups) names.push_back(g.name);
+            CHECK(std::find(names.begin(), names.end(), "kv_attn_i8h_demote_k4h_v4") != names.end());
+            CHECK(std::find(names.begin(), names.end(), "kv_attn_i8h_demote_k4h_v4_k4h_v2h") != names.end());
+            int two = 0, one = 0, cnt = 0;
+            for (const auto& o : m.ops) {
+                cnt += o.op == "qsa_count";
+                if (o.op == "qsa_page") (pstr(&o, "store_layout2") == "<absent>" ? one : two)++;
+            }
+            CHECK_EQ(two, has_cache ? 1 : 0);
+            CHECK_EQ(one, has_cache ? 2 : 0);
+            CHECK_EQ(cnt, two);   /* layer 3's; the head is behind layer 7's one-layout group */
+        }
+    /* A second layout the plugin does not serve is refused naming the layer. */
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | ((int)RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT) |
+           ((int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE2_SHIFT);
+    r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+    RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+    RadBuilder b;
+    b.encs = { { "draft_head", u2_head() } };
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, &meta, &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(err.find("layer 3 asks for demote layouts") != std::string::npos);
+}
+
 /* A demote layout the plugin does not serve is refused naming the layer: fp8_v4 as a demote layout
  * (a hand-built entry; the recipe parser refuses it first), a k6_v4 resident layout, and an fp8
  * layer without its rotation. */

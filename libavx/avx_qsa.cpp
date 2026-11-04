@@ -771,7 +771,8 @@ AVX_KERNEL(qsa_page) {
      * width as `block_bytes` holds of the pool's. */
     const char* sl = p_str(a, "store_layout", nullptr);
     const char* pw = p_str(a, "pool_layout", nullptr);
-    int xf = -1, xt = -1;
+    const char* sl2 = p_str(a, "store_layout2", nullptr);
+    int xf = -1, xt = -1, xf2 = -1;
     int64_t hd = 0, rows = 0, sbb = bb;
     if (sl || pw) {
         xf = kvx_layout(sl); xt = kvx_layout(pw); hd = p_int(a, "head_dim", 0);
@@ -781,8 +782,16 @@ AVX_KERNEL(qsa_page) {
         rows = bb / kvx_row(xt, hd);
         sbb = rows * kvx_row(xf, hd);
     }
+    /* The second demote layout and its slot table (libref's refusals). */
+    const RadTensor* sly = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
+    if (sl2) {
+        xf2 = kvx_layout(sl2);
+        if (xf < 0 || xf2 < 0 || xf2 == xf || xf2 == xt || !sly) return RAD_E_INVAL;
+        sbb = std::max(sbb, rows * kvx_row(xf2, hd));
+    }
     if (st->shape[1] < sbb) return RAD_E_SHAPE;
     const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
+    if (sl2 && (sly->dtype != RAD_U8 || numel(sly) < slots)) return RAD_E_SHAPE;
     /* The cold positions as (sel offset, slot, page), validated before any write. */
     int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
     if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
@@ -802,9 +811,11 @@ AVX_KERNEL(qsa_page) {
     uint8_t* pb = (uint8_t*)pl->data;
     AVX_PARALLEL_FOR_IF(n * bb >= AVX_PAR_MIN && n > 1)
     for (int64_t i = 0; i < n; ++i) {
+        /* The slot's own layout: its table byte picks the second one when not 0. */
+        const int from = sl2 && ((const uint8_t*)sly->data)[cold[3 * i + 1] * sly->stride[0]] ? xf2 : xf;
         if (xf >= 0)
             for (int64_t r = 0; r < rows; ++r)
-                kvx_row_copy(xf, xt, hd, sb + cold[3 * i + 1] * slot_b + r * kvx_row(xf, hd),
+                kvx_row_copy(from, xt, hd, sb + cold[3 * i + 1] * slot_b + r * kvx_row(from, hd),
                              pb + cold[3 * i + 2] * pitch + r * kvx_row(xt, hd));
         else
             std::memcpy(pb + cold[3 * i + 2] * pitch, sb + cold[3 * i + 1] * slot_b,
@@ -812,6 +823,46 @@ AVX_KERNEL(qsa_page) {
         st_int_dt(sel->dtype, sel->data, cold[3 * i], cold[3 * i + 2]);
     }
     if (paged) *paged += n;   /* the optional counter operand (libref's ref_qsa_page) */
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_count */
+/* libref's ref_qsa_count (the contract is stated there), with its refusals: a full row -- nsel less
+ * the partial page equal to topk -- adds one to count[e] for each of its first topk entries e >= 0.
+ * Serial: the adds collide on popular blocks, and the counts are tiny next to the selection. */
+AVX_KERNEL(qsa_count) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *sel = &a->t[0], *ns = &a->t[1], *po = &a->t[2], *ct = &a->t[3];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (sel->rank != 2) return RAD_E_SHAPE;
+    if (ct->dtype != RAD_U32) return RAD_E_DTYPE;
+    const int64_t M = sel->shape[0], n = numel(ct);
+    if (M <= 0 || sel->shape[1] < topk + 1 || numel(ns) < M || numel(po) < M || n <= 0)
+        return RAD_E_SHAPE;
+    /* `cu`: only the rows that open a sequence count (a decode sequence's first). */
+    const RadTensor* cu = a->n_t > 4 && a->t[4].data ? &a->t[4] : nullptr;
+    std::vector<char> opens((size_t)M, cu ? 0 : 1);
+    if (cu)
+        for (int64_t s = 0; s + 1 < numel(cu); ++s) {
+            const int64_t m = ldi(cu, s * cu->stride[0]), e = ldi(cu, (s + 1) * cu->stride[0]);
+            if (m >= 0 && m < M && e > m) opens[(size_t)m] = 1;
+        }
+    std::vector<int64_t> full;
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t k = ldi(ns, m * ns->stride[0]), p = ldi(po, m * po->stride[0]);
+        if (k < 0 || k > topk + 1 || p < 0) return RAD_E_INVAL;
+        if (!opens[(size_t)m] || k - ((p + 1) % ratio != 0 ? 1 : 0) != topk) continue;
+        for (int64_t j = 0; j < topk; ++j)
+            if (ldi(sel, m * sel->stride[0] + j * sel->stride[1]) >= n) return RAD_E_INVAL;
+        full.push_back(m);
+    }
+    uint32_t* c = (uint32_t*)ct->data;
+    for (int64_t m : full)
+        for (int64_t j = 0; j < topk; ++j) {
+            const int64_t e = ldi(sel, m * sel->stride[0] + j * sel->stride[1]);
+            if (e >= 0) c[e * ct->stride[0]] += 1u;
+        }
     return RAD_OK;
 }
 

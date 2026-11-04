@@ -3601,6 +3601,13 @@ int Engine::configure_kv() {
                     per_group += fmt(" stored as %s, %s a block (%s a layer paged in)",
                                      kv_layout_name(p.res_to), humanb(p.residency_bytes()).c_str(),
                                      humanb(p.residency_frag()).c_str());
+                /* Two demote layouts: the narrow one's link bytes, in the wide one's slot. */
+                if (p.split())
+                    per_group += fmt(" or, for the %.0f %% of blocks the selection keeps least, as "
+                                     "%s, %s a block (%s a layer) in the same slot",
+                                     100.0 * (1.0 - cfg_.kv_demote_split), kv_layout_name(p.res_to2),
+                                     humanb(p.residency_bytes(1)).c_str(),
+                                     humanb(p.res_frag2).c_str());
             }
         for (size_t i = 0; i < ranks_.size(); ++i) {
             res_off[i] = slot_bytes;
@@ -3680,6 +3687,29 @@ int Engine::configure_kv() {
                     return rc != RAD_OK ? rc : RAD_E_NOMEM;
                 }
                 r->kv.set_residency_paged(paged);
+                /* Importance-tiered demotion (KVGroupPlan::split): every rank's slot table, which
+                 * its pager reads; rank 0's selection counters and the split, which decide. */
+                bool split = false;
+                for (const auto& p : r->kv.plans()) split = split || (p.residency() && p.split());
+                if (!split) continue;
+                r->kv.set_residency_split(cfg_.kv_demote_split);
+                const uint8_t* table = r->resx.slot_table(slots);
+                bool counted = table != nullptr;
+                if (&r == &ranks_[0])
+                    for (int32_t g : rg) {
+                        const KVGroupPlan* p = r->kv.plan(g);
+                        if (!p || !p->split()) continue;
+                        const uint32_t* host = nullptr;
+                        uint32_t* dev = r->resx.count_buffer(g, p->n_blocks, &host);
+                        counted = counted && dev && host;
+                        r->kv.set_residency_count(g, dev, host, p->n_blocks);
+                    }
+                if (!counted) {
+                    RAD_ERR("kv residency: rank %d has no memory for the demote layouts' slot table "
+                            "or selection counter", r->index);
+                    return RAD_E_NOMEM;
+                }
+                r->kv.set_residency_slot_table(table);
             }
             RAD_TRY(rad_dev_set(ranks_[0]->device));
             RAD_INFO("kv residency: window enforced -- after a decode step, blocks outside the sink "

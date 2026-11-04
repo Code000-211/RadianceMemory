@@ -1772,7 +1772,23 @@ int ref_qsa_page_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx_dt((uint32_t)RAD_U8, { pool + blocks, bb }, 256, -1, 0);  /* pool */
     o.t_idx({ M, topk + 1 }, pool, -1, 0);                        /* scratch */
     o.t_idx_dt((uint32_t)RAD_I64, { 1 }, 1, -1, 0);               /* paged: the counter, starts at 0 */
+    o.skip();                                                     /* slot_layout: only with store_layout2 */
     return o.finish("qsa_page", operand, out);
+}
+
+/* qsa_count: entries drawn from [-1, blocks) and nsel from [0, topk + 1], so full rows (counted)
+ * and short ones (not) both occur, at positions either side of a block boundary. */
+int ref_qsa_count_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), topk = gi(p, n_p, "topk", 0);
+    const int64_t ratio = gi(p, n_p, "ratio", 0), blocks = 64;
+    if (M <= 0 || topk <= 0 || ratio <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M, topk + 1 }, blocks, -1, 0);                      /* sel */
+    o.t_idx({ M }, topk + 2, -1, 0);                              /* nsel */
+    o.t_idx({ M }, 1 << 20, -1, 0);                               /* pos */
+    o.t_idx_dt((uint32_t)RAD_U32, { blocks }, 1 << 16, -1, 0);    /* count */
+    o.skip();                                                     /* cu: every row counts */
+    return o.finish("qsa_count", operand, out);
 }
 
 /* kv_transcode: every byte of a row drawn, so E4M3 NaN codes and f16 scales that are inf or NaN

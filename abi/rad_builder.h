@@ -149,16 +149,27 @@ enum {
  * (RAD_KVQ_VMEAN): the transcode decodes and encodes values and never rotates or centres. Served
  * today as i8h or fp8 (rotated) resident with k4h_v4 or k4h_v2h demoted; a RAD_KVQ_BF16 entry takes
  * none. A plugin keys its KV groups by the pair, since a store slot holds one group's block at one
- * width. */
+ * width.
+ *
+ * RAD_KVQ_DEMOTE2 (ABI 43, --kv-recipe `demote WIDE NARROW`): bits 24-30 hold a second, narrower
+ * demote layout (bit 31 stays clear, since -1 is "no entry"). The engine stores each demoted block
+ * in one of the two, the wide one for the blocks the QSA selection kept most often while they were
+ * resident (`qsa_count`, --kv-demote-split), and the pager reads which from the store's per-slot
+ * table (RadKVGroupBatch::residency_slot_layout, `qsa_page`'s `store_layout2`). A store slot is
+ * sized by the wide layout. Served today as k4h_v4 then k4h_v2h; 0 is none, one demote layout as
+ * at ABI 42. The pair (resident, wide, narrow) is still one KV group's key. */
 enum {
     RAD_KVQ_LAYOUT  = 0xff,
     RAD_KVQ_ROTATED = 0x100,
     RAD_KVQ_VMEAN   = 0x200,
     RAD_KVQ_DEMOTE  = 0xff0000,
-    RAD_KVQ_DEMOTE_SHIFT = 16
+    RAD_KVQ_DEMOTE_SHIFT = 16,
+    RAD_KVQ_DEMOTE2 = 0x7f000000,
+    RAD_KVQ_DEMOTE2_SHIFT = 24
 };
-/* The demote layout of a kv_recipe entry, 0 (RAD_KVQ_NONE) for none. */
+/* The demote layout of a kv_recipe entry, 0 (RAD_KVQ_NONE) for none; and its second one. */
 #define RAD_KVQ_DEMOTE_OF(e) (((e) & RAD_KVQ_DEMOTE) >> RAD_KVQ_DEMOTE_SHIFT)
+#define RAD_KVQ_DEMOTE2_OF(e) (((e) & RAD_KVQ_DEMOTE2) >> RAD_KVQ_DEMOTE2_SHIFT)
 
 /* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
  * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */

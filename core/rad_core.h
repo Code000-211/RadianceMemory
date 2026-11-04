@@ -1002,6 +1002,10 @@ struct Config {
      * nothing and the receipt says so (see the bringup's report line). */
     int64_t residency_mib = 0;
     int64_t residency_sink_tokens = 512;
+    /* --kv-demote-split: under a recipe with two demote layouts (RAD_KVQ_DEMOTE2), the fraction
+     * of demoted blocks that take the wide one, by their QSA selection count against the blocks
+     * demoted just before them (KVManager::residency_pick). Unused otherwise. */
+    double  kv_demote_split = 0.5;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The
@@ -1242,7 +1246,7 @@ int  config_parse(int argc, char** argv, Config* c);
 /* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
  * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4, k4h_v2h and i8h, rotated
  * layouts, RAD_KVQ_VMEAN where it ends in `vmean`, and a RAD_KVQ_DEMOTE layout where it says
- * `demote LAYOUT`) or -1. `vmean_file`, when given, receives
+ * `demote LAYOUT`, with a RAD_KVQ_DEMOTE2 one for `demote WIDE NARROW`) or -1. `vmean_file`, when given, receives
  * the path a `vmean FILE` line names, as written.
  * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
  * is then left empty. */

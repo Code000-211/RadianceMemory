@@ -25,6 +25,9 @@
 #include "sched_fakes.h"
 
 #include <algorithm>
+#include <cmath>
+#include <deque>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8829,11 +8832,12 @@ static std::vector<KVGroupInfo> tiered_groups() {
     return { null_group(), k };
 }
 
-static Config tiered_config(int demote) {
+static Config tiered_config(int demote, int demote2 = 0) {
     Config c = small_config();
     c.kv_recipe.assign(8, -1);
     for (int l : { 3, 7 })
-        c.kv_recipe[(size_t)l] = (int)RAD_KVQ_I8H | (int)RAD_KVQ_ROTATED | (demote << RAD_KVQ_DEMOTE_SHIFT);
+        c.kv_recipe[(size_t)l] = (int)RAD_KVQ_I8H | (int)RAD_KVQ_ROTATED | (demote << RAD_KVQ_DEMOTE_SHIFT) |
+                                 (demote2 << RAD_KVQ_DEMOTE2_SHIFT);
     return c;
 }
 
@@ -8842,8 +8846,8 @@ struct TieredFixture {
     HostArena store;
     KVManager kv;
     Config cfg;
-    int build(int demote, int64_t slots) {
-        cfg = tiered_config(demote);
+    int build(int demote, int64_t slots, int demote2 = 0) {
+        cfg = tiered_config(demote, demote2);
         int s = configure_pools(pools, cfg);
         if (s < 0) return s;
         s = kv.configure(tiered_groups(), cfg, pools.kv());
@@ -9063,6 +9067,316 @@ TEST(a_tiered_block_leaves_at_the_demote_width_and_comes_back_expanded_or_emulat
             CHECK_EQ(x.move_stats().in_bytes, 14 * 2 * sfrag);
             const std::vector<int32_t> back = t.kv.block_table(1, G_TIER);
             for (size_t e = 2; e < 16; ++e) CHECK(block_is_trip(back[e], orig[e]));
+        }
+        t.kv.free_sequence(1);
+        CHECK_OK(rad_stream_sync(compute));
+        rad_stream_destroy(compute);
+    }
+}
+
+/* ------------------------------------------------------------------ importance-tiered demotion */
+
+/* Two demote layouts (`demote k4h_v4 k4h_v2h`, RAD_KVQ_DEMOTE2): the slot is the wide layout's
+ * block -- each layer's 32 rows at k4h_v4's 36 bytes, 1152 a layer -- and the narrow layout's 28-byte
+ * rows (896 a layer) sit at the front of each layer's fragment, so the layer offsets the pager reads
+ * are the wide ones. A block moves 2304 bytes wide and 1792 narrow. */
+TEST(a_split_groups_slot_is_the_wide_layouts_block_and_a_narrow_block_fills_its_front) {
+    TieredFixture t;
+    CHECK_OK(t.build(RAD_KVQ_K4H, 16, RAD_KVQ_K4HV2H));
+    const KVGroupPlan* p = t.kv.plan(G_TIER);
+    REQUIRE(p && p->tiered() && p->split());
+    CHECK_EQ(p->res_to, (int)RAD_KVQ_K4H);
+    CHECK_EQ(p->res_to2, (int)RAD_KVQ_K4HV2H);
+    CHECK_EQ(p->residency_frag(), 1152ll);
+    CHECK_EQ(p->res_frag2, 896ll);
+    CHECK_EQ(p->residency_bytes(0), 2304ll);
+    CHECK_EQ(p->residency_bytes(1), 1792ll);
+    CHECK_EQ(t.kv.residency_block_bytes(G_TIER), 2304ll);
+    CHECK_EQ(t.kv.residency_slot_bytes(), 2304ll);
+    CHECK_EQ(t.kv.residency_layer_off(G_TIER)[7], 1152ll);
+    /* One demote layout: no split, and the plan's bytes are the one layout's for either index. */
+    TieredFixture u;
+    CHECK_OK(u.build(RAD_KVQ_K4H, 16));
+    REQUIRE(u.kv.plan(G_TIER) && !u.kv.plan(G_TIER)->split());
+    CHECK_EQ(u.kv.plan(G_TIER)->residency_bytes(1), 2304ll);
+}
+
+/* The split rule by hand at --kv-demote-split 0.5: a block is wide when fewer than half of itself
+ * and the last decided scores are at least as large, so a tie goes narrow; 0 sends every block
+ * narrow and 1 every block wide. The comparison looks back only kPickCohort (64) decisions, the
+ * blocks demoted just before this one: a low score after 70 high ones and 64 lower ones is judged
+ * against the lower ones. Over many distinct counts the wide share is the split. A group
+ * with one demote layout always takes it. */
+TEST(the_split_rule_gives_the_wide_layout_to_the_most_selected_fraction_of_recent_blocks) {
+    TieredFixture t;
+    CHECK_OK(t.build(RAD_KVQ_K4H, 16, RAD_KVQ_K4HV2H));
+    t.kv.set_residency_split(0.5);
+    const uint32_t c[] = { 5, 1, 9, 5, 0, 7 };
+    const int want[] = { 0, 1, 0, 1, 1, 0 };
+    for (size_t i = 0; i < 6; ++i) CHECK_EQ(t.kv.residency_pick(G_TIER, c[i]), want[i]);
+
+    for (double f : { 0.0, 1.0 }) {
+        TieredFixture e;
+        CHECK_OK(e.build(RAD_KVQ_K4H, 16, RAD_KVQ_K4HV2H));
+        e.kv.set_residency_split(f);
+        for (uint32_t k = 0; k < 50; ++k)
+            CHECK_EQ(e.kv.residency_pick(G_TIER, (k * 37) % 23), f > 0.5 ? 0 : 1);
+    }
+    {
+        TieredFixture w;
+        CHECK_OK(w.build(RAD_KVQ_K4H, 16, RAD_KVQ_K4HV2H));
+        REQUIRE_EQ(KVManager::kPickCohort, 64ll);
+        w.kv.set_residency_split(0.25);
+        for (int k = 0; k < 70; ++k) (void)w.kv.residency_pick(G_TIER, 100);
+        for (int k = 0; k < 64; ++k) (void)w.kv.residency_pick(G_TIER, 1);
+        CHECK_EQ(w.kv.residency_pick(G_TIER, 2), 0);
+        CHECK_EQ(w.kv.residency_pick(G_TIER, 0.5), 1);
+    }
+    for (double f : { 0.25, 0.5, 0.75 }) {
+        TieredFixture r;
+        CHECK_OK(r.build(RAD_KVQ_K4H, 16, RAD_KVQ_K4HV2H));
+        r.kv.set_residency_split(f);
+        std::mt19937 rng(11);
+        int wide = 0;
+        for (int k = 0; k < 2000; ++k) wide += r.kv.residency_pick(G_TIER, rng() % 100000) == 0;
+        CHECK(std::fabs(wide / 2000.0 - f) < 0.04);
+    }
+    TieredFixture one;
+    CHECK_OK(one.build(RAD_KVQ_K4HV2H, 16));
+    CHECK_EQ(one.kv.residency_pick(G_TIER, 0), 0);
+    CHECK_EQ(one.kv.residency_pick(G_TIER, 1000), 0);
+}
+
+namespace {
+/* The layouts residency_pick() gives `scores` in order, recomputed from the rule's statement. */
+std::vector<int> split_by_hand(const std::vector<double>& scores, double split, size_t window) {
+    std::vector<int> out;
+    std::deque<double> last;
+    for (double c : scores) {
+        size_t ge = 0;
+        for (double h : last) ge += h >= c;
+        out.push_back((double)ge < split * (double)(last.size() + 1) ? 0 : 1);
+        last.push_back(c);
+        if (last.size() > window) last.pop_front();
+    }
+    return out;
+}
+}  /* namespace */
+
+/* The counter as the sweep reads it: a counted group's blocks are listed for zeroing when handed
+ * out, and a demotion takes each block's layout from its count in the host copy, in table order,
+ * scored against what a uniform selection would have given it (residency_score) -- the rule's
+ * choice, recomputed here. The slot records it, the demotion's bytes are each layout's,
+ * a promotion names the slot's layout, and a re-demotion points back at the same slot, whose
+ * layout stands. The emulation, with the same counts, names the same layouts for the same blocks. */
+TEST(a_split_groups_blocks_take_their_layout_from_their_count_and_their_slot_keeps_it) {
+    std::vector<int> emul_lay;
+    for (bool emul : { false, true }) {
+        TieredFixture t;
+        CHECK_OK(t.build(RAD_KVQ_K4H, 64, RAD_KVQ_K4HV2H));
+        t.kv.set_residency_split(0.5);
+        t.kv.residency_emulate(emul);
+        const int64_t n = t.kv.plan(G_TIER)->n_blocks;
+        std::vector<uint32_t> dev((size_t)n), host((size_t)n, 0);
+        t.kv.set_residency_count(G_TIER, dev.data(), host.data(), n);
+        CHECK(t.kv.residency_count(G_TIER) == dev.data());
+        CHECK_EQ(t.kv.residency_count_blocks(G_TIER), n);
+        CHECK_OK(t.kv.add_sequence(1));
+        CHECK_OK(t.kv.ensure(1, 16 * 40));
+        const std::vector<int32_t> tbl = t.kv.block_table(1, G_TIER);
+        const auto clears = t.kv.take_count_clears();
+        REQUIRE_EQ(clears.size(), tbl.size());
+        for (size_t i = 0; i < tbl.size(); ++i) {
+            CHECK_EQ(clears[i].first, (int32_t)G_TIER);
+            CHECK_EQ(clears[i].second, tbl[i]);
+        }
+        CHECK(t.kv.take_count_clears().empty());
+        /* Window 512 tokens, 16-token blocks, 640 tokens held: block i's score is its count over
+         * ln(640 / max(16 (i + 1), 512)). */
+        std::vector<double> want_s;
+        for (size_t i = 2; i < 36; ++i) {
+            host[(size_t)tbl[i]] = (uint32_t)((i * 7919) % 41);
+            want_s.push_back(host[(size_t)tbl[i]] /
+                             std::log(640.0 / (double)std::max<int64_t>(16 * (int64_t)(i + 1), 512)));
+            CHECK_EQ(KVManager::residency_score(host[(size_t)tbl[i]], 16 * (int64_t)(i + 1), 512, 640),
+                     want_s.back());
+        }
+        const std::vector<int> want = split_by_hand(want_s, 0.5, 64);
+        std::vector<BlockMove> mv;
+        CHECK_OK(t.kv.residency_demote(1, G_TIER, 2, 4, &mv));
+        REQUIRE_EQ(mv.size(), 34u);
+        int64_t bytes = 0, narrow = 0;
+        for (size_t i = 0; i < 34; ++i) {
+            CHECK_EQ(mv[i].block, tbl[2 + i]);
+            CHECK_EQ(mv[i].layout, want[i]);
+            bytes += want[i] ? 1792 : 2304;
+            narrow += want[i];
+        }
+        CHECK(narrow > 0 && narrow < 34);
+        CHECK_EQ(t.kv.residency_stats().demoted_bytes, bytes);
+        CHECK_EQ(t.kv.residency_stats().demoted_narrow, narrow);
+        if (emul) {
+            for (const BlockMove& m : mv) emul_lay.push_back(m.layout);
+            continue;
+        }
+        for (const BlockMove& m : mv) CHECK_EQ(t.kv.residency_slot_layout(m.host_slot), m.layout);
+        t.kv.residency_demote_landed();
+        std::vector<BlockMove> up;
+        CHECK_OK(t.kv.residency_promote_all(1, &up));
+        REQUIRE_EQ(up.size(), 34u);
+        for (size_t i = 0; i < 34; ++i) {
+            CHECK_EQ(up[i].host_slot, mv[i].host_slot);
+            CHECK_EQ(up[i].layout, mv[i].layout);
+        }
+        CHECK_EQ(t.kv.residency_stats().promoted_bytes, bytes);
+        t.kv.residency_complete();
+        /* The promoted blocks are fresh: listed for zeroing. Re-demoted, they point back at their
+         * slots and nothing is decided again. */
+        CHECK_EQ(t.kv.take_count_clears().size(), 34u);
+        mv.clear();
+        CHECK_OK(t.kv.residency_demote(1, G_TIER, 2, 4, &mv));
+        CHECK(mv.empty());
+        const std::vector<int32_t> cold = t.kv.block_table(1, G_TIER);
+        for (size_t i = 0; i < 34; ++i) {
+            CHECK_EQ(rad_kv_entry_slot(cold[2 + i]), up[i].host_slot);
+            CHECK_EQ(t.kv.residency_slot_layout(up[i].host_slot), want[i]);
+        }
+        CHECK_EQ(t.kv.residency_stats().demoted_narrow, narrow);
+        emul_lay.clear();
+        for (int w : want) emul_lay.push_back(w);
+    }
+    REQUIRE_EQ(emul_lay.size(), 68u);
+    for (size_t i = 0; i < 34; ++i) CHECK_EQ(emul_lay[i], emul_lay[34 + i]);
+}
+
+/* Without a second demote layout nothing of this exists: every move names layout 0, no block is
+ * listed for zeroing, the bytes are the one layout's -- the ABI 42 behaviour. */
+TEST(a_group_with_one_demote_layout_demotes_as_before_and_counts_nothing) {
+    TieredFixture t;
+    CHECK_OK(t.build(RAD_KVQ_K4HV2H, 64));
+    CHECK_OK(t.kv.add_sequence(1));
+    CHECK_OK(t.kv.ensure(1, 16 * 20));
+    CHECK(t.kv.take_count_clears().empty());
+    CHECK(t.kv.residency_count(G_TIER) == nullptr);
+    std::vector<BlockMove> mv;
+    CHECK_OK(t.kv.residency_demote(1, G_TIER, 2, 4, &mv));
+    REQUIRE_EQ(mv.size(), 14u);
+    for (const BlockMove& m : mv) {
+        CHECK_EQ(m.layout, 0);
+        CHECK_EQ(t.kv.residency_slot_layout(m.host_slot), 0);
+    }
+    CHECK_EQ(t.kv.residency_stats().demoted_bytes, 14 * 1792ll);
+    CHECK_EQ(t.kv.residency_stats().demoted_narrow, 0ll);
+}
+
+/* The split transfer end to end on the host backend (the test plugin's transcode stand-in: a row
+ * keeps its first bytes, a wider one is padded with 0xA5): the counter's device words are zeroed for
+ * the blocks handed out and copied to the host copy (TierExec::count_clear, count_snapshot); a wide
+ * block's slot holds each layer's rows at k4h_v4's 36 bytes, a narrow one's at k4h_v2h's 28 at the
+ * front of the same layer offsets, and the device slot table says which; a promotion expands each
+ * from its own layout, and the emulation's round trip leaves the same bytes in place. */
+TEST(a_split_groups_blocks_leave_and_come_back_in_their_own_layouts) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    const int64_t rf = 68, rw = 36, rn = 28, rows = 32, frag = rows * rf, sw = rows * rw;
+    auto trip = [&](int64_t l, int32_t pat_block, int64_t i, int64_t rt) -> unsigned char {
+        return i % rf < rt ? resid_pat(l, pat_block, i) : (unsigned char)0xA5;
+    };
+    for (bool emul : { false, true }) {
+        TieredFixture t;
+        CHECK_OK(t.build(RAD_KVQ_K4H, 64, RAD_KVQ_K4HV2H));
+        t.kv.set_residency_split(0.5);
+        t.kv.residency_emulate(emul);
+        IdleTiers it;
+        CHECK_OK(it.configure(tier_config(0, 0)));
+        RadStream compute = nullptr;
+        REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+        TierExec x;
+        CHECK_OK(x.configure(&reg, &t.kv, &it, { G_TIER }, TierExec::kMoveBatch, 64, 64,
+                             /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+        const int64_t n = t.kv.plan(G_TIER)->n_blocks;
+        const uint32_t* host = nullptr;
+        uint32_t* dev = x.count_buffer(G_TIER, n, &host);
+        REQUIRE(dev && host);
+        t.kv.set_residency_count(G_TIER, dev, host, n);
+        const uint8_t* table = x.slot_table(64);
+        REQUIRE(table);
+        t.kv.set_residency_slot_table(table);
+        CHECK_OK(rad_memset_async(dev, 0xff, n * 4, compute));
+        CHECK_OK(t.kv.add_sequence(1));
+        CHECK_OK(t.kv.ensure(1, 16 * 40));
+        resid_fill(t.kv, G_TIER);
+        const std::vector<int32_t> orig = t.kv.block_table(1, G_TIER);
+        CHECK_OK(x.count_clear(t.kv.take_count_clears(), compute));
+        /* What the step's qsa_count would add: block entry e gets e's count. */
+        std::vector<uint32_t> add((size_t)n, 0);
+        for (size_t e = 2; e < 36; ++e) add[(size_t)orig[e]] = (uint32_t)((e * 13) % 17);
+        CHECK_OK(rad_stream_sync(compute));
+        for (size_t e = 0; e < orig.size(); ++e) dev[orig[e]] += add[(size_t)orig[e]];
+        CHECK_OK(x.count_snapshot(compute));
+        CHECK_OK(rad_stream_sync(compute));
+        for (size_t e = 0; e < orig.size(); ++e) CHECK_EQ(host[orig[e]], add[(size_t)orig[e]]);
+        std::vector<BlockMove> down;
+        CHECK_OK(t.kv.residency_demote(1, G_TIER, 2, 4, &down));
+        REQUIRE_EQ(down.size(), 34u);
+        int64_t narrow = 0;
+        for (const BlockMove& m : down) narrow += m.layout;
+        CHECK(narrow > 0 && narrow < 34);
+        for (size_t a = 0; a < down.size(); a += TierExec::kMoveBatch) {
+            const std::vector<BlockMove> part(
+                down.begin() + (long)a,
+                down.begin() + (long)std::min(down.size(), a + TierExec::kMoveBatch));
+            CHECK_OK(x.issue_moves(part, compute, /*to_host=*/true));
+            x.quiesce();
+        }
+        t.kv.residency_demote_landed();
+        const KVGroupPlan* p = t.kv.plan(G_TIER);
+        auto* base = (const unsigned char*)p->base;
+        auto block_is_trip = [&](int32_t b, int32_t pat_block, int64_t rt) {
+            for (int64_t l = 0; l < 2; ++l)
+                for (int64_t i = 0; i < frag; ++i)
+                    if (base[l * p->layer_stride() + b * frag + i] != trip(l, pat_block, i, rt))
+                        return false;
+            return true;
+        };
+        if (emul) {
+            CHECK_EQ(t.store.used_slots(), 0ll);
+            for (size_t i = 0; i < 34; ++i)
+                CHECK(block_is_trip(down[i].block, down[i].block, down[i].layout ? rn : rw));
+            CHECK_EQ(resid_mismatches(t.kv, G_TIER, orig[36]), 0ll);
+        } else {
+            CHECK_EQ(x.move_stats().out_bytes, (34 - narrow) * 2 * sw + narrow * 2 * rows * rn);
+            for (const BlockMove& m : down) {
+                const int64_t rt = m.layout ? rn : rw;
+                CHECK_EQ((int)table[m.host_slot], m.layout);
+                const auto* s = (const unsigned char*)t.store.at(m.host_slot);
+                int64_t bad = 0;
+                for (int64_t l = 0; l < 2; ++l)
+                    for (int64_t r = 0; r < rows; ++r)
+                        for (int64_t j = 0; j < rt; ++j)
+                            bad += s[l * sw + r * rt + j] != resid_pat(l, m.block, r * rf + j);
+                CHECK_EQ(bad, 0ll);
+            }
+            resid_scribble(t.kv, G_TIER);
+            std::vector<BlockMove> up;
+            CHECK_OK(t.kv.residency_promote_all(1, &up));
+            REQUIRE_EQ(up.size(), 34u);
+            for (size_t a = 0; a < up.size(); a += TierExec::kMoveBatch) {
+                const std::vector<BlockMove> part(
+                    up.begin() + (long)a,
+                    up.begin() + (long)std::min(up.size(), a + TierExec::kMoveBatch));
+                CHECK_OK(x.issue_moves(part, compute, /*to_host=*/false));
+                x.quiesce();
+            }
+            t.kv.residency_complete();
+            const std::vector<int32_t> back = t.kv.block_table(1, G_TIER);
+            for (size_t i = 0; i < 34; ++i)
+                CHECK(block_is_trip(back[2 + i], down[i].block, down[i].layout ? rn : rw));
         }
         t.kv.free_sequence(1);
         CHECK_OK(rad_stream_sync(compute));

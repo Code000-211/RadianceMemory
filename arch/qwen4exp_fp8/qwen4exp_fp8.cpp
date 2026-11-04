@@ -120,13 +120,18 @@ struct Layer {
  * demote tier, 0 none, 1 k4h_v4, 2 k4h_v2h (RAD_KVQ_DEMOTE). The stride is the layout count, so
  * a layout added to the enum moves it with no key colliding; bf16 takes no demote layout. */
 constexpr int kKvqN   = RAD_KVQ_BF16 + 1;
-constexpr int kKvKeys = 3 * kKvqN;
-constexpr int kv_key(int q, int dq) {
-    return q + kKvqN * (dq == RAD_KVQ_K4H ? 1 : dq == RAD_KVQ_K4HV2H ? 2 : 0);
+/* Tier 3 is the two-layout pair k4h_v4 then k4h_v2h (RAD_KVQ_DEMOTE2): its slots are k4h_v4 wide
+ * and its blocks take either, so it is a group of its own. */
+constexpr int kKvKeys = 4 * kKvqN;
+constexpr int kv_key(int q, int dq, int dq2 = 0) {
+    return q + kKvqN * (dq2 == RAD_KVQ_K4HV2H && dq == RAD_KVQ_K4H ? 3
+                        : dq == RAD_KVQ_K4H ? 1 : dq == RAD_KVQ_K4HV2H ? 2 : 0);
 }
 static_assert(kv_key(RAD_KVQ_BF16, 0) < kv_key(RAD_KVQ_NONE, RAD_KVQ_K4H) &&
               kv_key(RAD_KVQ_BF16, RAD_KVQ_K4H) < kv_key(RAD_KVQ_NONE, RAD_KVQ_K4HV2H) &&
-              kv_key(RAD_KVQ_BF16, RAD_KVQ_K4HV2H) < kKvKeys, "kv_key: keys must not collide");
+              kv_key(RAD_KVQ_BF16, RAD_KVQ_K4HV2H) < kv_key(RAD_KVQ_NONE, RAD_KVQ_K4H, RAD_KVQ_K4HV2H) &&
+              kv_key(RAD_KVQ_BF16, RAD_KVQ_K4H, RAD_KVQ_K4HV2H) < kKvKeys,
+              "kv_key: keys must not collide");
 
 struct Model {
     Names          nm{""};
@@ -155,6 +160,7 @@ struct Model {
     const char*      kv_dt[kKvKeys] = {};
     int64_t          kv_page_bytes[kKvKeys] = {};
     const char*      kv_demote[kKvKeys] = {};
+    const char*      kv_demote2[kKvKeys] = {};       /* the second demote layout word, the pager's store_layout2 */
     const char*      kv_pool_layout[kKvKeys] = {};   /* the key's resident layout word, the pager's */
     std::vector<int> kvq;
     /* Each trunk layer's RAD_KVQ_ROTATED (a `rotated` recipe line): AttnGatedFP8::rotate. */
@@ -747,7 +753,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (ctx->kv_recipe[l] < 0) continue;
                 /* The layout, and apart from it whether the layer runs rotated, which any layout
                  * can: the rotation is an op of its own beside the layout's rows. */
-                const int q = ctx->kv_recipe[l] & ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN | RAD_KVQ_DEMOTE);
+                const int q = ctx->kv_recipe[l] & ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN | RAD_KVQ_DEMOTE |
+                                                    RAD_KVQ_DEMOTE2);
                 /* Its demote layout (RAD_KVQ_DEMOTE): k4h_v4 or k4h_v2h of an i8h or rotated fp8
                  * layer, which the pager expands (arch/common/rad_qsa.h). Both share the layer's
                  * basis and V mean, so the rotation and the centring below are the layer's. */
@@ -764,6 +771,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     fprintf(stderr, "radiance: KV recipe: layer %lld asks for demote layout %d "
                                     "under layout %d; this plugin demotes rotated i8h or fp8 "
                                     "to k4h_v4 or k4h_v2h\n", (long long)l, dq, q);
+                    return RAD_E_UNSUPPORTED;
+                }
+                /* A second demote layout (RAD_KVQ_DEMOTE2): k4h_v2h beside a k4h_v4 first, whose
+                 * slots hold either; the pager reads which from the slot table. */
+                const int dq2 = RAD_KVQ_DEMOTE2_OF(ctx->kv_recipe[l]);
+                if (dq2 && (dq != RAD_KVQ_K4H || dq2 != RAD_KVQ_K4HV2H)) {
+                    fprintf(stderr, "radiance: KV recipe: layer %lld asks for demote layouts %d "
+                                    "and %d; this plugin takes k4h_v4 then k4h_v2h\n",
+                            (long long)l, dq, dq2);
                     return RAD_E_UNSUPPORTED;
                 }
                 if (l >= g.n_layer || !is_full_attention(l, interval)) {
@@ -798,7 +814,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                               : "the engine did not hand over (kv_vmean)");
                     return RAD_E_UNSUPPORTED;
                 }
-                kvq_of[(size_t)l] = kv_key(q, dq);
+                kvq_of[(size_t)l] = kv_key(q, dq, dq2);
                 rot_of[(size_t)l] = (ctx->kv_recipe[l] & RAD_KVQ_ROTATED) != 0;
                 vmean_of[(size_t)l] = vm;
             }
@@ -848,7 +864,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (!used[key] && !(key == RAD_KVQ_NONE && n_layouts == 0)) continue;
             const int q = key % kKvqN;
             const char* name = kvq_name(q);
-            const char* dname = key >= 2 * kKvqN ? "k4h_v2h" : key >= kKvqN ? "k4h_v4" : nullptr;
+            const int tier = key / kKvqN;
+            const char* dname = tier == 2 ? "k4h_v2h" : tier ? "k4h_v4" : nullptr;
+            const char* dname2 = tier == 3 ? "k4h_v2h" : nullptr;
             /* A token's row in a head, in bytes of the E4M3-declared group. */
             const int64_t row = q == RAD_KVQ_V4     ? g.head_dim * 25 / 16
                               : q == RAD_KVQ_K6V4   ? g.head_dim * 22 / 16
@@ -863,8 +881,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 qd.head_dim = g.head_dim;
             }
             m.kv_q[key] = rad_decl_kv_group(
-                b, n_layouts > 1 ? (dname ? nm.f("kv_attn_%s_demote_%s", name ? name : "fp8", dname)
-                                          : nm.f("kv_attn_%s", name ? name : "fp8"))
+                b, n_layouts > 1 ? (dname2 ? nm.f("kv_attn_%s_demote_%s_%s", name ? name : "fp8",
+                                                  dname, dname2)
+                                    : dname ? nm.f("kv_attn_%s_demote_%s", name ? name : "fp8", dname)
+                                            : nm.f("kv_attn_%s", name ? name : "fp8"))
                                  : nm.f("kv_attn"), &qd);
             if (!m.kv_q[key]) return RAD_E_INVAL;
             /* The pager's `block_bytes` (arch/common/rad_qsa.h): one layer's fragment of a block in
@@ -873,8 +893,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                                              qd.head_dim);
             m.kv_dt[key] = name ? name : rad_dtype_name(fd.dtype);   /* bf16's is rad_dtype_name's */
             m.kv_demote[key] = dname;
+            m.kv_demote2[key] = dname2;
             m.kv_pool_layout[key] = name ? name : "fp8";
-            if (dname)
+            if (dname2)
+                rad_note(b, "kv cache %s: demoted blocks stored as %s, or %s where the QSA "
+                            "selection kept them least, under window residency, expanded back on "
+                            "the card", name ? name : "fp8", dname, dname2);
+            else if (dname)
                 rad_note(b, "kv cache %s: demoted blocks stored as %s under window residency, "
                             "expanded back on the card", name ? name : "fp8", dname);
             if (q == RAD_KVQ_I8H)
@@ -932,6 +957,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.qsacfg.bkey_i8 = ctx->qsa_bkey_dtype == RAD_I8;
         m.qsacfg.page_block_bytes = m.kv_page_bytes[last_q];
         m.qsacfg.page_store_layout = m.kv_demote[last_q];
+        m.qsacfg.page_store_layout2 = m.kv_demote2[last_q];
         m.qsacfg.page_pool_layout  = m.kv_pool_layout[last_q];
         m.qsacfg.page_head_dim     = g.head_dim;
         /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
@@ -1389,6 +1415,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 qc.kv_attn  = kv;
                 qc.page_block_bytes = m.kv_page_bytes[kq];
                 qc.page_store_layout = m.kv_demote[kq];
+                qc.page_store_layout2 = m.kv_demote2[kq];
+                qc.count = m.kv_demote2[kq] != nullptr;
                 qc.page_pool_layout  = m.kv_pool_layout[kq];
                 qc.emit_sel = lay.attn.qsa_sel != 0;
                 RAD_ARCH_TRY(lay.qsa.declare(b, nm, g, (int)l, qc, m.qsaw, aw.h,

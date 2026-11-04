@@ -5,7 +5,9 @@
 #include "kvstream/plan.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 
 namespace rad {
@@ -200,7 +202,8 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                 for (int l : p.layers) {
                     if (l < 0 || (size_t)l >= cfg.kv_recipe.size() || cfg.kv_recipe[(size_t)l] < 0)
                         continue;   /* the MTP head's layer shares its group's layout */
-                    const int k = cfg.kv_recipe[(size_t)l] & (RAD_KVQ_LAYOUT | RAD_KVQ_DEMOTE);
+                    const int k = cfg.kv_recipe[(size_t)l] & (RAD_KVQ_LAYOUT | RAD_KVQ_DEMOTE |
+                                                              RAD_KVQ_DEMOTE2);
                     if (key >= 0 && k != key && (RAD_KVQ_DEMOTE_OF(k) || RAD_KVQ_DEMOTE_OF(key))) {
                         RAD_ERR("KV group '%s': layer %d's recipe entry names another resident or "
                                 "demote layout than the group's other layers; a store slot holds "
@@ -222,6 +225,18 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                         return RAD_E_INVAL;
                     }
                     p.res_frag = lb / row * kv_layout_row_bytes(p.res_to, p.res_head_dim);
+                    /* The second, narrower demote layout (RAD_KVQ_DEMOTE2) at the front of the
+                     * wide one's fragment: the slot stays the wide layout's. */
+                    if (const int to2 = RAD_KVQ_DEMOTE2_OF(key)) {
+                        p.res_to2   = to2;
+                        p.res_frag2 = lb / row * kv_layout_row_bytes(to2, p.res_head_dim);
+                        if (p.res_frag2 <= 0 || p.res_frag2 > p.res_frag) {
+                            RAD_ERR("KV group '%s': the second demote layout %s is not narrower "
+                                    "than the first, %s, whose width sizes the store's slot",
+                                    p.name.c_str(), kv_layout_name(to2), kv_layout_name(p.res_to));
+                            return RAD_E_INVAL;
+                        }
+                    }
                 }
             }
         } else if (p.kind == RAD_KV_LINEAR || p.kind == RAD_KV_CONV) {
@@ -806,6 +821,8 @@ int KVManager::grab_block(int32_t g, int32_t* out) {
         refcount_[(size_t)g][(size_t)b] = 1;
         --free_usable_[(size_t)g];
         note_held(g, b, +1);
+        /* A counted group's block starts at no selections (set_residency_count). */
+        if ((size_t)g < res_count_.size() && res_count_[(size_t)g].dev) res_count_clears_.push_back({ g, b });
         *out = b;
         return RAD_OK;
     }
@@ -1378,6 +1395,7 @@ int KVManager::reserve_specific_block(int32_t g, int32_t b) {
     refcount_[(size_t)g][(size_t)b] = 1;
     --free_usable_[(size_t)g];
     note_held(g, b, +1);
+    if ((size_t)g < res_count_.size() && res_count_[(size_t)g].dev) res_count_clears_.push_back({ g, b });
     return RAD_OK;
 }
 
@@ -1525,6 +1543,70 @@ int64_t KVManager::residency_shard_bytes() const {
     for (const KVGroupPlan& p : plans_)
         if (p.residency()) b = std::max(b, p.residency_bytes());
     return b;
+}
+
+void KVManager::set_residency_count(int32_t g, uint32_t* dev, const uint32_t* host, int64_t n) {
+    if (g < 0 || g >= (int32_t)plans_.size()) return;
+    if (res_count_.size() != plans_.size()) res_count_.resize(plans_.size());
+    res_count_[(size_t)g] = ResCount{ dev, host, dev ? n : 0 };
+}
+
+uint32_t* KVManager::residency_count(int32_t g) const {
+    return g >= 0 && (size_t)g < res_count_.size() ? res_count_[(size_t)g].dev : nullptr;
+}
+
+int64_t KVManager::residency_count_blocks(int32_t g) const {
+    return g >= 0 && (size_t)g < res_count_.size() ? res_count_[(size_t)g].n : 0;
+}
+
+std::vector<std::pair<int32_t, int32_t>> KVManager::take_count_clears() {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    out.swap(res_count_clears_);
+    return out;
+}
+
+double KVManager::residency_score(uint32_t count, int64_t end, int64_t window, int64_t now) {
+    const int64_t from = std::max<int64_t>(std::max<int64_t>(end, window), 1);
+    return now > from ? (double)count / std::log((double)now / (double)from) : 0.0;
+}
+
+int KVManager::pick_of(int32_t g, int32_t b, int64_t i, const Seq& s) {
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->split()) return 0;
+    /* RADIANCE_DEBUG_KV_SPLIT=hash: the control the selection signal is measured against -- the
+     * same rule and fraction, scored by a hash of the block's place instead of its count. */
+    static const bool hashed = [] {
+        const char* v = std::getenv("RADIANCE_DEBUG_KV_SPLIT");
+        return v && !std::strcmp(v, "hash");
+    }();
+    if (hashed) {
+        uint64_t h = (s.id * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)i * 0xC2B2AE3D27D4EB4Full);
+        h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+        return residency_pick(g, (double)(h >> 11));
+    }
+    const ResCount* rc = (size_t)g < res_count_.size() ? &res_count_[(size_t)g] : nullptr;
+    const uint32_t c = rc && rc->host && b >= 0 && b < rc->n ? rc->host[b] : 0u;
+    return residency_pick(g, residency_score(c, (i + 1) * p->block_size, p->residency_window,
+                                             s.n_tokens));
+}
+
+int KVManager::residency_pick(int32_t g, double score) {
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->split()) return 0;
+    if (res_cohort_.size() != plans_.size()) res_cohort_.resize(plans_.size());
+    auto& last = res_cohort_[(size_t)g];
+    int64_t ge = 0;
+    for (double h : last) ge += h >= score;
+    /* Fewer than split * (n + 1) at least as selected: the block ranks in the top fraction of
+     * itself and the last n. split 1 always passes (ge <= n), split 0 never. */
+    const int lay = (double)ge < res_split_ * (double)(last.size() + 1) ? 0 : 1;
+    last.push_back(score);
+    if ((int64_t)last.size() > kPickCohort) last.pop_front();
+    return lay;
+}
+
+int KVManager::residency_slot_layout(int32_t slot) const {
+    return slot >= 0 && (size_t)slot < res_slot_lay_.size() ? res_slot_lay_[(size_t)slot] : 0;
 }
 
 bool KVManager::residency_emulated(int32_t g, int32_t b) const {
@@ -1695,13 +1777,15 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         if (res_emulate_) {
             if (res_emul_.size() != plans_.size()) res_emul_.resize(plans_.size());
             if (!res_emul_[(size_t)g].insert(b).second) continue;   /* as an entry already cold */
-            out->push_back(BlockMove{g, b, -1});
+            const int lay = pick_of(g, b, i, *s);
+            out->push_back(BlockMove{g, b, -1, lay});
             --left;
             ++res_stats_.demoted;
-            res_stats_.demoted_bytes += p->residency_bytes();
+            res_stats_.demoted_narrow += lay;
+            res_stats_.demoted_bytes += p->residency_bytes(lay);
             SeqResidency& sr = seq_res(id);
             ++sr.demoted;
-            sr.link_bytes += p->residency_bytes();
+            sr.link_bytes += p->residency_bytes(lay);
             continue;
         }
         /* A block promoted from a slot and untouched since (a prefix block is immutable; only the
@@ -1738,18 +1822,24 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
             ++seq_res(id).skipped;
             continue;
         }
-        /* The entry is cold from here; the block keeps its one reference until the copy lands. */
+        /* The entry is cold from here; the block keeps its one reference until the copy lands. A
+         * split group's slot records the layout chosen now, for every later reader of the slot
+         * (a promotion, the pager through TierExec's device table, a re-pointed entry). */
+        const int lay = pick_of(g, b, i, *s);
+        if ((size_t)slot >= res_slot_lay_.size()) res_slot_lay_.resize((size_t)slot + 1, 0);
+        res_slot_lay_[(size_t)slot] = (uint8_t)lay;
         tbl[(size_t)i] = rad_kv_cold_entry(slot);
         s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
         res_demoting_.push_back({ g, b, slot, id });
         ++res_cold_;
-        out->push_back(BlockMove{g, b, slot});
+        out->push_back(BlockMove{g, b, slot, lay});
         --left;
         ++res_stats_.demoted;
-        res_stats_.demoted_bytes += p->residency_bytes();
+        res_stats_.demoted_narrow += lay;
+        res_stats_.demoted_bytes += p->residency_bytes(lay);
         SeqResidency& sr = seq_res(id);
         ++sr.demoted;
-        sr.link_bytes += p->residency_bytes();
+        sr.link_bytes += p->residency_bytes(lay);
     }
     return RAD_OK;
 }
@@ -1790,13 +1880,15 @@ int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64
             slot_ref(slot);
             res_origin_[(size_t)g][fresh] = slot;
         }
-        out->push_back(BlockMove{g, fresh, slot});
+        /* Expanded from the layout its slot holds (a split group's per-slot choice). */
+        const int lay = p->split() ? residency_slot_layout(slot) : 0;
+        out->push_back(BlockMove{g, fresh, slot, lay});
         ++res_stats_.promoted;
         ++res_stats_.promoted_misses;
-        res_stats_.promoted_bytes += p->residency_bytes();
+        res_stats_.promoted_bytes += p->residency_bytes(lay);
         SeqResidency& sr = seq_res(id);
         ++sr.promoted;
-        sr.link_bytes += p->residency_bytes();
+        sr.link_bytes += p->residency_bytes(lay);
     }
     return RAD_OK;
 }

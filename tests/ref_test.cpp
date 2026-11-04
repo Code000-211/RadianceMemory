@@ -1005,6 +1005,8 @@ TEST(op_vocabulary) {
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "qsa_page", "dflash_conv",
         /* Window residency's demote layout (RAD_KVQ_DEMOTE): the requantise and the expand. */
         "kv_transcode",
+        /* Importance-tiered demotion's selection counter (RAD_KVQ_DEMOTE2). */
+        "qsa_count",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -3932,6 +3934,112 @@ TEST(qsa_page_refuses_an_expansion_it_cannot_make) {
     CHECK_EQ(sel.iat(0), (int64_t)rad_kv_cold_entry(0));
     CHECK_OK(go("k4h_v4", "i8h", 4 * rt));
     CHECK_EQ(sel.iat(0), 1);
+}
+
+/* The pager over a layer with two demote layouts (RAD_KVQ_DEMOTE2): the store's slots are k4h_v4
+ * wide, slot 1 holds its fragment in k4h_v2h at the front of that width (the slot table says 1),
+ * slots 0 and 2 in k4h_v4 (0, and 0 again). Each cold entry's page receives the expand of its own
+ * slot's layout, as a promotion of that slot would write it; the bytes past a narrow fragment's
+ * rows are never read (poisoned here). */
+TEST(qsa_page_expands_each_slot_from_the_demote_layout_its_slot_table_names) {
+    const int64_t hd = 256, rows = 8, slots = 3, blocks = 9;
+    const int64_t rw = xrow("k4h_v4", hd), rn = xrow("k4h_v2h", hd), rt = xrow("i8h", hd);
+    const int64_t sfrag = rows * rw, pfrag = rows * rt;
+    std::mt19937 rng(5);
+    std::vector<float> k, v;
+    xvalues(rng, slots * rows * hd, &k, &v);
+    T i8 = xstore(k, v, slots * rows, hd, "i8h");
+    T store(RAD_U8, {slots, sfrag});
+    std::fill(store.mem.begin(), store.mem.end(), (uint8_t)0xC5);
+    const uint8_t lay[3] = { 0, 1, 0 };
+    for (int64_t s = 0; s < slots; ++s) {
+        const char* dem = lay[s] ? "k4h_v2h" : "k4h_v4";
+        T src(RAD_U8, {rows, rt}), frag(RAD_U8, {rows, lay[s] ? rn : rw});
+        std::memcpy(src.mem.data(), i8.mem.data() + s * pfrag, (size_t)pfrag);
+        CHECK_OK(xcode(src, frag, hd, "i8h", dem));
+        std::memcpy(store.mem.data() + s * sfrag, frag.mem.data(), frag.mem.size());
+    }
+    T table(RAD_U8, {slots});
+    std::memcpy(table.mem.data(), lay, 3);
+    T sel(RAD_I32, {2, 3}), scratch(RAD_I32, {2, 3}), paged(RAD_I64, {1});
+    sel.n({ rad_kv_cold_entry(1), 4, rad_kv_cold_entry(0),  -1, rad_kv_cold_entry(2), 5 });
+    scratch.n({ 6, 0, 7,  0, 8, 0 });
+    T pool(RAD_U8, {blocks, pfrag});
+    std::fill(pool.mem.begin(), pool.mem.end(), (uint8_t)0xEE);
+    A a; a.t(sel).t(store).t(pool).t(scratch).t(paged).t(table);
+    a.i("M", 2).i("topk", 2).i("blocks", blocks).i("seqs", 1).i("block_bytes", pfrag)
+     .s("store_layout", "k4h_v4").s("pool_layout", "i8h").i("head_dim", hd)
+     .s("store_layout2", "k4h_v2h");
+    CHECK_OK(run("qsa_page", a));
+    const std::vector<int64_t> want = { 6, 4, 7,  -1, 8, 5 };
+    for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(sel.iat((int64_t)i), want[i]);
+    CHECK_EQ(paged.iat(0), 3);
+    auto holds = [&](int64_t b, int64_t slot) {
+        const int64_t rf = lay[slot] ? rn : rw;
+        T frag(RAD_U8, {rows, rf}), exp(RAD_U8, {rows, rt});
+        std::memcpy(frag.mem.data(), store.mem.data() + slot * sfrag, (size_t)(rows * rf));
+        if (xcode(frag, exp, hd, lay[slot] ? "k4h_v2h" : "k4h_v4", "i8h") != RAD_OK) return false;
+        return std::memcmp(pool.mem.data() + b * pfrag, exp.mem.data(), (size_t)pfrag) == 0;
+    };
+    CHECK(holds(6, 1)); CHECK(holds(7, 0)); CHECK(holds(8, 2));
+    /* Without the table, or with the second word the first's or the pool's, refused unwritten. */
+    T sel2(RAD_I32, {1, 2}), scr2(RAD_I32, {1, 2});
+    sel2.n({ rad_kv_cold_entry(1), -1 });
+    scr2.n({ 1, 0 });
+    auto go = [&](const char* second, bool with_table) {
+        A b; b.t(sel2).t(store).t(pool).t(scr2);
+        if (with_table) b.t(paged).t(table);
+        b.i("M", 1).i("topk", 1).i("blocks", blocks).i("seqs", 1).i("block_bytes", pfrag)
+         .s("store_layout", "k4h_v4").s("pool_layout", "i8h").i("head_dim", hd)
+         .s("store_layout2", second);
+        return run("qsa_page", b);
+    };
+    CHECK_EQ(go("k4h_v2h", false), RAD_E_INVAL);
+    CHECK_EQ(go("k4h_v4", true), RAD_E_INVAL);
+    CHECK_EQ(go("i8h", true), RAD_E_INVAL);
+    CHECK_EQ(sel2.iat(0), (int64_t)rad_kv_cold_entry(1));
+}
+
+/* The selection counter by hand (topk 3, ratio 4): a row adds one to each of its first three
+ * entries only when they are three complete blocks -- nsel 4 with the partial page appended
+ * (position 9: (9 + 1) % 4 != 0), or nsel 3 on a block boundary (position 11). A row of fewer
+ * (nsel 3 at position 9: two blocks and the partial page; nsel 2) chose nothing and adds nothing;
+ * empty and cold entries add nothing; the counter is added to, not stored. */
+TEST(qsa_count_adds_one_to_each_block_a_full_selection_kept) {
+    T sel(RAD_I32, {5, 4}), nsel(RAD_I32, {5}), pos(RAD_I32, {5}), cnt(RAD_U32, {8});
+    sel.n({ 1, 2, 3, 7,     /* full, partial page 7 */
+            2, 5, 1, -1,    /* full at a block boundary */
+            4, 6, 0, -1,    /* two blocks and the partial page 0: not full */
+            3, rad_kv_cold_entry(4), 2, 6,   /* full, a cold entry */
+            5, 0, -1, -1 }); /* two entries */
+    nsel.n({ 4, 3, 3, 4, 2 });
+    pos.n({ 9, 11, 9, 9, 7 });
+    cnt.n({ 10, 0, 0, 0, 0, 0, 0, 0 });
+    A a; a.t(sel).t(nsel).t(pos).t(cnt).i("M", 5).i("topk", 3).i("ratio", 4);
+    CHECK_OK(run("qsa_count", a));
+    const std::vector<int64_t> want = { 10, 2, 3, 2, 0, 1, 0, 0 };
+    for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(cnt.iat((int64_t)i), want[i]);
+    /* With `cu` (decode sequences of rows 0-1, 2, 3-4 and an empty one) only a row opening its
+     * sequence counts: row 0 (full) adds to 1, 2, 3; row 2 is short; row 3 adds to 3 and 2; rows 1
+     * and 4, a sequence's later rows, add nothing. */
+    {
+        T cu(RAD_I32, {5});
+        cu.n({ 0, 2, 3, 3, 5 });
+        A c; c.t(sel).t(nsel).t(pos).t(cnt).t(cu).i("M", 5).i("topk", 3).i("ratio", 4);
+        CHECK_OK(run("qsa_count", c));
+        const std::vector<int64_t> want2 = { 10, 3, 5, 4, 0, 1, 0, 0 };
+        for (size_t i = 0; i < want2.size(); ++i) CHECK_EQ(cnt.iat((int64_t)i), want2[i]);
+        cnt.n({ 10, 2, 3, 2, 0, 1, 0, 0 });
+    }
+    /* Refused before any add: a block id past the counter, an nsel past topk + 1. */
+    T bad(RAD_I32, {1, 4}), n1(RAD_I32, {1}), p1(RAD_I32, {1});
+    bad.n({ 1, 8, 2, -1 }); n1.n({ 3 }); p1.n({ 11 });
+    A b; b.t(bad).t(n1).t(p1).t(cnt).i("M", 1).i("topk", 3).i("ratio", 4);
+    CHECK_EQ(run("qsa_count", b), RAD_E_INVAL);
+    n1.n({ 5 });
+    bad.n({ 1, 2, 3, -1 });
+    CHECK_EQ(run("qsa_count", b), RAD_E_INVAL);
+    for (size_t i = 0; i < want.size(); ++i) CHECK_EQ(cnt.iat((int64_t)i), want[i]);
 }
 
 /* kv_store at kv_dtype bf16_e4m3r stores into a bf16 cache what the fp8 store stores into an E4M3
@@ -11201,6 +11309,7 @@ std::vector<Geo> geometries() {
         G("qsa_page", "M", 4, a.i("M", R).i("topk", 3).i("blocks", 6).i("seqs", 2)
                               .i("block_bytes", 16)),
         G("kv_transcode", "M", 3, a.i("M", R).i("head_dim", 64).s("from", "i8h").s("to", "k4h_v2h")),
+        G("qsa_count", "M", 4, a.i("M", R).i("topk", 3).i("ratio", 4)),
         G("dflash_conv", "T", 6, a.i("T", R).i("hidden_size", 32).i("taps", 2).i("group_size", 16)
                                  .i("NG", 2).i("block_size", 4).s("dtype", "bf16")),
         G("scale_rows", "M", 3, a.i("M", R).i("n", 8).s("act", "sigmoid").s("dtype", "f32")),

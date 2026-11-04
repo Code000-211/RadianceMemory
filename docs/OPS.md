@@ -3068,10 +3068,12 @@ order, not a slow one.
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
-| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` `store_layout`/opt `pool_layout`/opt `head_dim`/opt | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout? |
+| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` `store_layout`/opt `pool_layout`/opt `head_dim`/opt `store_layout2`/opt | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout?, `slot_layout`? |
+| `qsa_count` | `M`(range) `topk` `ratio` | `sel`, `nsel`, `pos`, `count`:inout, `cu`? |
 
 `qsa_page` is the sixth op of the family and runs only when the attention group declares a
-residency window and the store is open (see "`qsa_page`" below).
+residency window and the store is open (see "`qsa_page`" below). `qsa_count`, the seventh, runs only for a
+layer with two demote layouts (see "`qsa_count`" below).
 
 Five ops decompose one indexer, which scores blocks of key history against the query and hands
 `attn_paged` a shorter block table. `docs/QSA.md` describes the decomposition and
@@ -3215,6 +3217,38 @@ the store, a scratch id outside the pool, or two cold positions sharing a scratc
   (`RAD_E_INVAL`, `RAD_E_SHAPE`) for one without the other, an unknown or repeated word, or a
   `block_bytes` that is not whole rows of the pool's layout. libr4d's four waves split a
   fragment's rows; `r4d_emu_kvx` and r4d_selftest hold it to libref.
+- **Two demote layouts** (`store_layout2`, with the optional sixth operand `slot_layout`; a layer
+  with `RAD_KVQ_DEMOTE2`): `slot_layout` is `[slots]` u8 (`RadKVGroupBatch::residency_slot_layout`),
+  and a cold entry's slot holds its fragment in `store_layout` where its byte is 0 and in
+  `store_layout2` otherwise, at the front of a store fragment as wide as the wider of the two.
+  Each entry expands from its own slot's layout. Refused (`RAD_E_INVAL`) without `store_layout`,
+  without the table, or with a second word equal to the first or to `pool_layout`. The table is
+  written with the slot's bytes on the transfer stream, so a slot and its byte change together.
+
+### `qsa_count`
+
+Importance-tiered demotion's selection counter (`RAD_KVQ_DEMOTE2`, `--kv-demote-split`).
+
+- **Inputs:** `sel` `[M, topk + 1]` i32 and `nsel` `[M]` i32 as `qsa_select` wrote them (before
+  `qsa_page` rewrites cold entries), `pos` `[M]` i32 the rows' positions; `count` `[blocks]` u32
+  (`RadKVGroupBatch::residency_count`), indexed by pool block id.
+- **Rule:** row `m` holds `k = nsel[m] - ((pos[m] + 1) % ratio != 0)` complete blocks (the
+  partial page is appended exactly then). Only a full row, `k == topk`, chose among more blocks
+  than it could keep (or exactly as many); a shorter one took every live block, and counting it
+  would rate a block by how short the history was. A full row adds one to `count[e]` for each of
+  its first `topk` entries `e >= 0`; empty and cold entries add nothing. An add, so the counts sum
+  over the group's layers and over steps; the engine zeroes a block's entry when it hands the block
+  out.
+- **`cu`** (optional, `[S + 1]` i32 row offsets): only a row that opens a non-empty sequence
+  (`m == cu[s] < cu[s + 1]`) counts. `arch/common/rad_qsa.h` passes the decode sequences' offsets
+  over the decode rows, whose later rows verify drafts (two runs that agree on every committed
+  token need not agree on a rejected draft's selection), and none over the prefill rows. Only the
+  trunk's layers count; the MTP head's passes read drafted tokens.
+- **Refused** by libref and libavx before any add (`RAD_E_INVAL`): a full row's id at or past the
+  counter's length, an `nsel` outside `[0, topk + 1]`, a negative position. libr4d's
+  `qsa_count_u32` (a thread an entry, an atomic add a counted block, so the order does not change
+  the sum) skips an id past the counter; `r4d_emu_kvx`, r4d_selftest and avx_check hold both to
+  libref's counts.
 
 ### `qsa_select`
 

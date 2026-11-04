@@ -120,6 +120,11 @@ struct IKVManager {
         const int64_t* layer_off = nullptr;
         const int32_t* scratch = nullptr;
         int64_t*       paged = nullptr;   /* the pager's counter on this rank's card, or null */
+        /* Importance-tiered demotion: the selection counter (rank 0, a split group) and its
+         * length, and this rank's slot-layout table; null for every other group. */
+        uint32_t*      count = nullptr;
+        int64_t        count_blocks = 0;
+        const uint8_t* slot_layout = nullptr;
     };
     virtual Pager   pager(int32_t group, int rank) const { (void)group; (void)rank; return {}; }
     virtual int64_t scratch_pitch(int32_t group) const { (void)group; return 0; }
@@ -454,6 +459,9 @@ struct KVBinding final : IKVManager {
         p.layer_off  = k->residency_layer_off(g).data();
         p.scratch    = k->scratch_table(g).data();
         p.paged      = k->residency_paged();
+        p.count        = k->residency_count(g);
+        p.count_blocks = k->residency_count_blocks(g);
+        p.slot_layout  = pl->split() ? k->residency_slot_table() : nullptr;
         return p;
     }
     int64_t scratch_pitch(int32_t g) const override {

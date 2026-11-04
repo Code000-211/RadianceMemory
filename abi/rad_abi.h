@@ -58,8 +58,15 @@ extern "C" {
  * (RAD_KVQ_DEMOTE, rad_builder.h; --kv-recipe `demote LAYOUT`), and the optional `store_layout`,
  * `pool_layout` and `head_dim` of `qsa_page` with the new op `kv_transcode` (docs/OPS.md); no
  * struct moved. A plugin built at 41 would read a tiered layer's entry as a layout it does not
- * know and refuse it. */
-#define RAD_ABI_VERSION 42u
+ * know and refuse it.
+ *
+ * 43: a second demote layout per kv_recipe entry (RAD_KVQ_DEMOTE2, rad_builder.h; --kv-recipe
+ * `demote WIDE NARROW`), each demoted block stored in one of the two by how often the QSA
+ * selection kept it: RadKVGroupBatch gained residency_count, residency_count_blocks and
+ * residency_slot_layout (rad_runtime.h), `qsa_page` an optional `store_layout2` with a `slot_layout`
+ * operand, and the op `qsa_count` is new (docs/OPS.md). A plugin built at 42 would read a two-layout
+ * entry as a layout it does not know, and its batch would end before the new fields. */
+#define RAD_ABI_VERSION 43u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

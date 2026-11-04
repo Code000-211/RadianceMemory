@@ -234,7 +234,12 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
  *
  * With `store_layout` and `pool_layout` (RAD_KVQ_DEMOTE, a tiered layer) the copy expands: the
  * slot holds the fragment's rows in the demote layout and each is decoded and re-encoded into the
- * pool's layout (kv_transcode's codec), so the attention reads the one layout it was declared at. */
+ * pool's layout (kv_transcode's codec), so the attention reads the one layout it was declared at.
+ *
+ * With `store_layout2` as well (RAD_KVQ_DEMOTE2, a layer with two demote layouts) a sixth operand,
+ * `slot_layout` [slots] u8, says per slot which of the two its fragment holds: 0 `store_layout`,
+ * any other value `store_layout2`. The store's fragment is then as wide as the wider of the two
+ * (a narrow slot uses the front of it), and each cold entry expands from its own slot's layout. */
 int ref_qsa_page(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *sel = &a->t[0], *st = &a->t[1], *pl = &a->t[2], *sc = &a->t[3];
@@ -265,7 +270,8 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
      * fragment, and the store's is as many rows of its own width. Both words or neither. */
     const char* sl = p_str(a, "store_layout", nullptr);
     const char* plw = p_str(a, "pool_layout", nullptr);
-    int xf = -1, xt = -1;
+    const char* sl2 = p_str(a, "store_layout2", nullptr);
+    int xf = -1, xt = -1, xf2 = -1;
     int64_t hd = 0, rows = 0, sbb = bb;
     if (sl || plw) {
         xf = kvx_layout(sl); xt = kvx_layout(plw); hd = p_int(a, "head_dim", 0);
@@ -275,8 +281,17 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
         rows = bb / kvx_row_bytes(xt, hd);
         sbb  = rows * kvx_row_bytes(xf, hd);
     }
+    /* The second demote layout: only beside the first, another word than both, and with the
+     * per-slot table it is chosen by. */
+    const RadTensor* sly = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
+    if (sl2) {
+        xf2 = kvx_layout(sl2);
+        if (xf < 0 || xf2 < 0 || xf2 == xf || xf2 == xt || !sly) return RAD_E_INVAL;
+        sbb = std::max(sbb, rows * kvx_row_bytes(xf2, hd));
+    }
     if (st->shape[1] < sbb) return RAD_E_SHAPE;
     const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
+    if (sl2 && (sly->dtype != RAD_U8 || numel(sly) < slots)) return RAD_E_SHAPE;
     int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
     if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
     int64_t n_cold = 0;
@@ -298,14 +313,59 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
             const int64_t e = ldi(sel, so);
             if (e > -2) continue;
             const int64_t pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
+            /* The slot's own layout: the table's entry picks the second one when it is not 0. */
+            const int from = sl2 && ((const uint8_t*)sly->data)[offlin(sly, -2 - e)] ? xf2 : xf;
             if (xf >= 0)
-                kvx_rows(xf, xt, hd, sb + (-2 - e) * slot_b, kvx_row_bytes(xf, hd), pb + pg * pitch,
-                         kvx_row_bytes(xt, hd), rows);
+                kvx_rows(from, xt, hd, sb + (-2 - e) * slot_b, kvx_row_bytes(from, hd),
+                         pb + pg * pitch, kvx_row_bytes(xt, hd), rows);
             else
                 std::memcpy(pb + pg * pitch, sb + (-2 - e) * slot_b, (size_t)bb);
             st_int(sel->dtype, sel->data, so, pg);
         }
     if (paged) *paged += n_cold;
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_count */
+/* The selection counter of importance-tiered demotion (RAD_KVQ_DEMOTE2, docs/OPS.md): row m of
+ * `sel` holds k = nsel[m] - ((pos[m] + 1) % ratio != 0) complete blocks (qsa_select appends the
+ * partial page exactly then). Only a full row, k == topk, chose: below that every live block was
+ * taken, and counting it would rate a block by how short the history was when it was read. A full
+ * row adds one to count[e] for each of its first `topk` entries e >= 0; empty (-1) and cold (<= -2)
+ * entries add nothing. An add, so the counts sum over layers and launches. With the optional fifth
+ * operand `cu` (S + 1 row offsets, the decode sequences') a row counts only where it opens its
+ * sequence (m == cu[s]): a decode sequence's later rows verify drafts, which two runs agreeing on
+ * every committed token need not share. Refused before any add (RAD_E_INVAL): a pool id at or past
+ * the counter's length, or a row's nsel outside [0, topk + 1]. */
+int ref_qsa_count(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *sel = &a->t[0], *ns = &a->t[1], *po = &a->t[2], *ct = &a->t[3];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (sel->rank != 2 || ct->dtype != RAD_U32) return sel->rank != 2 ? RAD_E_SHAPE : RAD_E_DTYPE;
+    const int64_t M = sel->shape[0], n = numel(ct);
+    if (M <= 0 || sel->shape[1] < topk + 1 || numel(ns) < M || numel(po) < M || n <= 0)
+        return RAD_E_SHAPE;
+    const RadTensor* cu = a->n_t > 4 && a->t[4].data ? &a->t[4] : nullptr;
+    std::vector<char> opens((size_t)M, cu ? 0 : 1);
+    if (cu)
+        for (int64_t s = 0; s < numel(cu) - 1; ++s)
+            if (const int64_t m = cu_at(cu, s); m >= 0 && m < M && cu_at(cu, s + 1) > m) opens[(size_t)m] = 1;
+    std::vector<int64_t> full;
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t k = ldi(ns, offlin(ns, m)), p = ldi(po, offlin(po, m));
+        if (k < 0 || k > topk + 1 || p < 0) return RAD_E_INVAL;
+        if (!opens[(size_t)m] || k - ((p + 1) % ratio != 0 ? 1 : 0) != topk) continue;
+        for (int64_t j = 0; j < topk; ++j)
+            if (ldi(sel, m * sel->stride[0] + j * sel->stride[1]) >= n) return RAD_E_INVAL;
+        full.push_back(m);
+    }
+    uint32_t* c = (uint32_t*)ct->data;
+    for (int64_t m : full)
+        for (int64_t j = 0; j < topk; ++j) {
+            const int64_t e = ldi(sel, m * sel->stride[0] + j * sel->stride[1]);
+            if (e >= 0) c[offlin(ct, e)] += 1u;
+        }
     return RAD_OK;
 }
 

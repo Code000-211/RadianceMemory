@@ -3524,6 +3524,33 @@ void kvx_cases(std::vector<Hand>& hs) {
         h.expect(0, { 7, 4, -1, 8, 9, 6, 1, -1 });
         hs.push_back(std::move(h));
     }
+    /* Two demote layouts (RAD_KVQ_DEMOTE2): k4h_v4-wide slots, slots 1 and 3 holding k4h_v2h at the
+     * front of the width (the slot table's 1), each cold entry expanded from its own slot's. */
+    for (const char* pool : { "i8h", "fp8" }) {
+        const int64_t pr = !std::strcmp(pool, "i8h") ? 516 : 512;
+        const int64_t sfrag = rows * 288, pfrag = rows * pr;
+        const std::string name = std::string("expanding k4h_v4 and k4h_v2h slots by the slot table "
+                                             "into an ") + pool + " pool";
+        Hand h(name.c_str(), "qsa_page", 0.0);
+        h.dense(RAD_I32, { 2, 4 }, [](int64_t i) {
+             const int64_t v[8] = { -2 - 3, 4, -1, -2 - 0, -2 - 2, 6, -2 - 1, -1 };
+             return (float)v[i];
+         }, true)
+         .view(RAD_U8, { slots, sfrag }, { layers * sfrag, 1 }, slots * layers * sfrag,
+               [](int64_t i) { return (float)((i * 2654435761u >> 13) & 0xff); })
+         .dense(RAD_U8, { blocks, pfrag }, [](int64_t) { return (float)0xEE; }, true)
+         .dense(RAD_I32, { 2, 4 }, [](int64_t i) {
+             const int64_t v[8] = { 7, 0, 0, 8, 9, 0, 1, 0 };
+             return (float)v[i];
+         })
+         .dense(RAD_I64, { 1 }, [](int64_t) { return 0.0f; }, true)
+         .dense(RAD_U8, { slots }, [](int64_t i) { return (float)(i & 1); })
+         .pi("M", 2).pi("topk", 3).pi("blocks", blocks).pi("seqs", 2).pi("block_bytes", pfrag)
+         .ps("store_layout", "k4h_v4").ps("pool_layout", pool).pi("head_dim", hd)
+         .ps("store_layout2", "k4h_v2h");
+        h.expect(0, { 7, 4, -1, 8, 9, 6, 1, -1 });
+        hs.push_back(std::move(h));
+    }
 }
 
 void kv_cases(std::vector<Hand>& hs) {

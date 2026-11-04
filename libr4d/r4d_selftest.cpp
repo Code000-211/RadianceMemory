@@ -24519,10 +24519,12 @@ static void sam_attn_case(const Plugin& pl) {
  */
 /* `xs` / `xp` (with `xs_rowb`, the store layout's row): the expanding pager of a tiered layer
  * (RAD_KVQ_DEMOTE), the store holding each fragment as rows of `xs` and the pool rows of `xp`. */
+/* `xs2` (with `xs2_rowb`): a second demote layout (RAD_KVQ_DEMOTE2), the slots alternating
+ * between the two by the slot table, which the pager then reads. */
 static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t slot_pitch,
                          int64_t pool_pitch, int64_t store_skew, bool kv_shaped = false,
                          int64_t kv_rowb = 0, const char* xs = nullptr, const char* xp = nullptr,
-                         int64_t xs_rowb = 0) {
+                         int64_t xs_rowb = 0, const char* xs2 = nullptr, int64_t xs2_rowb = 0) {
     const RadKernelInfo* r = find(pl, "qsa_page_u8");
     if (!r || !g_plugin) { ok(what, false, "row or plugin path absent"); return; }
     std::string path(g_plugin);
@@ -24560,7 +24562,9 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
     for (size_t i = 0; i < store.size(); ++i) store[i] = (uint8_t)(st_mix32((uint32_t)i) >> 7);
 
     /* The store's fragment: as many rows of its own layout as the pool's holds. */
-    const int64_t sbb = xs ? bb / kv_rowb * xs_rowb : bb;
+    const int64_t sbb = xs ? bb / kv_rowb * std::max(xs_rowb, xs2 ? xs2_rowb : 0) : bb;
+    /* Which layout each slot holds: slots 1, 2 and 4 the second. */
+    const std::vector<uint8_t> slot_lay = { 0, 1, 1, 0, 1, 0 };
     auto mk = [&](void* ds, void* dst, void* dp, void* dc, std::vector<RadTensor>& ts) {
         RadTensor tst = T(dst, RAD_U8, { slots, sbb });
         tst.stride[0] = slot_pitch;
@@ -24584,6 +24588,7 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
         ps.push_back(PS("pool_layout", xp));
         ps.push_back(PI("head_dim", 256));
     }
+    if (xs2) ps.push_back(PS("store_layout2", xs2));
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.p = ps.data(); a.n_p = (int)ps.size();
@@ -24595,6 +24600,7 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
     mk(wsel.data(), store.data() + store_skew, wpool.data(), scr.data(), hts);
     int64_t want_count = 1000;
     with_count(&want_count, hts);
+    if (xs2) hts.push_back(T((void*)slot_lay.data(), RAD_U8, { slots }));
     a.t = hts.data(); a.n_t = (int)hts.size();
     const int rr = oracle->launch(&a, nullptr);
     if (rr != RAD_OK) { ok(what, false, "reference rc=" + std::to_string(rr)); dlclose(ref); return; }
@@ -24614,6 +24620,11 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
     const int64_t seed = 1000;
     st_memcpy(d_ct, &seed, sizeof seed, hipMemcpyHostToDevice);
     with_count(d_ct, dts);
+    if (xs2) {
+        void* d_sl = dalloc(slot_lay.size());
+        st_memcpy(d_sl, slot_lay.data(), slot_lay.size(), hipMemcpyHostToDevice);
+        dts.push_back(T(d_sl, RAD_U8, { slots }));
+    }
     a.t = dts.data(); a.n_t = (int)dts.size();
     const int rc = r->launch(&a, nullptr);
     st_stream_sync(nullptr);
@@ -24673,6 +24684,101 @@ static void qsa_page_case(const Plugin& pl) {
                                  "head(s)", t.s, t.p, (long long)heads).c_str(),
                          bb, 2 * sb + 64, bb + 16, sb + 64, false, t.pr, t.s, t.p, t.sr);
         }
+    /* Two demote layouts (RAD_KVQ_DEMOTE2): k4h_v4 slots and k4h_v2h ones in the same store, a slot
+     * the wide layout's width, each expanded from the layout the slot table names. */
+    for (const char* res : { "i8h", "fp8" })
+        for (int64_t heads : { 1, 2 }) {
+            const int64_t pr = !std::strcmp(res, "i8h") ? 516 : 512;
+            const int64_t bb = 4 * heads * pr, sb = 4 * heads * 288;
+            qsa_page_one(pl, fmt("qsa_page vs libref byte for byte, k4h_v4 and k4h_v2h slots by the "
+                                 "slot table expanded into %s, %lld head(s)", res,
+                                 (long long)heads).c_str(),
+                         bb, 2 * sb + 64, bb + 16, sb + 64, false, pr, "k4h_v4", res, 288,
+                         "k4h_v2h", 224);
+        }
+}
+
+/* qsa_count (importance-tiered demotion's counter), against libref's, word for word: selections
+ * as qsa_select writes them past its budget (full rows with and without the partial page) beside
+ * short rows, empty and cold entries, many rows naming the same blocks so the atomics collide, and
+ * a counter seeded non-zero (the op adds); once over every row, then with `cu` (each sequence's
+ * first row only). */
+static void qsa_count_case(const Plugin& pl) {
+    const char* what = "qsa_count vs libref word for word";
+    const RadKernelInfo* r = find(pl, "qsa_count_u32");
+    if (!r || !g_plugin) { ok(what, false, "row or plugin path absent"); return; }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what, false, "reference plugin unavailable"); return; }
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "qsa_count")) { oracle = at(i); break; }
+    if (!oracle) { ok(what, false, "reference operation unavailable"); dlclose(ref); return; }
+    const int64_t M = 300, topk = 512, w = topk + 1, ratio = 4, blocks = 2000;
+    std::vector<int32_t> sel((size_t)(M * w)), ns((size_t)M), po((size_t)M);
+    std::vector<uint32_t> cnt((size_t)blocks);
+    for (int64_t m = 0; m < M; ++m) {
+        po[(size_t)m] = (int32_t)(2048 + 3 * m);
+        const bool part = (po[(size_t)m] + 1) % ratio != 0;
+        const int64_t k = m % 5 == 0 ? topk - 7 : topk;          /* every fifth row short */
+        for (int64_t j = 0; j < w; ++j) {
+            const uint32_t h = st_mix32((uint32_t)(m * w + j));
+            int32_t e = (int32_t)(h % 900);                          /* collisions on purpose */
+            if (h % 61 == 0) e = (int32_t)(-2 - (int32_t)(h % 17));
+            if (j >= k + (part ? 1 : 0)) e = -1;
+            sel[(size_t)(m * w + j)] = e;
+        }
+        ns[(size_t)m] = (int32_t)(k + (part ? 1 : 0));
+    }
+    for (int64_t b = 0; b < blocks; ++b) cnt[(size_t)b] = st_mix32((uint32_t)b) % 1000;
+    std::vector<RadParam> ps = { PI("M", M), PI("topk", topk), PI("ratio", ratio) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    /* Rows grouped as decode sequences of one to three rows (the `cu` form counts only each first
+     * row), the counter run without and then with it. */
+    std::vector<int32_t> cu = { 0 };
+    while (cu.back() < M) cu.push_back(std::min<int32_t>((int32_t)M, cu.back() + 1 + (int32_t)(st_mix32((uint32_t)cu.size()) % 3)));
+    std::vector<uint32_t> want = cnt;
+    std::vector<RadTensor> hts = { T(sel.data(), RAD_I32, { M, w }), T(ns.data(), RAD_I32, { M }),
+                                   T(po.data(), RAD_I32, { M }), T(want.data(), RAD_U32, { blocks }),
+                                   T(cu.data(), RAD_I32, { (int64_t)cu.size() }) };
+    a.t = hts.data(); a.n_t = 4;
+    int rr = oracle->launch(&a, nullptr);
+    a.n_t = 5;
+    if (rr == RAD_OK) rr = oracle->launch(&a, nullptr);
+    if (rr != RAD_OK) { ok(what, false, "reference rc=" + std::to_string(rr)); dlclose(ref); return; }
+    void* d_se = dalloc(sel.size() * 4);
+    void* d_ns = dalloc(ns.size() * 4);
+    void* d_po = dalloc(po.size() * 4);
+    void* d_ct = dalloc(cnt.size() * 4);
+    void* d_cu = dalloc(cu.size() * 4);
+    st_memcpy(d_cu, cu.data(), cu.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_se, sel.data(), sel.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_ns, ns.data(), ns.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_po, po.data(), po.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_ct, cnt.data(), cnt.size() * 4, hipMemcpyHostToDevice);
+    std::vector<RadTensor> dts = { T(d_se, RAD_I32, { M, w }), T(d_ns, RAD_I32, { M }),
+                                   T(d_po, RAD_I32, { M }), T(d_ct, RAD_U32, { blocks }),
+                                   T(d_cu, RAD_I32, { (int64_t)cu.size() }) };
+    a.t = dts.data();
+    a.n_t = 4;
+    int rc = r->launch(&a, nullptr);
+    a.n_t = 5;
+    if (rc == RAD_OK) rc = r->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc)); dlclose(ref); return; }
+    std::vector<uint32_t> got(cnt.size());
+    st_memcpy(got.data(), d_ct, got.size() * 4, hipMemcpyDeviceToHost);
+    int64_t diff = 0, added = 0;
+    for (size_t i = 0; i < got.size(); ++i) { diff += got[i] != want[i]; added += want[i] - cnt[i]; }
+    ok(what, diff == 0 && added > 0,
+       "words differing=" + std::to_string(diff) + " counted=" + std::to_string(added));
+    dlclose(ref);
 }
 
 /* kv_transcode (window residency's demote layout), against libref's byte for byte: every direction
@@ -33108,6 +33214,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_page_u8")) {
         if (!g_case) std::printf("\nthe QSA pager, against libref's reference\n");
         qsa_page_case(pl);
+    }
+
+    if (sel("qsa_count_u32")) {
+        if (!g_case) std::printf("\nthe QSA selection counter, against libref's reference\n");
+        qsa_count_case(pl);
     }
 
     if (sel("kv_transcode_u8")) {

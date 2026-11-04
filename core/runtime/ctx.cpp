@@ -946,7 +946,7 @@ int Ctx::lane_join(int from, int to) {
  * (below). */
 static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 408,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 136,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 160,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
@@ -993,6 +993,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         ptr(k.residency_store); mix((uint64_t)k.residency_slot_bytes); ptr(k.residency_layer_off);
         ptr(k.residency_scratch); mix((uint64_t)k.residency_scratch_pitch); ptr(k.residency_paged);
         mix((uint64_t)k.residency_slots);
+        ptr(k.residency_count); mix((uint64_t)k.residency_count_blocks); ptr(k.residency_slot_layout);
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);

@@ -385,6 +385,66 @@ are byte-identical. **Open:** with a tiered recipe, int8 block keys (`--qsa-bkey
 drafter together, residency on and the emulation diverge (identical with `--num-speculative-tokens
 0`); the drafter's acceptance falls from about 0.68 to 0.10 once blocks really move, also untiered.
 
+### Two demote layouts, chosen by the QSA selection count
+
+A tiered line may name two demote layouts, the wide one first (RAD_KVQ_DEMOTE2, ABI 43):
+
+```
+layer 3 i8h demote k4h_v4 k4h_v2h vmean    # each demoted block k4h_v4 or k4h_v2h
+```
+
+and `--kv-demote-split F` (default 0.5) is the fraction of demoted blocks that take the wide one.
+
+* **The counter.** `qsa_count` (docs/OPS.md), issued by each trunk layer's indexer between
+  `qsa_select` and the pager, adds one to a u32 per pool block (`RadKVGroupBatch::residency_count`)
+  for every query whose selection was full -- it kept `topk` blocks out of more (or exactly as
+  many) -- and kept that block. Prefill rows all count; of a decode sequence's rows only the first,
+  the committed token's (the later ones verify drafts); the MTP head counts nothing. The engine
+  zeroes a block's word when it hands the block out and copies the array to pinned host memory
+  after every step, ahead of the sampled ids, so the commit's sweep reads that step's counts. So
+  a count is the selections a block got while resident; the residency window is the window, and
+  nothing decays.
+* **The split rule.** At a block's first demotion its score is its count over what a uniform
+  choice would have given it, `count / ln(now / max(end, window))` (a query at q keeps topk of q /
+  ratio blocks); the block is wide when fewer than `F (n + 1)` of the last n <= 64 blocks the group
+  decided scored at least as high, ties narrow. A fraction rather than a count threshold because a
+  count's scale moves with the history length, the chunking and the layer count, while the
+  fraction fixes the bytes; a short, recent look back because scores still drift with position (a
+  sweep after a long prompt demotes thousands of blocks oldest first). Realized: 27 / 48.5 / 71 %
+  wide at 0.25 / 0.5 / 0.75 in the KL runs (ties at a zero count go narrow), 50.4 % in the
+  identity run at 0.5.
+* **Slots.** A slot is the wide layout's block; a narrow block's rows sit at the front of each
+  layer's fragment, so the layer offsets are the wide ones. Rank 0's manager records each slot's
+  layout and names it in every move (`BlockMove::layout`), so every rank stores and expands a block
+  the same way; each rank's mover writes the slot's byte into its device table
+  (`RadKVGroupBatch::residency_slot_layout`) behind the slot's bytes, and the pager (`qsa_page`
+  with `store_layout2`) expands each cold entry from its slot's layout. Promotion, re-pointing and
+  the prefix cache's cold entries read the slot's layout; a block is still decided and rounded once.
+* **TP.** Only rank 0 counts and decides; the other ranks' batches carry no counter.
+* **The emulation** follows the same decision from the same counts.
+
+Measured as above (`prep/aq/m8/card17.sh`, `{kl,recall,mr}/imp-*.json`); link bytes are a demoted
+block's both ranks in the serving geometry (13 layers), the store slot is 29.25 KiB at every split:
+
+| middle | link a block | long KL / top-1 / ΔNLL | recall KL / top-1 / ΔNLL | multi-round KL / top-1 / ΔNLL |
+|---|--:|--:|--:|--:|
+| k4h_v4 | 29.25 KiB | 0.0284 / 93.91 % / +0.0012 | 0.0151 / 99.62 % / −0.0084 | 0.0047 / 98.43 % / −0.0003 |
+| split 0.75 (71 % wide) | 27.4 KiB | 0.0279 / 94.22 % / −0.0020 | 0.0171 / 99.64 % / −0.0089 | 0.0046 / 98.04 % / −0.0017 |
+| split 0.5 (48.5 % wide) | 25.9 KiB | 0.0319 / 93.79 % / +0.0040 | 0.0175 / 99.59 % / −0.0082 | 0.0047 / 98.14 % / −0.0012 |
+| split 0.25 (27 % wide) | 24.5 KiB | 0.0349 / 93.71 % / +0.0028 | 0.0164 / 99.62 % / −0.0090 | 0.0053 / 98.63 % / −0.0013 |
+| k4h_v2h | 22.75 KiB | 0.0408 / 93.00 % / +0.0028 | 0.0183 / 99.62 % / −0.0073 | 0.0063 / 97.55 % / +0.0043 |
+| control: split 0.5 by a hash (50.7 % wide) | 26.0 KiB | 0.0328 / 93.60 % / +0.0001 | 0.0152 / 99.64 % / −0.0046 | 0.0048 / 97.94 % / +0.0014 |
+
+No ΔNLL of a split is significant (block bootstraps). The mixed middles sit between the two
+uniform ones and, on the long corpus, below the byte-weighted line; but the control
+(`RADIANCE_DEBUG_KV_SPLIT=hash`: the same rule and fraction scored by a hash of the block's place)
+is as good: importance minus control at 0.5 is −0.0009 KL long (95 % −0.0024…+0.0003), +0.0024
+recall (−0.0012…+0.0052), −0.0002 multi-round (−0.0008…+0.0006). So far the gain is the byte mix,
+not the selection signal. Residency on against the emulation at split 0.5 is byte-identical with
+`--num-speculative-tokens 0`; with the MTP drafter the two runs decide differently, since the
+drafter's acceptance collapses under real residency (above: 206 decode steps instead of 79) and
+decode counts follow the steps.
+
 ---
 
 ## 9. Correctness: why the output does not change
