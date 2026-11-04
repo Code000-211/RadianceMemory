@@ -1915,6 +1915,7 @@ static void attn_decode_scratch_band_case(const Plugin& pl) {
                            : !std::strcmp(kvs, "k6v4") ? 22 * hd / 16
                            : !std::strcmp(kvs, "k4hv4") ? 18 * hd / 16
                            : !std::strcmp(kvs, "k4hv2h") ? 14 * hd / 16
+                           : !std::strcmp(kvs, "k5v4") ? 20 * hd / 16
                            : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 2 * hd;
         const int64_t bs = std::strstr(r->name, "_bs4_") ? 4 : 16;
         const int64_t max_seqs = 32, max_ctx = 200000, mb = (max_ctx + bs - 1) / bs;
@@ -25137,12 +25138,14 @@ static void vmean_add_case(const Plugin& pl) {
         }
 }
 
-/* A rotated layout: its kv_dtype, a token's row at head_dim 256, where the scales start, V in two
- * bits, and i8h's int8 codes under one scale a head. */
-struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2, i8; };
-static const K4hLayout kK4hv4L  = { "k4h_v4",  "k4hv4",  18 * 256 / 16, 256,         false, false };
-static const K4hLayout kK4hv2hL = { "k4h_v2h", "k4hv2h", 14 * 256 / 16, 3 * 256 / 4, true,  false };
-static const K4hLayout kI8hL    = { "i8h",     "i8h",    2 * 256 + 4,   2 * 256,     false, true };
+/* A packed layout held to libref: its kv_dtype, a token's row at head_dim 256, where the scales
+ * start, V in two bits, i8h's int8 codes under one scale a head, and k5_v4's int5 K (rotated or
+ * not; the kernels read either alike). */
+struct K4hLayout { const char* kv_dtype; const char* tag; int row, scales; bool v2, i8, k5; };
+static const K4hLayout kK4hv4L  = { "k4h_v4",  "k4hv4",  18 * 256 / 16, 256,         false, false, false };
+static const K4hLayout kK4hv2hL = { "k4h_v2h", "k4hv2h", 14 * 256 / 16, 3 * 256 / 4, true,  false, false };
+static const K4hLayout kI8hL    = { "i8h",     "i8h",    2 * 256 + 4,   2 * 256,     false, true,  false };
+static const K4hLayout kK5v4L   = { "k5_v4",   "k5v4",   20 * 256 / 16, 9 * 256 / 8, false, false, true };
 
 /* One kv_store launch (host or device pointers alike), k and v [T, kvh * 256] at pitch `ld`. */
 static int k4h_store(RadLaunchFn fn, const K4hLayout& L, const void* k, const void* v, int64_t T_,
@@ -25219,6 +25222,8 @@ static void k4h_store_case(const Plugin& pl, const K4hLayout& L) {
             for (int i = 0; i < 32; ++i) r0[i] = 0;
             const float tie[8] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f, 0.875f };
             for (int i = 0; i < 32; ++i) r0[32 + i] = rad_f32_to_bf16(i < 8 ? tie[i] : 0.0f);
+            /* k5_v4: 3.75 makes K's scale 3.75 / 15 = 0.25, so the ties above are ties at 5 bits. */
+            if (L.k5) r0[32 + 8] = rad_f32_to_bf16(3.75f);
             for (int i = 0; i < 32; ++i) r0[64 + i] = rad_f32_to_bf16((i & 1 ? -1.f : 1.f) * 1e5f * (1 + i));
             r0[96 + 3] = 0x7f80;
             r0[128 + 5] = 0x7fc0;
@@ -33115,13 +33120,14 @@ static void device_phase(const Plugin& pl) {
         kv_transcode_case(pl);
     }
 
-    /* Rotated KV layers: the rotation, the k4h_v4 / k4h_v2h / i8h store and attention, and the
+    /* Rotated KV layers: the rotation, the k4h_v4 / k4h_v2h / i8h store and attention (and k5_v4's,
+     * held to libref the same way, rotated or not), and the
      * fp8-rounding experiment's store. */
     had_rotate_case(pl, "had_rotate_g128_bf16", 128);
     had_rotate_case(pl, "had_rotate_g256_bf16", 256);
     /* A `vmean` layer's adds: the broadcast row over V and over the output. */
     vmean_add_case(pl);
-    for (const K4hLayout* L : { &kK4hv4L, &kK4hv2hL, &kI8hL }) {
+    for (const K4hLayout* L : { &kK4hv4L, &kK4hv2hL, &kI8hL, &kK5v4L }) {
         k4h_store_case(pl, *L);
         k4h_attn_case(pl, *L);
     }

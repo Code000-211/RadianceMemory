@@ -867,7 +867,7 @@ struct Config {
      * another name. */
     std::string kv_cache_dtype = "bf16";
     /* --kv-recipe FILE: each attention layer's cache layout, from the fp8 set (fp8, fp8_v4,
-     * k6_v4, and k4h_v4, k4h_v2h and i8h, always rotated; bf16, the unquantised cache), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
+     * k6_v4, k5_v4 (a recipe word only), and k4h_v4, k4h_v2h and i8h, always rotated; bf16, the unquantised cache), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
      * checked at parse, so a malformed file stops the start before the model is opened; the plugin
      * then checks it against the model's layers (RadBuildCtx::kv_recipe). `kv_recipe` is indexed
      * by layer, a RAD_KVQ_* (with RAD_KVQ_ROTATED for a `rotated` line or a k4h or i8h layout) or -1 where the file names
@@ -1262,16 +1262,19 @@ int  kv_vmean_parse(const std::string& text, const char* name, KvVMean* out);
  * file named, where its head_dim or KV heads are not the model's or a vmean layer has no entry. */
 int  kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_t head_dim,
                     int64_t n_head_kv, int64_t n_head, std::vector<uint16_t>* out);
-/* A recipe's RAD_KVQ_* by its name in the file (bf16, i8h, fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h), and back; -1 / null for
+/* A recipe's RAD_KVQ_* by its name in the file (bf16, i8h, fp8, fp8_v4, k6_v4, k5_v4, k4h_v4, k4h_v2h), and back; -1 / null for
  * anything else. */
 int         kv_layout_of(const char* name);
 const char* kv_layout_name(int kvq);
 /* Every recipe layout's RAD_KVQ_*, widest first, and what a group of 32 K and 32 V elements of
  * one costs in bits with its scales (bf16 1024, i8h 516 at head_dim 256, fp8 512, fp8_v4 400, k6_v4 352,
- * k4h_v4 288, k4h_v2h 224); -1 for anything else.
+ * k5_v4 320, k4h_v4 288, k4h_v2h 224); -1 for anything else.
  * Rotation (RAD_KVQ_ROTATED) does not change the bits. */
 std::vector<int> kv_layouts();
 int              kv_layout_group_bits(int kvq);
+/* Whether rad-autoquant calibrates layout `kvq` only where --layouts or --variants names it (k5_v4,
+ * a newer layout kept out of default runs); false for every other layout and for anything else. */
+bool             kv_layout_opt_in(int kvq);
 /* A (token, head) row's bytes in layout `kvq` at head_dim `hd` (abi/rad_builder.h's rows: fp8
  * 2 * hd, i8h 2 * hd + 4, the group layouts their bits a group times hd / 256), and the head_dim
  * a row of `row` bytes holds in that layout; -1 where there is none. */

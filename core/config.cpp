@@ -96,7 +96,8 @@ static const Flag g_flags[] = {
     { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, k4h_v4\n"
                                         "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
                                         "(int8, a scale a token and head, 1.01; all rotated,\n"
-                                        "Flash-Next) or bf16 (2; Flash-Next), a 'layer N\n"
+                                        "Flash-Next), k5_v4 (int5 K, int4 V, 0.63; Flash-Next)\n"
+                                        "or bf16 (2; Flash-Next), a 'layer N\n"
                                         "LAYOUT [rotated] [demote LAYOUT] [vmean]' line a layer\n"
                                         "(docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
@@ -531,8 +532,11 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
  * (the unit rad-autoquant's bit budget is counted in). A row added here is a recipe word and a
  * calibration candidate at once: rad-autoquant's variants are each row as kv_recipe_parse reads it
  * plain, `rotated` and `vmean` (kv_autoquant_variants), so a new layout's rules (rotation implied,
- * no V mean) belong in the parser below and nowhere else. */
-struct KvLayout { const char* name; int kvq; int group_bits; };
+ * no V mean) belong in the parser below and nowhere else. A row marked `opt_in` is a recipe word
+ * like any other but no default candidate: rad-autoquant calibrates it only where --layouts or
+ * --variants names it (kv_layout_opt_in), so adding it leaves a default calibration run as it was.
+ * Unmarking the row makes it a default candidate. */
+struct KvLayout { const char* name; int kvq; int group_bits; bool opt_in = false; };
 static const KvLayout kKvLayouts[] = {
     /* The cache --kv-cache-dtype bf16 keeps, for one layer: nothing rounded but bf16's own. Twice
      * fp8; what a layer too sensitive for any 8-bit layout keeps (rad-autoquant's base). */
@@ -547,6 +551,8 @@ static const KvLayout kKvLayouts[] = {
     { "fp8_v4", RAD_KVQ_V4,   32 * 8 + (32 * 4 + 16) },
     /* K int6 too, its own f16 scale: 22/32. */
     { "k6_v4",  RAD_KVQ_K6V4, (32 * 6 + 16) + (32 * 4 + 16) },
+    /* K int5, a bit a dim under k6_v4's: 20/32, 5.0 bits an element. Rotated or not, as k6_v4. */
+    { "k5_v4",  RAD_KVQ_K5V4, (32 * 5 + 16) + (32 * 4 + 16), true },
     /* K int4 as well, stored rotated: 18/32. The rotation is part of the layout (below). */
     { "k4h_v4", RAD_KVQ_K4H,  (32 * 4 + 16) + (32 * 4 + 16) },
     /* V int2 under KVarN's variance normalisation, rotated as k4h_v4: 14/32. */
@@ -564,6 +570,12 @@ const char* kv_layout_name(int kvq) {
     for (const KvLayout& l : kKvLayouts)
         if (l.kvq == kvq) return l.name;
     return nullptr;
+}
+
+bool kv_layout_opt_in(int kvq) {
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.opt_in;
+    return false;
 }
 
 int kv_layout_group_bits(int kvq) {
@@ -673,7 +685,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         const int q = kv_layout_of(layout.c_str());
         if (q < 0) {
             RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, "
-                    "k4h_v4, k4h_v2h or i8h", name, ln, l, layout.c_str());
+                    "k5_v4, k4h_v4, k4h_v2h or i8h", name, ln, l, layout.c_str());
             return RAD_E_INVAL;
         }
         if (q == RAD_KVQ_BF16 && (rot_word || vmean)) {
@@ -714,7 +726,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
          * its store, so the resident and the demoted bytes are both centred. */
         if (vmean && q == RAD_KVQ_NONE && dq == 0) {
             RAD_ERR("%s line %d: layer %ld: 'vmean' is for a layout with integer V (fp8_v4, "
-                    "k6_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
+                    "k6_v4, k5_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
             return RAD_E_INVAL;
         }
         if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);

@@ -1386,12 +1386,12 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     if (ctx < M) ctx = M;
     const int64_t max_blocks = (ctx + bs - 1) / bs;
 
-    /* A k4h_v4, k4h_v2h or i8h cache is codes and f16 scales in E4M3-declared bytes: drawn, a quarter
+    /* A k4h_v4, k4h_v2h, k5_v4 or i8h cache is codes and f16 scales in E4M3-declared bytes: drawn, a quarter
      * of its scales would be infinities and NaNs, which says nothing about a kernel. Its attention
      * is held to this reference over stored caches instead (tests/r4d_emu/test_k4h.cpp). */
     const char* kvs = gs(p, n_p, "kv_dtype");
     if (kvs && (!std::strcmp(kvs, "k4h_v4") || !std::strcmp(kvs, "k4h_v2h") ||
-                !std::strcmp(kvs, "i8h")))
+                !std::strcmp(kvs, "i8h") || !std::strcmp(kvs, "k5_v4")))
         return RAD_E_UNSUPPORTED;
     /* `q_dtype` and `kv_dtype` are read separately: the engine issues fp8 caches beside bf16
      * queries. */
@@ -1551,11 +1551,12 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     const char*    kvs = gs(p, n_p, "kv_dtype");
     const uint32_t kv = dt_parse(kvs);
     const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? D : kv;
-    /* k4h_v4 / k4h_v2h / i8h: a token's row is 18 / 14 * head_dim / 16 or 2 * head_dim + 4 bytes
-     * of an E4M3-declared cache (ref_attn.cpp). bf16_e4m3r is a bf16 cache (dt_parse refuses the
+    /* k4h_v4 / k4h_v2h / k5_v4 / i8h: a token's row is 18 / 14 / 20 * head_dim / 16 or 2 * head_dim
+     * + 4 bytes of an E4M3-declared cache (ref_attn.cpp). bf16_e4m3r is a bf16 cache (dt_parse refuses the
      * name, so KV falls back on bf16). */
     const int64_t row = !kvs ? 0 : !std::strcmp(kvs, "k4h_v4") ? 18 * hd / 16
                       : !std::strcmp(kvs, "k4h_v2h") ? 14 * hd / 16
+                      : !std::strcmp(kvs, "k5_v4") ? 20 * hd / 16
                       : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 0;
     const bool k4h = row != 0;
     if (k4h && hd % 32) return RAD_E_UNSUPPORTED;

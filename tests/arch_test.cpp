@@ -10379,7 +10379,8 @@ TEST(a_k4h_v4_recipe_layer_on_flashnext_is_a_rotated_288_byte_cache_on_its_own_r
     RadArchProbe p4{};
     CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
     CHECK_EQ(p4.kv_quant_ok, (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H) |
-                             (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H) | (1 << RAD_KVQ_BF16));
+                             (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H) | (1 << RAD_KVQ_BF16) |
+                             (1 << RAD_KVQ_K5V4));
 
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
@@ -11050,6 +11051,116 @@ TEST(a_bf16_layer_beside_a_tiered_fp8_layer_on_flashnext_keeps_its_own_group) {
                 CHECK_PASSES(b, v);
             }
         }
+}
+
+/* k5_v4 on Flash-Next (RAD_KVQ_K5V4: int5 K, int4 V, 320 bytes a token and head, declared as 160
+ * E4M3 columns) at one, two and four ranks. Layer 3 in k5_v4 and layer 7 in k6_v4 are two groups in
+ * RAD_KVQ_* order (k6_v4's first), layer 3 paging its own 160-column fragment. Unlike the k4h
+ * layouts it is rotated only where the recipe says: unrotated, nothing rotates; with `rotated`,
+ * layer 3's q, k and v before its store and its output after. Every op on its group bands on
+ * kv_dtype k5_v4, and none of them is a fused form k5_v4 has no row for (the prologue's store fold,
+ * the gate in the decode merge), while the k6_v4 layer keeps both; the steps lint clean. */
+TEST(a_k5_v4_recipe_layer_on_flashnext_is_a_320_byte_cache_rotated_only_when_asked) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (const bool rotated : { false, true })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> r(8, -1);
+                r[3] = (int)RAD_KVQ_K5V4 | (rotated ? (int)RAD_KVQ_ROTATED : 0);
+                r[7] = RAD_KVQ_K6V4;
+                RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+                ctx.kv_residency = 1;
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                REQUIRE(b.kv_groups.size() >= 2);
+                CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_k6_v4"));
+                CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k5_v4"));
+                CHECK_EQ(b.kv_groups[0].d.head_dim, 176);
+                CHECK_EQ(b.kv_groups[1].d.head_dim, 160);
+                CHECK(noted(b, "kv cache k5_v4: int5 K, int4 V, in groups of 32 with f16 scales, "
+                               "320 bytes a token and head instead of 512"));
+                std::map<int, rad_kvgroup> bound;
+                for (const auto& [layer, g] : b.binds)
+                    if (g == 1 || g == 2) bound[layer] = g;
+                CHECK_EQ(bound[3], (rad_kvgroup)2);
+                CHECK_EQ(bound[7], (rad_kvgroup)1);
+                const bool has_cache = !b.kv_groups[0].zero;
+                std::vector<long long> page;
+                for (const auto& o : b.ops)
+                    if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+                int rot_ops = 0, fused_k5 = 0, fused_k6 = 0;
+                for (const auto& o : b.ops) {
+                    rot_ops += o.op == "had_rotate";
+                    if (o.op != "qk_norm_rope_gate_kv_store" && o.op != "attn_paged_gate_quant")
+                        continue;
+                    fused_k5 += pstr(&o, "kv_dtype") == "k5_v4";
+                    fused_k6 += pstr(&o, "kv_dtype") == "k6_v4";
+                }
+                CHECK_EQ(fused_k5, 0);
+                if (has_cache) {
+                    const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                    REQUIRE_EQ(page.size(), (size_t)3);
+                    CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 160));
+                    CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 176));
+                    CHECK_EQ(rot_ops, rotated ? 1 : 0);   /* the head, behind k6_v4, is unrotated */
+                    CHECK(fused_k6 > 0);
+                }
+
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    int on = 0;
+                    for (const auto& i : v[0]->issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o) continue;
+                        for (const RadOperand& d : i.opd)
+                            if (d.kind == RAD_OPK_KV && d.handle == 2) {
+                                const std::string kd = pstr(o, "kv_dtype");
+                                if (!kd.empty()) CHECK_EQ(kd, std::string("k5_v4"));
+                                ++on;
+                                break;
+                            }
+                    }
+                    if (!has_cache) continue;
+                    CHECK(on > 0);
+                    if (!rotated) continue;
+                    std::vector<std::string> seq;
+                    for (const std::string& e : around_layer(b, *v[0], 3))
+                        if (e.rfind("rot:", 0) == 0 || e == "kv_store" || e.rfind("attn_paged", 0) == 0)
+                            seq.push_back(e);
+                    const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "kv_store" };
+                    REQUIRE(seq.size() >= head.size() + 2);
+                    CHECK(std::vector<std::string>(seq.begin(), seq.begin() + 4) == head);
+                    CHECK_EQ(seq.back(), std::string("rot:out"));
+                }
+            }
+}
+
+/* k5_v4's refusals: as every layer's --kv-cache-dtype (a recipe word only), and where libr4d has no
+ * rows for it (gqa 8, which the probe does not offer). */
+TEST(a_k5_v4_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_K5V4;
+    CHECK(has(refusal(mk, flag), "KV cache layout 7 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_K5V4), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_K5V4 })),
+              "layer 7 asks for k5_v4"));
 }
 
 /* The fp8-rounding experiment (RADIANCE_DEBUG_KV_E4M3R, rad_block_attn_gated_fp8.h) on Flash-Next

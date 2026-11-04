@@ -1236,6 +1236,19 @@ their `_gqa6_bs4_` twins, k4h_v4's kernels with the codes widened from bytes (`0
 0x80)` less 1152 is c in f16) and read a 4-byte word at a time, since a 516-byte row is not
 16-byte aligned. `r4d_emu_k4h` and r4d_selftest hold them to libref as k4h_v4's.
 
+**`k5_v4` is k6_v4 with one high bit a K dim** (`RAD_KVQ_K5V4`, ABI 43): a row of `20 * head_dim /
+16` bytes, K's low four bits (V's nibble order), K's fifth bits (a 4-byte word per group of 32
+dims, dim `16c + 8h + 2j + p` at bit `4c + 2h + p` of the word's byte j, so a kernel lane's eight
+dims take theirs with one shift and mask), V's int4 codes, K's f16 scales, V's. K per group:
+`scale = f16(fmin(amax / 15, 4364))` (amax by `fmax`, 4364 the largest f16 with 15 times it an
+f16) and codes `clamp(rint(x / scale), -15, 15)` (0 at a zero scale, a NaN -15, -16 never
+stored); V is k4h_v4's. Rotated or not as the recipe line says, as k6_v4. libr4d: `kv_store_k5v4`,
+byte-identical to libref, and `attn_prefill_h256_gqa12_k5v4`, `attn_decode_h256_gqa12_k5v4` and
+their `_gqa6_bs4_` twins, k6_v4's kernels (`O_K5`) with the fifth bit widened as `(1024 + (code ^
+16) - 1040) * scale`; no gated-merge or prologue-store-fold rows, so its layers take the unfused
+ops. libavx serves both ops at `k5_v4` (the attention over the cache widened to f32). `r4d_emu_k4h
+--layout k5_v4` and r4d_selftest hold the libr4d rows to libref as k4h_v4's.
+
 **`kv_dtype` `bf16_e4m3r` is an experiment, not a layout**: `kv_store` into a bf16 cache of the
 shared layout, each value `x / k_scale` clamped to ±448 (a NaN to -448), rounded to E4M3 to
 nearest even, decoded and multiplied by `k_scale` (V likewise), then rounded to bf16 (exact at the

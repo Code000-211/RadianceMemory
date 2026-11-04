@@ -738,12 +738,13 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
     const int64_t bs  = pi(p, n_p, "block_size");
     const uint32_t KV = dt_act(p, n_p, "kv_dtype");
     if (M <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
-    /* kv_store_k4hv4 / kv_store_k4hv2h / kv_store_i8h: a token's row is 18 / 14 * head_dim / 16 or
-     * 2 * head_dim + 4 bytes of an E4M3-declared cache (RAD_KVQ_K4H, RAD_KVQ_K4HV2H, RAD_KVQ_I8H),
-     * as libref/ref_shapes.cpp describes it. */
+    /* kv_store_k4hv4 / kv_store_k4hv2h / kv_store_k5v4 / kv_store_i8h: a token's row is 18 / 14 /
+     * 20 * head_dim / 16 or 2 * head_dim + 4 bytes of an E4M3-declared cache (RAD_KVQ_K4H,
+     * RAD_KVQ_K4HV2H, RAD_KVQ_K5V4, RAD_KVQ_I8H), as libref/ref_shapes.cpp describes it. */
     const char* kvs = r4d_pgets(p, n_p, "kv_dtype");
     const int64_t row = !kvs ? 0 : !std::strcmp(kvs, "k4h_v4") ? 18 * hd / 16
                       : !std::strcmp(kvs, "k4h_v2h") ? 14 * hd / 16
+                      : !std::strcmp(kvs, "k5_v4") ? 20 * hd / 16
                       : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 0;
     const bool k4h = row != 0;
     if (k4h && hd % 32) return RAD_E_UNSUPPORTED;

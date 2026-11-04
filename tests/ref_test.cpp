@@ -3365,7 +3365,7 @@ int store_k4h(T& k, T& v, T& sm, T& kv, int64_t M, int64_t hd, int64_t nkv, int6
 }
 
 /* attend()'s prefill over a k4h_v4 (or `layout`) cache: bf16 q, k and v, optionally rotated as a
- * recipe layer is, the output in f32. `layout` may also be i8h, fp8_e4m3 (the plain E4M3 cache)
+ * recipe layer is, the output in f32. `layout` may also be i8h, k5_v4, fp8_e4m3 (the plain E4M3 cache)
  * or bf16_e4m3r (the experiment's bf16 cache, read as bf16). */
 std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<float>& k,
                               const std::vector<float>& v, int64_t Tn, bool rotated,
@@ -3374,6 +3374,7 @@ std::vector<float> attend_k4h(const std::vector<float>& q, const std::vector<flo
     const bool fp8 = std::strcmp(layout, "fp8_e4m3") == 0, e4r = std::strcmp(layout, "bf16_e4m3r") == 0;
     const int64_t row = std::strcmp(layout, "k4h_v2h") == 0 ? 14 * hd / 16
                       : std::strcmp(layout, "i8h") == 0 ? 2 * hd + 4
+                      : std::strcmp(layout, "k5_v4") == 0 ? 20 * hd / 16
                       : fp8 || e4r ? 2 * hd : 18 * hd / 16;
     T tq(RAD_BF16, {Tn, nh, hd}), tk(RAD_BF16, {Tn, nkv, hd}), tv(RAD_BF16, {Tn, nkv, hd});
     tq.f(q); tk.f(k); tv.f(v);
@@ -3686,6 +3687,183 @@ TEST(an_i8h_cache_of_the_wrong_shape_is_refused) {
     A at; at.t(q).t(plain).t(bt).t(su).tnull().tnull().tnull().t(out)
              .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
              .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "i8h");
+    CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
+/* ================================================================== the k5_v4 cache */
+namespace {
+
+/* Dim d of K in a k5_v4 row of head_dim hd, read straight from abi/rad_builder.h's RAD_KVQ_K5V4
+ * (not libref's code): the low nibble at byte d / 2, the fifth bit at bit 4c + 2h + p of byte j of
+ * the group's word (c, h, j, p the dim's place in its group), sign-extended from five bits, times
+ * the group's f16 scale. V is k4h_v4's int4 at 5 * hd / 8 with its scales at 19 * hd / 16. */
+float k5_k(const uint8_t* r, int64_t hd, int64_t d) {
+    const int x = (int)(d % 32);
+    const int lo = (r[d / 2] >> (4 * (d % 2))) & 15;
+    const int hi = (r[hd / 2 + (d / 32) * 4 + (x % 8) / 2] >> (4 * (x / 16) + 2 * ((x % 16) / 8) + x % 2)) & 1;
+    const int code = (lo | (hi << 4)) >= 16 ? (lo | (hi << 4)) - 32 : (lo | (hi << 4));
+    uint16_t s;
+    std::memcpy(&s, r + hd * 9 / 8 + (d / 32) * 2, 2);
+    return (float)code * rad_f16_to_f32(s);
+}
+float k5_v(const uint8_t* r, int64_t hd, int64_t d) {
+    const int u = (r[hd * 5 / 8 + d / 2] >> (4 * (d % 2))) & 15;
+    uint16_t s;
+    std::memcpy(&s, r + hd * 19 / 16 + (d / 32) * 2, 2);
+    return (float)(u >= 8 ? u - 16 : u) * rad_f16_to_f32(s);
+}
+
+}  // namespace
+
+/* Worked by hand at head_dim 32, one group: K's absmax 3.75 makes its scale 3.75 / 15 = 0.25 (f16
+ * 0x3400), and its codes are the values over 0.25 rounded to even -- 0.375 (1.5) to 2, 0.125 (0.5)
+ * to 0, 0.625 (2.5) to 2 -- in five bits: 15 is 01111, -15 10001, -8 11000, -1 11111, -5 11011.
+ * Their low nibbles sit two a byte as V's do; their fifth bits in the group's word, dim 1 at byte 0
+ * bit 1, dim 10 at byte 1 bit 2, dim 21 at byte 2 bit 5, dim 31 at byte 3 bit 7. V all zero: scale
+ * 0, codes 0. The row is 40 bytes; the block's other slot keeps its bytes, a slot of -1 writes
+ * nothing. */
+TEST(a_k5_v4_store_writes_low_nibbles_a_fifth_bit_word_and_an_absmax_over_15_scale) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, 0.0f);
+    kx[0] = 3.75f; kx[1] = -3.75f; kx[2] = 0.375f; kx[3] = 0.125f; kx[4] = 0.625f;
+    kx[10] = -2.0f; kx[21] = -0.25f; kx[31] = -1.25f;
+    for (int i = 32; i < 64; ++i) kx[(size_t)i] = 1000.0f;   /* token 1, dropped */
+    k.f(kx);
+    T sm(RAD_I32, {2}); sm.n({1, -1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 40});
+    std::vector<uint8_t> fill(80, 0x5a);
+    kv.raw(fill);
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2, "k5_v4"));
+    const uint8_t* b = kv.mem.data();
+    for (int i = 0; i < 40; ++i) CHECK_EQ((int)b[i], 0x5a);          /* slot 0: untouched */
+    const uint8_t* r = b + 40;                                        /* slot 1: token 0 */
+    std::vector<int> want(40, 0);
+    want[0] = 0x1F; want[1] = 0x02; want[2] = 0x02; want[5] = 0x08; want[10] = 0xF0; want[15] = 0xB0;
+    want[16] = 0x02; want[17] = 0x04; want[18] = 0x20; want[19] = 0x80;   /* the fifth bits */
+    want[36] = 0x00; want[37] = 0x34;                                      /* K's scale, 0.25 */
+    for (int i = 0; i < 40; ++i) CHECK_EQ((int)r[i], want[(size_t)i]);
+    /* The independent reading gives the values back where they are on the grid. */
+    CHECK_EQ(k5_k(r, 32, 0), 3.75f);
+    CHECK_EQ(k5_k(r, 32, 1), -3.75f);
+    CHECK_EQ(k5_k(r, 32, 10), -2.0f);
+    CHECK_EQ(k5_k(r, 32, 21), -0.25f);
+    CHECK_EQ(k5_k(r, 32, 31), -1.25f);
+}
+
+/* K's scale is capped at 4364, the largest f16 whose 15 times is an f16, so a group past it clamps
+ * its codes at +-15. A NaN drops out of the absmax and stores the clamp's -15; an infinity takes
+ * the cap and stores +15; a group of NaNs is NaN's absmax, capped, every code -15. Nothing stores
+ * -16. V keeps k4h_v4's rule (cap 8188, codes +-7). */
+TEST(a_k5_v4_store_caps_the_scale_and_clamps_nan_and_infinity) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, std::nanf("")), vx(64, 0.0f);
+    for (int i = 0; i < 32; ++i) kx[(size_t)i] = 0.0f;
+    kx[0] = 1e6f; kx[1] = -2e5f; kx[2] = 20000.0f; kx[3] = std::nanf(""); kx[4] = INFINITY;
+    vx[0] = 1e6f; vx[1] = std::nanf("");
+    k.f(kx); v.f(vx);
+    T sm(RAD_I32, {2}); sm.n({0, 1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 40});
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2, "k5_v4"));
+    const uint8_t* r = kv.mem.data();
+    auto scale = [&](const uint8_t* p) { uint16_t s16; std::memcpy(&s16, p, 2); return rad_f16_to_f32(s16); };
+    CHECK_EQ(scale(r + 36), 4364.0f);                 /* inf / 15 capped */
+    CHECK_EQ(k5_k(r, 32, 0), 15.0f * 4364.0f);        /* 1e6 to +15 */
+    CHECK_EQ(k5_k(r, 32, 1), -15.0f * 4364.0f);       /* -2e5 to -15 */
+    CHECK_EQ(k5_k(r, 32, 2), 5.0f * 4364.0f);         /* 20000 / 4364 = 4.58 to 5 */
+    CHECK_EQ(k5_k(r, 32, 3), -15.0f * 4364.0f);       /* NaN to -15 */
+    CHECK_EQ(k5_k(r, 32, 4), 15.0f * 4364.0f);        /* inf to +15 */
+    CHECK_EQ(scale(r + 38), 8188.0f);                 /* V: 1e6 / 7 capped */
+    CHECK_EQ(k5_v(r, 32, 0), 7.0f * 8188.0f);
+    CHECK_EQ(k5_v(r, 32, 1), -7.0f * 8188.0f);        /* NaN to -7 */
+    const uint8_t* r1 = r + 40;                       /* token 1: K a group of NaNs */
+    CHECK_EQ(scale(r1 + 36), 4364.0f);
+    for (int d = 0; d < 32; ++d) CHECK_EQ(k5_k(r1, 32, d), -15.0f * 4364.0f);
+    CHECK_EQ(scale(r1 + 38), 0.0f);                   /* its V all zero */
+}
+
+/* A k5_v4 read is code times its group's scale and then the fp8 path's arithmetic, so attention
+ * over a stored cache is attention over its values as abi/rad_builder.h reads them, bit for bit
+ * (as for k4h_v4 and i8h), at two groups a head and over two blocks out of order. */
+TEST(attention_over_a_k5_v4_cache_is_attention_over_its_dequantised_values) {
+    const int64_t Tn = 7, hd = 64, nh = 4, nkv = 2, bs = 4, nb = 2, row = 20 * hd / 16;
+    std::mt19937 rng(15);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    T tq(RAD_F32, {Tn, nh, hd}), tk(RAD_F32, {Tn, nkv, hd}), tv(RAD_F32, {Tn, nkv, hd});
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) st_dt(RAD_F32, tq.t.data, i, nd(rng));
+    for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+        st_dt(RAD_F32, tk.t.data, i, nd(rng) * (i % hd == 9 ? 20.0f : 1.0f));
+        st_dt(RAD_F32, tv.t.data, i, nd(rng));
+    }
+    T sm(RAD_I32, {Tn}); sm.n({4, 5, 6, 7, 0, 1, 2});   /* block 1, then block 0 */
+    T kv(RAD_F8E4M3, {nb, nkv, bs, row});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, "k5_v4"));
+    T f(RAD_F32, {nb, nkv, bs, 2 * hd});
+    const uint8_t* c = kv.mem.data();
+    int64_t high = 0;   /* codes past int4's range, so the fifth bit is exercised */
+    for (int64_t s = 0; s < nb * nkv * bs; ++s)
+        for (int64_t d = 0; d < hd; ++d) {
+            const uint8_t* r = c + s * row;
+            st_dt(RAD_F32, f.t.data, s * 2 * hd + d, k5_k(r, hd, d));
+            st_dt(RAD_F32, f.t.data, s * 2 * hd + hd + d, k5_v(r, hd, d));
+            uint16_t sc;
+            std::memcpy(&sc, r + hd * 9 / 8 + (d / 32) * 2, 2);
+            if (rad_f16_to_f32(sc) > 0 && std::fabs(k5_k(r, hd, d) / rad_f16_to_f32(sc)) > 7.5f) ++high;
+        }
+    CHECK(high > 50);
+    T bt(RAD_I32, {1, 2}); bt.n({1, 0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T o5(RAD_F32, {Tn, nh, hd}), of(RAD_F32, {Tn, nh, hd});
+    A a5; a5.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(o5)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k5_v4");
+    CHECK_OK(run("attn_paged", a5));
+    A af; af.t(tq).t(f).t(bt).t(su).tnull().tnull().tnull().t(of)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", af));
+    int64_t same = 0;
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) same += o5.at(i) == of.at(i);
+    CHECK_EQ(same, Tn * nh * hd);
+    CHECK(o5.at(0) != 0.0f);
+}
+
+/* The ticket's premise on the reference: K's fifth bit halves its step, so k5_v4 holds the
+ * attention closer than k4h_v4 at 0.5 bits an element more. Gaussian keys (no outlier channel:
+ * one would zero the rest of its group at either width) against the exact attention; V whole
+ * numbers to +-7 with a 7 in every group, which int4 stores exactly, so the gap is K's alone. Both
+ * unrotated (the reference stores what it is given; a rotation would mix V off its grid): 0.0079
+ * against 0.0141 here. */
+TEST(k5_v4_holds_the_attention_closer_than_k4h_v4) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(19);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd)), v((size_t)(Tn * nkv * hd));
+    for (auto& x : q) x = nd(rng) * 0.3f;
+    for (auto& x : k) x = nd(rng);
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = i % 32 == 0 ? 7.0f : std::fmin(std::fmax(std::rint(nd(rng) * 2.5f), -7.0f), 7.0f);
+    for (auto* w : { &q, &k, &v })
+        for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+    const double e_k4h = rel_l2(attend_k4h(q, k, v, Tn, false, "k4h_v4"), exact);
+    const double e_k5 = rel_l2(attend_k4h(q, k, v, Tn, false, "k5_v4"), exact);
+    std::printf("    k4h_v4 vs exact %.3g, k5_v4 vs exact %.3g\n", e_k4h, e_k5);
+    CHECK(e_k5 < 0.75 * e_k4h);
+}
+
+/* A cache whose last extent is not 20 * head_dim / 16 bytes is refused, store and attention alike:
+ * a k4h_v4-sized row has no room for the fifth bits. */
+TEST(a_k5_v4_cache_of_the_wrong_shape_is_refused) {
+    T k(RAD_F32, {1, 1, 32}), v(RAD_F32, {1, 1, 32});
+    T sm(RAD_I32, {1}); sm.n({0});
+    T narrow(RAD_F8E4M3, {1, 1, 1, 36});
+    CHECK_EQ(store_k4h(k, v, sm, narrow, 1, 32, 1, 1, "k5_v4"), RAD_E_SHAPE);
+    T q(RAD_F32, {1, 1, 32}), out(RAD_F32, {1, 1, 32});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({1});
+    A at; at.t(q).t(narrow).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "k5_v4");
     CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
 }
 

@@ -625,7 +625,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   # The packed caches' cases, one test a layout: together they take about 110 s here, too close to
   # the per-test limit to stay one test.
-  foreach(l k4h_v4 k4h_v2h i8h)
+  foreach(l k4h_v4 k4h_v2h i8h k5_v4)
     add_test(NAME r4d_emu_k4h_${l} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_k4h --layout ${l})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -637,7 +637,7 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_had r4d_emu_k4h_k4h_v4 r4d_emu_k4h_k4h_v2h
-                       r4d_emu_k4h_i8h r4d_emu_vmean
+                       r4d_emu_k4h_i8h r4d_emu_k4h_k5_v4 r4d_emu_vmean
                        r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
@@ -646,7 +646,7 @@ if(R4D_EMU_BUILT)
   # do the k4h_v4 and k4h_v2h caches' stores and attention, a `vmean` layer's adds, the gdn
   # kernels at an f16 state, the int8 block keys' store and score, and the KV transcodes.
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_had r4d_emu_k4h_k4h_v4 r4d_emu_k4h_k4h_v2h
-                       r4d_emu_k4h_i8h r4d_emu_vmean r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx PROPERTIES
+                       r4d_emu_k4h_i8h r4d_emu_k4h_k5_v4 r4d_emu_vmean r4d_emu_gdn r4d_emu_bkey r4d_emu_kvx PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.

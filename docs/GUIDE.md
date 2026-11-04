@@ -952,7 +952,7 @@ layer 63 k6_v4
 
 The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
 line that is not three words, a layer number that is not one, a layout outside `bf16`, `fp8`, `fp8_v4`,
-`k6_v4`, `k4h_v4`, `k4h_v2h` and `i8h`, `rotated` or `vmean` on a `bf16` line, a layer named twice, or no layer at all. At startup the server refuses the flag,
+`k6_v4`, `k5_v4`, `k4h_v4`, `k4h_v2h` and `i8h`, `rotated` or `vmean` on a `bf16` line, a layer named twice, or no layer at all. At startup the server refuses the flag,
 naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
 MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
 layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
@@ -1082,6 +1082,13 @@ the same plugin and geometry, the MTP head rotating behind it. E4M3 keeps three 
 seven; once the rotation has spread a head's outlier channels one scale holds the head, and on the
 card's real q/k/v the attention output's error is about a quarter of the E4M3 cache's (0.0036
 against 0.0152). The rows are 4-byte aligned only, so its kernels read codes a word at a time.
+
+**Five-bit keys: `k5_v4`.** K as int5 and V as int4, groups of 32 with an f16 scale each (absmax /
+15 and / 7): 320 bytes a token and head at head_dim 256, 5.0 bits an element, between `k6_v4` (5.5)
+and `k4h_v4` (4.5). A recipe word only (no `--kv-cache-dtype`), Flash-Next's geometry only; like
+`k6_v4` it is rotated only where the line says `rotated`, and takes `vmean` (`layer 7 k5_v4 rotated
+vmean`). It cannot be a tiered layer's resident or demote layout. rad-autoquant measures it only
+where `--layouts` or `--variants` names it. KL on the card: not measured yet.
 
 Where `fp8`'s KL comes from was measured with an experiment, not a layout:
 `RADIANCE_DEBUG_KV_E4M3R=1` with `--kv-cache-dtype bf16` stores every K and V value of the bf16
@@ -2324,7 +2331,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
-| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, `bf16` (`qwen4exp_fp8`), one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k5_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, `bf16` (`qwen4exp_fp8`), one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
 | `--qsa-bkey-dtype T` | bf16 | `bf16` or `i8`: the QSA indexer's block keys; i8 is int8 with one f16 scale a key, 1.73 instead of 3.25 KiB a 4-token block on Qwen3.8-Flash-Next (the part window residency never demotes), and moves the selection about as much as an fp8 attention cache does; `qwen4exp_fp8` only (§4.4) |
 | `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins and `qwen4exp_fp8` (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |

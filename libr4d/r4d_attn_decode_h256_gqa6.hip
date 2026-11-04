@@ -58,9 +58,11 @@
 // cache (int6 K, int4 V), with O_K4 the k4h_v4 cache (int4 K and V, stored rotated: the kernel
 // reads it as any other), and O_K4 with O_V2 the k4h_v2h cache (int4 K, int2 V: V's codes two
 // bits, widened by v_codes_nm in r4d_dt16.h), and O_K4 with O_I8 the i8h cache (int8 K and V, one
-// f16 scale a token and head, stored rotated); a token's row layout is RadBuildCtx::kv_quant's
-// (abi/rad_builder.h).
+// f16 scale a token and head, stored rotated), and O_K6 with O_K5 the k5_v4 cache (int5 K: k6_v4's
+// walk with one high bit a dim, k5x8_to_f16x4w in r4d_dt16.h); a token's row layout is
+// RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V2    4
+#define O_K5    256
 #define O_I8    8192
 #define O_V4    33554432
 #define O_K6    67108864
@@ -110,6 +112,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // k5_v4: k6_v4 with K's fifth bits in a word a group of 32, the row 20 * HEAD_DIM / 16.
+    constexpr int K5    = ((OPT & O_K5) && K6) ? 1 : 0;
     // k4h_v4 (r4d_attn_prefill_h256_gqa6.hip): k6_v4's walk, K's codes widened as V's.
     constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
     constexpr int KQ    = K6 || K4;
@@ -119,12 +123,15 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // (2 * HEAD_DIM + 4) is 4-byte aligned only, so its codes are read a dword at a time.
     constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : I8 ? 2 * HEAD_DIM + 4
+    constexpr int ROWB  = K5 ? HEAD_DIM * 20 / 16 : K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16
+                        : I8 ? 2 * HEAD_DIM + 4
                         : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM : K4 ? HEAD_DIM / 2 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16 : I8 ? 2 * HEAD_DIM + 2
-                        : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int VOFF  = K5 ? HEAD_DIM * 5 / 8 : K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM
+                        : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = K5 ? HEAD_DIM * 19 / 16 : K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16
+                        : I8 ? 2 * HEAD_DIM + 2 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = K5 ? HEAD_DIM * 9 / 8 : V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM
+                        : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
@@ -523,9 +530,15 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                         // chunk's high-bit word and the group's scale.
                         uint32_t w4[4];
                         const uint32_t sb = *(const uint16_t*)(grow + KSOFF + (t >> 1) * 2);
-                        k6x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
-                                       *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * t), h,
-                                       sb | (sb << 16), w4);
+                        if constexpr (K5)   // k5_v4: the group's high-bit word at this chunk
+                            k5x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
+                                           *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * (t >> 1))
+                                               >> (4 * (t & 1)),
+                                           h, sb | (sb << 16), w4);
+                        else
+                            k6x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
+                                           *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * t), h,
+                                           sb | (sb << 16), w4);
                         kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     } else if constexpr (I8) {
                         // i8h: this lane's eight dims (16t + 8h ..), a byte each, and the token's

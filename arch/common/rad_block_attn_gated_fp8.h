@@ -45,6 +45,15 @@ inline bool kv_store_streamed_dtype(const char* kv_dtype) {
                         std::strcmp(kv_dtype, "bf16") == 0);
 }
 
+/* Whether the layout has the fused forms' rows: the prologue's store fold
+ * (qk_norm_rope_gate_kv_store) and the gate in the decode merge (attn_paged_gate_quant). k5_v4
+ * (RAD_KVQ_K5V4) has neither, and a declared op no kernel serves is a hole that refuses startup,
+ * so its layers declare neither and take kv_store and the separate gate, which give the same
+ * values. Every other layout is as before. */
+inline bool kv_fused_dtype(const char* kv_dtype) {
+    return !kv_dtype || std::strcmp(kv_dtype, "k5_v4") != 0;
+}
+
 /* RADIANCE_DEBUG_KV_E4M3R set (and not "0"), with --kv-cache-dtype bf16: an experiment that
  * separates what the fp8 cache costs in storage rounding from what its attention path costs. Each
  * K and V value is stored as the fp8 store rounds it (k / k_scale clamped to +-448 and rounded to
@@ -532,7 +541,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
      * Resolves for E4M3 and bf16 caches. Not on a rotated layer, whose store follows a rotation. */
-    if (op_fused && !rotate && !op_vsub && !e4m3r &&
+    if (op_fused && !rotate && !op_vsub && !e4m3r && kv_fused_dtype(g.kv_dtype) &&
         rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
@@ -615,7 +624,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * pair). Declared only with a selection: the dense path also uses the prefill kernel, which
      * has no merge. Not on a rotated layer, whose output is rotated back before the gate. */
     if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !rotate && !op_vsub &&
-        rad_op_declared(b, "attn_paged_gate_quant")) {
+        kv_fused_dtype(g.kv_dtype) && rad_op_declared(b, "attn_paged_gate_quant")) {
         op_attn_gq = RAD_OP(b, "attn_paged_gate_quant",
                             RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
                                        RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
