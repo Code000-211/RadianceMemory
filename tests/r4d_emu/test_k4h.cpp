@@ -76,6 +76,22 @@ int64_t r4d_rad_attn_prefill_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_i8h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv2hpk_scratch(const RadArgs*);
 }
 extern int emu_grids;
 
@@ -90,10 +106,16 @@ struct Layout {
     const char* kv_dtype;
     int row, scales;
     bool v2, i8;
+    /* A `vpred` layer's second attention over the layout (`attn`, k4h_v4_pk / k4h_v2h_pk): the
+     * cache stored at kv_dtype and read with K in V's place, so the output is P K-hat. */
+    bool pk = false;
+    const char* attn = nullptr;
 };
 const Layout kK4hv4  = { "k4h_v4", 18 * HD / 16, HD, false, false };
 const Layout kK4hv2h = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true, false };
 const Layout kI8h    = { "i8h", 2 * HD + 4, 2 * HD, false, true };
+const Layout kK4hv4Pk  = { "k4h_v4", 18 * HD / 16, HD, false, false, true, "k4h_v4_pk" };
+const Layout kK4hv2hPk = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true, false, true, "k4h_v2h_pk" };
 const Layout* L = &kK4hv4;
 
 int g_fails = 0;
@@ -428,9 +450,19 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
                          * scale a head), each exact in f16 and in bf16. K's 28 is then stored as
                          * 127 * f16(28 / 127), about 28: still decisive, only not a power of two. */
                         const int e = (int)(rng() % 5) - 2;
+                        /* P K-hat (L->pk): K is the output, so outside the target's group it
+                         * holds whole codes times 2^-4..2^-2 (one of them +-7, so the group's
+                         * scale is a power of two): at most 1.75, a score of 14 against the
+                         * target's 224, still decisive, and the target's K-hat row comes out
+                         * exactly in every dim. */
+                        const int ek = (int)(rng() % 3) - 4;
                         for (int x = 0; x < HD; ++x) {
                             const size_t at = ((size_t)j * kvh + kh) * HD + (size_t)x;
-                            kt[at] = rad_f32_to_bf16(x == d ? 28.0f : 0.0f);
+                            const bool kgrp = d >= 0 && x / 32 == d / 32;
+                            const int ck = x % 32 == 0 ? (rng() & 1 ? 1 : -1) * 7 : code(rng);
+                            kt[at] = rad_f32_to_bf16(x == d ? 28.0f
+                                                     : L->pk && !kgrp ? std::ldexp((float)ck, ek)
+                                                                      : 0.0f);
                             const int cv = L->v2 ? (rng() & 1 ? 1 : -1) * (x % 2 ? 1 : 3)
                                          : x % (L->i8 ? HD : 32) == 0
                                              ? (rng() & 1 ? 1 : -1) * (L->i8 ? 127 : 7) : code(rng);
@@ -477,7 +509,7 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
     /* The band bound: the row's own for decode, past the step's for prefill. */
     p.i("q_len", c.decode ? g.verify_max : maxq + 3);
     p.i("head_dim", HD); p.i("gqa", g.gqa); p.i("block_size", BS); p.i("causal", 1);
-    p.i("window", 0); p.s("q_dtype", "bf16"); p.s("kv_dtype", L->kv_dtype);
+    p.i("window", 0); p.s("q_dtype", "bf16"); p.s("kv_dtype", L->attn ? L->attn : L->kv_dtype);
     p.f("scale", 1.0 / 16.0);
     p.i("n_head", nh); p.i("max_seqs", n_seq); p.i("max_ctx", maxctx);
     RadArgs a{};
@@ -538,7 +570,8 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
 
 }  // namespace
 
-/* [--layout k4h_v4|k4h_v2h|i8h]: one layout's cases only, so ctest runs the three as separate
+/* [--layout k4h_v4|k4h_v2h|i8h|k4h_v4_pk|k4h_v2h_pk]: one layout's cases only (the `_pk` two are
+ * a `vpred` layer's P K-hat attention over the k4h caches; they have no store of their own), so ctest runs the three as separate
  * tests (each takes about a third of the whole, which grew past the per-test limit's reach with every
  * layout); the bf16_e4m3r experiment's store runs with i8h. Every layout seeds its own generator, so a
  * layout's cases are the same whether it runs alone or with the others. */
@@ -546,10 +579,11 @@ int main(int argc, char** argv) {
     const char* only = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--layout" && i + 1 < argc) only = argv[++i];
-        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h]\n", argv[0]); return 2; }
+        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h|k4h_v4_pk|k4h_v2h_pk]\n", argv[0]); return 2; }
     }
-    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h")) {
-        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h or i8h\n");
+    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h") &&
+        std::strcmp(only, "k4h_v4_pk") && std::strcmp(only, "k4h_v2h_pk")) {
+        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h, i8h, k4h_v4_pk or k4h_v2h_pk\n");
         return 2;
     }
     const Fn kst = load_libref("ref_kv_store");
@@ -587,12 +621,28 @@ int main(int argc, char** argv) {
             { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_i8h, r4d_rad_attn_decode_h256_gqa6_i8h,
               r4d_rad_attn_prefill_h256_gqa6_i8h_scratch,
               r4d_rad_attn_decode_h256_gqa6_i8h_scratch, 10 } } },
+        { &kK4hv4Pk, nullptr,
+          { { "gqa12", 12, r4d_rad_attn_prefill_h256_gqa12_k4hv4pk, r4d_rad_attn_decode_h256_gqa12_k4hv4pk,
+              r4d_rad_attn_prefill_h256_gqa12_k4hv4pk_scratch,
+              r4d_rad_attn_decode_h256_gqa12_k4hv4pk_scratch, 5 },
+            { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_k4hv4pk, r4d_rad_attn_decode_h256_gqa6_k4hv4pk,
+              r4d_rad_attn_prefill_h256_gqa6_k4hv4pk_scratch,
+              r4d_rad_attn_decode_h256_gqa6_k4hv4pk_scratch, 10 } } },
+        { &kK4hv2hPk, nullptr,
+          { { "gqa12", 12, r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk, r4d_rad_attn_decode_h256_gqa12_k4hv2hpk,
+              r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk_scratch,
+              r4d_rad_attn_decode_h256_gqa12_k4hv2hpk_scratch, 5 },
+            { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk, r4d_rad_attn_decode_h256_gqa6_k4hv2hpk,
+              r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk_scratch,
+              r4d_rad_attn_decode_h256_gqa6_k4hv2hpk_scratch, 10 } } },
     };
     for (size_t ri = 0; ri < sizeof runs / sizeof runs[0]; ++ri) {
         const Run& run = runs[ri];
-        if (only && std::strcmp(only, run.layout->kv_dtype)) continue;
+        const char* lname = run.layout->attn ? run.layout->attn : run.layout->kv_dtype;
+        if (only && std::strcmp(only, lname)) continue;
         L = run.layout;
         rng.seed(20261104u + (unsigned)ri);
+        if (run.store) {
         std::printf("kv_store %s: the emulated kernel against libref\n", L->kv_dtype);
         store_case(kst, run.store, "Flash-Next's two kv heads, a prefill chunk", 37, 2, 0, 1.0, 1.0,
                    false, rng);
@@ -601,8 +651,9 @@ int main(int argc, char** argv) {
         store_case(kst, run.store, "one kv head (four ranks), a decode token", 1, 1, 0, 1.0, 1.0,
                    false, rng);
         store_case(kst, run.store, "a descale on each side", 6, 2, 0, 0.75, 1.5, true, rng);
+        }
 
-        std::printf("attn_paged %s: the emulated kernels against libref\n", L->kv_dtype);
+        std::printf("attn_paged %s: the emulated kernels against libref\n", lname);
         for (const Geo& g : run.geos) {
             const int vq = g.verify_max;
             const std::vector<Case> cases = {

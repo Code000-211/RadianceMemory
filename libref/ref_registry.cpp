@@ -524,6 +524,11 @@ static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
                                              P_STR("to") };
 static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
+/* kv_vpred: a `vpred` layer's V less its prediction from K, and the prediction back on the output. */
+static const RadParamSpec pKvVpred[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                         P_INT("gqa"), P_STR("k_quant"), P_INT("sign"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oKvVpred[] = { OPD("x"), OPD("map"), OPD("y"), OUT("out") };
 
 /* DFlash2's grouped convolution, libr4d's schema exactly. */
 static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
@@ -1552,6 +1557,11 @@ static const RadOpSchema kSchemas[] = {
   "Each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), decoded "
   "exactly and re-encoded in layout `to` as that layout's store encodes, into the row of out. "
   "Window residency's requantise (resident -> demote) and expand (demote -> resident)." },
+{ "kv_vpred", ARR(pKvVpred), ARR(oKvVpred),
+  "out = y + sign * (xq A + b) per row and head h, A and b map[h / gqa] (head_dim rows of A, then "
+  "b, f32), xq x's head through k4h_v4's K store and back when k_quant is k4h, else x: f32, b "
+  "first, then fma over the rows in order, one rounding. A `vpred` layer's V less its prediction "
+  "from the stored K, and the prediction back on the attention output." },
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
@@ -2452,7 +2462,7 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales, or the "
     "k4h_v4 cache (int4 K and V in groups of 32 with f16 scales), the k4h_v2h cache (int2 V) or the "
-    "i8h cache (int8 K and V, one f16 scale a token and head)",
+    "i8h cache (int8 K and V, one f16 scale a token and head); k4h_v4_pk / k4h_v2h_pk read K as V",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
 ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
@@ -2530,6 +2540,9 @@ SIMPLE("ref_qsa_page", "qsa_page", "attn",
 SIMPLE("ref_kv_transcode", "kv_transcode", "attn",
        "KV rows re-encoded from one cache layout into another (the residency demote layout)",
        "u8 bytes", ref_kv_transcode),
+SIMPLE("ref_kv_vpred", "kv_vpred", "attn",
+       "V predicted from K: a per-head affine map of x (optionally its k4h_v4 K-hat) added to y",
+       "bf16 f32 x, y, out; f32 map", ref_kv_vpred),
 SIMPLE("ref_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, ref_qsa_work),
 SIMPLE("ref_kv_resolve", "kv_resolve", "attn",

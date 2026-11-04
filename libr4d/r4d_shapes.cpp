@@ -1980,6 +1980,18 @@ extern "C" int r4d_shape_kv_transcode(const RadParam* p, int n_p, int operand, R
     R4D_PICK(l);
 }
 
+/* kv_vpred: x, y and out [M, n_head * head_dim] bf16 normals, the map [n_head / gqa, head_dim + 1,
+ * head_dim] f32, as libref describes it. */
+extern "C" int r4d_shape_kv_vpred(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), hd = pi(p, n_p, "head_dim");
+    const int64_t nh = pi(p, n_p, "n_head"), gqa = pi(p, n_p, "gqa");
+    if (M <= 0 || hd <= 0 || nh <= 0 || gqa <= 0 || nh % gqa || hd % 32) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, nh * hd), opd((uint32_t)RAD_F32, nh / gqa, hd + 1, hd),
+                             opd(D, M, nh * hd), opd(D, M, nh * hd) };
+    R4D_PICK(l);
+}
+
 /* The QSA pager. A generated table draws resident ids only (a random draw cannot pair a cold entry
  * with a slot and a scratch page), so this exercises the pass-through; the selftest builds the cold
  * cases by hand. The store is four slots twice the fragment wide, so the row pitch exceeds

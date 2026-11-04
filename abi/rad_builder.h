@@ -139,6 +139,16 @@ enum {
  * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
  * k6_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged.
  *
+ * RAD_KVQ_VPRED (ABI 43, --kv-recipe `vpred`): the layer stores V less a calibrated affine
+ * prediction from the same token's K as the cache holds it (K-hat, after the layout's own K
+ * rounding), V - (K-hat A + b) per KV head, and its attention adds (P K-hat) A + b back to the
+ * output: a second attention over the cache with the keys as values (attn_paged at kv_dtype
+ * `<layout>_pk`) gives P K-hat, and `kv_vpred` applies the map on both sides (docs/OPS.md). A row of
+ * attention weights sums to one, so the output is the unpredicted one but for roundings; V's
+ * integer layout quantises a residual with less variance. Only on k4h_v4 and k4h_v2h (whose K is
+ * int4 in groups of 32 and whose layers are rotated); not with RAD_KVQ_VMEAN (the map's bias is the
+ * mean's place) nor with a demote layout. The maps are RadBuildCtx::kv_vpred's.
+ *
  * RAD_KVQ_DEMOTE (ABI 42, --kv-recipe `demote LAYOUT`): bits 16-23 hold a second layout, the one a
  * block of this layer takes in the window-residency store (spec §7.3) when the sweep demotes it;
  * 0 is none, the block's bytes moving as they are. The pool, the attention and the store kernel
@@ -154,6 +164,7 @@ enum {
     RAD_KVQ_LAYOUT  = 0xff,
     RAD_KVQ_ROTATED = 0x100,
     RAD_KVQ_VMEAN   = 0x200,
+    RAD_KVQ_VPRED   = 0x400,
     RAD_KVQ_DEMOTE  = 0xff0000,
     RAD_KVQ_DEMOTE_SHIFT = 16
 };
@@ -424,6 +435,14 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int32_t  qsa_bkey_dtype;
+
+    /* ---- appended in ABI 43 (V predicted from K) */
+    /* The maps of the recipe's `vpred` layers (RAD_KVQ_VPRED), this rank's device copy; null when
+     * no layer takes one. Read at declare only. A plugin that does not serve RAD_KVQ_VPRED refuses
+     * the entry, naming the layer.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    const struct RadKvVPred* kv_vpred;
 } RadBuildCtx;
 
 /* ================================================================== a static V mean per layer */
@@ -450,6 +469,26 @@ typedef struct RadKvVMean {
     int64_t     n_head;
     int64_t     head_dim;
 } RadKvVMean;
+
+/* ================================================================== V predicted from K */
+/* What a RAD_KVQ_VPRED layer predicts V from, prepared once by the engine from the recipe's map file
+ * (--kv-recipe `vpred FILE`, docs/GUIDE.md §4.4) and uploaded to every rank whole (3.1 MiB a
+ * layer at Flash-Next's two KV heads of 256), a rank's KV heads being a slice at the offset it
+ * already knows (Geom::kv_off), replicated heads included.
+ *
+ * `table` is f32, [entries][n_head_kv][head_dim + 1][head_dim]: per KV head the map A's head_dim
+ * rows (row i the weights of K-hat's dim i into V's dims), then the bias b, in the rotated basis
+ * (the normalised Hadamard over head_dim, `had_rotate`'s), as a vpred layer, always rotated,
+ * stores K and V. `entry` (host, n_layers long) is layer l's entry in `table`, or -1 for a layer
+ * without RAD_KVQ_VPRED. The MTP head, which shares the last attention layer's cache, takes that
+ * layer's map. A query head h of a rank reads the map of its cache head, h / gqa. */
+typedef struct RadKvVPred {
+    const void*    table;      /* device, this rank's copy, f32 */
+    const int32_t* entry;      /* host, [n_layers] */
+    int64_t        n_layers;   /* the recipe's length (RadBuildCtx::n_kv_recipe) */
+    int64_t        n_head_kv;  /* the model's, over every rank */
+    int64_t        head_dim;
+} RadKvVPred;
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:

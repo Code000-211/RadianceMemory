@@ -1458,6 +1458,24 @@ static const RadOperandSpec oKvTranscode[] = {
     { "out", RAD_OPD_OUT, 0 },
 };
 
+/* `kv_vpred` (docs/OPS.md): a `vpred` layer's V less its prediction from K, and the prediction from
+ * P K-hat back on the attention output. */
+static const RadParamSpec pKvVpred[] = {
+    { "M",        RAD_P_INT, RAD_REQUIRED },
+    { "head_dim", RAD_P_INT, RAD_REQUIRED },
+    { "n_head",   RAD_P_INT, RAD_REQUIRED },
+    { "gqa",      RAD_P_INT, RAD_REQUIRED },
+    { "k_quant",  RAD_P_STR, RAD_REQUIRED },
+    { "sign",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype",    RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oKvVpred[] = {
+    { "x",   RAD_OPD_IN,  0 },
+    { "map", RAD_OPD_IN,  0 },
+    { "y",   RAD_OPD_IN,  0 },
+    { "out", RAD_OPD_OUT, 0 },
+};
+
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
  * block of key history for one query.
  *
@@ -3683,6 +3701,11 @@ static const RadOpSchema kSchemas[] = {
            "each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), "
            "decoded exactly and re-encoded in layout `to` as that layout's store encodes, into the "
            "same row of out; libref's kvx_rows byte for byte."),
+    SCHEMA("kv_vpred", pKvVpred, oKvVpred,
+           "out = y + sign * (xq A + b) per row and head h, A and b map[h / gqa] (head_dim rows of "
+           "A, then b, f32), xq x's head through k4h_v4's K store and back when k_quant is k4h, "
+           "else x; f32, b first, then fma over the rows in order, one rounding (libref's "
+           "ref_kv_vpred byte for byte)."),
     SCHEMA("qsa_page", pQsaPage, oQsaPage,
            "for each position of `sel` holding a cold entry (<= -2), the first `block_bytes` of "
            "`store` row -2 - entry are copied into pool block scratch[m][j] and the entry becomes "
@@ -4419,6 +4442,40 @@ static const RadConstraint cAttnDecodeH256G6Bs4I8h[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
     C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "i8h"),
 };
+/* P K-hat over the k4h_v4 and k4h_v2h caches (`_pk`, a `vpred` layer's second attention): the
+ * layouts' rows' constraints at their own kv_dtype. */
+static const RadConstraint cAttnPrefillH256G12K4hv4Pk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 12), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4_pk"),
+};
+static const RadConstraint cAttnDecodeH256G12K4hv4Pk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 12), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 5), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4_pk"),
+};
+static const RadConstraint cAttnPrefillH256G6Bs4K4hv4Pk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4_pk"),
+};
+static const RadConstraint cAttnDecodeH256G6Bs4K4hv4Pk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v4_pk"),
+};
+static const RadConstraint cAttnPrefillH256G12K4hv2hPk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 12), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v2h_pk"),
+};
+static const RadConstraint cAttnDecodeH256G12K4hv2hPk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 12), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 5), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v2h_pk"),
+};
+static const RadConstraint cAttnPrefillH256G6Bs4K4hv2hPk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v2h_pk"),
+};
+static const RadConstraint cAttnDecodeH256G6Bs4K4hv2hPk[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k4h_v2h_pk"),
+};
 static const RadConstraint cAttnPrefillH128G8Fp8[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
@@ -5096,6 +5153,9 @@ static const RadConstraint cQsaPage[] = { C_GE("topk", 1), C_GE("blocks", 1), C_
 /* The codec's lane map: head_dim a multiple of 128, at most 512. */
 static const RadConstraint cKvTranscode[] = { C_DIV("head_dim", 128), C_LE("head_dim", 512),
                                               C_GE("head_dim", 128) };
+/* kv_vpred: a thread a column and a wave a k4h group, so head_dim on the 32-grid up to 512. */
+static const RadConstraint cKvVpred[] = { C_DIV("head_dim", 32), C_LE("head_dim", 512),
+                                          C_IN("dtype", "bf16"), C_IN("k_quant", "none k4h") };
 
 /* No dtype: every operand is f32 or i32. */
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), C_GE("ratio", 1) };
@@ -7750,6 +7810,104 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr,
   nullptr },
 
+/* P K-hat over the k4h_v4 and k4h_v2h caches (kv_dtype k4h_v4_pk / k4h_v2h_pk): the layouts'
+ * kernels with V's tile read from K's codes and scales (O_PK), a `vpred` layer's second attention
+ * (docs/OPS.md "kv_vpred"). Held to libref's attn_paged at the same kv_dtype over stored caches
+ * in the emulator (tests/r4d_emu/test_k4h.cpp, --layout k4h_v4_pk / k4h_v2h_pk); no operands for
+ * rad-kbench, as the layouts' rows. */
+{ "attn_prefill_h256_gqa12_k4hv4pk", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill), the keys as values",
+  "head_dim 256, 12 queries per kv head, paged block 4, varlen",
+  "bf16 query, k4h_v4 kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G12K4hv4Pk), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_k4hv4pk, r4d_rad_attn_prefill_h256_gqa12_k4hv4pk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa12_k4hv4pk", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block), the keys "
+  "as values",
+  "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, k4h_v4 kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G12K4hv4Pk), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa12_k4hv4pk, r4d_rad_attn_decode_h256_gqa12_k4hv4pk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_prefill_h256_gqa6_bs4_k4hv4pk", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill), the keys as values",
+  "head_dim 256, 6 queries per kv head, paged block 4, varlen",
+  "bf16 query, k4h_v4 kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G6Bs4K4hv4Pk), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_k4hv4pk, r4d_rad_attn_prefill_h256_gqa6_k4hv4pk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa6_bs4_k4hv4pk", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block), the keys "
+  "as values",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, k4h_v4 kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4K4hv4Pk), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_k4hv4pk, r4d_rad_attn_decode_h256_gqa6_k4hv4pk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_prefill_h256_gqa12_k4hv2hpk", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill), the keys as values",
+  "head_dim 256, 12 queries per kv head, paged block 4, varlen",
+  "bf16 query, k4h_v2h kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G12K4hv2hPk), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk, r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa12_k4hv2hpk", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block), the keys "
+  "as values",
+  "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, k4h_v2h kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G12K4hv2hPk), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa12_k4hv2hpk, r4d_rad_attn_decode_h256_gqa12_k4hv2hpk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_prefill_h256_gqa6_bs4_k4hv2hpk", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill), the keys as values",
+  "head_dim 256, 6 queries per kv head, paged block 4, varlen",
+  "bf16 query, k4h_v2h kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G6Bs4K4hv2hPk), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk, r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa6_bs4_k4hv2hpk", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block), the keys "
+  "as values",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, k4h_v2h kv cache read as P K-hat (K's int4 codes and f16 scales in V's place), "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4K4hv2hPk), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_k4hv2hpk, r4d_rad_attn_decode_h256_gqa6_k4hv2hpk_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+
 
 { "attn_prefill_h128_gqa8_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -9196,6 +9354,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cKvTranscode), NOTUNE,
   nullptr, nullptr, r4d_rad_kv_transcode, nullptr, nullptr, nullptr,
   r4d_shape_kv_transcode },
+
+/* A workgroup a (row, head), a thread a column: a `vpred` layer's two sides (docs/OPS.md). */
+{ "kv_vpred_bf16", "kv_vpred", "attn",
+  "V less its prediction from the k4h K-hat, or the prediction from P K-hat back on the output",
+  "head_dim a multiple of 32 up to 512; any rows, heads and gqa; `y` may be `out`",
+  "bf16 x, y and out, f32 map, f32 accumulation in libref's order; byte-identical to libref",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvVpred), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_vpred_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_kv_vpred },
 
 /* A four-digit radix select, one workgroup per query. Not a sort: attention is a softmax over a
  * set, and sorting 65536 scores per query per layer per step is too costly. The set is exact and

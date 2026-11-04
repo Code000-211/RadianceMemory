@@ -15,6 +15,7 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <random>
 #include <dlfcn.h>
 #include <sstream>
 #include <thread>
@@ -9454,9 +9455,9 @@ TEST(a_rotated_kv_recipe_entry_is_refused_where_its_layer_or_layout_would_be) {
     std::vector<int32_t> gdn = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
     gdn[2] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED;
     CHECK(has(refusal(gdn), "layer 2 keeps no attention cache"));
-    /* 0x400: past RAD_KVQ_VMEAN (0x200, ABI 38), the first bit the ABI does not define. */
-    CHECK(has(refusal(q35_recipe(RAD_KVQ_NONE, RAD_KVQ_ROTATED | 0x400)),
-              "layer 7 asks for layout 1024"));
+    /* 0x800: past RAD_KVQ_VPRED (0x400, ABI 43), the first bit the ABI does not define. */
+    CHECK(has(refusal(q35_recipe(RAD_KVQ_NONE, RAD_KVQ_ROTATED | 0x800)),
+              "layer 7 asks for layout 2048"));
 }
 
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob
@@ -11368,6 +11369,357 @@ TEST(a_vmean_layer_that_cannot_be_centred_is_refused_naming_the_layer) {
     const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, q35.meta(), &ctx); });
     CHECK_EQ(rc, RAD_E_UNSUPPORTED);
     CHECK(has(err, "layer 3 subtracts a V mean, which this plugin does not serve"));
+}
+
+/* ================================================================== V predicted from K */
+namespace {
+
+/* The maps as the engine hands them over (RadKvVPred, abi/rad_builder.h), on the host: the plugin
+ * records the pointer and never reads it. Flash-Next's fixture: 8 layers, 2 KV heads of 256, an
+ * entry per vpred layer of 2 * 257 * 256 f32. Entries for layers 3 and 7, in that order. */
+struct VPredFix {
+    static constexpr int64_t kPer = 257 * 256, kE = 2 * kPer;
+    std::vector<float> t;
+    std::vector<int32_t> en;
+    RadKvVPred v{};
+    VPredFix() : t((size_t)(2 * kE), 0.0f), en(8, -1) {
+        en[3] = 0;
+        en[7] = 1;
+        v.table = t.data();
+        v.entry = en.data();
+        v.n_layers = 8;
+        v.n_head_kv = 2;
+        v.head_dim = 256;
+    }
+    /* Where layer l's maps for this rank's first KV head start, in elements. */
+    int64_t at(int l, int rank, int world) const {
+        return en[(size_t)l] * kE + VMeanFix::kv0(rank, world) / 256 * kPer;
+    }
+};
+
+/* What a pass does around `layer`'s cache: the rotations by buffer, the store, each attention by
+ * its kv_dtype ("attn_paged" or "attn_paged:<kv_dtype>" when it ends in _pk), and kv_vpred by the
+ * buffer it changes (`vpred:v`, `vpred:out`) where its map lies in `fx`'s table, the map's element
+ * offset to `offs`. */
+std::vector<std::string> around_predicted(const RadBuilder& b, const RadCtx& c, int layer,
+                                          const VPredFix& fx, std::vector<int64_t>* offs) {
+    std::vector<std::string> seq;
+    const char* lo = reinterpret_cast<const char*>(fx.t.data());
+    const char* hi = lo + fx.t.size() * 4;
+    auto ends = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    auto name_of = [&](const RadOperand& d) {
+        return d.handle >= 1 && d.handle <= b.bufs.size() ? b.bufs[d.handle - 1].name
+                                                           : std::string("?");
+    };
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_rotate") {
+            const std::string nm = name_of(i.opd.at(0));
+            seq.push_back(ends(nm, "attn_q") ? "rot:q" : ends(nm, "attn_k") ? "rot:k"
+                        : ends(nm, "attn_v") ? "rot:v" : ends(nm, "attn_out") ? "rot:out"
+                        : "rot:" + nm);
+            continue;
+        }
+        if (o->op == "kv_vpred" && i.opd.size() >= 4 && i.opd[1].kind == RAD_OPK_RAW) {
+            const char* r = static_cast<const char*>(i.opd[1].raw);
+            if (r < lo || r >= hi) continue;
+            const std::string nm = name_of(i.opd.at(2));
+            seq.push_back(ends(nm, "attn_v") ? "vpred:v" : ends(nm, "attn_out") ? "vpred:out"
+                                                                                 : "vpred:" + nm);
+            offs->push_back((int64_t)(r - lo) / 4);
+            continue;
+        }
+        if (o->op != "kv_store" && o->op.rfind("attn_paged", 0) != 0) continue;
+        const std::string kd = pstr(o, "kv_dtype");
+        for (const RadOperand& d : i.opd)
+            if (d.kind == RAD_OPK_KV && d.offset == layer) {
+                seq.push_back(ends(kd, "_pk") ? o->op + ":" + kd : o->op);
+                break;
+            }
+    }
+    return seq;
+}
+
+/* Two programs' ops, in order, leaving out a predicted layer's kv_vpred pair and P K-hat attention
+ * and the folds such a layer does not declare: the rest must be the same ops, the same parameters. */
+std::string ops_but_prediction_diff(const RadBuilder& a, const RadBuilder& b) {
+    auto keep = [](const RecOp& o) {
+        if (o.op == "kv_vpred" || o.op == "attn_paged_gate_quant" ||
+            o.op == "qk_norm_rope_gate_kv_store" || o.op == "qk_norm_rope_gate_kv_store_streamed")
+            return false;
+        const std::string kd = o.op == "attn_paged" ? pstr(&o, "kv_dtype") : "";
+        return !(kd.size() > 3 && kd.compare(kd.size() - 3, 3, "_pk") == 0);
+    };
+    std::vector<const RecOp*> x, y;
+    for (const auto& o : a.ops) if (keep(o)) x.push_back(&o);
+    for (const auto& o : b.ops) if (keep(o)) y.push_back(&o);
+    if (x.size() != y.size()) return "op count";
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i]->op != y[i]->op || x[i]->p.size() != y[i]->p.size()) return "op " + x[i]->op;
+        for (size_t j = 0; j < x[i]->p.size(); ++j) {
+            const RecParam& p = x[i]->p[j];
+            const RecParam& q = y[i]->p[j];
+            if (p.key != q.key || p.ival != q.ival || p.ihi != q.ihi || p.dval != q.dval ||
+                p.sval != q.sval)
+                return "op " + x[i]->op + ", parameter " + p.key;
+        }
+    }
+    return "";
+}
+
+}  /* namespace */
+
+/* A `vpred` recipe layer on Flash-Next (RAD_KVQ_VPRED), layer 3 in k4h_v4 and in k4h_v2h (both
+ * rotated), layer 7 k6_v4 as it was, at one, two and four ranks: the layer declares two kv_vpred
+ * ops -- the store's over this rank's KV heads (gqa 1, k_quant k4h, minus) and the output's over its
+ * query heads (the rank's gqa, k_quant none, plus) -- and a second attn_paged at kv_dtype
+ * `<layout>_pk` with op_attn's parameters otherwise; every other op is the unpredicted recipe's,
+ * with the same groups. In a pass, at decode (the sparse path) and in a long prefill (the dense
+ * one): the rotations, then V less its prediction, the store, the attention and the P K-hat
+ * attention, then the prediction back on the output and its rotation back; both maps are this
+ * rank's slice of layer 3's entry (its first KV head's, replicated at four ranks). */
+TEST(a_vpred_kv_recipe_layer_on_flashnext_stores_v_less_its_prediction_and_adds_it_back) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VPredFix fx;
+    for (int q : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> plain(8, -1), pred(8, -1);
+                plain[3] = q | RAD_KVQ_ROTATED;
+                pred[3] = q | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+                plain[7] = pred[7] = RAD_KVQ_K6V4;
+                RadBuildCtx pc = with_recipe(q4_ctx(rank, world), plain);
+                RadBuildCtx vc = with_recipe(q4_ctx(rank, world), pred);
+                pc.kv_residency = vc.kv_residency = 1;
+                vc.kv_vpred = &fx.v;
+                RadBuilder a, b;
+                a.encs = b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &vc), RAD_OK);
+                CHECK_EQ(ops_but_prediction_diff(a, b), std::string());
+                REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+                for (size_t i = 0; i < a.kv_groups.size(); ++i)
+                    CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d,
+                                       sizeof a.kv_groups[i].d));
+                CHECK(a.binds == b.binds);
+                const int64_t kvh = world == 4 ? 1 : 2 / world, nh = 24 / world;
+                const std::string pkd = std::string(q == RAD_KVQ_K4H ? "k4h_v4" : "k4h_v2h") + "_pk";
+                int subs = 0, adds = 0, pks = 0;
+                const RecOp* att = nullptr;
+                for (const auto& o : b.ops) {
+                    if (o.op == "attn_paged" && pstr(&o, "kv_dtype") == pkd.substr(0, pkd.size() - 3))
+                        att = &o;
+                    if (o.op == "attn_paged" && pstr(&o, "kv_dtype") == pkd) {
+                        ++pks;
+                        REQUIRE(att != nullptr);
+                        for (const char* k : { "q_len", "head_dim", "gqa", "n_head", "block_size",
+                                               "max_seqs", "max_ctx" })
+                            CHECK_EQ(pint(&o, k), pint(att, k));
+                    }
+                    if (o.op != "kv_vpred") continue;
+                    CHECK_EQ(pint(&o, "head_dim"), 256LL);
+                    CHECK_EQ(pstr(&o, "dtype"), std::string("bf16"));
+                    if (pint(&o, "sign") < 0) {
+                        ++subs;
+                        CHECK_EQ(pint(&o, "n_head"), (long long)kvh);
+                        CHECK_EQ(pint(&o, "gqa"), 1LL);
+                        CHECK_EQ(pstr(&o, "k_quant"), std::string("k4h"));
+                    } else {
+                        ++adds;
+                        CHECK_EQ(pint(&o, "n_head"), (long long)nh);
+                        CHECK_EQ(pint(&o, "gqa"), (long long)(nh / kvh));
+                        CHECK_EQ(pstr(&o, "k_quant"), std::string("none"));
+                    }
+                }
+                CHECK_EQ(subs, 1);
+                CHECK_EQ(adds, 1);
+                CHECK_EQ(pks, 1);
+
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    std::vector<int64_t> offs;
+                    const std::vector<std::string> seq = around_predicted(b, *v[0], 3, fx, &offs);
+                    const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "vpred:v",
+                                                            "kv_store" };
+                    REQUIRE(seq.size() >= head.size() + 4);
+                    CHECK(std::vector<std::string>(seq.begin(), seq.begin() + head.size()) == head);
+                    /* Every launch of the attention has its P K-hat twin over the same rows. */
+                    const size_t j = seq.size() - 2;
+                    int outs = 0, pkl = 0;
+                    for (size_t x = head.size(); x < j; ++x) {
+                        outs += seq[x] == "attn_paged";
+                        pkl += seq[x] == "attn_paged:" + pkd;
+                        CHECK(seq[x] == "attn_paged" || seq[x] == "attn_paged:" + pkd);
+                    }
+                    CHECK(outs >= 1);
+                    CHECK_EQ(outs, pkl);
+                    CHECK_EQ(seq[head.size()], std::string("attn_paged"));
+                    CHECK_EQ(seq[j], std::string("vpred:out"));
+                    CHECK_EQ(seq[j + 1], std::string("rot:out"));
+                    REQUIRE_EQ(offs.size(), (size_t)2);
+                    CHECK_EQ(offs[0], fx.at(3, rank, world));
+                    CHECK_EQ(offs[1], fx.at(3, rank, world));
+                }
+            }
+}
+
+/* The calibration's fit (rad_calib_vpred.h) recovers a map it was given: K drawn with unequal
+ * channel scales and a mean, V = K A + b exactly, the sums accumulated as the tap accumulates them
+ * (upper triangle of K K^T), and the ridge solve gives A and b back to within the ridge's pull
+ * (lambda is 1e-4 of the mean K variance). With every K the same the moments are singular and the
+ * fit says so rather than write a map. */
+TEST(the_vpred_calibration_fit_recovers_a_known_map_from_its_sums) {
+    const int64_t D = 16;
+    const long long n = 4000;
+    std::mt19937 rng(9);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    std::vector<double> A((size_t)(D * D)), b((size_t)D);
+    for (auto& x : A) x = 0.3 * nd(rng);
+    for (auto& x : b) x = nd(rng);
+    std::vector<double> sk((size_t)D, 0.0), sv((size_t)D, 0.0), skk((size_t)(D * D), 0.0),
+        skv((size_t)(D * D), 0.0), k((size_t)D), v((size_t)D);
+    for (long long r = 0; r < n; ++r) {
+        for (int64_t i = 0; i < D; ++i) k[(size_t)i] = 0.5 + (1.0 + (double)i / 4.0) * nd(rng);
+        for (int64_t j = 0; j < D; ++j) {
+            v[(size_t)j] = b[(size_t)j];
+            for (int64_t i = 0; i < D; ++i) v[(size_t)j] += k[(size_t)i] * A[(size_t)(i * D + j)];
+        }
+        for (int64_t i = 0; i < D; ++i) {
+            sk[(size_t)i] += k[(size_t)i];
+            sv[(size_t)i] += v[(size_t)i];
+            for (int64_t j = i; j < D; ++j) skk[(size_t)(i * D + j)] += k[(size_t)i] * k[(size_t)j];
+            for (int64_t j = 0; j < D; ++j) skv[(size_t)(i * D + j)] += k[(size_t)i] * v[(size_t)j];
+        }
+    }
+    std::vector<double> fit;
+    REQUIRE(rad::arch::vpred_fit(D, n, sk, sv, skk, skv, &fit));
+    REQUIRE_EQ(fit.size(), (size_t)((D + 1) * D));
+    double worst = 0.0;
+    for (int64_t i = 0; i < D * D; ++i) worst = std::max(worst, std::fabs(fit[(size_t)i] - A[(size_t)i]));
+    for (int64_t j = 0; j < D; ++j) worst = std::max(worst, std::fabs(fit[(size_t)(D * D + j)] - b[(size_t)j]));
+    std::printf("    worst error of the fitted map %.3g\n", worst);
+    CHECK(worst < 2e-3);
+    /* Every K the same: no variance to fit, refused. */
+    std::vector<double> ck((size_t)D, 0.0), cv((size_t)D, 0.0), ckk((size_t)(D * D), 0.0),
+        ckv((size_t)(D * D), 0.0);
+    for (int64_t i = 0; i < D; ++i) {
+        ck[(size_t)i] = 2.0 * (double)n;
+        for (int64_t j = i; j < D; ++j) ckk[(size_t)(i * D + j)] = 4.0 * (double)n;
+    }
+    CHECK(!rad::arch::vpred_fit(D, n, ck, cv, ckk, ckv, &fit));
+}
+
+/* The MTP head shares the last attention layer's cache, so behind a `vpred` layer 7 (k4h_v4, whose
+ * group the head rotates in) its V goes in less layer 7's prediction, from layer 7's maps, and its
+ * attention adds it back; the trunk's layer 7 uses the same maps. The verify and the history pass
+ * lint clean. */
+TEST(the_mtp_head_behind_a_vpred_layer_on_flashnext_takes_that_layers_maps) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VPredFix fx;
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            std::vector<int32_t> r(8, -1);
+            r[3] = RAD_KVQ_NONE;
+            r[7] = RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_vpred = &fx.v;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            std::vector<int64_t> offs;
+            const std::vector<std::string> seq = around_predicted(b, *v[1], 8, fx, &offs);
+            REQUIRE(!offs.empty());
+            CHECK_EQ(offs[0], fx.at(7, rank, world));
+            CHECK(std::find(seq.begin(), seq.end(), "vpred:v") <
+                  std::find(seq.begin(), seq.end(), "kv_store"));
+            std::vector<int64_t> o7;
+            (void)around_predicted(b, *v[0], 7, fx, &o7);
+            REQUIRE_EQ(o7.size(), (size_t)2);
+            CHECK_EQ(o7[0], fx.at(7, rank, world));
+            CHECK_EQ(o7[1], fx.at(7, rank, world));
+        }
+}
+
+/* Without a `vpred` layer nothing of the prediction reaches the program: the same recipe declares
+ * the same program byte for byte with the engine's maps handed over or not, at one, two and four
+ * ranks. */
+TEST(without_a_vpred_layer_the_flashnext_program_is_unchanged_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VPredFix fx;
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED;
+    r[7] = (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx pc = with_recipe(q4_ctx(rank, world), r);
+            RadBuildCtx tc = pc;
+            tc.kv_vpred = &fx.v;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &tc), RAD_OK);
+            CHECK_EQ(program_diff(a, b), std::string());
+        }
+}
+
+/* What cannot be predicted is refused naming the layer (hand-built entries; the recipe parser
+ * never makes them): `vpred` on a layout whose K is not k4h's int4 (k6_v4, i8h), beside a V mean,
+ * without the engine's maps, with maps of another geometry or none for the layer; and on
+ * qwen35_fp8, which does not serve it. */
+TEST(a_vpred_layer_that_cannot_be_predicted_is_refused_naming_the_layer) {
+    MetaKV mk = q4_small();
+    VPredFix fx;
+    VMeanFix vm;
+    auto refusal = [&](const std::vector<int32_t>& r, const RadKvVPred* t) {
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        ctx.kv_vpred = t;
+        ctx.kv_vmean = &vm.v;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    const int32_t vp = RAD_KVQ_VPRED, rot = RAD_KVQ_ROTATED;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K6V4 | vp, -1, -1, -1, RAD_KVQ_V4 }, &fx.v),
+              "layer 3 predicts V from K, which only a k4h_v4 or k4h_v2h layer"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_I8H | rot | vp, -1, -1, -1, RAD_KVQ_V4 }, &fx.v),
+              "layer 3 predicts V from K, which only a k4h_v4 or k4h_v2h layer"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K4H | rot | vp | RAD_KVQ_VMEAN, -1, -1, -1, RAD_KVQ_V4 },
+                      &fx.v),
+              "layer 3 predicts V from K, which only a k4h_v4 or k4h_v2h layer without a V mean"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K4H | rot | vp, -1, -1, -1, RAD_KVQ_V4 }, nullptr),
+              "layer 3 predicts V from K, which the engine did not hand over"));
+    VPredFix narrow;
+    narrow.v.head_dim = 128;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_V4, -1, -1, -1, RAD_KVQ_K4H | rot | vp }, &narrow.v),
+              "layer 7 predicts V from K and the engine's maps do not fit this model"));
+    VPredFix none;
+    none.en[3] = -1;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K4HV2H | rot | vp, -1, -1, -1, RAD_KVQ_V4 }, &none.v),
+              "or name no map for it"));
+
+    MetaKV q35 = q35fp8_meta();
+    const std::vector<int32_t> r35 = q35_recipe(RAD_KVQ_K4H | rot | vp, RAD_KVQ_V4);
+    const RadBuildCtx ctx = with_recipe(build_ctx(), r35);
+    RadBuilder b;
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, q35.meta(), &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(has(err, "layer 3 predicts V from K, which this plugin does not serve"));
 }
 
 /* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked

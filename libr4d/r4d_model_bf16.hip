@@ -941,6 +941,40 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
     }
 }
 
+// kv_vpred (docs/OPS.md): a `vpred` layer's V less its prediction from K, and the prediction back
+// on the attention output. A workgroup a (row, head) of head_dim threads, thread j one output
+// column. With KQ the head is first taken through k4h_v4's K store and back -- a group of 32 is one
+// wave, its absmax a butterfly of fmaxf (which drops a NaN; a group of NaNs is NaN and takes the
+// cap), the scale f16(fminf(amax / 7, 8188)), the code clamp(rint(x / scale), +-7) and the value
+// code times scale, exactly kv_store_fp8v4_kernel's KM 2 and libref's k4h_group / k4h_int4 -- so
+// the prediction is made from the K-hat the cache holds. Then acc = b[j], acc = fmaf(xq[i],
+// A[i][j], acc) for i ascending, and out = bf16(y +- acc): libref's ref_kv_vpred in its order, so
+// the bytes are libref's. `y` may be `out`: each element is read before it is written, by its own
+// thread.
+__global__ __launch_bounds__(512) void kv_vpred_kernel(
+    const uint16_t* __restrict__ x, const float* __restrict__ map, const uint16_t* y,
+    uint16_t* out, uint32_t hd, uint32_t n_head, uint32_t gqa, uint32_t x_ld, uint32_t y_ld,
+    uint32_t o_ld, int kq, int neg) {
+    __shared__ float xs[512];
+    const uint32_t r = blockIdx.x / n_head, h = blockIdx.x % n_head, j = threadIdx.x;
+    float xv = bf16_to_f32(x[(size_t)r * x_ld + (size_t)h * hd + j]);
+    if (kq) {
+        float amax = fabsf(xv);
+        for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
+        const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);
+        const float sc = (float)s16;
+        const float q = sc > 0.0f ? rintf(xv / sc) : 0.0f;
+        xv = (float)(int)fminf(fmaxf(q, -7.0f), 7.0f) * sc;
+    }
+    xs[j] = xv;
+    __syncthreads();
+    const float* __restrict__ A = map + (size_t)(h / gqa) * (hd + 1) * hd;
+    float acc = A[(size_t)hd * hd + j];
+    for (uint32_t i = 0; i < hd; ++i) acc = fmaf(xs[i], A[(size_t)i * hd + j], acc);
+    const float yv = bf16_to_f32(y[(size_t)r * y_ld + (size_t)h * hd + j]);
+    out[(size_t)r * o_ld + (size_t)h * hd + j] = f32_to_bf16(yv + (neg ? -acc : acc));
+}
+
 // The i8h store (RAD_KVQ_I8H): one wave a (token, head), K then V, each as int8 under one f16
 // scale for the whole head (absmax / 127, capped at 512 so 127 times it stays an f16). Lane l takes
 // dims 4l + 128i; the absmax is a butterfly of fmaxf, which drops a NaN in any order, from NaN as
@@ -2607,6 +2641,38 @@ extern "C" int r4d_rad_kv_store_i8h(const RadArgs* a, RadStream stream) {
                     (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
                     (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
                     (float)(1.0 / vs)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* kv_vpred: x, y and out bf16 [rows, n_head * head_dim] at their own row pitches, map f32
+ * [n_head / gqa, head_dim + 1, head_dim] dense; head_dim a multiple of 32 up to 512 (a thread a
+ * column, a wave a k4h group). The refusals are libref's. */
+extern "C" int r4d_rad_kv_vpred_bf16(const RadArgs* a, RadStream stream) {
+    const RadTensor *x = r4d_opt(a, 0), *mp = r4d_opt(a, 1), *y = r4d_opt(a, 2), *o = r4d_opt(a, 3);
+    if (!x || !mp || !y || !o) return R4D_NO(RAD_E_INVAL);
+    const long long hd = r4d_geti_or(a, "head_dim", 0), nh = r4d_geti_or(a, "n_head", 0);
+    const long long gqa = r4d_geti_or(a, "gqa", 1), sign = r4d_geti_or(a, "sign", 1);
+    const char* kq = r4d_gets(a, "k_quant");
+    const bool k4 = kq && !std::strcmp(kq, "k4h");
+    if (kq && !k4 && std::strcmp(kq, "none")) return R4D_NO(RAD_E_INVAL);
+    if (sign != 1 && sign != -1) return R4D_NO(RAD_E_INVAL);
+    if (hd <= 0 || nh <= 0 || gqa <= 0 || nh % gqa || hd % 32) return R4D_NO(RAD_E_SHAPE);
+    if (hd > 512) return R4D_NO(RAD_E_UNSUPPORTED);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(y));
+    R4D_NEED(dt_bf16(o));
+    if (mp->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(mp) || r4d_numel(mp) < (nh / gqa) * (hd + 1) * hd) return R4D_NO(RAD_E_SHAPE);
+    const long long w = nh * hd;
+    long long M = 0, My = 0, Mo = 0;
+    const long long x_ld = r4d_rows_pitch(x, w, &M), y_ld = r4d_rows_pitch(y, w, &My),
+                    o_ld = r4d_rows_pitch(o, w, &Mo);
+    if (x_ld < 0 || y_ld < 0 || o_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M || Mo < M) return R4D_NO(RAD_E_SHAPE);
+    return R4D_EMIT(stream, kv_vpred_kernel, dim3((uint32_t)(M * nh)), dim3((uint32_t)hd), 0,
+                    (const uint16_t*)r4d_addr(x), (const float*)r4d_addr(mp),
+                    (const uint16_t*)r4d_addr(y), (uint16_t*)r4d_addr(o), (uint32_t)hd,
+                    (uint32_t)nh, (uint32_t)gqa, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)o_ld,
+                    k4 ? 1 : 0, sign < 0 ? 1 : 0) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* The bf16_e4m3r experiment's store: a bf16 cache at the shared paged layout, values rounded

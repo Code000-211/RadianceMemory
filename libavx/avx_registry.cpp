@@ -426,6 +426,10 @@ static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
                                              P_STR("to") };
 static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
+static const RadParamSpec pKvVpred[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                         P_INT("gqa"), P_STR("k_quant"), P_INT("sign"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oKvVpred[] = { OPD("x"), OPD("map"), OPD("y"), OUT("out") };
 static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                          P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
@@ -1165,6 +1169,9 @@ static const RadOpSchema kSchemas[] = {
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "each row of x, one token's K and V head in layout `from`, decoded exactly and re-encoded in "
   "layout `to` as that layout's store encodes; libref's bytes." },
+{ "kv_vpred", ARR(pKvVpred), ARR(oKvVpred),
+  "out = y + sign * (xq A + b) per row and head, A and b map[head / gqa], xq x's head through "
+  "k4h_v4's K store and back when k_quant is k4h; libref's order and bytes." },
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "the blocks completing in this batch: each block's `ratio` raw keys staged contiguously, its "
   "block-key page and first-token position; slots past the count get page -1. nc is each "
@@ -1819,6 +1826,9 @@ SIMPLE("avx_qsa_page", "qsa_page", "attn",
 SIMPLE("avx_kv_transcode", "kv_transcode", "attn",
        "KV rows re-encoded from one cache layout into another (the residency demote layout)",
        "u8 bytes", L(kv_transcode)),
+SIMPLE("avx_kv_vpred", "kv_vpred", "attn",
+       "V predicted from K: a per-head affine map of x (optionally its k4h_v4 K-hat) added to y",
+       "bf16 f32 x, y, out; f32 map", L(kv_vpred)),
 SIMPLE("avx_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, L(qsa_work)),
 

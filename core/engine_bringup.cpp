@@ -1032,6 +1032,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* The recipe's V means, this rank's copy; a plugin reads them at declare only. */
     if (rank >= 0 && rank < (int) kv_vmean_views_.size() && kv_vmean_views_[(size_t) rank].table)
         bc.kv_vmean = &kv_vmean_views_[(size_t) rank];
+    /* The recipe's maps from K to V likewise. */
+    if (rank >= 0 && rank < (int) kv_vpred_views_.size() && kv_vpred_views_[(size_t) rank].table)
+        bc.kv_vpred = &kv_vpred_views_[(size_t) rank];
     return bc;
 }
 
@@ -1220,6 +1223,17 @@ int Engine::declare() {
             RAD_INFO("kv recipe %s: V means from %s (%lld tokens)", cfg_.kv_recipe_path.c_str(),
                      cfg_.kv_vmean.path.c_str(), cfg_.kv_vmean.rows);
         }
+        /* The `vpred` layers' maps, rotated and checked against this model's heads; uploaded per
+         * rank at declare. Whether the plugin serves RAD_KVQ_VPRED is its own to say. */
+        kv_vpred_table_.clear();
+        kv_vpred_entry_.clear();
+        if (!cfg_.kv_vpred.layer.empty()) {
+            RAD_TRY(kv_vpred_table(cfg_.kv_vpred, cfg_.kv_recipe, meta_.head_dim,
+                                   meta_.n_head_kv ? meta_.n_head_kv : meta_.n_head,
+                                   &kv_vpred_table_, &kv_vpred_entry_));
+            RAD_INFO("kv recipe %s: K-to-V maps from %s (%lld tokens)", cfg_.kv_recipe_path.c_str(),
+                     cfg_.kv_vpred.path.c_str(), cfg_.kv_vpred.rows);
+        }
     }
     /* The row split is a graph only the plugin can declare, and it splits over ranks. A plugin
      * that does not say it serves it (RadArchProbe::tp_attn_rows_ok), or a single rank, would
@@ -1392,6 +1406,7 @@ int Engine::declare() {
         }
     }
     kv_vmean_views_.assign(ranks_.size(), RadKvVMean{});
+    kv_vpred_views_.assign(ranks_.size(), RadKvVPred{});
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
@@ -1469,6 +1484,31 @@ int Engine::declare() {
                 v.n_head_kv = cfg_.kv_vmean.n_head_kv;
                 v.n_head    = meta_.n_head;
                 v.head_dim  = cfg_.kv_vmean.head_dim;
+            }
+            /* This rank's copy of the K-to-V maps likewise. */
+            if (!kv_vpred_table_.empty() && !kv_vpred_views_[(size_t)ri].table) {
+                const int64_t bytes = (int64_t)kv_vpred_table_.size() * 4;
+                void* d = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+                RadStream s = nullptr;
+                int rc = d && rad_stream_create(&s, 0) >= 0 ? 0 : -1;
+                if (rc == 0) {
+                    rc = rad_memcpy_async(d, kv_vpred_table_.data(), bytes, s);
+                    rad_stream_sync(s);
+                    rad_stream_destroy(s);
+                }
+                if (rc < 0) {
+                    RAD_ERR("rank %d: could not put the KV recipe's K-to-V maps on the card: %s", ri,
+                            rad_dev_last_error());
+                    if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+                    st[(size_t)ri] = RAD_E_DEVICE;
+                    return;
+                }
+                RadKvVPred& v = kv_vpred_views_[(size_t)ri];
+                v.table     = d;
+                v.entry     = kv_vpred_entry_.data();
+                v.n_layers  = (int64_t)kv_vpred_entry_.size();
+                v.n_head_kv = cfg_.kv_vpred.n_head_kv;
+                v.head_dim  = cfg_.kv_vpred.head_dim;
             }
             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
             LoraDeclare ld;

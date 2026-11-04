@@ -794,6 +794,19 @@ struct KvVMean {
     std::map<int, std::vector<float>> layer;
 };
 
+/* A KV recipe's maps from K to V (--kv-recipe `vpred FILE`, docs/GUIDE.md §4.4): per listed layer
+ * and KV head a least-squares affine map from K to V over a calibration corpus, in the basis the
+ * projections write (unrotated; kv_vpred_parse gives the file format). `layer[l]` is n_head_kv *
+ * (head_dim + 1) * head_dim floats: per head A's head_dim rows (row i the weights of K's dim i into
+ * V's dims), then the bias b, so V ~ K A + b. */
+struct KvVPred {
+    std::string path;
+    int64_t     head_dim  = 0;
+    int64_t     n_head_kv = 0;
+    long long   rows      = 0;     /* tokens the maps were fitted over, for provenance */
+    std::map<int, std::vector<float>> layer;
+};
+
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
@@ -880,6 +893,10 @@ struct Config {
      * listed layer's V mean by KV head, as the projection writes V (unrotated). Empty (no layers)
      * without one. Checked against the model's heads and head_dim at startup (kv_vmean_table). */
     KvVMean kv_vmean;
+    /* The recipe's `vpred FILE`, read at parse when a layer says `vpred` (RAD_KVQ_VPRED): each listed
+     * layer's map from K to V by KV head, unrotated. Empty (no layers) without one. Checked against
+     * the model's heads and head_dim at startup (kv_vpred_table). */
+    KvVPred kv_vpred;
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
     /* --qsa-bkey-dtype bf16 | i8: the QSA indexer's block keys (RadBuildCtx::qsa_bkey_dtype).
      * bf16 is the plugin's own; i8 is refused at startup by a plugin that does not serve it. */
@@ -1242,12 +1259,12 @@ int  config_parse(int argc, char** argv, Config* c);
 /* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
  * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4, k4h_v2h and i8h, rotated
  * layouts, RAD_KVQ_VMEAN where it ends in `vmean`, and a RAD_KVQ_DEMOTE layout where it says
- * `demote LAYOUT`) or -1. `vmean_file`, when given, receives
- * the path a `vmean FILE` line names, as written.
+ * `demote LAYOUT`, RAD_KVQ_VPRED where it ends in `vpred`) or -1. `vmean_file` and `vpred_file`,
+ * when given, receive the paths a `vmean FILE` and a `vpred FILE` line name, as written.
  * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
  * is then left empty. */
 int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out,
-                     std::string* vmean_file = nullptr);
+                     std::string* vmean_file = nullptr, std::string* vpred_file = nullptr);
 /* A recipe's V mean file (`vmean FILE`) into KvVMean. The text format, a line a (layer, KV head):
  *
  *     kv_vmean 1 head_dim D kv_heads H rows R
@@ -1262,6 +1279,26 @@ int  kv_vmean_parse(const std::string& text, const char* name, KvVMean* out);
  * file named, where its head_dim or KV heads are not the model's or a vmean layer has no entry. */
 int  kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_t head_dim,
                     int64_t n_head_kv, int64_t n_head, std::vector<uint16_t>* out);
+/* A recipe's map file (`vpred FILE`) into KvVPred. The text format, per (layer, KV head) a bias
+ * line and head_dim row lines in any order:
+ *
+ *     kv_vpred 1 head_dim D kv_heads H rows R
+ *     layer L head h bias  b_0 ... b_{D-1}
+ *     layer L head h row i  a_i0 ... a_i(D-1)        i in 0..D-1: K's dim i into V's dims
+ *
+ * `#` starts a comment. Refused with the file and the line named: a missing or wrong header, a
+ * line of other than D values, a value that is not a finite number, a head outside 0..H-1, a row
+ * outside 0..D-1, a bias or row twice, or a layer missing a head, a head's bias or one of its
+ * rows. */
+int  kv_vpred_parse(const std::string& text, const char* name, KvVPred* out);
+/* The RadKvVPred table (abi/rad_builder.h) for `recipe`'s RAD_KVQ_VPRED layers from `vp`, rotated
+ * into the basis a vpred layer stores (A' = H A H, b' = b H, H the normalised Sylvester Hadamard
+ * over head_dim that had_rotate applies, in f64, then f32), entries in layer order, and `entry` the
+ * recipe's length with each vpred layer's entry index (-1 elsewhere). Refused, the file named, where
+ * its head_dim or KV heads are not the model's, head_dim is not a power of two, or a vpred layer
+ * has no maps. */
+int  kv_vpred_table(const KvVPred& vp, const std::vector<int32_t>& recipe, int64_t head_dim,
+                    int64_t n_head_kv, std::vector<float>* table, std::vector<int32_t>* entry);
 /* A recipe's RAD_KVQ_* by its name in the file (bf16, i8h, fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h), and back; -1 / null for
  * anything else. */
 int         kv_layout_of(const char* name);

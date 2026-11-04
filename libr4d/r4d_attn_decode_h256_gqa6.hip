@@ -65,6 +65,11 @@
 #define O_V4    33554432
 #define O_K6    67108864
 #define O_K4    1073741824
+// O_PK with O_K4 (k4h_v4) or O_K4 | O_V2 (k4h_v2h): the attention's values are the keys, read
+// from K's int4 codes and scales with V's int4 widening, so the output is P K-hat (attn_paged at
+// kv_dtype k4h_v4_pk / k4h_v2h_pk, a `vpred` layer's second attention; docs/OPS.md "kv_vpred").
+// The scores, the softmax and the row layout are the layout's own.
+#define O_PK    131072
 // The two views of R4DArgs (r4d.h), compiled in only where a row asks for them, since the h256
 // instances sit at the 256-VGPR bound and a runtime pitch and head map spill there:
 //   QLD    q rows at R4DArgs::q_ld (attn_paged_qrow), not dense.
@@ -118,13 +123,16 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // i8h: k4h_v4's walk with a byte a code and one scale a token for each of K and V. Its row
     // (2 * HEAD_DIM + 4) is 4-byte aligned only, so its codes are read a dword at a time.
     constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
+    // P K-hat (O_PK): V's tile is K's codes and scales, int4 even on k4h_v2h (VV2 is V's width).
+    constexpr int PK    = ((OPT & O_PK) && K4 && !I8) ? 1 : 0;
+    constexpr int VV2   = V2 && !PK;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
     constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : I8 ? 2 * HEAD_DIM + 4
                         : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM : K4 ? HEAD_DIM / 2 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16 : I8 ? 2 * HEAD_DIM + 2
-                        : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
     constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int VOFF  = PK ? 0 : K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = PK ? KSOFF : K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16
+                        : I8 ? 2 * HEAD_DIM + 2 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
     constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
@@ -314,8 +322,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                         sc[j]     = *(const uint16_t*)(base + VSOFF);
                         continue;
                     }
-                    v4c[r][j] = V2 ? *(const uint16_t*)(base + VOFF + o * 2)
-                                   : *(const uint32_t*)(base + VOFF + o * 4);
+                    v4c[r][j] = VV2 ? *(const uint16_t*)(base + VOFF + o * 2)
+                                    : *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
@@ -340,11 +348,11 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     v8_codes_nm(v4c[r][0], v8c[r][0], n0, m0);
                     v8_codes_nm(v4c[r][1], v8c[r][1], n1, m1);
                 } else {
-                    v_codes_nm<V2>(v4c[r][0], n0, m0);
-                    v_codes_nm<V2>(v4c[r][1], n1, m1);
+                    v_codes_nm<VV2>(v4c[r][0], n0, m0);
+                    v_codes_nm<VV2>(v4c[r][1], n1, m1);
                 }
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                constexpr float VB = I8 ? kI8Bias : VBias<V2>::v;
+                constexpr float VB = I8 ? kI8Bias : VBias<VV2>::v;
                 const h2 bias = { (_Float16)VB, (_Float16)VB };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
                                       + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];

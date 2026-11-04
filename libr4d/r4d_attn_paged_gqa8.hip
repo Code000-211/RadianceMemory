@@ -490,6 +490,10 @@ G8_V4_GQ_ENTRY(k6v4, 352, O_V4 | O_K6)
 G8_V4_ENTRIES(k4hv4, 288, O_V4 | O_K4)
 G8_V4_ENTRIES(k4hv2h, 224, O_V4 | O_K4 | O_V2)
 G8_V4_ENTRIES(i8h, 516, O_V4 | O_K4 | O_I8)
+/* P K-hat over the k4h_v4 and k4h_v2h caches (kv_dtype k4h_v4_pk / k4h_v2h_pk): the same kernels
+ * with V's tile read from K's codes and scales (O_PK), a `vpred` layer's second attention. */
+G8_V4_ENTRIES(k4hv4pk, 288, O_V4 | O_K4 | O_PK)
+G8_V4_ENTRIES(k4hv2hpk, 224, O_V4 | O_K4 | O_V2 | O_PK)
 #undef G8_V4_ENTRIES
 #undef G8_V4_GQ_ENTRY
 #endif

@@ -610,6 +610,12 @@ std::vector<Case> build_cases() {
                 add("kv_transcode", { HI("M", 7), HI("head_dim", hd), HS("from", res), HS("to", dem) });
                 add("kv_transcode", { HI("M", 7), HI("head_dim", hd), HS("from", dem), HS("to", res) });
             }
+    /* A `vpred` layer's two sides at Flash-Next's head_dim: the store's (k4h K-hat of two KV
+     * heads, V less the prediction) and the output's (twelve query heads over one map, plus). */
+    add("kv_vpred", { HI("M", 5), HI("head_dim", 256), HI("n_head", 2), HI("gqa", 1),
+                      HS("k_quant", "k4h"), HI("sign", -1), HS("dtype", "bf16") });
+    add("kv_vpred", { HI("M", 3), HI("head_dim", 256), HI("n_head", 12), HI("gqa", 12),
+                      HS("k_quant", "none"), HI("sign", 1), HS("dtype", "bf16") });
     /* The proportional ladder: a partial rotary (rotary_dim < head_dim) with `ladder` head, so the
      * frequency denominator is head_dim. */
     for (const char* mode : { "neox", "gptj" }) {

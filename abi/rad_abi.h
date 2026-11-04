@@ -58,8 +58,14 @@ extern "C" {
  * (RAD_KVQ_DEMOTE, rad_builder.h; --kv-recipe `demote LAYOUT`), and the optional `store_layout`,
  * `pool_layout` and `head_dim` of `qsa_page` with the new op `kv_transcode` (docs/OPS.md); no
  * struct moved. A plugin built at 41 would read a tiered layer's entry as a layout it does not
- * know and refuse it. */
-#define RAD_ABI_VERSION 42u
+ * know and refuse it.
+ *
+ * 43: V predicted from the same layer's K (--kv-recipe `vpred`): a kv_recipe entry's fifth
+ * meaning, RAD_KVQ_VPRED, RadBuildCtx gained kv_vpred (past qsa_bkey_dtype), RadKvVPred
+ * (rad_builder.h) is new, and with it the op `kv_vpred` and attn_paged's kv_dtype k4h_v4_pk /
+ * k4h_v2h_pk (docs/OPS.md). A plugin built at 42 would read a vpred layer's entry as a layout it
+ * does not know and refuse it. */
+#define RAD_ABI_VERSION 43u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

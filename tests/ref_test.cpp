@@ -1005,6 +1005,8 @@ TEST(op_vocabulary) {
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "qsa_page", "dflash_conv",
         /* Window residency's demote layout (RAD_KVQ_DEMOTE): the requantise and the expand. */
         "kv_transcode",
+        /* A `vpred` layer's V less its prediction from K, and the prediction back. */
+        "kv_vpred",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -3861,6 +3863,180 @@ TEST(kv_transcode_refuses_what_it_cannot_read) {
     T o1(RAD_U8, {1, 36});
     CHECK_EQ(xcode(x, o1, 32, "i8h", "k4h_v4"), RAD_E_SHAPE);
     for (uint8_t b : o.mem) CHECK_EQ((int)b, 0x5a);
+}
+
+/* ================================================================== kv_vpred: V predicted from K */
+namespace {
+
+/* kv_vpred over f32 x, y and out [M, nh * hd] with `map` [nh / gqa, hd + 1, hd]. */
+int vpred(T& x, T& map, T& y, T& out, int64_t M, int64_t hd, int64_t nh, int64_t gqa,
+          const char* kq, int64_t sign) {
+    A a; a.t(x).t(map).t(y).t(out).i("M", M).i("head_dim", hd).i("n_head", nh).i("gqa", gqa)
+           .s("k_quant", kq).i("sign", sign).s("dtype", "f32");
+    return run("kv_vpred", a);
+}
+
+/* The op's statement on the host: b first, then fma over A's rows in order, then y plus or minus
+ * the sum, every step in f32. */
+float vpred_at(const float* xq, const float* Am, int64_t hd, int64_t j, float y, int64_t sign) {
+    float acc = Am[hd * hd + j];
+    for (int64_t i = 0; i < hd; ++i) acc = std::fma(xq[i], Am[i * hd + j], acc);
+    return y + (sign < 0 ? -acc : acc);
+}
+
+}  /* namespace */
+
+/* Worked by hand at head_dim 32, two query heads sharing one map (gqa 2): A is 2 on the diagonal
+ * and 1 from dim 0 into dim 1, b is 0.5 at every dim, so row r's head h gives y + 2 x[d] + 0.5 and
+ * at dim 1 also + x[0]. Small integers and halves, so every sum is exact and the order is moot;
+ * sign -1 subtracts the same. */
+TEST(kv_vpred_adds_the_bias_and_the_map_of_each_heads_kv_head_by_hand) {
+    const int64_t hd = 32, nh = 2, M = 2;
+    T x(RAD_F32, {M, nh * hd}), y(RAD_F32, {M, nh * hd}), out(RAD_F32, {M, nh * hd});
+    T map(RAD_F32, {1, hd + 1, hd});
+    std::vector<float> xv((size_t)(M * nh * hd)), yv(xv.size()), mv((size_t)((hd + 1) * hd), 0.f);
+    for (size_t i = 0; i < xv.size(); ++i) { xv[i] = (float)((int)(i % 7) - 3); yv[i] = (float)(i % 5); }
+    for (int64_t d = 0; d < hd; ++d) { mv[(size_t)(d * hd + d)] = 2.f; mv[(size_t)(hd * hd + d)] = 0.5f; }
+    mv[(size_t)(0 * hd + 1)] = 1.f;
+    x.f(xv); y.f(yv); map.f(mv);
+    for (int64_t sign : { 1, -1 }) {
+        CHECK_OK(vpred(x, map, y, out, M, hd, nh, 2, "none", sign));
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t h = 0; h < nh; ++h)
+                for (int64_t d = 0; d < hd; ++d) {
+                    const size_t at = (size_t)((r * nh + h) * hd + d);
+                    const float* xr = &xv[(size_t)((r * nh + h) * hd)];
+                    const float pred = 2.f * xr[d] + 0.5f + (d == 1 ? xr[0] : 0.f);
+                    CHECK_EQ(out.at((int64_t)at), yv[at] + (float)sign * pred);
+                }
+    }
+}
+
+/* With k_quant k4h the prediction is made from the K the k4h_v4 cache holds, not from the K that
+ * came in: the op's output equals the statement applied to the K-hat that kv_store wrote (decoded
+ * here from the row layout), bit for bit, and differs from the prediction from raw K (the
+ * quantiser moved it). Two KV heads, each its own map. */
+TEST(kv_vpred_predicts_from_the_k_hat_the_k4h_v4_store_writes) {
+    const int64_t M = 5, hd = 64, nkv = 2;
+    std::mt19937 rng(77);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> k((size_t)(M * nkv * hd)), v(k.size()), mv((size_t)(nkv * (hd + 1) * hd));
+    for (size_t i = 0; i < k.size(); ++i) { k[i] = nd(rng) * (i % hd == 3 ? 12.f : 1.f); v[i] = nd(rng); }
+    for (auto& m : mv) m = 0.2f * nd(rng);
+    T tk(RAD_F32, {M, nkv * hd}), tv(RAD_F32, {M, nkv * hd}), out(RAD_F32, {M, nkv * hd});
+    T map(RAD_F32, {nkv, hd + 1, hd});
+    tk.f(k); tv.f(v); map.f(mv);
+    CHECK_OK(vpred(tk, map, tv, out, M, hd, nkv, 1, "k4h", -1));
+    /* K-hat: kv_store's k4h_v4 rows, one a (token, head), decoded from the layout. */
+    T ck(RAD_F32, {M * nkv, 1, hd}), cv(RAD_F32, {M * nkv, 1, hd});
+    ck.f(k); cv.f(v);
+    T sm(RAD_I32, {M * nkv});
+    for (int64_t i = 0; i < M * nkv; ++i) st_int(RAD_I32, sm.t.data, i, i);
+    T kv(RAD_F8E4M3, {M * nkv, 1, 1, 18 * hd / 16});
+    CHECK_OK(store_k4h(ck, cv, sm, kv, M * nkv, hd, 1, 1));
+    int64_t same = 0, moved = 0;
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t h = 0; h < nkv; ++h) {
+            std::vector<float> kh((size_t)hd), vh((size_t)hd);
+            xdecode("k4h_v4", kv.mem.data() + (r * nkv + h) * (18 * hd / 16), hd, kh.data(), vh.data());
+            const float* Am = &mv[(size_t)(h * (hd + 1) * hd)];
+            const float* kr = &k[(size_t)((r * nkv + h) * hd)];
+            for (int64_t j = 0; j < hd; ++j) {
+                const int64_t at = (r * nkv + h) * hd + j;
+                const float y = v[(size_t)at];
+                same += out.at(at) == vpred_at(kh.data(), Am, hd, j, y, -1);
+                moved += vpred_at(kr, Am, hd, j, y, -1) != out.at(at);
+            }
+        }
+    CHECK_EQ(same, M * nkv * hd);
+    CHECK(moved > M * nkv * hd / 2);
+}
+
+/* The layer end to end where nothing rounds V: the store side takes V less K-hat A + b (kv_vpred,
+ * k4h, sign -1), an f32 cache keeps K-hat and that residual exactly, the `_pk` attention over the
+ * k4h cache gives P K-hat, and the output side adds (P K-hat) A + b back (kv_vpred, gqa 2, sign
+ * +1). That equals plain attention over K-hat and V to f32 rounding, because each row of P sums to
+ * one. And the `_pk` attention is P K-hat bit for bit: the same output as an f32 cache whose V is
+ * K-hat. For both k4h layouts (k4h_v2h's K is k4h_v4's). */
+TEST(a_vpred_layer_gives_back_the_plain_attention_when_v_is_kept_exactly) {
+    const int64_t Tn = 9, hd = 64, nh = 4, nkv = 2, bs = 4, nb = 3;
+    for (const char* lay : { "k4h_v4", "k4h_v2h" }) {
+        std::mt19937 rng(5);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        const int64_t row = std::strcmp(lay, "k4h_v2h") == 0 ? 14 * hd / 16 : 18 * hd / 16;
+        T tq(RAD_F32, {Tn, nh, hd}), tk(RAD_F32, {Tn, nkv, hd}), tv(RAD_F32, {Tn, nkv, hd});
+        for (int64_t i = 0; i < Tn * nh * hd; ++i) st_dt(RAD_F32, tq.t.data, i, nd(rng));
+        for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+            st_dt(RAD_F32, tk.t.data, i, nd(rng));
+            st_dt(RAD_F32, tv.t.data, i, nd(rng) + 0.4f);
+        }
+        T map(RAD_F32, {nkv, hd + 1, hd});
+        for (int64_t i = 0; i < nkv * (hd + 1) * hd; ++i) st_dt(RAD_F32, map.t.data, i, 0.1f * nd(rng));
+        T sm(RAD_I32, {Tn}); sm.n({4, 5, 6, 7, 8, 9, 10, 11, 0});   /* blocks 1, 2, then 0 */
+        T kv(RAD_F8E4M3, {nb, nkv, bs, row});
+        CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, lay));
+        /* V less its prediction, then an f32 cache of K-hat with that residual (and, for the
+         * reference, K-hat with V itself, and K-hat in V's place). */
+        T vres(RAD_F32, {Tn, nkv, hd});
+        CHECK_OK(vpred(tk, map, tv, vres, Tn, hd, nkv, 1, "k4h", -1));
+        T fres(RAD_F32, {nb, nkv, bs, 2 * hd}), fref(RAD_F32, {nb, nkv, bs, 2 * hd});
+        T fkk(RAD_F32, {nb, nkv, bs, 2 * hd});
+        const std::vector<int64_t> slot = { 4, 5, 6, 7, 8, 9, 10, 11, 0 };
+        for (int64_t t = 0; t < Tn; ++t)
+            for (int64_t h = 0; h < nkv; ++h) {
+                const int64_t s = slot[(size_t)t], b = s / bs, o = s % bs;
+                std::vector<float> kh((size_t)hd), vh((size_t)hd);
+                xdecode(lay, kv.mem.data() + ((b * nkv + h) * bs + o) * row, hd, kh.data(), vh.data());
+                const int64_t base = ((b * nkv + h) * bs + o) * 2 * hd;
+                for (int64_t d = 0; d < hd; ++d) {
+                    const int64_t in = (t * nkv + h) * hd + d;
+                    for (T* f : { &fres, &fref, &fkk }) st_dt(RAD_F32, f->t.data, base + d, kh[(size_t)d]);
+                    st_dt(RAD_F32, fres.t.data, base + hd + d, vres.at(in));
+                    st_dt(RAD_F32, fref.t.data, base + hd + d, tv.at(in));
+                    st_dt(RAD_F32, fkk.t.data, base + hd + d, kh[(size_t)d]);
+                }
+            }
+        T bt(RAD_I32, {1, nb}); bt.n({1, 2, 0});
+        T su(RAD_I32, {1});     su.n({Tn});
+        auto attend = [&](T& cache, const char* kvd, T& out) {
+            A at; at.t(tq).t(cache).t(bt).t(su).tnull().tnull().tnull().t(out)
+                     .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+                     .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", kvd);
+            return run("attn_paged", at);
+        };
+        T o_res(RAD_F32, {Tn, nh * hd}), o_pk(RAD_F32, {Tn, nh * hd}), o_kk(RAD_F32, {Tn, nh * hd});
+        T o_ref(RAD_F32, {Tn, nh * hd}), o(RAD_F32, {Tn, nh * hd});
+        CHECK_OK(attend(fres, "f32", o_res));
+        CHECK_OK(attend(fref, "f32", o_ref));
+        CHECK_OK(attend(fkk, "f32", o_kk));
+        CHECK_OK(attend(kv, std::strcmp(lay, "k4h_v2h") == 0 ? "k4h_v2h_pk" : "k4h_v4_pk", o_pk));
+        int64_t pk_same = 0;
+        for (int64_t i = 0; i < Tn * nh * hd; ++i) pk_same += o_pk.at(i) == o_kk.at(i);
+        CHECK_EQ(pk_same, Tn * nh * hd);
+        CHECK_OK(vpred(o_pk, map, o_res, o, Tn, hd, nh, nh / nkv, "none", 1));
+        std::vector<float> got((size_t)(Tn * nh * hd));
+        std::vector<double> want(got.size());
+        for (size_t i = 0; i < got.size(); ++i) { got[i] = o.at((int64_t)i); want[i] = o_ref.at((int64_t)i); }
+        const double e = rel_l2(got, want);
+        std::printf("    %s: vpred layer vs plain attention rel_l2 %.3g\n", lay, e);
+        CHECK(e < 1e-5);
+    }
+}
+
+/* Refused before any write: k_quant other than none or k4h, a sign other than +-1, query heads
+ * that do not share the maps evenly, k4h off the 32-grid, a map not f32, operands too short. */
+TEST(kv_vpred_refuses_what_it_cannot_read) {
+    const int64_t hd = 32, nh = 2;
+    T x(RAD_F32, {1, nh * hd}), y(RAD_F32, {1, nh * hd}), out(RAD_F32, {1, nh * hd});
+    T map(RAD_F32, {nh, hd + 1, hd}), m16(RAD_BF16, {nh, hd + 1, hd}), small(RAD_F32, {1, hd, hd});
+    CHECK_EQ(vpred(x, map, y, out, 1, hd, nh, 1, "fp8", 1), (int)RAD_E_INVAL);
+    CHECK_EQ(vpred(x, map, y, out, 1, hd, nh, 1, "none", 0), (int)RAD_E_INVAL);
+    CHECK_EQ(vpred(x, map, y, out, 1, hd, nh, 3, "none", 1), (int)RAD_E_SHAPE);
+    CHECK_EQ(vpred(x, m16, y, out, 1, hd, nh, 1, "none", 1), (int)RAD_E_DTYPE);
+    CHECK_EQ(vpred(x, small, y, out, 1, hd, nh, 1, "none", 1), (int)RAD_E_SHAPE);
+    T x24(RAD_F32, {1, 48}), y24(RAD_F32, {1, 48}), o24(RAD_F32, {1, 48}), m24(RAD_F32, {2, 25, 24});
+    CHECK_EQ(vpred(x24, m24, y24, o24, 1, 24, 2, 1, "k4h", 1), (int)RAD_E_SHAPE);
+    CHECK_OK(vpred(x24, m24, y24, o24, 1, 24, 2, 1, "none", 1));
 }
 
 /* The pager over a tiered layer: the slot holds this layer's fragment in k4h_v2h (two heads of a
@@ -11201,6 +11377,8 @@ std::vector<Geo> geometries() {
         G("qsa_page", "M", 4, a.i("M", R).i("topk", 3).i("blocks", 6).i("seqs", 2)
                               .i("block_bytes", 16)),
         G("kv_transcode", "M", 3, a.i("M", R).i("head_dim", 64).s("from", "i8h").s("to", "k4h_v2h")),
+        G("kv_vpred", "M", 3, a.i("M", R).i("head_dim", 32).i("n_head", 4).i("gqa", 2)
+                              .s("k_quant", "k4h").i("sign", -1).s("dtype", "f32")),
         G("dflash_conv", "T", 6, a.i("T", R).i("hidden_size", 32).i("taps", 2).i("group_size", 16)
                                  .i("NG", 2).i("block_size", 4).s("dtype", "bf16")),
         G("scale_rows", "M", 3, a.i("M", R).i("n", 8).s("act", "sigmoid").s("dtype", "f32")),

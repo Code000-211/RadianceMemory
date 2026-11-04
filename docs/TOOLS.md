@@ -904,6 +904,13 @@ sums its own KV heads' rows in f64 on the host, one copy back a layer and step, 
 heads complete the set writes the file once every layer has seen the corpus's tokens. Record it
 over long documents with a bf16 cache, and not over the documents the KL mode will score.
 
+**The K-to-V maps.** With `RADIANCE_CALIB_VPRED=1` the same run also fits each trunk attention
+layer's least-squares map from K (after its norm and rotary embedding) to V, per KV head, into
+`DIR/kv_vpred.txt`: the file a KV recipe's `vpred FILE` line names (GUIDE.md §4.4). Each rank sums
+n, K, V, K K^T and K V^T in f64 on the host (head_dim^2 a token and head, hence opt-in), and the
+fit is a ridge solve (lambda 1e-4 of the mean K variance) when the corpus is done. A (layer, head)
+whose moments are singular leaves no file.
+
 ## rad-autoquant
 
 ```
