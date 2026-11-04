@@ -283,7 +283,8 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * pool, prefix cache and residency store follow from the declaration as before. Unsplit
      * `bs` is `ratio` and everything below is today's arithmetic. */
     const int64_t bs = R * c.ratio;
-    if (*bk == 0) {
+    const bool first = *bk == 0;
+    if (first) {
         if ((c.head_dim % (2 * bs)) != 0) return RAD_E_SHAPE;
         RadKVGroupDecl d{};
         d.kind      = RAD_KV_FULL;
@@ -313,13 +314,23 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
          * parameter for parameter; `mode` and `sections` only under M-RoPE. */
         RadParam pk[sizeof ps / sizeof ps[0]];
         int n_ps = 0;
+        /* Split, only the op the group binds to states `block_size` (the kernels default it to
+         * `ratio` and only check it). The attention groups are all declared before any op and
+         * bind to the first unclaimed op with a block size (Builder::find_kv_consumer), so a
+         * later layer's qsa_block_key stating 2 * ratio would hand a fifth layout's group a block
+         * of 8 tokens and its attention a shape no kernel serves. Unsplit every op states `ratio`,
+         * today's program parameter for parameter. */
         for (const RadParam& p : ps)
             if ((g.rope_mc || (std::strcmp(p.key, "mode") && std::strcmp(p.key, "sections"))) &&
-                (c.bkey_i8 || std::strcmp(p.key, "key_dtype")))
+                (c.bkey_i8 || std::strcmp(p.key, "key_dtype")) &&
+                (first || R == 1 || std::strcmp(p.key, "block_size")))
                 pk[n_ps++] = p;
         op_bkey = rw(b, decl_rotary(b, g, "qsa_block_key", pk, n_ps, &w_kn, 1),
                      {w.stage, w.page, w.bpos}, {});
     }
+    /* Bind the group to this op now, before a layer's attention asks for its own group's block
+     * size and claims it first (the binding is first-come, declaration order). */
+    if (first && rad_kv_block_size(b, kv_bk) <= 0) return RAD_E_STATE;
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv_bk));
 
     op_tail = rw(b, RAD_OP(b, "qsa_tail_store",

@@ -12121,7 +12121,7 @@ TEST(flashnext_split_block_keys_halve_the_block_key_pages_and_select_through_a_g
             }
             /* On: a's ops with each qsa_select replaced by part, gather, join. */
             std::vector<const RecOp*> rest;
-            int parts = 0, joins = 0, gathers = 0, works = 0, stores = 0;
+            int parts = 0, joins = 0, gathers = 0, works = 0, stores = 0, unstated = 0;
             for (const RecOp& y : b.ops) {
                 if (y.op == "qsa_select_part") {
                     ++parts;
@@ -12160,6 +12160,20 @@ TEST(flashnext_split_block_keys_halve_the_block_key_pages_and_select_through_a_g
                     REQUIRE_EQ(y.p.size(), x.p.size() + 2);
                     continue;
                 }
+                /* Only the first qsa_block_key (layer 3's, the one the group binds to) states the
+                 * split block size; the others leave it out, so no attention group declared before
+                 * them can bind to one. */
+                if (y.op == "qsa_block_key" && pint(&y, "block_size") == -12345LL) {
+                    ++unstated;
+                    REQUIRE_EQ(y.p.size() + 1, x.p.size());
+                    for (size_t j = 0, k = 0; j < x.p.size(); ++j) {
+                        if (x.p[j].key == "block_size") continue;
+                        CHECK_EQ(y.p[k].key, x.p[j].key);
+                        CHECK_EQ(y.p[k].ival, x.p[j].ival);
+                        ++k;
+                    }
+                    continue;
+                }
                 REQUIRE_EQ(y.p.size(), x.p.size());
                 for (size_t j = 0; j < x.p.size(); ++j) {
                     CHECK_EQ(y.p[j].key, x.p[j].key);
@@ -12174,7 +12188,8 @@ TEST(flashnext_split_block_keys_halve_the_block_key_pages_and_select_through_a_g
                 }
             }
             CHECK_EQ(works, 3);
-            CHECK_EQ(stores, 3);
+            CHECK_EQ(stores, 1);     /* layer 3's */
+            CHECK_EQ(unstated, 2);   /* layer 7's and the MTP head's */
             /* Decode, a prefill after a long history (sparse), a verify and the head's passes. */
             for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
                 const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, 2);
