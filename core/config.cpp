@@ -555,8 +555,9 @@ static const KvLayout kKvLayouts[] = {
     { "fp8_v4", RAD_KVQ_V4,   32 * 8 + (32 * 4 + 16) },
     /* K int6 too, its own f16 scale: 22/32. */
     { "k6_v4",  RAD_KVQ_K6V4, (32 * 6 + 16) + (32 * 4 + 16) },
-    /* K int5, a bit a dim under k6_v4's: 20/32, 5.0 bits an element. Rotated or not, as k6_v4. */
-    { "k5_v4",  RAD_KVQ_K5V4, (32 * 5 + 16) + (32 * 4 + 16), true },
+    /* K int5, a bit a dim under k6_v4's: 20/32, 5.0 bits an element. Rotated or not, as k6_v4.
+     * A default candidate since RadianceMemory #22 (opt-in before it, #19). */
+    { "k5_v4",  RAD_KVQ_K5V4, (32 * 5 + 16) + (32 * 4 + 16) },
     /* K int4 as well, stored rotated: 18/32. The rotation is part of the layout (below). */
     { "k4h_v4", RAD_KVQ_K4H,  (32 * 4 + 16) + (32 * 4 + 16) },
     /* V int2 under KVarN's variance normalisation, rotated as k4h_v4: 14/32. */

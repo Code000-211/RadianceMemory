@@ -65,14 +65,27 @@ struct KvVariant {
     std::string words;   /* "fp8_v4 rotated vmean" */
 };
 
-/* Every variant: the table's layouts widest first, each plain, `vmean`, `rotated` and `rotated
- * vmean`; with `vmean` false none that subtracts a V mean. Found by asking the recipe parser, not
- * by rules kept here: a combination it refuses (`fp8 vmean`) is no variant, and one it reads as
- * another (`k4h_v4 rotated` is `k4h_v4`, rotated by its name) is listed once, in its fewest
- * words. So a layout or recipe word added to the table and the parser is a candidate with no
- * change here or in rad-autoquant. A layout the table marks opt-in (kv_layout_opt_in) is left out
- * unless `opt_in` is set. */
-std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in = false);
+/* Every variant: the table's layouts widest first, each plain, `vmean`, `vpred`, `rotated`,
+ * `rotated vmean` and `rotated vpred`; with `vmean` (`vpred`) false none that subtracts a V mean
+ * (a prediction of V from K). Found by asking the recipe parser, not by rules kept here: a
+ * combination it refuses (`fp8 vmean`, `k6_v4 vpred`) is no variant, and one it reads as another
+ * (`k4h_v4 rotated` is `k4h_v4`, rotated by its name) is listed once, in its fewest words. So a
+ * layout or recipe word added to the table and the parser is a candidate with no change here or
+ * in rad-autoquant. A layout the table marks opt-in (kv_layout_opt_in) is left out unless
+ * `opt_in` is set. */
+std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in = false, bool vpred = false);
+
+/* The variant order of rad-autoquant's second pass: of the candidates `v` (each a variant's bits
+ * and its uniform recipe's measured KL; kvq is not read), the indices on the lower convex hull of
+ * KL over bits, by bits from the most accurate down to the narrowest. A layer steps "one
+ * narrower" to the next entry with fewer bits than its own. Of equal bits the lower KL stands (an
+ * exact tie: the earlier); past the least KL a wider variant is no step down; and a variant above
+ * the straight line between its neighbours is skipped, since mixing those two reaches its bits
+ * at less KL, so stepping onto it spends KL for almost no bits (Flash-Next: fp8 at 8.00 bits and
+ * 0.0262, beside i8h at 8.06 and 0.0236, saves 0.06 bits a step where k6_v4 rotated vmean saves
+ * 2.56 for 0.0309; i8h itself lies 0.0002 above the line from bf16 to k6_v4 rotated vmean, so a
+ * layer in either steps to k6_v4 rotated vmean). Collinear points stay. Empty for no candidate. */
+std::vector<size_t> kv_autoquant_hull(const std::vector<KvCandidate>& v);
 
 /* One limit a measured assignment is checked against, both sides measured from the base (the
  * most accurate recipe): for the mean KL the run's minus the base's and the limit minus the

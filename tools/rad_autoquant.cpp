@@ -10,10 +10,11 @@
  * unquantised (bf16) cache, so a run's KL is what its cache costs and nothing else.
  *
  * The candidates are the variants (kv_autoquant_variants): every layout of the recipe table
- * (core/config.cpp, kKvLayouts), each plain, `rotated` and, with --vmean FILE, `vmean`, as far as
- * the recipe parser takes the words. So a layout or recipe word added there is calibrated with no
- * change here. --layouts and --variants restrict the set; a layout the table marks opt-in (k5_v4)
- * is a candidate only where one of them names it.
+ * (core/config.cpp, kKvLayouts), each plain, `rotated` and, with --vmean FILE, `vmean`, with
+ * --vpred FILE, `vpred`, as far as the recipe parser takes the words (vpred: k4h_v4 and k4h_v2h,
+ * never beside vmean on one layer). So a layout or recipe word added there is calibrated with no
+ * change here. --layouts and --variants restrict the set; a layout the table marks opt-in (none
+ * today) is a candidate only where one of them names it.
  *
  *   1. Every variant uniform, one run each. The base is the one of least mean KL (bf16, the
  *      unquantised cache, whose KL against the bf16 reference is about zero; i8h with --layouts
@@ -37,13 +38,29 @@
  *      each solved assignment and tightens the predicted room by how far the prediction fell
  *      short, at most --verify times. The recipe written is the fewest bits of every recipe
  *      measured within the limits (uniform, single-layer or solved), so it is never worse than the
- *      best uniform variant. --min-top1 adds a floor on top-1 agreement; --strict checks both at
+ *      best uniform variant.
+ *   4b. The second pass (measured limits only): the costs of step 3 are measured from the base,
+ *      and one quantised early layer costs about as much as all of them (Flash-Next: i8h on layer
+ *      3 alone +0.0236, every layer i8h 0.0236), so the first pass finds answers only at the
+ *      extremes and misses a recipe that narrows the late layers of a uniform one already within
+ *      the limits (i8h on 3-23 and k6_v4 rotated vmean on 27-47: 6.78 bits, 0.0260, where
+ *      --max-kl 0.0262 answered every layer i8h at 8.06). So the best recipe measured within the
+ *      limits becomes a second base, B2, unless it is the first base (whose steps step 3
+ *      measured). Each layer alone moves one step narrower in the variant order
+ *      (kv_autoquant_hull: the kept variants by bits, the lower hull of their uniform runs' KL),
+ *      the rest as in B2: at most L runs, named step_layerN_VARIANT_HASH by the recipe's text so
+ *      another limit that lands on the same B2 reads them back. Each layer then has two
+ *      candidates, as B2 (no cost) and the step (its run's KL above B2's), and the same fit loop
+ *      solves, measures and tightens from B2 under the same limits, the rounds named verify_HASH
+ *      as the first pass's. One pass, not repeated from its own answer. --min-top1 adds a floor on top-1 agreement; --strict checks both at
  *      the 95 % bound from each run's .rows, the documents as strata (kv_autoquant_interval).
  *      --max-dkl and --max-dnll are limits of the same kind (Limits below states the rules).
  *   5. Global knobs (--knobs): the chosen recipe once more with each knob that compresses
  *      (--qsa-bkey-dtype i8, --state-cache-dtype f16), then with every one that stayed within
  *      the limits together; the setting of fewest bytes a token, then fewest state bytes a
- *      sequence, that is within every limit is written as the serve flags' comment line.
+ *      sequence, that is within every limit is written as the serve flags' comment line. The
+ *      block-key split (--qsa-bkey-split on, at --tp 2) is exact, so it is never run: it is added
+ *      to that setting with its block keys' bytes halved.
  *
  * Every run is a child `radiance` with the flags after `--`, plus the cache and KL flags this tool
  * sets; its recipe, report, .rows and log stay in the work directory, so a surprising number can
@@ -100,9 +117,15 @@ struct Knob {
     const char* name;    /* for --knobs and run names */
     const char* flag;
     const char* value;
+    /* Exact: the KL rows are the knob-free run's byte for byte, so it costs no run and is kept
+     * whenever searched. Only the block-key split is, whose ranks merge their local top-k lists
+     * to the unsplit selection (#21); it halves the block keys a card at --tp 2, the only --tp it
+     * is searched at. */
+    bool exact = false;
 };
-const Knob kKnobs[] = { { "bkey_i8", "--qsa-bkey-dtype", "i8" },        /* #12 */
-                        { "state_f16", "--state-cache-dtype", "f16" } };  /* #14 */
+const Knob kKnobs[] = { { "bkey_i8", "--qsa-bkey-dtype", "i8" },          /* #12 */
+                        { "state_f16", "--state-cache-dtype", "f16" },    /* #14 */
+                        { "bkey_split", "--qsa-bkey-split", "on", true } };  /* #21 */
 
 void usage() {
     std::printf(
@@ -133,15 +156,18 @@ void usage() {
         "  --noise-flags \"..\"  the engine flags the noise run adds to the base (default\n"
         "                      \"%s\")\n"
         "  --knobs K,K,...     the global knobs to try on the answer: bkey_i8 (--qsa-bkey-dtype\n"
-        "                      i8), state_f16 (--state-cache-dtype f16); default both\n"
+        "                      i8), state_f16 (--state-cache-dtype f16), bkey_split\n"
+        "                      (--qsa-bkey-split on: exact, never run, block keys halved;\n"
+        "                      --tp 2 only); default all three at --tp 2, the first two else\n"
         "  --no-knobs          try none\n"
         "  --vmean FILE        a V mean file (radiance --calib-dir): the variants that\n"
         "                      subtract it join the candidates\n"
-        "  --layouts L,L,...   only these layouts' variants (default every recipe layout\n"
-        "                      but the opt-in k5_v4, 5.0 bits, which only this or\n"
-        "                      --variants adds)\n"
+        "  --vpred FILE        a K-to-V map file (RADIANCE_CALIB_VPRED=1, kv_vpred.txt): the\n"
+        "                      variants that subtract the prediction (k4h_v4, k4h_v2h) join\n"
+        "  --layouts L,L,...   only these layouts' variants (default every recipe layout)\n"
         "  --variants V,V,...  only these variants, a variant's words joined by '+'\n"
-        "                      (k6_v4+rotated+vmean)\n"
+        "                      (k6_v4+rotated+vmean, k4h_v4+vpred)\n"
+
         "  --keep-dominated    per-layer runs for the variants screening would drop too\n"
         "  --reuse             take a run's KL from the work dir where its recipe and flags\n"
         "                      are the same as before, instead of running it again\n"
@@ -149,7 +175,10 @@ void usage() {
         "  --min-context N     refuse a reference with a document under N tokens (default\n"
         "                      %lld); 0 measures any\n"
         "  --radiance PATH     the engine (default: radiance beside this tool)\n"
-        "  -h, --help\n",
+        "  -h, --help\n"
+        "\n"
+        "  Under a measured limit a second pass narrows the best recipe within it one step a\n"
+        "  layer (docs/TOOLS.md, rad-autoquant).\n",
         kVerify, kNoiseFlags, (long long)kMinContext);
 }
 
@@ -239,6 +268,7 @@ struct Meas {
     double dnll = NAN;
     KvInterval kl_ci, top1_ci, dnll_ci;
     double tok_bytes = NAN, state_bytes = NAN;
+    double bkey_bytes = NAN;    /* of tok_bytes, the QSA block keys' (a group named *bkey*) */
 };
 
 /* The limits a measured recipe is checked against: the means, or under --strict the 95 % bound
@@ -269,7 +299,8 @@ struct Limits {
 };
 
 struct Run {
-    std::string radiance, ref, work, vmean, vmean_id;   /* vmean absolute, or empty */
+    /* vmean and vpred absolute, or empty; each _id its file's content hash, for --reuse */
+    std::string radiance, ref, work, vmean, vmean_id, vpred, vpred_id;
     std::vector<std::string> engine;
     std::vector<int> layers;
     std::vector<KvVariant> all;        /* every variant, for the words of a RAD_KVQ_* */
@@ -282,11 +313,15 @@ struct Run {
             if (v.kvq == kvq) return &v;
         return nullptr;
     }
-    /* The recipe a run is given: the mean file first where a layer subtracts it. */
+    static bool any(const std::vector<int32_t>& kvq, int32_t bit) {
+        return std::any_of(kvq.begin(), kvq.end(), [&](int32_t q) { return q & bit; });
+    }
+    /* The recipe a run is given: the mean file first where a layer subtracts it, then the map
+     * file where one predicts V from K (so a recipe without vpred is the text it always was). */
     std::string text(const std::vector<int32_t>& kvq) const {
         std::string s;
-        if (std::any_of(kvq.begin(), kvq.end(), [](int32_t q) { return q & RAD_KVQ_VMEAN; }))
-            s += "vmean " + vmean + "\n";
+        if (any(kvq, RAD_KVQ_VMEAN)) s += "vmean " + vmean + "\n";
+        if (any(kvq, RAD_KVQ_VPRED)) s += "vpred " + vpred + "\n";
         for (size_t i = 0; i < kvq.size(); ++i)
             s += "layer " + std::to_string(layers[i]) + " " + variant(kvq[i])->words + "\n";
         return s;
@@ -316,7 +351,8 @@ struct Run {
         a.push_back(out);
         std::string cmd;
         for (const std::string& s : a) cmd += s + "\n";
-        if (text.rfind("vmean ", 0) == 0) cmd += "# vmean " + vmean_id + "\n";
+        if (any(kvq, RAD_KVQ_VMEAN)) cmd += "# vmean " + vmean_id + "\n";
+        if (any(kvq, RAD_KVQ_VPRED)) cmd += "# vpred " + vpred_id + "\n";
         m->label = label;
         m->kvq = kvq;
         m->flags = flags;
@@ -434,7 +470,7 @@ struct Run {
         };
         bool ok = false;
         std::istringstream in(read_file(log, &ok));
-        std::map<std::string, double> tok, st;
+        std::map<std::string, double> tok, st, bkey;
         for (std::string l; std::getline(in, l);) {
             std::istringstream w(l);
             std::string name;
@@ -445,15 +481,18 @@ struct Run {
             size_t at = l.find(" layers  block ");
             if (at != std::string::npos &&
                 std::sscanf(l.c_str() + at, " layers block %lld tok page %lf %15s", &blk, &v, u) == 3 &&
-                blk > 0 && std::isfinite(unit(u)))
+                blk > 0 && std::isfinite(unit(u))) {
                 tok[name] = v * unit(u) / (double)blk;
+                if (name.find("bkey") != std::string::npos) bkey[name] = tok[name];
+            }
             at = l.find(" layers  state ");
             if (at != std::string::npos &&
                 std::sscanf(l.c_str() + at, " layers state %lf %15s", &v, u) == 2 && std::isfinite(unit(u)))
                 st[name] = v * unit(u);
         }
-        m->tok_bytes = m->state_bytes = NAN;
-        if (!tok.empty()) m->tok_bytes = 0;
+        m->tok_bytes = m->state_bytes = m->bkey_bytes = NAN;
+        if (!tok.empty()) m->tok_bytes = m->bkey_bytes = 0;
+        for (const auto& [n, b] : bkey) m->bkey_bytes += b;
         for (const auto& [n, b] : tok) m->tok_bytes += b;
         if (!st.empty()) m->state_bytes = 0;
         for (const auto& [n, b] : st) m->state_bytes += b;
@@ -506,7 +545,7 @@ struct Run {
 
 int main(int argc, char** argv) {
     std::string ref, out, work, radiance, layers_arg, layouts_arg, variants_arg, bits_arg,
-        max_kl_arg, min_top1_arg, vmean_arg, max_dkl_arg, max_dnll_arg, knobs_arg,
+        max_kl_arg, min_top1_arg, vmean_arg, vpred_arg, max_dkl_arg, max_dnll_arg, knobs_arg,
         noise_arg = kNoiseFlags;
     int64_t min_context = kMinContext, verify = kVerify;
     bool reuse = false, strict = false, keep_dominated = false, have_verify = false,
@@ -530,6 +569,7 @@ int main(int argc, char** argv) {
         if (a == "--layouts" && val(&layouts_arg)) continue;
         if (a == "--variants" && val(&variants_arg)) continue;
         if (a == "--vmean" && val(&vmean_arg)) continue;
+        if (a == "--vpred" && val(&vpred_arg)) continue;
         if (a == "--bits" && val(&bits_arg)) continue;
         if (a == "--max-kl" && val(&max_kl_arg)) continue;
         if (a == "--max-dkl" && val(&max_dkl_arg)) continue;
@@ -570,18 +610,30 @@ int main(int argc, char** argv) {
         return fail("--min-top1, --strict, --verify, --noise-flags and the knobs go with --max-kl, "
                     "--max-dkl or --max-dnll; --bits measures nothing it writes");
     if (!knobs_arg.empty() && no_knobs) return fail("--knobs and --no-knobs contradict each other");
-    /* The knobs searched, in kKnobs' order whatever --knobs lists. */
+    /* The engine's --tp, as it reads it (the last one given; 1 without): the split knob's. */
+    std::string tp = "1";
+    for (size_t i = 0; i < engine.size(); ++i) {
+        if (engine[i] == "--tp" && i + 1 < engine.size()) tp = engine[i + 1];
+        else if (engine[i].rfind("--tp=", 0) == 0) tp = engine[i].substr(5);
+    }
+    /* The knobs searched, in kKnobs' order whatever --knobs lists. The split only at --tp 2:
+     * named elsewhere it is refused, by default left out. */
     std::vector<const Knob*> knobs;
     if (by_kl && !no_knobs) {
         std::set<std::string> want;
         for (const std::string& s : split(knobs_arg, ',')) {
             if (std::none_of(std::begin(kKnobs), std::end(kKnobs),
                              [&](const Knob& k) { return s == k.name; }))
-                return fail("--knobs: '%s' is not a knob; they are bkey_i8, state_f16", s.c_str());
+                return fail("--knobs: '%s' is not a knob; they are bkey_i8, state_f16, bkey_split",
+                            s.c_str());
             want.insert(s);
         }
+        if (want.count("bkey_split") && tp != "2")
+            return fail("--knobs bkey_split splits the block keys across two ranks and counts "
+                        "them halved; the engine's flags give --tp %s, not 2", tp.c_str());
         for (const Knob& k : kKnobs)
-            if (knobs_arg.empty() || want.count(k.name)) knobs.push_back(&k);
+            if ((knobs_arg.empty() || want.count(k.name)) && (!k.exact || tp == "2"))
+                knobs.push_back(&k);
     }
     std::vector<std::string> noise;
     {
@@ -639,14 +691,30 @@ int main(int argc, char** argv) {
                         vmean.c_str());
         vmean_id = fnv_hex(vt);
     }
+    /* The K-to-V map file, likewise. */
+    std::string vpred, vpred_id;
+    if (!vpred_arg.empty()) {
+        char buf[PATH_MAX];
+        if (!::realpath(vpred_arg.c_str(), buf))
+            return fail("--vpred %s: %s", vpred_arg.c_str(), std::strerror(errno));
+        vpred = buf;
+        bool ok = false;
+        const std::string pt = read_file(vpred, &ok);
+        KvVPred vp;
+        if (!ok || kv_vpred_parse(pt, vpred.c_str(), &vp) != RAD_OK)
+            return fail("--vpred %s is not a K-to-V map file (radiance --calib-dir with "
+                        "RADIANCE_CALIB_VPRED=1 writes one)", vpred.c_str());
+        vpred_id = fnv_hex(pt);
+    }
 
     /* The candidates: the variants, widest first so that a tie keeps the wider one, restricted by
      * --layouts and --variants. */
     /* An opt-in layout (kv_layout_opt_in, k5_v4) is a candidate only where --layouts or --variants
      * names it: both filter `variants` below, so with either given every layout starts in it. */
-    const std::vector<KvVariant> every = kv_autoquant_variants(true, true);
+    const std::vector<KvVariant> every = kv_autoquant_variants(true, true, true);
     std::vector<KvVariant> variants =
-        kv_autoquant_variants(!vmean.empty(), !layouts_arg.empty() || !variants_arg.empty());
+        kv_autoquant_variants(!vmean.empty(), !layouts_arg.empty() || !variants_arg.empty(),
+                              !vpred.empty());
     if (!layouts_arg.empty()) {
         std::set<int> want;
         for (const std::string& s : split(layouts_arg, ',')) {
@@ -669,6 +737,9 @@ int main(int argc, char** argv) {
             }
             if ((hit->kvq & RAD_KVQ_VMEAN) && vmean.empty())
                 return fail("--variants: %s subtracts a V mean, and no --vmean FILE names one",
+                            s.c_str());
+            if ((hit->kvq & RAD_KVQ_VPRED) && vpred.empty())
+                return fail("--variants: %s predicts V from K, and no --vpred FILE names the maps",
                             s.c_str());
             want.insert(hit->kvq);
         }
@@ -754,15 +825,19 @@ int main(int argc, char** argv) {
 
     if (::mkdir(work.c_str(), 0755) != 0 && errno != EEXIST)
         return fail("cannot create %s: %s", work.c_str(), std::strerror(errno));
-    Run run{ radiance, ref, work, vmean, vmean_id, engine, layers, every, doc_rows, reuse };
+    Run run{ radiance, ref, work, vmean, vmean_id, vpred, vpred_id, engine, layers, every, doc_rows,
+             reuse };
     std::printf("rad-autoquant: %zu layers, %zu variants, over %zu documents (shortest %lld "
                 "tokens); work in %s\n", L, C, manifest["docs"].size(), (long long)shortest,
                 work.c_str());
     std::printf("rad-autoquant: runs: %zu uniform, then at most %zu per-layer, L (C - 1), fewer "
                 "for the variants screening drops", C, L * (C - 1));
+    const size_t run_knobs = (size_t)std::count_if(knobs.begin(), knobs.end(),
+                                                   [](const Knob* k) { return !k->exact; });
     if (by_kl)
-        std::printf(", 1 for the noise floor, up to %lld to verify and up to %zu for the knobs",
-                    (long long)verify, knobs.size() + (knobs.size() > 1));
+        std::printf(", 1 for the noise floor, up to %lld to verify, a second pass of up to %zu "
+                    "per-layer and %lld to verify, and up to %zu for the knobs", (long long)verify,
+                    L, (long long)verify, run_knobs + (run_knobs > 1));
     std::printf("\n");
     std::fflush(stdout);
 
@@ -885,12 +960,13 @@ int main(int argc, char** argv) {
             cand[i].push_back({ variants[k].kvq, variants[k].bits, d });
         }
 
-    /* The variants of an assignment. */
-    auto kvq_of = [&](const KvAssignment& a) {
+    /* The variants of an assignment, in a pass's table (cand, the first pass's). */
+    auto kvq_in = [&](const std::vector<std::vector<KvCandidate>>& t, const KvAssignment& a) {
         std::vector<int32_t> q;
-        for (size_t i = 0; i < L; ++i) q.push_back(cand[i][(size_t)a.pick[i]].kvq);
+        for (size_t i = 0; i < L; ++i) q.push_back(t[i][(size_t)a.pick[i]].kvq);
         return q;
     };
+    auto kvq_of = [&](const KvAssignment& a) { return kvq_in(cand, a); };
 
     /* What is written: a variant per layer, and the comment lines that say why. */
     std::vector<int32_t> chosen;
@@ -936,42 +1012,46 @@ int main(int argc, char** argv) {
                     w = &m;
             return w;
         };
-        /* 4. Solve, measure, tighten. Every check is measured from the base, so excess <=
-         * allowed is exactly the Limits rule for that limit. */
-        std::vector<KvRound> trail;
-        std::string capped;
-        if (search) {
+        /* 4. Solve, measure, tighten. Every check is measured from the pass's base (`from`: the
+         * first base, then the second pass's), so excess <= allowed is exactly the Limits rule
+         * for that limit. `pass` prefixes the log and labels ("" or "pass 2 "). */
+        auto fit = [&](const std::vector<std::vector<KvCandidate>>& t, const Meas& from,
+                       const std::string& pass, double room, std::vector<KvRound>* trail,
+                       std::string* capped) -> int {
             int round = 0;
             const KvMeasure measure = [&](const KvAssignment& a, std::vector<KvCheck>* ch) {
-                const std::vector<int32_t> kvq = kvq_of(a);
+                const std::vector<int32_t> kvq = kvq_in(t, a);
                 const Meas* m = find(kvq);
                 ++round;
                 if (!m) {
                     Meas n;
                     if (!run.measure("verify_" + fnv_hex(run.text(kvq)).substr(0, 12),
-                                     "verify " + std::to_string(round), kvq, &n))
+                                     pass + "verify " + std::to_string(round), kvq, &n))
                         return (int)RAD_E_IO;
-                    if (const char* w = unusable(n)) { fail("verify %d %s", round, w); return (int)RAD_E_IO; }
+                    if (const char* w = unusable(n)) {
+                        fail("%sverify %d %s", pass.c_str(), round, w);
+                        return (int)RAD_E_IO;
+                    }
                     runs.push_back(n);
                     m = &runs.back();
                 }
-                std::printf("rad-autoquant: solved %d: %.4f bits an element, predicted mean KL "
-                            "%.6f, measured %.6f (%s), %s\n", round, run.per_element(a.bits),
-                            base.kl + a.kl, m->kl, m->label.c_str(),
+                std::printf("rad-autoquant: %ssolved %d: %.4f bits an element, predicted mean KL "
+                            "%.6f, measured %.6f (%s), %s\n", pass.c_str(), round,
+                            run.per_element(a.bits), from.kl + a.kl, m->kl, m->label.c_str(),
                             lim.within(*m) ? "within the limit" : "above the limit");
                 std::fflush(stdout);
-                ch->push_back({ lim.kl(*m) - lim.kl(base), lim.kl_bound() - lim.kl(base) });
+                ch->push_back({ lim.kl(*m) - lim.kl(from), lim.kl_bound() - lim.kl(from) });
                 if (!std::isnan(lim.min_top1))
-                    ch->push_back({ lim.top1(base) - lim.top1(*m), lim.top1(base) - lim.min_top1 });
+                    ch->push_back({ lim.top1(from) - lim.top1(*m), lim.top1(from) - lim.min_top1 });
                 if (!std::isnan(lim.max_dnll))
-                    ch->push_back({ lim.dnll(*m) - lim.dnll(base), lim.max_dnll - lim.dnll(base) });
+                    ch->push_back({ lim.dnll(*m) - lim.dnll(from), lim.max_dnll - lim.dnll(from) });
                 return (int)RAD_OK;
             };
             /* Without a KL bound (only --max-dnll or --min-top1) the room is every layer's dearest
              * cost summed: everything fits, finite as the solver needs, and the other checks
              * tighten it. */
             double most = 0;
-            for (const std::vector<KvCandidate>& c : cand) {
+            for (const std::vector<KvCandidate>& c : t) {
                 double x = 0;
                 for (const KvCandidate& k : c) x = std::max(x, k.kl);
                 most += x;
@@ -979,15 +1059,120 @@ int main(int argc, char** argv) {
             /* A solution of no fewer bits than a recipe already measured within cannot be the
              * answer, so it is not measured. */
             const Meas* had = best();
-            const int rc = kv_autoquant_fit(cand, std::min(kl_room, most), (int)verify, measure,
-                                            &trail, had ? had->bits : INT64_MAX);
+            const int rc = kv_autoquant_fit(t, std::min(room, most), (int)verify, measure, trail,
+                                            had ? had->bits : INT64_MAX);
             if (rc == RAD_E_IO) return 1;
             if (rc != RAD_OK) return fail("the solver refused the per-layer costs; this is a bug");
-            if (had && (trail.empty() || (!trail.back().within && (int64_t)trail.size() < verify &&
-                                          trail.back().pick.kl > 0))) {
-                capped = "the next solution has no fewer bits than " + had->label +
-                         ", measured within the limits, and is not measured";
-                std::printf("rad-autoquant: %s\n", capped.c_str());
+            if (had && (trail->empty() || (!trail->back().within && (int64_t)trail->size() < verify &&
+                                           trail->back().pick.kl > 0))) {
+                *capped = (pass.empty() ? std::string() : pass.substr(0, pass.size() - 1) + ": ") +
+                          "the next solution has no fewer bits than " + had->label +
+                          ", measured within the limits, and is not measured";
+                std::printf("rad-autoquant: %s\n", capped->c_str());
+            }
+            return 0;
+        };
+        std::vector<KvRound> trail;
+        std::string capped;
+        if (search && fit(cand, base, "", kl_room, &trail, &capped)) return 1;
+
+        /* 4b. The second pass, from B2: the best measured within the limits after the first. The
+         * variant order is the kept variants on the lower hull of their uniform runs' mean KL
+         * over bits (kv_autoquant_hull); a layer's step is the first variant in it with fewer
+         * bits than the layer has in B2, so a layer in a variant off the hull steps onto it too.
+         * Skipped where B2 is the first base (step 3 measured every step from it) or no layer of
+         * B2 has a narrower variant in the order. */
+        std::ostringstream pass2;   /* its recipe comments */
+        std::vector<std::vector<KvCandidate>> cand2;
+        std::vector<KvRound> trail2;
+        std::string capped2;
+        const Meas* b2 = search ? best() : nullptr;
+        if (b2) {
+            std::vector<KvCandidate> pts;
+            for (size_t k : kept) pts.push_back({ variants[k].kvq, variants[k].bits, uni[k]->kl });
+            std::vector<int32_t> order;
+            std::string on, off;
+            for (size_t h : kv_autoquant_hull(pts)) {
+                order.push_back(pts[h].kvq);
+                std::snprintf(line, sizeof line, "%s%s (%.2f bits, %.6f)", on.empty() ? "" : " > ",
+                              run.variant(pts[h].kvq)->words.c_str(), (double)pts[h].bits / kGroupElems,
+                              pts[h].kl);
+                on += line;
+            }
+            for (const KvCandidate& c : pts)
+                if (std::find(order.begin(), order.end(), c.kvq) == order.end()) {
+                    std::snprintf(line, sizeof line, "%s%s (%.2f bits, %.6f)", off.empty() ? "" : ", ",
+                                  run.variant(c.kvq)->words.c_str(), (double)c.bits / kGroupElems, c.kl);
+                    off += line;
+                }
+            const std::string order_text = "the variant order (the kept variants by bits, on the "
+                                           "lower hull of their uniform runs' mean KL): " + on +
+                                           (off.empty() ? "" : "; off it: " + off);
+            std::printf("rad-autoquant: pass 2: %s\n", order_text.c_str());
+            pass2 << "# pass 1 answer: " << run.describe(*b2) << " (" << b2->label << ")\n";
+            pass2 << "# pass 2: " << order_text << "\n";
+            /* Each layer's step, or none where B2's variant is the order's narrowest or narrower. */
+            std::vector<int32_t> step(L, -1);
+            size_t steps = 0;
+            for (size_t i = 0; i < L; ++i) {
+                const int bits = run.variant(b2->kvq[i])->bits;
+                for (int32_t q : order)
+                    if (run.variant(q)->bits < bits) { step[i] = q; ++steps; break; }
+            }
+            std::string skip;
+            if (b2->kvq == std::vector<int32_t>(L, variants[b0].kvq))
+                skip = "the best within the limits is the base, every step from which the first "
+                       "pass measured";
+            else if (!steps)
+                skip = "no layer of " + b2->label + " has a narrower variant in the order";
+            if (!skip.empty()) {
+                std::printf("rad-autoquant: pass 2 skipped: %s\n", skip.c_str());
+                pass2 << "# pass 2 skipped: " << skip << "\n";
+            } else {
+                std::printf("rad-autoquant: pass 2 from %s (%s): each layer alone one step "
+                            "narrower, the rest as it: %zu per-layer runs\n", b2->label.c_str(),
+                            run.describe(*b2).c_str(), steps);
+                std::fflush(stdout);
+                /* Per layer: as B2 (free), then its step, its cost the run's KL above B2's. A
+                 * recipe measured before (in either pass) is not run again. */
+                cand2.resize(L);
+                for (size_t i = 0; i < L; ++i) {
+                    const int32_t q = b2->kvq[i];
+                    cand2[i].push_back({ q, (int64_t)run.variant(q)->bits, 0.0 });
+                    if (step[i] < 0) continue;
+                    std::vector<int32_t> kvq = b2->kvq;
+                    kvq[i] = step[i];
+                    const KvVariant& v = *run.variant(step[i]);
+                    double kl = 0;
+                    if (const Meas* m = find(kvq)) {
+                        kl = m->kl;
+                    } else {
+                        Meas n;
+                        if (!run.measure("step_layer" + std::to_string(layers[i]) + "_" + tag(v) + "_" +
+                                             fnv_hex(run.text(kvq)).substr(0, 12),
+                                         "pass 2, layer " + std::to_string(layers[i]) + " " + v.words,
+                                         kvq, &n))
+                            return 1;
+                        kl = n.kl;
+                        if (!unusable(n)) runs.push_back(n);
+                    }
+                    cand2[i].push_back({ step[i], (int64_t)v.bits, std::max(0.0, kl - b2->kl) });
+                }
+                pass2 << "# pass 2 from " << b2->label
+                      << ": each layer alone one step narrower, the rest as it: mean KL above it\n";
+                for (size_t i = 0; i < L; ++i) {
+                    if (cand2[i].size() < 2) {
+                        std::snprintf(line, sizeof line, "#   %5d  %s: no narrower variant\n",
+                                      layers[i], run.variant(cand2[i][0].kvq)->words.c_str());
+                    } else {
+                        std::snprintf(line, sizeof line, "#   %5d  %s -> %s  %.3e\n", layers[i],
+                                      run.variant(cand2[i][0].kvq)->words.c_str(),
+                                      run.variant(cand2[i][1].kvq)->words.c_str(), cand2[i][1].kl);
+                    }
+                    pass2 << line;
+                }
+                if (fit(cand2, *b2, "pass 2 ", lim.kl_bound() - lim.kl(*b2), &trail2, &capped2))
+                    return 1;
             }
         }
         const Meas* w = best();
@@ -1030,6 +1215,17 @@ int main(int argc, char** argv) {
             why << line;
         }
         if (!capped.empty()) why << "# " << capped << "\n";
+        why << pass2.str();
+        for (size_t k = 0; k < trail2.size(); ++k) {
+            const Meas& m = *find(kvq_in(cand2, trail2[k].pick));
+            std::snprintf(line, sizeof line,
+                          "# pass 2 solved %zu: room %.6f above %s, predicted mean KL %.6f, "
+                          "measured %s (%s)%s\n", k + 1, trail2[k].allowed, b2->label.c_str(),
+                          b2->kl + trail2[k].pick.kl, run.describe(m).c_str(), m.label.c_str(),
+                          trail2[k].within ? "" : ", above the limit");
+            why << line;
+        }
+        if (!capped2.empty()) why << "# " << capped2 << "\n";
         std::snprintf(line, sizeof line, "# chosen: %s (%s), the fewest bits measured within %s",
                       run.describe(*w).c_str(), w->label.c_str(), limits_short.c_str());
         why << line << (lim.strict ? " at the 95% bounds\n" : "\n");
@@ -1071,21 +1267,41 @@ int main(int argc, char** argv) {
         std::vector<const Meas*> pass = { w };
         std::vector<const Knob*> alone_in;
         for (const Knob* k : knobs)
-            if (const Meas* m = try_knobs({ k })) {
+            if (const Meas* m = k->exact ? nullptr : try_knobs({ k })) {
                 pass.push_back(m);
                 alone_in.push_back(k);
             }
         if (alone_in.size() > 1)
             if (const Meas* m = try_knobs(alone_in)) pass.push_back(m);
-        const Meas* fin = w;
+        const Meas* best_run = w;
         for (const Meas* m : pass)
-            if (m->tok_bytes < fin->tok_bytes ||
-                (m->tok_bytes == fin->tok_bytes && m->state_bytes < fin->state_bytes))
-                fin = m;
+            if (m->tok_bytes < best_run->tok_bytes ||
+                (m->tok_bytes == best_run->tok_bytes && m->state_bytes < best_run->state_bytes))
+                best_run = m;
+        /* The exact knobs on top, unrun: the same KL rows, the block keys a card halved (--tp 2,
+         * the only --tp they are searched at), so always kept. */
+        Meas fin_m = *best_run;
+        const Meas* fin = &fin_m;
+        for (const Knob* k : knobs)
+            if (k->exact) {
+                fin_m.flags.push_back(k->flag);
+                fin_m.flags.push_back(k->value);
+                std::string bytes = "block keys a token not in its log";
+                if (!std::isnan(fin_m.bkey_bytes)) {
+                    std::snprintf(line, sizeof line, "block keys %.2f KiB a token, %.2f KiB split",
+                                  fin_m.bkey_bytes / 1024, fin_m.bkey_bytes / 2048);
+                    bytes = line;
+                    fin_m.tok_bytes -= fin_m.bkey_bytes / 2;
+                    fin_m.bkey_bytes /= 2;
+                }
+                why << "# with " << k->flag << " " << k->value << ": not run, exact (the ranks' "
+                    << "merged selection is the unsplit one byte for byte, the KL rows the same): "
+                    << bytes << "\n";
+            }
         for (size_t i = 0; i + 1 < fin->flags.size(); i += 2)
             serve_flags += " " + fin->flags[i] + " " + fin->flags[i + 1];
         if (!knobs.empty()) {
-            if (fin == w)
+            if (fin->flags.empty())
                 why << "# knobs: none kept, the fewest bytes a token within every limit\n";
             else
                 why << "# knobs:" << serve_flags << ", the fewest bytes a token within every limit: "

@@ -916,7 +916,7 @@ whose moments are singular leaves no file.
 ```
 radiance --model M.rad <serve flags> --kv-cache-dtype bf16 --kld-record REF --kld-corpus LONG.jsonl
 rad-autoquant --kld-ref REF --layers 3,7,...,47 --max-kl 0.035 [--vmean M.kvmean] -o M.kvrecipe -- --model M.rad <serve flags>
-rad-autoquant --kld-ref REF --layers 3,7,...,47 --max-dkl 0.01 [--max-dnll 0.005] [--vmean M.kvmean] -o M.kvrecipe -- --model M.rad <serve flags>
+rad-autoquant --kld-ref REF --layers 3,7,...,47 --max-dkl 0.01 [--max-dnll 0.005] [--vmean M.kvmean] [--vpred kv_vpred.txt] -o M.kvrecipe -- --model M.rad <serve flags>
 rad-autoquant --kld-ref REF --layers 3,7,...,63 --bits 6 -o M.kvrecipe -- --model M.rad <serve flags>
 
   --kld-ref DIR       the reference: this model with a bf16 cache, over long documents
@@ -936,13 +936,17 @@ rad-autoquant --kld-ref REF --layers 3,7,...,63 --bits 6 -o M.kvrecipe -- --mode
   --noise-flags "F"   the engine flags the noise run adds to the base (default
                       "--max-num-batched-tokens 64")
   --knobs K,K         the global knobs tried on the answer: bkey_i8 (--qsa-bkey-dtype i8),
-                      state_f16 (--state-cache-dtype f16); default both
+                      state_f16 (--state-cache-dtype f16), bkey_split (--qsa-bkey-split on:
+                      exact, never run; --tp 2 only); default all three at --tp 2, else the
+                      first two
   --no-knobs          try none
   --vmean FILE        a V mean file (radiance --calib-dir, kv_vmean.txt): the variants that
                       subtract it join the candidates
+  --vpred FILE        a K-to-V map file (radiance --calib-dir with RADIANCE_CALIB_VPRED=1,
+                      kv_vpred.txt): the variants that subtract V's prediction join
   --layouts L,L,...   only these layouts' variants (default every layout a recipe names)
   --variants V,V,...  only these variants, a variant's words joined by '+' (k6_v4+vmean,
-                      fp8_v4+rotated+vmean)
+                      fp8_v4+rotated+vmean, k4h_v4+vpred)
   --keep-dominated    per-layer runs for the variants screening would drop as well
   --reuse             take a run's KL from the work dir when its recipe and command line match
   --work DIR          each run's recipe, KL report, .rows and log (default FILE.work)
@@ -962,17 +966,18 @@ their scales: `bf16` 16 an element, `i8h` 8.06, `fp8` 8, `fp8_v4` 6.25, `k6_v4` 
 3.5; rotation and the V mean cost none.
 
 **Candidates.** Every layout of the recipe table (`kKvLayouts`, core/config.cpp) as the recipe
-parser reads it plain, `rotated` and, with `--vmean`, `vmean` and `rotated vmean`
-(`kv_autoquant_variants`, core/kv_autoquant.h). A combination the parser refuses (`fp8 vmean`: E4M3
-V has no group scale) is no variant, and one it reads as another (`k4h_v4 rotated` is `k4h_v4`) is
-listed once, so a layout or recipe word added to the table and the parser is a candidate with no
-change to the tool. Today that is 10 variants, 17 with `--vmean`: `bf16` (plain only), `i8h`, `fp8`, `fp8 rotated`,
-`fp8_v4` and `k6_v4` plain and rotated, `k4h_v4`, `k4h_v2h`, and with `--vmean` the `vmean` form of
-every one but the two `fp8`s. `k5_v4` is in the table but opt-in (`kv_layout_opt_in`): it is no
-default candidate, and its four variants (plain, `rotated`, each with `vmean`) join only where
-`--layouts` or `--variants` names it, so a calibration that names no layout runs what it ran
-before. `--layouts` keeps only some layouts' variants, `--variants` only the
-named variants; given both, what both allow. `bf16`, `k4h_v4`, `k4h_v2h`, `i8h` and the V mean are
+parser reads it plain, `rotated` and, with `--vmean`, `vmean`, with `--vpred`, `vpred`, and each
+of those `rotated` (`kv_autoquant_variants`, core/kv_autoquant.h). A combination the parser
+refuses (`fp8 vmean`: E4M3 V has no group scale; `k6_v4 vpred`: the prediction is from k4h's int4
+K) is no variant, and one it reads as another (`k4h_v4 rotated` is `k4h_v4`) is listed once, so a
+layout or recipe word added to the table and the parser is a candidate with no change to the tool.
+Today that is 12 variants: `bf16` (plain only), `i8h`, `fp8`, `fp8 rotated`, `fp8_v4`, `k6_v4` and
+`k5_v4` plain and rotated, `k4h_v4`, `k4h_v2h`; with `--vmean` 21, the `vmean` form of every one
+but `bf16` and the two `fp8`s; with `--vpred` 2 more, `k4h_v4 vpred` and `k4h_v2h vpred` (23 with
+both: a layer takes `vmean` or `vpred`, never both, but the recipe may name both files). `k5_v4`
+is a default candidate since RadianceMemory #22; a row marked opt-in (`kv_layout_opt_in`, none
+today) would join only where `--layouts` or `--variants` names it. `--layouts` keeps only some
+layouts' variants, `--variants` only the named variants; given both, what both allow. `bf16`, `k4h_v4`, `k4h_v2h`, `i8h` and the V mean are
 served only by `qwen4exp_fp8`, so on another model the first run of one stops the calibration,
 refused at startup: pass `--layouts fp8,fp8_v4,k6_v4` there.
 
@@ -1015,6 +1020,28 @@ refused at startup: pass `--layouts fp8,fp8_v4,k6_v4` there.
    `--bits`: the assignment of least summed cost within the budget (`kv_autoquant_solve`), written
    with its predicted KL, unmeasured. `--bits 3.5` narrows every layer to `k4h_v2h`; at a budget
    with bits to spare a tie keeps the wider variant.
+4b. *The second pass* (every measured limit; not `--bits`). Step 3 measures each layer from the
+   first base, and the costs are far from additive: on Flash-Next one quantised early layer costs
+   about what every layer does (`i8h` on layer 3 alone +0.0236, every layer `i8h` 0.0236). So the
+   first pass finds answers only at the extremes, and misses narrowing that starts from a uniform
+   recipe already within the limit: `i8h` on layers 3-23 with `k6_v4 rotated vmean` on 27-47
+   measures 0.0260 at 6.78 bits, under `fp8`'s 0.0262, where `--max-kl 0.0262` answered every
+   layer `i8h` at 8.06. The second pass takes the best recipe measured within the limits after the
+   first (the fewest bits, uniform, single-layer or solved) as a new base, B2, and measures each
+   layer alone one step narrower, the rest as in B2: at most L runs. The step is the next entry
+   with fewer bits in the *variant order*: the kept variants by bits, ties by their uniform runs'
+   mean KL (the lower stays), keeping only those on the lower convex hull of uniform KL over bits
+   (`kv_autoquant_hull`). A variant above the line between its neighbours spends KL for almost no
+   bits: on Flash-Next `fp8` (8.00 bits, 0.0262) beside `i8h` (8.06, 0.0236) saves 0.06 bits a
+   step, so a layer in `i8h` steps to `k6_v4 rotated vmean` (5.50, 0.0309). `i8h` itself lies
+   0.0002 above the line from `bf16` to `k6_v4 rotated vmean`, so on the card's runs the order is
+   `bf16` > `k6_v4 rotated vmean` > `k4h_v4` (`vmean` or `vpred`) > `k4h_v2h`, with `k5_v4`
+   between where it measures under the line. Each layer then has two candidates, as in B2 (no
+   cost) and its step (its run's mean KL above B2's), and the same fit loop solves, measures and
+   tightens from B2 under the same limits, at most `--verify` rounds, never measuring a solution
+   of no fewer bits than the best already within. Skipped, and said so in the log and the recipe,
+   where B2 is the first base (step 3 measured every step from it) or no layer of B2 has a
+   narrower variant in the order. One pass: it is not repeated from its own answer.
 5. *Global knobs*, one setting for the whole model rather than per layer: `--qsa-bkey-dtype i8`
    (`bkey_i8`, the QSA block keys in int8, RadianceMemory #12) and `--state-cache-dtype f16`
    (`state_f16`, the delta-net state, #14). The chosen recipe is measured once more with each knob
@@ -1025,19 +1052,29 @@ refused at startup: pass `--layouts fp8,fp8_v4,k6_v4` there.
    run that fails (a plugin that does not serve the knob refuses it at startup) is not kept and
    stops nothing. `--knobs` restricts the search, `--no-knobs` skips it; a knob searched is
    refused in the engine's flags, one left out may be fixed there and is run that way throughout.
+   `--qsa-bkey-split on` (`bkey_split`, #21) is exact: the ranks merge their local top-k lists to
+   the unsplit selection byte for byte, so the KL rows are the same and no run measures it. At
+   `--tp 2` it is searched by default and always kept: added to the setting the measured knobs
+   leave, its block keys counted halved in the bytes a token (the `*bkey*` group of the run's
+   KV report), and written into the serve line. Named in `--knobs` at another `--tp` it is
+   refused; by default it is left out there.
 
 So a search costs **C + L (K - 1) runs, plus, under a measured limit, 1 for the noise floor, at
-most `--verify` solved and at most 3 knob runs** (2 alone, 1 together): C variants, K of them kept
-by screening (K = C with `--keep-dominated`), L layers. The counts are printed as it goes: the
+most `--verify` solved, at most L + `--verify` for the second pass and at most 3 knob runs** (2
+alone, 1 together; the split runs nothing): C variants, K of them kept by screening (K = C with
+`--keep-dominated`), L layers. The counts are printed as it goes: the
 bound L (C - 1) before anything runs, the exact per-layer count after screening.
 
 **The answer** under `--max-kl` is the fewest bits of every recipe measured within the limits
 (uniform, single-layer or solved), the lowest KL of equal ones, so it is never worse than the best
 uniform variant. The recipe carries, as comments, every uniform run, the variants screening
-dropped, the per-layer costs, each solved round with its room, prediction and measurement, and the
+dropped, the per-layer costs, each solved round with its room, prediction and measurement, the
+first pass's answer, the variant order (and the variants off it), the second pass's step costs
+(`layer: B2's variant -> its step, KL above B2`) and solved rounds (or why it was skipped), and the
 chosen run, its bytes a token and state bytes a sequence, each knob run, the knob setting kept,
 and a `# serve with:` line naming the flags the recipe needs (`--kv-cache-dtype fp8 --kv-recipe
-FILE`, and `--qsa-bkey-dtype i8` or `--state-cache-dtype f16` where a knob is kept). Every run is
+FILE`, and `--qsa-bkey-dtype i8`, `--state-cache-dtype f16` or `--qsa-bkey-split on` where a
+knob is kept). The log states the same as it goes, each second-pass line prefixed `pass 2`. Every run is
 stated with its bits, mean KL, top-1, KL above the floor and NLL change (`dNLL`, candidate minus
 reference nats a token: the log of the report's perplexity ratio), each with its interval where
 the run left `.rows`. Where nothing measured is within the limits (the base itself is over), the
@@ -1096,12 +1133,13 @@ stratified one over each position's candidate minus reference NLL; without it th
 checked and the intervals only reported. Leave the margin, or record a larger corpus.
 
 **Re-solving.** With `--reuse`, a run whose recipe, command line (`NAME.args`, written once the
-run has succeeded, with the V mean file's content hash where the recipe reads it) and report in
-the work directory are this run's is read back instead of run again. Runs are named
-`uniform_VARIANT`, `layerN_VARIANT` (the variant's words joined by `+`), `verify_HASH` (of the
-solved recipe's text), `noise_BASE_HASH` and `knob_KNOBS_HASH` (the knobs joined by `+`, the
-recipe's text), so a second search at another limit reruns only the solved recipes and knob runs
-it has not measured; a run without extra flags has the command line it had before the noise run
+run has succeeded, with the V mean and K-to-V map files' content hashes where the recipe reads
+them) and report in the work directory are this run's is read back instead of run again. Runs are
+named `uniform_VARIANT`, `layerN_VARIANT` (the variant's words joined by `+`), `verify_HASH` (of the
+solved recipe's text, either pass), `step_layerN_VARIANT_HASH` (the second pass's, the recipe's
+text: from another B2 another run), `noise_BASE_HASH` and `knob_KNOBS_HASH` (the knobs joined by
+`+`, the recipe's text), so a second search at another limit reruns only the solved recipes, the
+steps from a B2 not measured before and the knob runs it has not measured; a run without extra flags has the command line it had before the noise run
 and the knobs existed, so earlier work directories are read back; a change to the engine's flags, the reference, the engine's
 path or the V means runs everything again. The engine binary's content is not compared: after
 rebuilding it, drop `--reuse` or the work directory.
@@ -1113,11 +1151,12 @@ default), naming it. A smaller bound is the explicit override; record the refere
 `--max-model-len` covering the longest document, and score only the tail (`score_from`) to keep
 the reference small without shortening the context the scored positions see.
 
-On Flash-Next (12 attention layers, `--vmean`): 17 uniform runs and the noise run; if screening
-keeps `bf16`, `i8h`, `fp8` and one variant of each narrower layout (K = 6 or 7), 60 to 72 per-layer
-runs; up to 6 solved recipes and up to 3 knob runs: 84 to 99 runs. A second limit in the same work
-directory adds only its solved and knob runs. With `--keep-dominated`, 17 + 1 + 12 x 16 = 210 plus
-the solved and knob runs.
+On Flash-Next (12 attention layers, `--vmean` and `--vpred`): 23 uniform runs and the noise run;
+if screening keeps `bf16`, `i8h`, `fp8` and one variant of each narrower layout (K = 7 or 8), 72 to
+84 per-layer runs; up to 6 solved recipes, up to 12 + 6 for the second pass and up to 3 knob runs:
+about 100 to 130 runs. A second limit in the same work directory adds only its solved runs, its
+second pass (unless its B2 was measured before) and its knob runs. With `--keep-dominated`,
+23 + 1 + 12 x 22 = 288 plus the solved, second-pass and knob runs.
 
 **Not yet in the search.**
 

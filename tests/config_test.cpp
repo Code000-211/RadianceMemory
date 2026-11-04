@@ -1044,8 +1044,8 @@ TEST(a_k4h_v2h_recipe_line_is_rotated_and_priced_at_fourteen_thirty_seconds_of_f
  * layouts': a plain line loads unrotated and `rotated` rotates it; it takes `vmean` (its V is
  * integer); it is priced at 320 bits a 32 + 32 group (5.0 bits an element, 20/32 of fp8), its row
  * 320 bytes at head_dim 256; it is a recipe word only, never a --kv-cache-dtype; it is no resident
- * layout of a tiered layer and no demote layout; and rad-autoquant calibrates it only where asked
- * (kv_layout_opt_in), so a default calibration run is the one it was. */
+ * layout of a tiered layer and no demote layout; and since RadianceMemory #22 rad-autoquant
+ * calibrates it by default (opt-in under #19, kv_layout_opt_in), so no layout is opt-in today. */
 TEST(a_k5_v4_recipe_line_is_rotated_only_when_it_says_so_and_priced_at_five_bits) {
     std::vector<int32_t> r;
     std::string file;
@@ -1062,8 +1062,8 @@ TEST(a_k5_v4_recipe_line_is_rotated_only_when_it_says_so_and_priced_at_five_bits
     CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_K5V4, 256), 320ll);
     CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K5V4, 320), 256ll);
     CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K5V4, 322), -1ll);
-    /* Only k5_v4 is opt-in: every layout before it stays a default candidate. */
-    for (int q : kv_layouts()) CHECK_EQ(kv_layout_opt_in(q), q == RAD_KVQ_K5V4);
+    /* No layout is opt-in: k5_v4 is a default candidate like every other (#22). */
+    for (int q : kv_layouts()) CHECK(!kv_layout_opt_in(q));
     CHECK(!kv_layout_opt_in(99));
 
     std::string err = stderr_of([&] { CHECK(parse_fresh({ "--kv-cache-dtype", "k5_v4" }) < 0); });

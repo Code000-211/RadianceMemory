@@ -1313,8 +1313,9 @@ const char* kv_layout_name(int kvq);
  * Rotation (RAD_KVQ_ROTATED) does not change the bits. */
 std::vector<int> kv_layouts();
 int              kv_layout_group_bits(int kvq);
-/* Whether rad-autoquant calibrates layout `kvq` only where --layouts or --variants names it (k5_v4,
- * a newer layout kept out of default runs); false for every other layout and for anything else. */
+/* Whether rad-autoquant calibrates layout `kvq` only where --layouts or --variants names it (a row
+ * of the layout table marked opt-in; none today, k5_v4 was until RadianceMemory #22); false for
+ * every other layout and for anything else. */
 bool             kv_layout_opt_in(int kvq);
 /* A (token, head) row's bytes in layout `kvq` at head_dim `hd` (abi/rad_builder.h's rows: fp8
  * 2 * hd, i8h 2 * hd + 4, the group layouts their bits a group times hd / 256), and the head_dim

@@ -31,6 +31,13 @@ using namespace rad;
 
 namespace {
 
+/* A K-to-V map file (kv_vpred_parse) for layers 3 and 7 at head_dim 2, one KV head: what a
+ * `vpred FILE` line and rad-autoquant's --vpred read. */
+const std::string kVpredFile = "kv_vpred 1 head_dim 2 kv_heads 1 rows 9\n"
+                               "layer 3 head 0 bias 1 2\nlayer 3 head 0 row 0 1 2\n"
+                               "layer 3 head 0 row 1 3 4\nlayer 7 head 0 bias 0 0\n"
+                               "layer 7 head 0 row 0 0.5 0\nlayer 7 head 0 row 1 0 0.5\n";
+
 /* The recipe layouts at their prices (bits a group of 32 K and 32 V elements). */
 KvCandidate fp8(double kl = 0)   { return { RAD_KVQ_NONE, 512, kl }; }
 KvCandidate v4(double kl)        { return { RAD_KVQ_V4,   400, kl }; }
@@ -534,42 +541,97 @@ TEST(the_interval_from_the_rows_is_batch_means_with_the_documents_as_strata) {
     CHECK_EQ(a.df, (int64_t)1);
 }
 
+/* The second pass's variant order on the card's own uniform runs (Flash-Next --tp 2, prep/aq/m8
+ * aq2-work, the kept variants): bf16 4.9e-8, i8h 0.023552, fp8 0.026249, k6_v4 rotated vmean
+ * 0.030866, k4h_v4 vmean 0.039379, k4h_v2h vmean 0.083314. fp8 lies 0.0025 above the line from
+ * i8h to k6_v4 rotated vmean: a step onto it saves 4 bits a group for 0.0027, where mixing its
+ * neighbours reaches its bits for less. i8h lies just above the line from bf16 to k6_v4 rotated
+ * vmean too (0.023552 against 0.023333 at 516 bits), so the order is bf16 > k6_v4 rotated vmean >
+ * k4h_v4 vmean > k4h_v2h vmean, and a layer in i8h or fp8 (B2 every layer i8h, the card's
+ * --max-kl 0.0262 answer) steps to k6_v4 rotated vmean, the next entry with fewer bits. With
+ * i8h a little lower it is on the order (bf16 > i8h > k6_v4 rotated vmean). Of equal bits the
+ * lower KL stands; a wider variant past the least KL is no step down; points on a line stay;
+ * one candidate is its own order; none, none. */
+TEST(the_variant_order_is_the_lower_hull_of_uniform_kl_over_bits_widest_first) {
+    const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
+    std::vector<KvCandidate> card = {
+        { RAD_KVQ_BF16, 1024, 4.9e-8 }, { RAD_KVQ_I8H | R, 516, 0.023552 }, { RAD_KVQ_NONE, 512, 0.026249 },
+        { RAD_KVQ_K6V4 | R | M, 352, 0.030866 }, { RAD_KVQ_K4H | R | M, 288, 0.039379 },
+        { RAD_KVQ_K4HV2H | R | M, 224, 0.083314 } };
+    CHECK(kv_autoquant_hull(card) == std::vector<size_t>({ 0, 3, 4, 5 }));
+    /* Listed in any order, the same order back. */
+    std::vector<KvCandidate> shuffled = { card[4], card[2], card[0], card[5], card[1], card[3] };
+    std::vector<int32_t> got;
+    for (size_t i : kv_autoquant_hull(shuffled)) got.push_back(shuffled[i].kvq);
+    CHECK(got == std::vector<int32_t>({ card[0].kvq, card[3].kvq, card[4].kvq, card[5].kvq }));
+    /* i8h at 0.0230, under that line: on the order; fp8 still off it. */
+    card[1].kl = 0.0230;
+    CHECK(kv_autoquant_hull(card) == std::vector<size_t>({ 0, 1, 3, 4, 5 }));
+    /* Equal bits: the lower KL (k6_v4 rotated vmean over k6_v4), an exact tie the earlier. */
+    CHECK(kv_autoquant_hull({ { 1, 512, 0.02 }, { 2, 352, 0.04 }, { 3, 352, 0.03 }, { 4, 352, 0.03 } }) ==
+          std::vector<size_t>({ 0, 2 }));
+    /* A wider variant that measures worse than a narrower one is no step down. */
+    CHECK(kv_autoquant_hull({ { 1, 1024, 0.05 }, { 2, 512, 0.02 }, { 3, 352, 0.04 } }) ==
+          std::vector<size_t>({ 1, 2 }));
+    /* Collinear: 0.01 per 100 bits all the way, every point kept. */
+    CHECK(kv_autoquant_hull({ { 1, 500, 0.0 }, { 2, 400, 0.01 }, { 3, 300, 0.02 } }) ==
+          std::vector<size_t>({ 0, 1, 2 }));
+    CHECK(kv_autoquant_hull({ { 1, 512, 0.02 } }) == std::vector<size_t>({ 0 }));
+    CHECK(kv_autoquant_hull({}).empty());
+}
+
 /* ================================================================== the variants */
 
 /* The candidates come from the layout table and the recipe parser: each layout plain, `vmean`,
- * `rotated` and both, where the parser takes the words and they make another cache. bf16 takes
- * neither word, so it is one variant; fp8 has no integer V to centre; i8h, k4h_v4 and k4h_v2h are
- * rotated by their names. Each is a recipe line
- * config_parse loads, with its means, as the flags the variant names. */
+ * `vpred`, `rotated` and with either, where the parser takes the words and they make another
+ * cache. bf16 takes no word, so it is one variant; fp8 has no integer V to centre; i8h, k4h_v4
+ * and k4h_v2h are rotated by their names; vpred predicts V from k4h's int4 K only. k5_v4, a
+ * default candidate since #22, sits after k6_v4 with the same words. Each is a recipe line
+ * config_parse loads, with its means or maps, as the flags the variant names. */
 TEST(every_variant_is_a_recipe_line_the_server_loads_as_that_variant) {
-    const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
-    std::vector<int32_t> plain, centred;
+    const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN, P = RAD_KVQ_VPRED;
+    std::vector<int32_t> plain, centred, predicted;
     for (const KvVariant& v : kv_autoquant_variants(false)) plain.push_back(v.kvq);
     CHECK(plain == std::vector<int32_t>({ RAD_KVQ_BF16, RAD_KVQ_I8H | R, RAD_KVQ_NONE, RAD_KVQ_NONE | R,
                                           RAD_KVQ_V4, RAD_KVQ_V4 | R, RAD_KVQ_K6V4,
-                                          RAD_KVQ_K6V4 | R, RAD_KVQ_K4H | R, RAD_KVQ_K4HV2H | R }));
-    const std::vector<KvVariant> all = kv_autoquant_variants(true);
-    for (const KvVariant& v : all) centred.push_back(v.kvq);
+                                          RAD_KVQ_K6V4 | R, RAD_KVQ_K5V4, RAD_KVQ_K5V4 | R,
+                                          RAD_KVQ_K4H | R, RAD_KVQ_K4HV2H | R }));
+    for (const KvVariant& v : kv_autoquant_variants(true)) centred.push_back(v.kvq);
     CHECK(centred == std::vector<int32_t>({
               RAD_KVQ_BF16, RAD_KVQ_I8H | R, RAD_KVQ_I8H | R | M, RAD_KVQ_NONE, RAD_KVQ_NONE | R, RAD_KVQ_V4,
               RAD_KVQ_V4 | M, RAD_KVQ_V4 | R, RAD_KVQ_V4 | R | M, RAD_KVQ_K6V4, RAD_KVQ_K6V4 | M,
-              RAD_KVQ_K6V4 | R, RAD_KVQ_K6V4 | R | M, RAD_KVQ_K4H | R, RAD_KVQ_K4H | R | M,
+              RAD_KVQ_K6V4 | R, RAD_KVQ_K6V4 | R | M, RAD_KVQ_K5V4, RAD_KVQ_K5V4 | M,
+              RAD_KVQ_K5V4 | R, RAD_KVQ_K5V4 | R | M, RAD_KVQ_K4H | R, RAD_KVQ_K4H | R | M,
               RAD_KVQ_K4HV2H | R, RAD_KVQ_K4HV2H | R | M }));
-    REQUIRE_EQ(all.size(), (size_t)17);
+    /* With the maps alone: the two k4h layouts gain `vpred`, nothing else does. */
+    for (const KvVariant& v : kv_autoquant_variants(false, false, true)) predicted.push_back(v.kvq);
+    CHECK(predicted == std::vector<int32_t>({ RAD_KVQ_BF16, RAD_KVQ_I8H | R, RAD_KVQ_NONE, RAD_KVQ_NONE | R,
+                                              RAD_KVQ_V4, RAD_KVQ_V4 | R, RAD_KVQ_K6V4,
+                                              RAD_KVQ_K6V4 | R, RAD_KVQ_K5V4, RAD_KVQ_K5V4 | R,
+                                              RAD_KVQ_K4H | R, RAD_KVQ_K4H | R | P,
+                                              RAD_KVQ_K4HV2H | R, RAD_KVQ_K4HV2H | R | P }));
+    const std::vector<KvVariant> all = kv_autoquant_variants(true, false, true);
+    REQUIRE_EQ(all.size(), (size_t)23);
     CHECK_EQ(all[0].words, std::string("bf16"));
     CHECK_EQ(all[1].words, std::string("i8h"));
     CHECK_EQ(all[8].words, std::string("fp8_v4 rotated vmean"));
-    CHECK_EQ(all[13].words, std::string("k4h_v4"));
-    CHECK_EQ(all[14].words, std::string("k4h_v4 vmean"));
+    CHECK_EQ(all[16].words, std::string("k5_v4 rotated vmean"));
+    CHECK_EQ(all[17].words, std::string("k4h_v4"));
+    CHECK_EQ(all[18].words, std::string("k4h_v4 vmean"));
+    CHECK_EQ(all[19].words, std::string("k4h_v4 vpred"));
+    CHECK_EQ(all[22].words, std::string("k4h_v2h vpred"));
+    CHECK_EQ(all[19].kvq, (int32_t)(RAD_KVQ_K4H | R | P));
 
     tiny::TempDir dir("autoquant-variants");
     REQUIRE(dir.ok());
     REQUIRE(tiny::write_text(dir / "m.kvmean", "kv_vmean 1 head_dim 2 kv_heads 1 rows 9\n"
                                                "layer 3 head 0 0.5 -0.25\nlayer 7 head 0 1 2\n"));
+    REQUIRE(tiny::write_text(dir / "m.kvpred", kVpredFile));
     for (const KvVariant& v : all) {
         CHECK_EQ(v.bits, kv_layout_group_bits(v.kvq & RAD_KVQ_LAYOUT));
         const std::string recipe = dir / "r.kvrecipe";
         REQUIRE(tiny::write_text(recipe, std::string(v.kvq & M ? "vmean m.kvmean\n" : "") +
+                                             (v.kvq & P ? "vpred m.kvpred\n" : "") +
                                              "layer 3 " + v.words + "\nlayer 7 fp8\n"));
         Config c;
         Argv a({ "--model", "/m/x.rad", "--kv-cache-dtype", "fp8", "--kv-recipe", recipe });
@@ -594,7 +656,8 @@ namespace {
  * makes a mixed run (not every layer in one variant) with layer N in V exit 1; `pair P` adds P for
  * every layer narrower than fp8 past the first, costs that do not add up when layouts are mixed,
  * as the card measures them; `all V KL` is what a recipe of every layer in V costs, whatever its
- * layers' costs sum to. With `scored` positions a document the reference scores them (score_from)
+ * layers' costs sum to; `max` takes a run's cost as its dearest layer's instead of the sum, the
+ * card's shape at the extreme (one quantised early layer costs about as much as all of them). With `scored` positions a document the reference scores them (score_from)
  * and each run writes its .rows: the mean KL as 0.5 and 1.5 times it in alternating stretches of
  * 37 positions, so the positions are correlated and the interval has a width, and a top-1 column
  * agreeing on that share of every 100 positions.
@@ -633,12 +696,13 @@ struct Bench {
             "    b[\"k6_v4\"] = 352; b[\"k5_v4\"] = 320; b[\"k4h_v4\"] = 288; b[\"k4h_v2h\"] = 224;\n"
             "    while ((getline l < t) > 0) { split(l, a, \" \");\n"
             "    if (a[1] == \"fail\") f[a[2] \" \" a[3]] = 1; else if (a[1] == \"pair\") p = a[2];\n"
-            "    else if (a[1] == \"all\") u[a[2]] = a[3];\n"
+            "    else if (a[1] == \"all\") u[a[2]] = a[3]; else if (a[1] == \"max\") mx = 1;\n"
             "    else if (a[1] == \"flag\") { if (a[2] in fl) { g += a[3]; gd += a[4] } }\n"
             "    else if (a[1] == \"refuse\") { if (a[2] in fl) no = 1 }\n"
             "    else { c[a[1] \" \" a[2]] = a[3]; d[a[1] \" \" a[2]] = a[4] } } }\n"
             "  $1 == \"layer\" { w = $3; for (i = 4; i <= NF; ++i) w = w \"+\" $i; k = $2 \" \" w;\n"
-            "    s += (k in c) ? c[k] : c[$2 \" \" $3]; e += (k in c) ? d[k] : d[$2 \" \" $3];\n"
+            "    v = ((k in c) ? c[k] : c[$2 \" \" $3]) + 0; if (mx) { if (v > s) s = v } else s += v;\n"
+            "    e += (k in c) ? d[k] : d[$2 \" \" $3];\n"
             "    page += b[$3] / 2; nl2++;\n"
             "    if ($3 != \"fp8\" && $3 != \"i8h\" && $3 != \"bf16\") n++;\n"
             "    if (f[k]) bad = 1; if (!nl++) first = w; else if (w != first) mixed = 1 }\n"
@@ -701,6 +765,8 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
         { { 11, RAD_KVQ_K4H }, 0.0500 }, { { 15, RAD_KVQ_K4H }, 0.0500 },
         { { 3, RAD_KVQ_K4HV2H }, 0.0900 },  { { 7, RAD_KVQ_K4HV2H }, 0.0900 },
         { { 11, RAD_KVQ_K4HV2H }, 0.0900 }, { { 15, RAD_KVQ_K4HV2H }, 0.0900 },
+        { { 3, RAD_KVQ_K5V4 }, 0.0900 },  { { 7, RAD_KVQ_K5V4 }, 0.0900 },
+        { { 11, RAD_KVQ_K5V4 }, 0.0900 }, { { 15, RAD_KVQ_K5V4 }, 0.0900 },
     };
     std::string t;
     for (const auto& [k, v] : cost)
@@ -713,11 +779,13 @@ TEST(the_driver_measures_each_layer_and_writes_a_recipe_the_server_loads) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
 
-    /* 10 uniform runs (bf16, i8h, fp8, fp8 rotated, fp8_v4, fp8_v4 rotated, k6_v4, k6_v4 rotated,
-     * k4h_v4, k4h_v2h), then 4 layers x the 4 narrower layouts: screening drops bf16 and i8h (the
-     * stand-in prices neither above fp8, so a narrower one measures as well for fewer bits) and
-     * the rotated ones (priced as their plain layouts, and an exact tie keeps the earlier). Each with the engine's flags and the driver's. */
-    CHECK_EQ(b.lines(b.calls), 26);
+    /* 12 uniform runs (bf16, i8h, fp8, fp8 rotated, fp8_v4, fp8_v4 rotated, k6_v4, k6_v4 rotated,
+     * k5_v4, k5_v4 rotated, k4h_v4, k4h_v2h), then 4 layers x the 4 narrower layouts: screening
+     * drops bf16 and i8h (the stand-in prices neither above fp8, so a narrower one measures as
+     * well for fewer bits), the rotated ones (priced as their plain layouts, and an exact tie
+     * keeps the earlier) and k5_v4 (priced over k4h_v4, which has fewer bits). Each with the
+     * engine's flags and the driver's. --bits measures nothing it writes: no second pass. */
+    CHECK_EQ(b.lines(b.calls), 28);
     CHECK(has(log, "screening drops bf16 (0.040000 at 16.00 bits; i8h: 0.040000 at 8.06)"));
     CHECK(has(log, "screening drops i8h (0.040000 at 8.06 bits; fp8: 0.040000 at 8.00)"));
     CHECK(has(log, "screening drops fp8_v4 rotated ("));
@@ -808,17 +876,16 @@ TEST(the_driver_refuses_a_short_reference_unless_the_bound_is_lowered) {
 
 /* What the driver refuses up front, and a run that fails stopping it with the run's log: no
  * recipe is written from a partial measurement. */
-/* k5_v4 is in the layout table but opt-in (kv_layout_opt_in): the default variants leave it out,
- * so a calibration that names no layout runs exactly what it ran before k5_v4 existed, while
- * --layouts or --variants naming it makes it a candidate like any other, plain, `rotated` (it is
- * not rotated by its name, as k6_v4 is not) and `vmean`, in the table's place after k6_v4. A recipe
- * the driver writes from it loads as k5_v4. */
-TEST(the_driver_calibrates_k5_v4_only_where_layouts_or_variants_name_it) {
+/* k5_v4 is a default candidate since #22 (opt-in under #19): a calibration that names no layout
+ * measures it like any other, plain, `rotated` (it is not rotated by its name, as k6_v4 is not)
+ * and `vmean`, in the table's place after k6_v4, at 320 bits a group. Here it is the cheapest
+ * layer cost at 5.0 bits, so --bits 5 narrows both layers to it, and the recipe loads as k5_v4.
+ * --variants reaches its rotated form alone. */
+TEST(the_driver_calibrates_k5_v4_by_default_like_every_other_layout) {
     const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
-    for (const KvVariant& v : kv_autoquant_variants(true))
-        CHECK((v.kvq & RAD_KVQ_LAYOUT) != RAD_KVQ_K5V4);
+    for (int q : kv_layouts()) CHECK(!kv_layout_opt_in(q));
     std::vector<int32_t> k5;
-    const std::vector<KvVariant> every = kv_autoquant_variants(true, true);
+    const std::vector<KvVariant> every = kv_autoquant_variants(true);
     for (size_t i = 0; i < every.size(); ++i)
         if ((every[i].kvq & RAD_KVQ_LAYOUT) == RAD_KVQ_K5V4) {
             k5.push_back(every[i].kvq);
@@ -828,26 +895,19 @@ TEST(the_driver_calibrates_k5_v4_only_where_layouts_or_variants_name_it) {
         }
     CHECK(k5 == std::vector<int32_t>({ RAD_KVQ_K5V4, RAD_KVQ_K5V4 | M, RAD_KVQ_K5V4 | R,
                                        RAD_KVQ_K5V4 | R | M }));
-    REQUIRE_EQ(every.size(), kv_autoquant_variants(true).size() + 4);
+    REQUIRE_EQ(every.size(), kv_autoquant_variants(true, true).size());
 
     Bench b;
     REQUIRE(b.dir.ok());
     REQUIRE(tiny::write_text(b.table, "3 fp8_v4 0.004\n7 fp8_v4 0.0001\n3 k6_v4 0.009\n"
-                                      "7 k6_v4 0.0002\n3 k5_v4 0.0001\n7 k5_v4 0.0003\n"));
+                                      "7 k6_v4 0.0002\n3 k5_v4 0.0001\n7 k5_v4 0.0003\n"
+                                      "3 k4h_v4 0.05\n7 k4h_v4 0.05\n3 k4h_v2h 0.09\n7 k4h_v2h 0.09\n"));
     std::string log;
-    REQUIRE_EQ(b.run({ "--layers", "3,7", "--bits", "6", "--", "--model", "/m/x.rad" }, &log), 0);
-    CHECK(!has(tiny::read_text(b.calls), "k5_v4"));
-    CHECK(!has(tiny::read_text(b.out), "k5_v4"));
-
-    /* Named, it is measured: both layers fit 5.0 bits only in it, and its plain variant wins the
-     * tie with `rotated` (priced alike here, the earlier kept). */
-    std::remove(b.calls.c_str());
-    log.clear();
-    const int rc = b.run({ "--layers", "3,7", "--bits", "5", "--layouts", "fp8,k5_v4", "--",
-                           "--model", "/m/x.rad" }, &log);
+    const int rc = b.run({ "--layers", "3,7", "--bits", "5", "--", "--model", "/m/x.rad" }, &log);
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
-    CHECK(has(tiny::read_text(b.calls), "uniform_k5_v4"));
+    CHECK(has(tiny::read_text(b.calls), "uniform_k5_v4.kvrecipe"));
+    CHECK(has(tiny::read_text(b.calls), "layer3_k5_v4.kvrecipe"));
     CHECK(has(tiny::read_text(b.out), "layer 3 k5_v4\n"));
     CHECK(has(tiny::read_text(b.out), "layer 7 k5_v4\n"));
     Config c;
@@ -933,6 +993,11 @@ const std::map<std::pair<int, int>, double> kCosts = {
     { { 11, RAD_KVQ_K4H }, 0.0500 }, { { 15, RAD_KVQ_K4H }, 0.0500 },
     { { 3, RAD_KVQ_K4HV2H }, 0.0900 },  { { 7, RAD_KVQ_K4HV2H }, 0.0900 },
     { { 11, RAD_KVQ_K4HV2H }, 0.0900 }, { { 15, RAD_KVQ_K4HV2H }, 0.0900 },
+    /* k5_v4, a default candidate since #22, priced like k4h_v2h: k4h_v4 measures less for fewer
+     * bits uniformly, so screening drops it and it adds only its two uniform runs (plain and
+     * rotated) to each search. */
+    { { 3, RAD_KVQ_K5V4 }, 0.0900 },  { { 7, RAD_KVQ_K5V4 }, 0.0900 },
+    { { 11, RAD_KVQ_K5V4 }, 0.0900 }, { { 15, RAD_KVQ_K5V4 }, 0.0900 },
 };
 
 std::string cost_table(const std::string& more = "") {
@@ -974,9 +1039,11 @@ TEST(the_driver_writes_the_fewest_bits_within_a_kl_limit) {
                            "/m/x.rad" }, &log);
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
-    /* 10 uniform, the noise floor, 16 per-layer runs, 1 verified, and the knobs on the answer:
+    /* 12 uniform, the noise floor, 16 per-layer runs, 1 verified; the second pass from that
+     * answer, one step a layer (4 runs, none of which with the others leaves fewer bits within
+     * the 0.0004 of room it has left, so nothing more is solved); and the knobs on the answer:
      * each alone and both, which the stand-in prices at nothing. */
-    CHECK_EQ(b.lines(b.calls), 27 + 1 + 3);
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1 + 3);
 
     KvAssignment want;
     REQUIRE_EQ(kv_autoquant_solve_kl(cost_layers(), 0.0012, &want), RAD_OK);
@@ -1048,7 +1115,9 @@ TEST(the_driver_reuses_runs_whose_recipe_and_flags_are_unchanged) {
     loose[4] = "0.0450";
     log.clear();
     REQUIRE_EQ(b.run(loose, &log), 0);
-    CHECK(b.lines(b.calls) - first <= 6);
+    /* Its solved rounds and knob runs, and the second pass's step runs from its own answer (one a
+     * layer, 4), which the first limit's second pass, from another recipe, did not measure. */
+    CHECK(b.lines(b.calls) - first <= 6 + 4);
     std::vector<std::string> other = args;
     other.push_back("--tp");
     other.push_back("2");
@@ -1066,8 +1135,8 @@ TEST(the_driver_refuses_a_kl_limit_it_cannot_serve) {
     CHECK(has(log, "no recipe measured is within the limits: the most accurate, every layer fp8, "
                    "measures a mean KL of 0.040000, above --max-kl 0.03"));
     /* The uniform runs and the noise floor, and no per-layer run: below the base the costs have
-     * nothing to give. */
-    CHECK_EQ(b.lines(b.calls), 10 + 1);
+     * nothing to give, and with nothing within there is no second pass. */
+    CHECK_EQ(b.lines(b.calls), 12 + 1);
     struct stat st{};
     CHECK(::stat(b.out.c_str(), &st) != 0);
     log.clear();
@@ -1119,8 +1188,10 @@ TEST(the_driver_takes_the_most_accurate_variant_as_its_base_and_meets_a_limit_un
     CHECK(has(log, "the base, the most accurate: every layer i8h\n"));
     /* 5 uniform (i8h, fp8, fp8 rotated, k6_v4, k6_v4 rotated); the rotated ones tie with their
      * plain layouts and are dropped; the noise floor; 4 layers x fp8 and k6_v4, the rest i8h;
-     * the three knob runs. */
-    CHECK_EQ(b.lines(b.calls), 5 + 1 + 8 + 3);
+     * the second pass from the answer, layers 3, 11 and 15 one step narrower (i8h to k6_v4: fp8
+     * is off the order, 0.048 uniform above the line from i8h's 0.04 to k6_v4's 0.0492; layer 7
+     * is already the narrowest), none within the 0.0003 of room left; the three knob runs. */
+    CHECK_EQ(b.lines(b.calls), 5 + 1 + 8 + 3 + 3);
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# every layer i8h: mean KL 0.040000, top-1 0.9500, +0.000000 above the "
                       "floor, dNLL +0.0000 (the base)\n"));
@@ -1154,7 +1225,9 @@ TEST(the_driver_takes_bf16_as_its_base_and_meets_a_limit_under_i8hs) {
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
     CHECK(has(log, "the base, the most accurate: every layer bf16\n"));
-    CHECK_EQ(b.lines(b.calls), 4 + 1 + 8 + 3);
+    /* And the second pass: layers 3, 11 and 15 one step narrower, bf16 to i8h (layer 7's fp8 is
+     * the order's narrowest), none within the 0.00005 of room left. */
+    CHECK_EQ(b.lines(b.calls), 4 + 1 + 8 + 3 + 3);
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# every layer bf16: mean KL 0.040000, top-1 0.9500, +0.000000 above the "
                       "floor, dNLL +0.0000 (the base)\n"));
@@ -1169,8 +1242,8 @@ TEST(the_driver_takes_bf16_as_its_base_and_meets_a_limit_under_i8hs) {
 }
 
 /* Screening: a variant beaten on its uniform run by one of no more bits gets no per-layer runs
- * (here bf16, i8h and the rotated variants, which tie with fp8 and their plain layouts); with
- * --keep-dominated every variant has them, 10 + 4 x 9 runs. The predicted KL is the same, and a
+ * (here bf16, i8h, the rotated variants, which tie with fp8 and their plain layouts, and k5_v4);
+ * with --keep-dominated every variant has them, 12 + 4 x 11 runs. The predicted KL is the same, and a
  * tie keeps the earlier variant: never a rotated one, which costs the same bits as its plain
  * layout, but i8h where the budget has 4 bits to spare for a layer the stand-in prices as fp8
  * (the solver keeps ties wide). */
@@ -1182,7 +1255,7 @@ TEST(the_driver_screens_out_dominated_variants_unless_asked_to_keep_them) {
                                             "--model", "/m/x.rad" };
     std::string log;
     REQUIRE_EQ(b.run(args, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 10 + 16);
+    CHECK_EQ(b.lines(b.calls), 12 + 16);
     const std::vector<int> screened = written(b);
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# no per-layer runs: i8h (0.040000 at 8.06 bits; fp8: 0.040000 at 8.00)"));
@@ -1193,7 +1266,7 @@ TEST(the_driver_screens_out_dominated_variants_unless_asked_to_keep_them) {
     std::remove(b.calls.c_str());
     log.clear();
     REQUIRE_EQ(b.run(keep, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 10 + 4 * 9);
+    CHECK_EQ(b.lines(b.calls), 12 + 4 * 11);
     CHECK(has(tiny::read_text(b.calls), "/layer3_k6_v4+rotated.kvrecipe"));
     CHECK(!has(log, "screening drops i8h"));
     const std::string kept = tiny::read_text(b.out);
@@ -1221,9 +1294,10 @@ TEST(the_driver_keeps_a_uniform_recipe_that_measures_cheaper_than_any_solved_one
     REQUIRE_EQ(rc, 0);
     CHECK(written(b) == std::vector<int>(4, RAD_KVQ_K6V4));
     CHECK(has(log, "screening drops fp8_v4 (0.044400 at 6.25 bits; k6_v4: 0.040500 at 5.50)"));
-    /* 10 uniform, the noise floor, 4 layers x k6_v4, k4h_v4, k4h_v2h; no verification; the
-     * three knob runs. */
-    CHECK_EQ(b.lines(b.calls), 10 + 1 + 12 + 3);
+    /* 12 uniform, the noise floor, 4 layers x k6_v4, k4h_v4, k4h_v2h; no verification; the
+     * second pass from every layer k6_v4, each layer alone in k4h_v4 (4 runs, none within the
+     * 0.0007 of room left); the three knob runs. */
+    CHECK_EQ(b.lines(b.calls), 12 + 1 + 12 + 4 + 3);
     CHECK(has(log, "the next solution has no fewer bits than every layer k6_v4"));
     CHECK(has(tiny::read_text(b.out), "(every layer k6_v4), the fewest bits measured within 0.0412"));
 }
@@ -1362,9 +1436,10 @@ TEST(the_driver_measures_a_noise_floor_and_meets_a_kl_limit_above_it) {
     CHECK(has(log, "the noise floor: mean KL 0.064000; every layer fp8 is -0.024000 above it\n"));
     CHECK(has(log, "every layer k6_v4: -0.011400 above the floor\n"));
     CHECK(has(log, "not a bound for KV-only changes; costs are measured above the base)\n"));
-    /* 10 uniform, the noise run, 4 layers x fp8_v4, k6_v4, k4h_v4 and k4h_v2h (bf16 and i8h are
-     * screened out by fp8, the rotated ones by their plain layouts), 1 solved. */
-    CHECK_EQ(b.lines(b.calls), 10 + 1 + 16 + 1);
+    /* 12 uniform, the noise run, 4 layers x fp8_v4, k6_v4, k4h_v4 and k4h_v2h (bf16 and i8h are
+     * screened out by fp8, the rotated ones by their plain layouts, k5_v4 by k4h_v4), 1 solved,
+     * and the second pass's one step a layer from it, none within the room it leaves. */
+    CHECK_EQ(b.lines(b.calls), 12 + 1 + 16 + 1 + 4);
     const std::string calls = tiny::read_text(b.calls);
     CHECK(has(calls, "--model /m/x.rad --max-num-batched-tokens 64 --kv-cache-dtype fp8 --kv-recipe " +
                          b.out + ".work/noise_fp8_"));
@@ -1390,7 +1465,7 @@ TEST(the_driver_measures_a_noise_floor_and_meets_a_kl_limit_above_it) {
                  "/m/x.rad" }, &log);
     REQUIRE_EQ(rc, 0);
     CHECK(!has(log, "is under the noise floor"));
-    CHECK_EQ(b.lines(b.calls), 10 + 1 + 16 + 1);
+    CHECK_EQ(b.lines(b.calls), 12 + 1 + 16 + 1 + 4);
     REQUIRE_EQ(kv_autoquant_solve_kl(cost_layers(), 0.01, &want), RAD_OK);
     CHECK(written(b) == kvq_of(cost_layers(), want));
     CHECK(0.04 + stand_in(written(b)).first <= 0.05 + 1e-12);
@@ -1417,8 +1492,9 @@ TEST(the_driver_finds_a_recipe_under_the_noise_floor_within_an_absolute_kl_limit
     CHECK(has(log, "the noise floor: mean KL 0.064000; every layer bf16 is -0.024000 above it\n"));
     CHECK(has(log, "every layer i8h: -0.000500 above the floor\n"));
     CHECK(!has(log, "is under the noise floor"));
-    /* 2 uniform, the noise run, 4 layers x i8h, 1 solved. */
-    CHECK_EQ(b.lines(b.calls), 2 + 1 + 4 + 1);
+    /* 2 uniform, the noise run, 4 layers x i8h, 1 solved, and the second pass: layers 3 and 7
+     * from bf16 to i8h, neither within the 0.0015 of room left. */
+    CHECK_EQ(b.lines(b.calls), 2 + 1 + 4 + 1 + 2);
     CHECK(written(b) == std::vector<int>({ RAD_KVQ_BF16, RAD_KVQ_BF16, RAD_KVQ_I8H, RAD_KVQ_I8H }));
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# each layer alone in a variant, the rest the base: mean KL above the base\n"));
@@ -1545,7 +1621,8 @@ TEST(the_driver_keeps_an_nll_limit_at_the_mean_and_under_strict_at_the_upper_bou
     CHECK(has(recipe, "the fewest bits measured within 0.046 and dNLL 0.003 at the 95% bounds\n"));
 
     REQUIRE(tiny::write_text(b.table, "3 bf16 0 0.01\n3 i8h 0 0.01\n3 fp8 0 0.01\n3 fp8_v4 0.004 0.01\n"
-                                      "3 k6_v4 0.009 0.01\n3 k4h_v4 0.05 0.01\n3 k4h_v2h 0.09 0.01\n"));
+                                      "3 k6_v4 0.009 0.01\n3 k5_v4 0.02 0.01\n3 k4h_v4 0.05 0.01\n"
+                                      "3 k4h_v2h 0.09 0.01\n"));
     log.clear();
     CHECK(b.run({ "--layers", "3,7", "--max-dnll", "0.005", "--no-knobs", "--", "--model",
                   "/m/x.rad" }, &log) != 0);
@@ -1570,8 +1647,9 @@ TEST(the_driver_keeps_a_knob_only_where_the_recipe_stays_within_every_limit) {
     int rc = b.run(args, &log);
     if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
     REQUIRE_EQ(rc, 0);
-    /* The first --max-kl test's 27 runs, the noise floor, and one run a knob. */
-    CHECK_EQ(b.lines(b.calls), 27 + 1 + 2);
+    /* The first --max-kl test's 29 runs, its second pass's 4, the noise floor, and one run a
+     * knob. */
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1 + 2);
     std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# its cache: 0.94 KiB a token, state 54.00 MiB a sequence (rank 0's, from its log)\n"));
     CHECK(has(recipe, "# with --qsa-bkey-dtype i8: 6.0625 bits, mean KL 0.040900, top-1 0.9482, "
@@ -1606,7 +1684,7 @@ TEST(the_driver_keeps_a_knob_only_where_the_recipe_stays_within_every_limit) {
     std::remove(b.calls.c_str());
     log.clear();
     REQUIRE_EQ(b.run(args, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 27 + 1 + 3);
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1 + 3);
     recipe = tiny::read_text(b.out);
     CHECK(has(recipe, "# with --qsa-bkey-dtype i8 --state-cache-dtype f16: "));
     CHECK(has(recipe, "# serve with: --kv-cache-dtype fp8 --kv-recipe " + b.out +
@@ -1619,13 +1697,13 @@ TEST(the_driver_keeps_a_knob_only_where_the_recipe_stays_within_every_limit) {
     log.clear();
     REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--knobs", "state_f16", "--",
                        "--model", "/m/x.rad", "--qsa-bkey-dtype", "i8" }, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 27 + 1 + 1);
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1 + 1);
     CHECK(has(tiny::read_text(b.out), "--kv-recipe " + b.out + " --state-cache-dtype f16\n"));
     std::remove(b.calls.c_str());
     log.clear();
     REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--no-knobs", "--",
                        "--model", "/m/x.rad" }, &log), 0);
-    CHECK_EQ(b.lines(b.calls), 27 + 1);
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1);
     CHECK(!has(tiny::read_text(b.out), "# knobs:"));
 
     auto refused = [&](const std::vector<std::string>& more, const std::string& why) {
@@ -1640,7 +1718,7 @@ TEST(the_driver_keeps_a_knob_only_where_the_recipe_stays_within_every_limit) {
     refused({ "--max-kl", "0.05", "--", "--model", "m", "--qsa-bkey-dtype", "i8" },
             "--qsa-bkey-dtype is the knob bkey_i8, which rad-autoquant tries on the answer");
     refused({ "--max-kl", "0.05", "--knobs", "bkey", "--", "--model", "m" },
-            "--knobs: 'bkey' is not a knob; they are bkey_i8, state_f16");
+            "--knobs: 'bkey' is not a knob; they are bkey_i8, state_f16, bkey_split");
     refused({ "--max-kl", "0.05", "--knobs", "bkey_i8", "--no-knobs", "--", "--model", "m" },
             "--knobs and --no-knobs contradict each other");
     refused({ "--max-dkl", "-0.01", "--", "--model", "m" }, "--max-dkl '-0.01' is not a mean KL");
@@ -1669,7 +1747,7 @@ TEST(the_driver_reuses_the_noise_floor_and_the_knob_runs_from_the_work_dir) {
     std::string log;
     REQUIRE_EQ(b.run(args, &log), 0);
     const int first = b.lines(b.calls);
-    CHECK_EQ(first, 10 + 1 + 16 + 1 + 2);
+    CHECK_EQ(first, 12 + 1 + 16 + 1 + 4 + 2);
     const std::string recipe = tiny::read_text(b.out);
     CHECK(has(recipe, " --qsa-bkey-dtype i8\n"));
     log.clear();
@@ -1686,6 +1764,235 @@ TEST(the_driver_reuses_the_noise_floor_and_the_knob_runs_from_the_work_dir) {
     CHECK_EQ(b.lines(b.calls), first + 1);
     CHECK(has(tiny::read_text(b.calls), "--max-num-batched-tokens 32 --kv-cache-dtype fp8"));
     CHECK(has(tiny::read_text(b.out), "every layer fp8 with --max-num-batched-tokens 32: "));
+}
+
+/* ================================================================== #22: vpred, the split, pass 2 */
+
+/* --vpred FILE: the variants that predict V from K (k4h_v4 vpred, k4h_v2h vpred) are candidates
+ * like any other. Here they cost a hundredth of their plain layouts', so screening drops the plain
+ * k4h ones and --bits 4.5 narrows both layers to k4h_v4 vpred; the recipe names the map file by its
+ * absolute path before the layers, and the server's parse loads it as RAD_KVQ_VPRED with the maps.
+ * A run whose recipe reads the maps has their content's hash in its NAME.args, so after the maps
+ * are recalibrated --reuse reruns exactly those (2 uniform and 4 per-layer) and reads the rest
+ * back. Without --vpred a vpred variant is refused by name, and a file that is no map file is
+ * refused up front. */
+TEST(the_driver_measures_vpred_variants_and_writes_a_recipe_the_server_loads_with_its_maps) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    const std::string maps = b.dir / "kv_vpred.txt";
+    REQUIRE(tiny::write_text(maps, kVpredFile));
+    REQUIRE(tiny::write_text(b.table, "3 k4h_v4 0.05\n7 k4h_v4 0.05\n3 k4h_v4+vpred 0.0005\n"
+                                      "7 k4h_v4+vpred 0.0005\n3 k4h_v2h 0.09\n7 k4h_v2h 0.09\n"
+                                      "3 k4h_v2h+vpred 0.08\n7 k4h_v2h+vpred 0.08\n"));
+    const std::vector<std::string> args = { "--reuse", "--layers", "3,7", "--bits", "4.5", "--vpred",
+                                            maps, "--layouts", "fp8,k4h_v4,k4h_v2h", "--",
+                                            "--model", "/m/x.rad" };
+    std::string log;
+    int rc = b.run(args, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    /* 6 uniform (fp8, fp8 rotated, k4h_v4, k4h_v4 vpred, k4h_v2h, k4h_v2h vpred), 2 layers x the
+     * kept k4h_v4 vpred and k4h_v2h vpred. */
+    CHECK_EQ(b.lines(b.calls), 6 + 4);
+    CHECK(has(log, "screening drops k4h_v4 (0.140000 at 4.50 bits; k4h_v4 vpred: 0.041000 at 4.50)"));
+    const std::string calls = tiny::read_text(b.calls);
+    CHECK(has(calls, "/uniform_k4h_v4+vpred.kvrecipe"));
+    CHECK(has(calls, "/layer7_k4h_v2h+vpred.kvrecipe"));
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "vpred " + maps + "\nlayer 3 k4h_v4 vpred\nlayer 7 k4h_v4 vpred\n"));
+    CHECK(has(tiny::read_text(b.out + ".work/uniform_k4h_v4+vpred.args"), "\n# vpred "));
+    CHECK(!has(tiny::read_text(b.out + ".work/uniform_fp8.args"), "# vpred"));
+    Config c;
+    Argv a({ "--model", "/m/x.rad", "--kv-cache-dtype", "fp8", "--kv-recipe", b.out });
+    REQUIRE_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_OK);
+    REQUIRE_EQ(c.kv_recipe.size(), (size_t)8);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)(RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED));
+    CHECK_EQ(c.kv_recipe[7], (int32_t)(RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED));
+    CHECK_EQ(c.kv_vpred.layer.size(), (size_t)2);
+
+    /* Recalibrated maps: only the runs that read them again. */
+    REQUIRE(tiny::write_text(maps, kVpredFile + "# recalibrated\n"));
+    log.clear();
+    REQUIRE_EQ(b.run(args, &log), 0);
+    CHECK_EQ(b.lines(b.calls), 6 + 4 + 2 + 4);
+    CHECK(has(log, "uniform_fp8: reused from "));
+    CHECK(!has(log, "uniform_k4h_v4+vpred: reused"));
+
+    auto refused = [&](const std::vector<std::string>& more, const std::string& why) {
+        std::vector<std::string> x = { "--layers", "3,7", "--bits", "6" };
+        x.insert(x.end(), more.begin(), more.end());
+        x.insert(x.end(), { "--", "--model", "m" });
+        std::string l;
+        CHECK(b.run(x, &l) != 0);
+        CHECK(has(l, why));
+        if (!has(l, why)) fprintf(stderr, "    wanted '%s' in:\n%s\n", why.c_str(), l.c_str());
+    };
+    const int before = b.lines(b.calls);
+    refused({ "--variants", "fp8,k4h_v4+vpred" },
+            "--variants: k4h_v4+vpred predicts V from K, and no --vpred FILE names the maps");
+    refused({ "--variants", "k6_v4+vpred" }, "--variants: 'k6_v4+vpred' is not a variant");
+    refused({ "--vpred", b.table }, "is not a K-to-V map file");
+    refused({ "--vpred", b.dir / "none.txt" }, "--vpred " + b.dir / "none.txt" + ": ");
+    CHECK_EQ(b.lines(b.calls), before);
+}
+
+/* The block-key split (--qsa-bkey-split on, #21) is exact: the ranks' merged selection is the
+ * unsplit one byte for byte, so the KL rows are the same and no run measures it. At --tp 2 it is a
+ * default knob: added to the setting the measured knobs leave (both of them here, which the
+ * stand-in prices at nothing), its block keys counted halved (0.40 KiB a token in int8, 0.20
+ * split, so 0.59 KiB a token in all becomes 0.39), and written into the serve line; the runs are
+ * the --max-kl search's without it. --knobs naming it at another --tp is refused (by default it is
+ * left out there, as every other driver test shows), so is the flag in the engine's flags while it
+ * is searched; left out of the search, it may be fixed there. */
+TEST(the_driver_counts_the_block_key_split_in_bytes_and_never_runs_it) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, cost_table()));
+    std::string log;
+    int rc = b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--", "--model", "/m/x.rad",
+                     "--tp", "2" }, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1 + 3);
+    CHECK(!has(tiny::read_text(b.calls), "--qsa-bkey-split"));
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# with --qsa-bkey-split on: not run, exact (the ranks' merged selection is "
+                      "the unsplit one byte for byte, the KL rows the same): block keys 0.40 KiB a "
+                      "token, 0.20 KiB split\n"));
+    CHECK(has(recipe, "# knobs: --qsa-bkey-dtype i8 --state-cache-dtype f16 --qsa-bkey-split on, "
+                      "the fewest bytes a token within every limit: "));
+    CHECK(has(recipe, "0.39 KiB a token, state 27.00 MiB a sequence\n"));
+    CHECK(has(recipe, "# serve with: --kv-cache-dtype fp8 --kv-recipe " + b.out +
+                      " --qsa-bkey-dtype i8 --state-cache-dtype f16 --qsa-bkey-split on\n"));
+    CHECK(has(log, "with --qsa-bkey-dtype i8 --state-cache-dtype f16 --qsa-bkey-split on)"));
+
+    /* Alone (--knobs bkey_split, --tp=2): no knob run at all, the bf16 block keys halved. */
+    std::remove(b.calls.c_str());
+    log.clear();
+    REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--knobs", "bkey_split", "--",
+                       "--model", "/m/x.rad", "--tp=2" }, &log), 0);
+    CHECK_EQ(b.lines(b.calls), 29 + 4 + 1);
+    CHECK(has(tiny::read_text(b.out), "block keys 0.75 KiB a token, 0.38 KiB split\n"));
+    CHECK(has(tiny::read_text(b.out), "--kv-recipe " + b.out + " --qsa-bkey-split on\n"));
+
+    auto refused = [&](const std::vector<std::string>& more, const std::string& why) {
+        std::vector<std::string> x = { "--layers", "3,7", "--max-kl", "0.05" };
+        x.insert(x.end(), more.begin(), more.end());
+        std::string l;
+        CHECK(b.run(x, &l) != 0);
+        CHECK(has(l, why));
+        if (!has(l, why)) fprintf(stderr, "    wanted '%s' in:\n%s\n", why.c_str(), l.c_str());
+    };
+    std::remove(b.calls.c_str());
+    refused({ "--knobs", "bkey_split", "--", "--model", "m" },
+            "--knobs bkey_split splits the block keys across two ranks and counts them halved; "
+            "the engine's flags give --tp 1, not 2");
+    refused({ "--knobs", "bkey_i8,bkey_split", "--", "--model", "m", "--tp", "4" },
+            "the engine's flags give --tp 4, not 2");
+    refused({ "--", "--model", "m", "--tp", "2", "--qsa-bkey-split", "on" },
+            "--qsa-bkey-split is the knob bkey_split, which rad-autoquant tries on the answer");
+    CHECK_EQ(b.lines(b.calls), 0);
+    log.clear();
+    REQUIRE_EQ(b.run({ "--layers", "3,7,11,15", "--max-kl", "0.0412", "--knobs", "bkey_i8", "--",
+                       "--model", "/m/x.rad", "--tp", "2", "--qsa-bkey-split", "on" }, &log), 0);
+    CHECK(has(tiny::read_text(b.calls), "--tp 2 --qsa-bkey-split on --kv-cache-dtype fp8"));
+    CHECK(!has(tiny::read_text(b.out), "--qsa-bkey-split on:"));
+}
+
+/* The second pass on the card's shape, at the extreme: a run costs its dearest layer (`max`), so
+ * one early layer in i8h costs what every layer in i8h does (0.0236 above bf16's 0.04, as on
+ * Flash-Next), and the per-layer costs from the bf16 base add up to far more than a mixed recipe
+ * measures. --max-kl 0.0662 leaves 0.0262 above the base. The first pass, from bf16: no solution
+ * of fewer bits than every layer i8h (2064 bits a group's sum, measured within at 0.0636) fits
+ * the summed costs, so its answer is every layer i8h -- the card's --max-kl 0.0262 answer. The
+ * second pass takes that as B2; the order (bf16 > i8h > k6_v4; fp8, 0.0665 at 8.00 bits, above
+ * the line from i8h to k6_v4) steps each layer from i8h to k6_v4: layer 3 costs 0.0264 above B2,
+ * layers 7, 11 and 15 nothing (their k6_v4 is under layer 3's i8h). Solved within B2's room of
+ * 0.0026: layer 3 i8h, the rest k6_v4, 6.1406 bits, measured at 0.0636: within, and written. The
+ * log and the recipe say which pass found what. A second limit that lands on the same B2 reads
+ * the step runs and the solved run back (named by their recipes' text) and runs nothing. */
+TEST(the_second_pass_finds_a_mixed_recipe_the_first_misses_when_costs_do_not_add_up) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, "max\n"
+                                      "3 i8h 0.0236\n7 i8h 0.01\n11 i8h 0.001\n15 i8h 0.0001\n"
+                                      "3 fp8 0.0265\n7 fp8 0.012\n11 fp8 0.002\n15 fp8 0.0002\n"
+                                      "3 k6_v4 0.05\n7 k6_v4 0.02\n11 k6_v4 0.003\n15 k6_v4 0.001\n"));
+    std::vector<std::string> args = { "--reuse", "--layers", "3,7,11,15", "--max-kl", "0.0662",
+                                      "--layouts", "bf16,i8h,fp8,k6_v4", "--no-knobs", "--",
+                                      "--model", "/m/x.rad" };
+    std::string log;
+    int rc = b.run(args, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(log, "the base, the most accurate: every layer bf16\n"));
+    /* The first pass: no solution fewer bits than every layer i8h, so none is measured. */
+    CHECK(has(log, "the next solution has no fewer bits than every layer i8h, measured within the "
+                   "limits, and is not measured\n"));
+    CHECK(has(log, "pass 2: the variant order (the kept variants by bits, on the lower hull of their "
+                   "uniform runs' mean KL): bf16 (16.00 bits, 0.040000) > i8h (8.06 bits, 0.063600) > "
+                   "k6_v4 (5.50 bits, 0.090000); off it: fp8 (8.00 bits, 0.066500)\n"));
+    CHECK(has(log, "pass 2 from every layer i8h (8.0625 bits, mean KL 0.063600"));
+    CHECK(has(log, "each layer alone one step narrower, the rest as it: 4 per-layer runs\n"));
+    CHECK(has(log, "pass 2 solved 1: 6.1406 bits an element, predicted mean KL 0.063600, measured "
+                   "0.063600 (pass 2 verify 1), within the limit\n"));
+    /* 6 uniform (bf16, i8h, fp8, fp8 rotated, k6_v4, k6_v4 rotated), the noise run, 4 layers x
+     * i8h, fp8 and k6_v4, then the second pass's 4 steps and 1 solved run. */
+    CHECK_EQ(b.lines(b.calls), 6 + 1 + 12 + 4 + 1);
+    const std::string calls = tiny::read_text(b.calls);
+    CHECK(has(calls, "/step_layer7_k6_v4_"));
+    CHECK(has(tiny::read_text(b.out + ".work/uniform_i8h.kvrecipe"), "layer 3 i8h\n"));
+    CHECK(written(b) == std::vector<int>({ RAD_KVQ_I8H, RAD_KVQ_K6V4, RAD_KVQ_K6V4, RAD_KVQ_K6V4 }));
+    const std::string recipe = tiny::read_text(b.out);
+    CHECK(has(recipe, "# pass 1 answer: 8.0625 bits, mean KL 0.063600, top-1 0.9028, +0.023600 above "
+                      "the floor, dNLL +0.0000 (every layer i8h)\n"));
+    CHECK(has(recipe, "# pass 2 from every layer i8h: each layer alone one step narrower, the rest as "
+                      "it: mean KL above it\n"));
+    CHECK(has(recipe, "#       3  i8h -> k6_v4  2.640e-02\n"));
+    CHECK(has(recipe, "#       7  i8h -> k6_v4  0.000e+00\n"));
+    CHECK(has(recipe, "# pass 2 solved 1: room 0.002600 above every layer i8h, predicted mean KL "
+                      "0.063600, measured 6.1406 bits, mean KL 0.063600"));
+    CHECK(has(recipe, "(pass 2 verify 1), the fewest bits measured within 0.0662\n"));
+    CHECK(has(recipe, "\nlayer 3 i8h\nlayer 7 k6_v4\nlayer 11 k6_v4\nlayer 15 k6_v4\n"));
+
+    /* Another limit whose first pass lands on the same B2 and whose second solves the same. */
+    args[4] = "0.0663";
+    log.clear();
+    REQUIRE_EQ(b.run(args, &log), 0);
+    CHECK_EQ(b.lines(b.calls), 6 + 1 + 12 + 4 + 1);
+    CHECK(has(log, ": reused from "));
+    CHECK(written(b) == std::vector<int>({ RAD_KVQ_I8H, RAD_KVQ_K6V4, RAD_KVQ_K6V4, RAD_KVQ_K6V4 }));
+}
+
+/* The second pass's stop rules: none where the best within the limits is the first base, every
+ * step from which the first pass measured (every layer bf16 here, the only recipe under 0.0401),
+ * and none where every layer of the best is already the order's narrowest (every layer k6_v4,
+ * within a limit every recipe meets). Neither runs a step. */
+TEST(the_second_pass_is_skipped_from_the_first_base_and_from_the_narrowest_recipe) {
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, "3 i8h 0.001\n7 i8h 0.001\n3 k6_v4 0.002\n7 k6_v4 0.002\n"));
+    const std::vector<std::string> base = { "--layers", "3,7", "--layouts", "bf16,i8h,k6_v4",
+                                            "--no-knobs", "--", "--model", "/m/x.rad" };
+    std::vector<std::string> args = { "--max-kl", "0.0401" };
+    args.insert(args.end(), base.begin(), base.end());
+    std::string log;
+    int rc = b.run(args, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(log, "pass 2 skipped: the best within the limits is the base, every step from which "
+                   "the first pass measured\n"));
+    CHECK(has(tiny::read_text(b.out), "# pass 2 skipped: the best within the limits is the base"));
+    CHECK(!has(tiny::read_text(b.calls), "/step_"));
+
+    args[1] = "0.1";
+    log.clear();
+    REQUIRE_EQ(b.run(args, &log), 0);
+    CHECK(has(log, "pass 2 skipped: no layer of every layer k6_v4 has a narrower variant in the "
+                   "order\n"));
+    CHECK(written(b).empty());   /* two layers, not the four `written` reads */
+    CHECK(has(tiny::read_text(b.out), "\nlayer 3 k6_v4\nlayer 7 k6_v4\n"));
+    CHECK(!has(tiny::read_text(b.calls), "/step_"));
 }
 
 RAD_TEST_MAIN()

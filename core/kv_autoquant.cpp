@@ -115,7 +115,7 @@ int kv_autoquant_solve_kl(const std::vector<std::vector<KvCandidate>>& layers, d
     return RAD_E_NOTFOUND;
 }
 
-std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in) {
+std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in, bool vpred) {
     std::vector<KvVariant> v;
     std::set<int32_t> seen;
     /* The parser's refusals are the answer here, not errors to print. */
@@ -124,12 +124,14 @@ std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in) {
     for (int q : kv_layouts()) {
         if (!opt_in && kv_layout_opt_in(q)) continue;
         for (bool rot : { false, true })
-            for (bool vm : { false, true }) {
-                if (vm && !vmean) continue;
+            /* The V word: none, `vmean` or `vpred`, one or the other (the parser refuses both). */
+            for (const char* vw : { "", "vmean", "vpred" }) {
+                const std::string w = vw;
+                if ((w == "vmean" && !vmean) || (w == "vpred" && !vpred)) continue;
                 const std::string words = std::string(kv_layout_name(q)) +
-                                          (rot ? " rotated" : "") + (vm ? " vmean" : "");
+                                          (rot ? " rotated" : "") + (w.empty() ? "" : " " + w);
                 std::vector<int32_t> r;
-                if (kv_recipe_parse((vm ? "vmean m\n" : "") + std::string("layer 0 ") + words,
+                if (kv_recipe_parse((w.empty() ? "" : w + " m\n") + "layer 0 " + words,
                                     "variant", &r) != RAD_OK || r.size() != 1)
                     continue;
                 if (seen.insert(r[0]).second) v.push_back({ r[0], kv_layout_group_bits(q), words });
@@ -137,6 +139,36 @@ std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in) {
     }
     log_set_level(was);
     return v;
+}
+
+std::vector<size_t> kv_autoquant_hull(const std::vector<KvCandidate>& v) {
+    /* By bits ascending; of equal bits the lower KL, then the earlier, first and alone kept. */
+    std::vector<size_t> o(v.size());
+    std::iota(o.begin(), o.end(), (size_t)0);
+    std::stable_sort(o.begin(), o.end(), [&](size_t a, size_t b) {
+        return v[a].bits != v[b].bits ? v[a].bits < v[b].bits : v[a].kl < v[b].kl;
+    });
+    std::vector<size_t> h;
+    for (size_t i : o) {
+        if (!h.empty() && v[h.back()].bits == v[i].bits) continue;
+        /* Andrew's lower chain: the middle of three goes where it lies above the line from the
+         * first to the third (a clockwise turn); on the line it stays. */
+        while (h.size() >= 2) {
+            const KvCandidate &a = v[h[h.size() - 2]], &m = v[h.back()];
+            const double cross = (double)(m.bits - a.bits) * (v[i].kl - a.kl) -
+                                 (m.kl - a.kl) * (double)(v[i].bits - a.bits);
+            if (cross >= 0) break;
+            h.pop_back();
+        }
+        h.push_back(i);
+    }
+    /* Up to the least KL (the first of equal ones, the fewer bits), then widest first. */
+    size_t least = 0;
+    for (size_t k = 1; k < h.size(); ++k)
+        if (v[h[k]].kl < v[h[least]].kl) least = k;
+    if (!h.empty()) h.resize(least + 1);
+    std::reverse(h.begin(), h.end());
+    return h;
 }
 
 int kv_autoquant_fit(const std::vector<std::vector<KvCandidate>>& layers, double room, int rounds,

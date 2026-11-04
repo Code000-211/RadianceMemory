@@ -1164,15 +1164,21 @@ under every 8-bit layout's is met with: keep the sensitive layers unquantised.
 reference over long documents. `--max-kl 0.035` asks for the fewest bits whose *measured* mean KL
 stays within 0.035 (`--min-top1` adds a floor on top-1 agreement, `--strict` checks both at the
 95 % bound from the per-position rows, each document a stratum). Every layout above is a
-candidate, plain, `rotated` and, given the `--vmean` file, `vmean`: 17 variants on
-`qwen4exp_fp8`. It measures each variant on every layer, takes the most accurate (`bf16`, whose
+candidate, plain, `rotated` and, given the `--vmean` file, `vmean`, given the `--vpred` file,
+`vpred` (`k4h_v4`, `k4h_v2h`): 23 variants on `qwen4exp_fp8` with both (`k5_v4` among them). It measures each variant on every layer, takes the most accurate (`bf16`, whose
 KL against the bf16 reference is about zero, so limits down to that are met) as
 the base, measures each layer alone in each variant not beaten outright by one of no more bits,
 solves for the fewest bits from those costs, and measures what it solved, tightening while the
 mixed recipe measures over the limit (the costs do not add up exactly). It writes the cheapest
 recipe measured within the limit, uniform ones included, so it is never worse than the best
-uniform layout: C + L (K - 1) runs, the noise run, at most six solved ones and three knob runs
-for C variants, K kept and L layers, 84 to 99 on Flash-Next. `--bits 6` instead picks the least
+uniform layout. The per-layer costs are measured from `bf16`, and one quantised early layer costs
+about what every layer does, so that answer sits at the extremes (`--max-kl 0.0262`: every layer
+`i8h`, 8.06 bits, where `i8h` on layers 3-23 and `k6_v4 rotated vmean` on 27-47 measures 0.0260 at
+6.78). A second pass therefore starts from the best recipe within the limit, moves each layer alone
+one step narrower (the next variant with fewer bits on the lower hull of the uniform runs' KL over
+bits, which skips `fp8` beside `i8h`), and solves and measures again from there. C + L (K - 1)
+runs, the noise run, at most six solved ones, at most L + 6 for the second pass and three knob
+runs, for C variants, K kept and L layers: about 100 to 130 on Flash-Next. `--bits 6` instead picks the least
 predicted KL within an average budget, unmeasured. On a model whose plugin does not serve `bf16`, `i8h`, the `k4h` layouts or the V mean
 (`qwen35_fp8`), pass `--layouts fp8,fp8_v4,k6_v4` or the first such run stops the calibration. A
 reference whose documents are shorter than 32768 tokens is refused unless the bound is lowered.
@@ -1191,8 +1197,9 @@ every recipe's KL against it, and anchors the relative limit there (the per-laye
 measured above the base, not the floor): `--max-dkl 0.01` is a mean KL of at most floor + 0.01; `--max-dnll 0.005` bounds the
 mean NLL change against the reference (nats a token), whether the model gets worse on the text.
 Then it tries the global knobs on the answer (`--qsa-bkey-dtype i8`, `--state-cache-dtype f16`)
-and keeps the setting of fewest bytes a token still within every limit; the recipe's
-`# serve with:` comment names the flags it needs.
+and keeps the setting of fewest bytes a token still within every limit; at `--tp 2` it adds the
+block-key split (`--qsa-bkey-split on`), which is exact and so never run, its block keys counted
+halved. The recipe's `# serve with:` comment names the flags it needs.
 
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities
