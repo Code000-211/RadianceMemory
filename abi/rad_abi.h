@@ -68,8 +68,14 @@ extern "C" {
  * meaning, RAD_KVQ_VPRED, RadBuildCtx gained kv_vpred (past qsa_bkey_dtype), RadKvVPred
  * (rad_builder.h) is new, and with it the op `kv_vpred` and attn_paged's kv_dtype k4h_v4_pk /
  * k4h_v2h_pk (docs/OPS.md). A plugin built at 43 would read a vpred layer's entry as a layout it
- * does not know and refuse it. */
-#define RAD_ABI_VERSION 44u
+ * does not know and refuse it.
+ *
+ * 45: the QSA indexer's block keys split across the tensor-parallel ranks (--qsa-bkey-split on):
+ * RadBuildCtx gained qsa_bkey_split (in the padding between qsa_bkey_dtype and kv_vpred) and
+ * RadArchProbe qsa_bkey_split_ok (rad_builder.h), with the new ops `qsa_select_part` and
+ * `qsa_select_join` and the optional `ranks` and `rank` of `qsa_work` (docs/OPS.md). A plugin built
+ * at 44 would keep every block key on every rank under a flag that promised to halve them. */
+#define RAD_ABI_VERSION 45u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

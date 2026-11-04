@@ -1318,6 +1318,10 @@ static const RadParamSpec pQsaWork[] = {
     /* A capacity: the launch is as wide as `page` (r4d_qsa_work_bf16.hip). */
     { "work",  RAD_P_INT, RAD_REQUIRED, RAD_PROLE_CAPACITY },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+    /* Block keys split across tensor-parallel ranks (docs/QSA.md): only blocks b % ranks == rank
+     * are stored, at page bt[b / ranks]; absent, every block (ranks 1). */
+    { "ranks", RAD_P_INT, RAD_OPTIONAL },
+    { "rank",  RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaWork[] = {
     { "k",     RAD_OPD_IN,  0 },
@@ -1394,6 +1398,50 @@ static const RadOperandSpec oQsaSelect[] = {
     /* With `seqused`, QSA needs no new attention kernel: `attn_paged` takes its block table and
      * per-sequence length as ordinary operands, so the sparse attention is the same op issued with
      * `sel` and this. Emitted here because it is one store of a value this kernel has. */
+    { "seqused", RAD_OPD_OUT, 0 },
+};
+
+/* `qsa_select_part` and `qsa_select_join`, new ops whose schemas this plugin fixes: the selection
+ * with the block keys split across tensor-parallel ranks. Each rank's own top-k as a list of
+ * (order key, global block) in block order, then the ranks' lists gathered side by side merged
+ * into qsa_select's table (docs/OPS.md). */
+static const RadParamSpec pQsaSelectPart[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "topk",   RAD_P_INT, RAD_REQUIRED },
+    { "ratio",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "ranks",  RAD_P_INT, RAD_REQUIRED },
+    { "rank",   RAD_P_INT, RAD_REQUIRED },
+    { "signed", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oQsaSelectPart[] = {
+    /* This rank's columns: column j is block j * ranks + rank. */
+    { "score", RAD_OPD_IN,  0 },
+    /* The attention group's table at the global block index, as qsa_select's. */
+    { "bt",    RAD_OPD_IN,  0 },
+    { "nc",    RAD_OPD_IN,  0 },
+    { "pos",   RAD_OPD_IN,  0 },
+    { "cu",    RAD_OPD_IN,  0 },
+    { "part",  RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pQsaSelectJoin[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "topk",   RAD_P_INT, RAD_REQUIRED },
+    { "ratio",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "ranks",  RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaSelectJoin[] = {
+    /* The ranks' lists side by side, as a row-interleaved all_gather lays them out. */
+    { "part",    RAD_OPD_IN,  0 },
+    { "bt",      RAD_OPD_IN,  0 },
+    { "nc",      RAD_OPD_IN,  0 },
+    { "pos",     RAD_OPD_IN,  0 },
+    { "cu",      RAD_OPD_IN,  0 },
+    { "sel",     RAD_OPD_OUT, 0 },
+    { "nsel",    RAD_OPD_OUT, 0 },
     { "seqused", RAD_OPD_OUT, 0 },
 };
 
@@ -3683,6 +3731,20 @@ static const RadOpSchema kSchemas[] = {
            "nowhere else, so the effective query position is (nsel-1)*ratio + pos%ratio. Ties "
            "break to the LOWER block index through a prefix count, never through atomic order. "
            "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0)."),
+    SCHEMA("qsa_select_part", pQsaSelectPart, oQsaSelectPart,
+           "ONE RANK'S SHARE of a split selection (block keys on rank b % ranks): over the "
+           "blocks b < n with b % ranks == rank, score column b / ranks and liveness from the "
+           "ATTENTION table at b, the topk largest by (order key desc, block asc), written in "
+           "BLOCK ORDER as [keys | global blocks | count, bit 30 when more than topk were live], "
+           "2 * topk + 1 words rounded up to four, zeros elsewhere. The order key is the selection's "
+           "own (bits(max(score, 0)) + 1, or the signed total order), so the join needs no "
+           "`signed`."),
+    SCHEMA("qsa_select_join", pQsaSelectJoin, oQsaSelectJoin,
+           "qsa_select's table, nsel and seqused from the ranks' qsa_select_part lists gathered "
+           "side by side, BYTE FOR BYTE the table qsa_select builds over the unsplit scores: each "
+           "rank's top-k holds every global top-k member of its share, and the bit-30 flags say "
+           "whether more than topk were live anywhere. The table width stands for the score "
+           "width, which only bounds n from above."),
     SCHEMA("kv_resolve", pKvResolve, oKvResolve,
            "make every block the selections name resident and rewrite them as ring slots: bump "
            "the epoch, take a hit or make a single claim (-1 -> -2) per distinct block, compact "
@@ -5176,6 +5238,14 @@ static const RadConstraint cKvVpred[] = { C_DIV("head_dim", 32), C_LE("head_dim"
 
 /* No dtype: every operand is f32 or i32. */
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), C_GE("ratio", 1) };
+/* The join holds the union of the ranks' lists in LDS three times over (raw blocks, merged keys,
+ * merged blocks): 3 * ranks * topk words within the 32 KiB the selection kernels budget, and the
+ * offset walk bounds ranks at 16. The part has the selection's bounds. */
+static const RadConstraint cQsaSelectPart[] = { C_GE("blocks", 1), C_GE("topk", 1),
+                                                C_GE("ratio", 1), C_GE("ranks", 1) };
+static const RadConstraint cQsaSelectJoin[] = { C_GE("blocks", 1), C_GE("topk", 1),
+                                                C_LE("topk", 1365), C_GE("ratio", 1),
+                                                C_GE("ranks", 1), C_LE("ranks", 2) };
 
 /* The two byte planes are read by pitch, so only positivity is fixed: any block extent and any
  * ring depth the device can address. */
@@ -9458,6 +9528,28 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,
   r4d_shape_qsa_select },
+
+/* Block keys split across ranks (docs/QSA.md): one rank's top-k list, one workgroup a query row. */
+{ "qsa_select_part_i32", "qsa_select_part", "attn",
+  "one rank's share of a split QSA selection: its top-k as (order key, global block) in block order",
+  "any M, any block count, any topk, any rank count; one workgroup a query, the share's keys "
+  "cached in LDS up to 64 rows and 8192 keys",
+  "f32 scores (the share's columns) and an i32 attention page table in; an i32 list row out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaSelectPart), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_select_part, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_select_part },
+
+/* The ranks' lists merged, one 1024-thread workgroup a query row as the split path's merge. */
+{ "qsa_select_join_i32", "qsa_select_join", "attn",
+  "the ranks' qsa_select_part lists merged into qsa_select's page-id table, byte for byte",
+  "two ranks, topk up to 1365 (the union three times over within 32 KiB of LDS); any M and block "
+  "count",
+  "i32 lists and an i32 attention page table in; an i32 [M, topk+1] table and counts out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaSelectJoin), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_select_join, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_select_join },
 
 /* The residency map of a streamed KV group, in one workgroup: the CLOCK hand is serial state and
  * the phases are barriers. The copies run in the same launch. */

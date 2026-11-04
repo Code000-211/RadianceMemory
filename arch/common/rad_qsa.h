@@ -80,6 +80,14 @@ struct QsaIndexer {
         const char* page_store_layout = nullptr;
         const char* page_pool_layout  = nullptr;
         int64_t     page_head_dim     = 0;
+        /* Block keys split across the tensor-parallel ranks (RadBuildCtx::qsa_bkey_split; docs/
+         * QSA.md, "Block keys split across ranks"): `split` ranks, this one `split_rank`. Block b
+         * is stored and scored only on rank b % split, the block-key group is paged at
+         * `split * ratio` tokens (one key a page, so a rank holds 1/split of them), and the
+         * selection is qsa_select_part, an all_gather of the lists and qsa_select_join: the
+         * unsplit selection byte for byte. 0 is today's program, parameter for parameter. */
+        int         split      = 0;
+        int         split_rank = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -118,7 +126,16 @@ struct QsaIndexer {
          * step by `rope_table` for the attention block; the indexer rotates at the same `rot`,
          * `theta` and `scale`. Without it the unfused per-head norms run. */
         rad_buf cos_sin = 0;
+        /* Under Config::split only: this rank's top-k list, [plane rows, part_width(topk)] i32,
+         * and every rank's side by side as the row-interleaved all_gather lays them out,
+         * [plane rows, split * part_width(topk)]. Scratch shared by every layer, like `sel`. */
+        rad_buf part = 0;
+        rad_buf gath = 0;
     };
+
+    /* One rank's list row (qsa_select_part, docs/OPS.md): 2 * topk + 1 i32 words rounded up to
+     * whole 16-byte words, which a row-interleaved all_gather moves. */
+    static int64_t part_width(int64_t topk) { return (2 * topk + 1 + 3) / 4 * 4; }
 
     Geom       g{};
     Config     c{};
@@ -132,6 +149,10 @@ struct QsaIndexer {
      * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0, op_page = 0;
+    /* Under Config::split, in place of op_select. */
+    rad_op      op_part = 0, op_gather = 0, op_join = 0;
+    /* Ranks the block keys are split over: Config::split, or 1. */
+    int64_t     ranks() const { return c.split > 1 ? c.split : 1; }
 
     bool on() const { return op_rope != 0; }
 
@@ -223,6 +244,10 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     if (!c.k_norm || !w.stage || !c.topk || !c.max_blocks || !c.max_work)
         return RAD_E_INVAL;
     if (!c.kv_tail || c.ring < c.ratio) return RAD_E_INVAL;
+    if (c.split == 1 || c.split < 0 || (c.split > 1 && (c.split_rank < 0 || c.split_rank >= c.split ||
+                                                        !w.part || !w.gath)))
+        return RAD_E_INVAL;
+    const int64_t R = ranks();
     /* This layer's tail state: the caller's group holds one state per sequence per bound layer. */
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, c.kv_tail));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.qsa_k_norm.weight", l), c.k_norm));
@@ -230,13 +255,18 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                   RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     if (!w_kn) return RAD_E_INVAL;
 
-    op_work = rw(b, RAD_OP(b, "qsa_work",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
-                               RAD_INT("ratio", c.ratio), RAD_INT("ring", c.ring),
-                               RAD_INT("seqs", g.max_seqs),
-                               RAD_INT("work", c.max_work), RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.qk}, {w.stage, w.page, w.bpos, w.nc});
+    /* Split, `ranks` and `rank` send every block another rank stores to page -1 and the rest to
+     * page bt[b / ranks]; unsplit the parameters are absent, today's op parameter for parameter. */
+    {
+        const RadParam ps[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
+                                RAD_INT("ratio", c.ratio), RAD_INT("ring", c.ring),
+                                RAD_INT("seqs", g.max_seqs),
+                                RAD_INT("work", c.max_work), RAD_STR("dtype", g.dtype),
+                                RAD_INT("ranks", R), RAD_INT("rank", c.split_rank) };
+        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (R > 1 ? 0 : 2);
+        op_work = rw(b, rad_decl_op(b, "qsa_work", ps, n_ps, RAD_NOWEIGHTS),
+                     {w.qk}, {w.stage, w.page, w.bpos, w.nc});
+    }
 
     /* The block-key group, declared immediately before its consumer (see the declaration). One KV
      * head, `block_size` = ratio and `head_dim` = n / (2 * ratio) make a page hold exactly one
@@ -248,14 +278,19 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * the pool, the prefix cache and the residency store size the page from the declaration as
      * they do any other. Every QSA layer and the MTP head share the group, so all take the same
      * dtype (one Config). */
+    /* Split across R ranks the group is paged at R * ratio tokens: a page still holds one key (the
+     * key of this rank's block in that span), so a rank allocates one page per R blocks and the
+     * pool, prefix cache and residency store follow from the declaration as before. Unsplit
+     * `bs` is `ratio` and everything below is today's arithmetic. */
+    const int64_t bs = R * c.ratio;
     if (*bk == 0) {
-        if ((c.head_dim % (2 * c.ratio)) != 0) return RAD_E_SHAPE;
+        if ((c.head_dim % (2 * bs)) != 0) return RAD_E_SHAPE;
         RadKVGroupDecl d{};
         d.kind      = RAD_KV_FULL;
         d.dtype     = c.bkey_i8 ? RAD_I8 : RAD_BF16;
         d.n_head_kv = 1;
-        d.head_dim  = c.bkey_i8 ? (c.head_dim + 2 + 2 * c.ratio - 1) / (2 * c.ratio)
-                                : c.head_dim / (2 * c.ratio);
+        d.head_dim  = c.bkey_i8 ? (c.head_dim + 2 + 2 * bs - 1) / (2 * bs)
+                                : c.head_dim / (2 * bs);
         *bk = rad_decl_kv_group(b, nm.f("kv_qsa_bkey"), &d);
         if (!*bk) return RAD_E_INVAL;
         /* qsa_score reads every complete block of the history each step, so this group stays resident
@@ -268,7 +303,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     {
         const RadParam ps[] = { RAD_RANGE("M", 1, c.max_work), RAD_INT("n", c.head_dim),
                                 RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
-                                RAD_INT("block_size", c.ratio),
+                                RAD_INT("block_size", bs),
                                 RAD_F64("eps", g.eps), RAD_F64("theta", g.theta),
                                 RAD_F64("scale", g.rope_scale), RAD_F64("wadd", g.wadd_qk),
                                 RAD_STR("dtype", g.dtype), RAD_STR("mode", g.rope_mode),
@@ -305,12 +340,40 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         op_score = rw(b, rad_decl_op(b, "qsa_score", ps, n_ps, RAD_NOWEIGHTS), {w.q, w.nc},
                       {w.score});
     }
-    op_select = rw(b, RAD_OP(b, "qsa_select",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
-                                 RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
-                                 RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
-                      RAD_NOWEIGHTS),
-                  {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
+    if (R == 1) {
+        op_select = rw(b, RAD_OP(b, "qsa_select",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                     RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                     RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
+                          RAD_NOWEIGHTS),
+                      {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
+    } else {
+        /* Split: this rank's top-k list, every rank's lists side by side (a row-interleaved
+         * gather, one list row a query), and their merge into the table qsa_select would build
+         * over the unsplit scores. `M` is a window of the score plane at most (step()). */
+        const int64_t PW = part_width(c.topk);
+        const int64_t rows = c.plane_rows > 0 ? c.plane_rows : g.max_tok;
+        op_part = rw(b, RAD_OP(b, "qsa_select_part",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                   RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                   RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs),
+                                   RAD_INT("ranks", R), RAD_INT("rank", c.split_rank)),
+                        RAD_NOWEIGHTS),
+                     {w.score, w.nc}, {w.part});
+        op_gather = rw(b, RAD_OP(b, "all_gather",
+                          RAD_PARAMS(RAD_INT("world_size", R), RAD_RANGE("numel", PW, rows * PW),
+                                     RAD_STR("dtype", "f32"), RAD_INT("row", PW)),
+                          RAD_NOWEIGHTS),
+                       {w.part}, {w.gath});
+        op_join = rw(b, RAD_OP(b, "qsa_select_join",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                   RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                   RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs),
+                                   RAD_INT("ranks", R)),
+                        RAD_NOWEIGHTS),
+                     {w.gath, w.nc}, {w.sel, w.nsel, w.sequ});
+        if (!op_part || !op_gather || !op_join) return RAD_E_INVAL;
+    }
 
     /* When the attention group streams, the attention block resolves `sel` to ring slots after its
      * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
@@ -448,6 +511,32 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
     int64_t live = reach / c.ratio + 1;
     if (live > c.max_blocks) live = c.max_blocks;
     if (live < 1) live = 1;
+    /* Split, this rank scores column j = block j * R + rank: ceil(live / R) columns hold every
+     * block of its share below `live` (qsa_select_part takes min(table, R * columns) as the
+     * width, which only ever bounds the query's n from above, as `live` does unsplit). */
+    const int64_t R = ranks();
+    const int64_t live_s = (live + R - 1) / R;
+    /* The selection of the score plane's first `rows` rows into rows [r0, r0 + rows) of
+     * sel/nsel/sequ: qsa_select, or split this rank's list, the gather and the merge, which
+     * writes the bytes qsa_select would. */
+    auto selection = [&](int64_t rows, int64_t r0, RadOperand cu, const int32_t* pos) {
+        const RadOperand sc = bcol_at(w.score, 0, c.max_blocks, 0, live_s, rows);
+        const RadOperand bt = praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch);
+        if (R == 1) {
+            RAD_ISSUE_N(c_, op_select, rows, sc, bt, brows(w.nc, S), praw(pos, RAD_I32, rows), cu,
+                        brow_slice(w.sel, r0, rows, c.topk + 1), brow_slice(w.nsel, r0, rows, 1),
+                        brow_slice(w.sequ, r0, rows, 1));
+            return;
+        }
+        const int64_t PW = part_width(c.topk);
+        RAD_ISSUE_N(c_, op_part, rows, sc, bt, brows(w.nc, S), praw(pos, RAD_I32, rows), cu,
+                    brows(w.part, rows));
+        RAD_ISSUE_N(c_, op_gather, rows * PW, brows(w.part, rows), brows(w.gath, rows));
+        RAD_ISSUE_N(c_, op_join, rows, brows(w.gath, rows), bt, brows(w.nc, S),
+                    praw(pos, RAD_I32, rows), cu,
+                    brow_slice(w.sel, r0, rows, c.topk + 1), brow_slice(w.nsel, r0, rows, 1),
+                    brow_slice(w.sequ, r0, rows, 1));
+    };
 
     /* A step wider than the score plane is one sequence (Config::plane_rows), scored and selected
      * in windows of the plane's rows from the front, the last one ending at the step's end and
@@ -468,14 +557,8 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                         brow_slice(w.q, w0, PR, qw), kv_cache(kv_bk, layer),
                         praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
                         praw(win_cu, RAD_I32, 2), brows(w.nc, S),
-                        bcol_at(w.score, 0, c.max_blocks, 0, live, PR));
-            RAD_ISSUE_N(c_, op_select, PR,
-                        bcol_at(w.score, 0, c.max_blocks, 0, live, PR),
-                        praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
-                        brows(w.nc, S), praw(batch->positions + w0, RAD_I32, PR),
-                        praw(win_cu, RAD_I32, 2),
-                        brow_slice(w.sel, w0, PR, c.topk + 1), brow_slice(w.nsel, w0, PR, 1),
-                        brow_slice(w.sequ, w0, PR, 1));
+                        bcol_at(w.score, 0, c.max_blocks, 0, live_s, PR));
+            selection(PR, w0, praw(win_cu, RAD_I32, 2), batch->positions + w0);
             if (w0 + PR >= T) break;
             w0 = w0 + PR + PR <= T ? w0 + PR : T - PR;
         }
@@ -485,13 +568,8 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 brows(w.q, T), kv_cache(kv_bk, layer),
                 praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
                 praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
-                bcol_at(w.score, 0, c.max_blocks, 0, live, T));
-    RAD_ISSUE_N(c_, op_select, T,
-                bcol_at(w.score, 0, c.max_blocks, 0, live, T),
-                praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
-                brows(w.nc, S), praw(batch->positions, RAD_I32, T),
-                praw(batch->cu_seqlens, RAD_I32, S + 1),
-                brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+                bcol_at(w.score, 0, c.max_blocks, 0, live_s, T));
+    selection(T, 0, praw(batch->cu_seqlens, RAD_I32, S + 1), batch->positions);
 
     /* The pager, on the decode rows (they come first, RadBatch::n_seq_decode, and own the scratch
      * pages). Only with the store open this step: the declare asked for the op, the batch says

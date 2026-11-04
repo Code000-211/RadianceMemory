@@ -590,6 +590,14 @@ std::vector<Case> build_cases() {
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
                       HI("work", 3), HS("dtype", "f32") });
+    /* Block keys split across ranks: one rank's share (the join's lists are built by hand,
+     * avx_check_hand.cpp), and the work list storing every other block. */
+    add("qsa_select_part", { HI("M", 4), HI("blocks", 300), HI("topk", 32), HI("ratio", 4),
+                             HI("seqs", 1), HI("ranks", 2), HI("rank", 1) });
+    add("qsa_select_part", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
+                             HI("seqs", 3), HI("ranks", 2), HI("rank", 0), HI("signed", 1) });
+    add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
+                      HI("work", 3), HS("dtype", "f32"), HI("ranks", 2), HI("rank", 1) });
     /* The residency map at a decode step's geometry and at the edges a description can reach: a ring
      * shallower and deeper than the id space, one query row, a pitch of one, and a `block_bytes`
      * that is not a whole vector (the copy's tail). The described map is all-resident, so misses,

@@ -185,6 +185,208 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ qsa_select_part / _join */
+/* The selection with the block keys split across `ranks` tensor-parallel ranks (docs/QSA.md,
+ * "Block keys split across ranks"): rank r holds the blocks b with b % ranks == r, scores them into
+ * column b / ranks of its own score plane, and qsa_select_part takes ITS top-k of them as a list of
+ * (order key, block index); an all_gather joins the ranks' lists and qsa_select_join merges them
+ * into exactly the table qsa_select builds over the unsplit plane, byte for byte.
+ *
+ * Exact for the reason the chunked device selection is: both stages rank by one total order, key
+ * descending then block index ascending, and a block in the global top-k has fewer than k blocks
+ * ahead of it globally, so fewer than k within its own rank's share: it is in its rank's list. The
+ * union of the lists therefore holds the whole global top-k, and the only fact a list cannot show
+ * is whether its rank had more than `topk` live blocks (a full list may be all of them), so each
+ * list carries that as a flag: with no flag set and at most topk candidates in all, the candidates
+ * are every live block, which qsa_select takes in block order; otherwise its layout (above the
+ * threshold in block order, then the ties in block order).
+ *
+ * A list row is `qsa_part_width(topk)` = 2 * topk + 1 rounded up to four i32 words (whole 16-byte
+ * words, which a row-interleaved all_gather needs): the keys at [0, topk), the blocks at
+ * [topk, 2 * topk), at [2 * topk] the entry count with bit 30 set when the rank had more than topk
+ * live blocks, zeros after it and past the count. The key is libr4d's order key (keyof in
+ * r4d_qsa_select_bf16.hip): bits(max(score, 0)) + 1 for a live block, or with `signed` the float's
+ * total order over all 32 bits (-0 keyed as +0), so a key orders exactly as qsa_select's values and
+ * the join needs no `signed`. Liveness is qsa_select's here: a page id >= 0 in the attention table
+ * at the block's global index and a live score. */
+namespace {
+
+constexpr int64_t kPartOver = int64_t(1) << 30;
+
+int64_t part_width(int64_t topk) { return (2 * topk + 1 + 3) / 4 * 4; }
+
+uint32_t order_key(float v, bool sgn) {
+    uint32_t u = 0;
+    if (sgn) {
+        if (v != 0.0f) std::memcpy(&u, &v, 4);
+        return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+    }
+    const float x = v > 0.0f ? v : 0.0f;
+    std::memcpy(&u, &x, 4);
+    return u + 1u;
+}
+
+/* Of (key, block) candidates, the indices qsa_select's rule takes, in its output order: every one
+ * in block order when `all`, else the topk largest by (key desc, block asc), those above the
+ * topk-th key in block order and then the ones equal to it in block order. */
+std::vector<size_t> take_rule(const std::vector<std::pair<uint32_t, int64_t>>& c, int64_t topk,
+                              bool all) {
+    std::vector<size_t> ix(c.size());
+    for (size_t i = 0; i < ix.size(); ++i) ix[i] = i;
+    auto by_block = [&](size_t x, size_t y) { return c[x].second < c[y].second; };
+    if (all) {
+        std::sort(ix.begin(), ix.end(), by_block);
+        if ((int64_t)ix.size() > topk) ix.resize((size_t)topk);
+        return ix;
+    }
+    std::sort(ix.begin(), ix.end(), [&](size_t x, size_t y) {
+        return c[x].first != c[y].first ? c[x].first > c[y].first : c[x].second < c[y].second;
+    });
+    if ((int64_t)ix.size() > topk) ix.resize((size_t)topk);
+    if (ix.empty()) return ix;
+    const uint32_t thr = c[ix.back()].first;
+    std::vector<size_t> hi, eq;
+    for (size_t i : ix) (c[i].first > thr ? hi : eq).push_back(i);
+    std::sort(hi.begin(), hi.end(), by_block);
+    std::sort(eq.begin(), eq.end(), by_block);
+    hi.insert(hi.end(), eq.begin(), eq.end());
+    return hi;
+}
+
+}  /* namespace */
+
+/* Operands score [M, >= ceil(width / ranks)] (column j is block j * ranks + rank), bt (the
+ * attention group's table, global block index), nc, pos, cu as qsa_select's; out `part`
+ * [M, >= qsa_part_width(topk)] i32. The query's bound is qsa_select's,
+ * n = min(nc[seq], (pos + 1) / ratio, width) with width = min(bt's, ranks * score's). */
+int ref_qsa_select_part(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
+    const RadTensor *cu = &a->t[4], *pt = &a->t[5];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t R = p_int(a, "ranks", 0), rk = p_int(a, "rank", -1);
+    const int64_t sgn = p_int(a, "signed", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (R < 1 || rk < 0 || rk >= R || (sgn != 0 && sgn != 1)) return RAD_E_INVAL;
+    if (sc->rank != 2 || bt->rank != 2 || pt->rank != 2) return RAD_E_SHAPE;
+    const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], R * sc->shape[1]);
+    const int64_t n_seq = numel(cu) - 1, W = part_width(topk);
+    if (M <= 0 || nb <= 0 || n_seq <= 0) return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
+    if (pt->shape[0] < M || pt->shape[1] < W || numel(po) < M) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
+    for (int64_t m = 0; m < M; ++m)
+        if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    const int64_t s_rs = sc->stride[0], s_cs = sc->stride[1];
+    const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
+    const int64_t o_rs = pt->stride[0], o_cs = pt->stride[1];
+    REF_PAR_FOR(M * nb)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq_holding(cu, n_seq, m, 0);
+        const int64_t p = ldi(po, offlin(po, m));
+        const int64_t n = std::min(std::min(ldi(nc, offlin(nc, s)), nb), (p + 1) / ratio);
+        std::vector<std::pair<uint32_t, int64_t>> live;
+        for (int64_t b = rk; b < n; b += R) {
+            const float v = ldt(sc, m * s_rs + (b / R) * s_cs);
+            if (ldi(bt, s * bt_rs + b * bt_cs) < 0) continue;
+            if (sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+            live.push_back({ order_key(v, sgn != 0), b });
+        }
+        const bool over = (int64_t)live.size() > topk;
+        /* This rank's top-k by the total order, written in block order. */
+        std::vector<size_t> take = take_rule(live, topk, !over);
+        std::sort(take.begin(), take.end(),
+                  [&](size_t x, size_t y) { return live[x].second < live[y].second; });
+        for (int64_t i = 0; i < W; ++i) st_int(pt->dtype, pt->data, m * o_rs + i * o_cs, 0);
+        for (size_t i = 0; i < take.size(); ++i) {
+            st_int(pt->dtype, pt->data, m * o_rs + (int64_t)i * o_cs,
+                   (int32_t)live[take[i]].first);
+            st_int(pt->dtype, pt->data, m * o_rs + (topk + (int64_t)i) * o_cs, live[take[i]].second);
+        }
+        st_int(pt->dtype, pt->data, m * o_rs + 2 * topk * o_cs,
+               (int64_t)take.size() | (over ? kPartOver : 0));
+    }
+    return RAD_OK;
+}
+
+/* Operands `part` [M, >= ranks * W] (rank q's list at columns [q * W, (q + 1) * W), as a
+ * row-interleaved all_gather of qsa_select_part's rows lays them out), then bt, nc, pos, cu, sel,
+ * nsel, seqused as qsa_select's, the table width standing for the score width (the caller's
+ * narrowed score columns only ever bound n from above, docs/QSA.md). Writes qsa_select's outputs.
+ * A list that is not one qsa_select_part writes -- a count past topk, a block outside its rank's
+ * share or the query's bound, blocks out of order, a dead key -- is refused before any write. */
+int ref_qsa_select_join(const RadArgs* a, RadStream) {
+    if (!have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *pt = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
+    const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t R = p_int(a, "ranks", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (R < 1) return RAD_E_INVAL;
+    if (pt->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
+    const int64_t M = pt->shape[0], nb = bt->shape[1], W = part_width(topk);
+    const int64_t n_seq = numel(cu) - 1;
+    if (M <= 0 || nb <= 0 || n_seq <= 0 || pt->shape[1] < R * W) return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
+    if (se->shape[0] < M || se->shape[1] < topk + 1) return RAD_E_SHAPE;
+    if (numel(ns) < M || numel(po) < M || numel(su) < M) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
+    for (int64_t m = 0; m < M; ++m)
+        if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    const int64_t p_rs = pt->stride[0], p_cs = pt->stride[1];
+    const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
+    const int64_t o_rs = se->stride[0], o_cs = se->stride[1];
+    auto bound = [&](int64_t m) {
+        const int64_t s = seq_holding(cu, n_seq, m, 0);
+        return std::min(std::min(ldi(nc, offlin(nc, s)), nb), (ldi(po, offlin(po, m)) + 1) / ratio);
+    };
+    /* Every list, validated before any write. */
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t n = bound(m);
+        for (int64_t q = 0; q < R; ++q) {
+            const int64_t base = m * p_rs + q * W * p_cs;
+            const int64_t cnt = ldi(pt, base + 2 * topk * p_cs) & ~kPartOver;
+            if (cnt < 0 || cnt > topk) return RAD_E_INVAL;
+            for (int64_t i = 0, last = -1; i < cnt; ++i) {
+                const int64_t b = ldi(pt, base + (topk + i) * p_cs);
+                if (b <= last || b >= n || b % R != q || ldi(pt, base + i * p_cs) == 0)
+                    return RAD_E_INVAL;
+                last = b;
+            }
+        }
+    }
+    REF_PAR_FOR(M * R * topk)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq_holding(cu, n_seq, m, 0);
+        const int64_t p = ldi(po, offlin(po, m)), n = bound(m);
+        std::vector<std::pair<uint32_t, int64_t>> cand;
+        bool over = false;
+        for (int64_t q = 0; q < R; ++q) {
+            const int64_t base = m * p_rs + q * W * p_cs;
+            const int64_t w = ldi(pt, base + 2 * topk * p_cs);
+            over = over || (w & kPartOver);
+            for (int64_t i = 0; i < (w & ~kPartOver); ++i)
+                cand.push_back({ (uint32_t)ldi(pt, base + i * p_cs),
+                                 ldi(pt, base + (topk + i) * p_cs) });
+        }
+        const bool all = n <= topk || (!over && (int64_t)cand.size() <= topk);
+        int64_t out = 0;
+        for (size_t i : take_rule(cand, topk, all))
+            st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs,
+                   ldi(bt, s * bt_rs + cand[i].second * bt_cs));
+        if (n < nb && (p + 1) % ratio != 0) {
+            const int64_t part = ldi(bt, s * bt_rs + n * bt_cs);
+            if (part >= 0) st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs, part);
+        }
+        for (int64_t i = out; i <= topk; ++i) st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);
+        st_int(ns->dtype, ns->data, offlin(ns, m), out);
+        st_int(su->dtype, su->data, offlin(su, m), out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_tail_store */
 /* state[sidx[s][0]][0][pos[t] % ring] = k[t] for the last `ring` rows of each sequence, rows in
  * ascending order (a row whose slot is -1, or that no sequence holds, writes nothing). Every other
@@ -317,7 +519,12 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
  * one its position plus the shift rope[0][cu[s]] - p0), and, when the slot exists, the block's
  * `ratio` raw keys in stage rows w * ratio + i: key q from the batch row cu[s] + q - p0 when q >= p0,
  * else from tail row q % ring. Items past the count get page -1 and position 0 and leave `stage`
- * alone. nc[s] = (last position + 1) / ratio, 0 for an empty sequence. */
+ * alone. nc[s] = (last position + 1) / ratio, 0 for an empty sequence.
+ *
+ * With `ranks` R > 1 and `rank` r (block keys split across tensor-parallel ranks, docs/QSA.md,
+ * "Block keys split across ranks"), this rank stores only the blocks b with b % R == r, one page
+ * per R blocks: such an item's page is bt[s][b / R], every other item gets page -1 and leaves
+ * `stage` alone (qsa_block_key skips it). nc stays the sequence's whole complete-block count. */
 int ref_qsa_work(const RadArgs* a, RadStream) {
     if (a->n_t < 11) return RAD_E_INVAL;
     const RadTensor *k = t_in(a, 0), *po = t_in(a, 1), *cu = t_in(a, 2), *tl = t_in(a, 3);
@@ -326,6 +533,8 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
     if (!k || !po || !cu || !tl || !sx || !bt || !stg || !pg || !bp || !nc) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
+    const int64_t R = p_int(a, "ranks", 1), rk = p_int(a, "rank", 0);
+    if (R < 1 || rk < 0 || rk >= R) return RAD_E_INVAL;
     if (k->rank != 2 || bt->rank != 2 || stg->rank != 2) return RAD_E_SHAPE;
     if (tl->rank != 4 || tl->shape[1] != 1 || tl->shape[2] < ring || tl->shape[3] != n)
         return RAD_E_SHAPE;
@@ -359,7 +568,7 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
         const int64_t p0 = ldi(po, offlin(po, t0)), p1 = ldi(po, offlin(po, t1 - 1));
         for (int64_t b = p0 / ratio; b <= (p1 + 1) / ratio - 1; ++b) {
             if ((int64_t)items.size() >= mw) break;
-            if (b >= bt->shape[1]) return RAD_E_SHAPE;
+            if (b / R >= bt->shape[1]) return RAD_E_SHAPE;
             const int64_t si = ldi(sx, col0(sx, s));
             if (si >= slots) return RAD_E_INVAL;
             for (int64_t i = 0; si >= 0 && i < ratio; ++i) {
@@ -386,8 +595,9 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
         const int64_t s = items[(size_t)w].s, b = items[(size_t)w].b;
         const int64_t t0 = cu_at(cu, s), p0 = ldi(po, offlin(po, t0));
         const int64_t si = ldi(sx, col0(sx, s));
+        const bool mine = b % R == rk;   /* stored on this rank (always, unsplit) */
         st_int(pg->dtype, pg->data, offlin(pg, w),
-               si < 0 ? -1 : ldi(bt, s * bt->stride[0] + b * bt->stride[1]));
+               si < 0 || !mine ? -1 : ldi(bt, s * bt->stride[0] + (b / R) * bt->stride[1]));
         const int64_t f = b * ratio;
         if (!rp) {
             st_int(bp->dtype, bp->data, bpos_at(w, 0), f);
@@ -398,7 +608,7 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
                        f >= p0 ? ldi(rp, c * rs + (t0 + f - p0) * rc)
                                : f + (ldi(rp, t0 * rc) - p0));
         }
-        if (si < 0) continue;
+        if (si < 0 || !mine) continue;
         for (int64_t i = 0; i < ratio; ++i) {
             const int64_t q = f + i;
             const RadTensor* src = q >= p0 ? k : tl;

@@ -12074,6 +12074,147 @@ TEST(flashnext_int8_block_keys_shrink_the_block_key_page_and_change_nothing_else
     CHECK(err.find("block keys") != std::string::npos);
 }
 
+/* --qsa-bkey-split on (RadBuildCtx::qsa_bkey_split) at two ranks: the block-key group is paged at
+ * 2 * ratio tokens with one key a page (head_dim 8 at bf16, a 256-byte page for two blocks' worth
+ * of tokens; 9 in int8, 144 bytes), so each rank holds half the keys. Every qsa_block_key states
+ * that block size and every qsa_work its rank; qsa_select is replaced, per QSA layer and in the MTP
+ * head, by qsa_select_part, an all_gather of one 1028-word list row a query (row-interleaved) and
+ * qsa_select_join. Everything else is today's op for op and parameter for parameter, and with the
+ * flag off the program has none of it. The split steps lint clean (decode, prefill, verify and the
+ * head) and each issue sizes the gather and narrows the score plane to its share. The probe says
+ * the plugin serves it; one rank and a value other than 0 or 1 are refused. */
+TEST(flashnext_split_block_keys_halve_the_block_key_pages_and_select_through_a_gather) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.qsa_bkey_split_ok, 1);
+    auto keys = [](const RadBuilder& x) -> const RecKV* {
+        for (const RecKV& g : x.kv_groups) if (g.name == "kv_qsa_bkey") return &g;
+        return nullptr;
+    };
+    for (bool i8 : { false, true })
+        for (int rank = 0; rank < 2; ++rank) {
+            RadBuildCtx ctx = q4_ctx(rank, 2);
+            ctx.qsa_bkey_dtype = i8 ? RAD_I8 : 0;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &ctx), RAD_OK);
+            ctx.qsa_bkey_split = 1;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            const RecKV *ka = keys(a), *kb = keys(b);
+            REQUIRE(ka != nullptr);
+            REQUIRE(kb != nullptr);
+            CHECK_EQ(ka->d.head_dim, i8 ? 17 : 16);
+            CHECK_EQ(kb->d.head_dim, i8 ? 9 : 8);
+            CHECK_EQ(kb->d.dtype, ka->d.dtype);
+            CHECK_EQ(kb->d.n_head_kv, 1);
+            CHECK_EQ(kb->d.residency_window, 0ll);
+            /* A page of the split group (2 * ratio = 8 tokens) holds one key: bytes a token a
+             * layer drop from 64 to 32 at bf16 and from 34 to 18 in int8. */
+            CHECK_EQ(rad_dtype_bytes(kb->d.dtype, 2 * 8 * kb->d.head_dim), i8 ? 144 : 256);
+            /* Off: no op of the split, and today's block size and qsa_work parameters. */
+            for (const RecOp& x : a.ops) {
+                CHECK(x.op != "qsa_select_part" && x.op != "qsa_select_join");
+                CHECK_EQ(pint(&x, "ranks"), -12345LL);
+                if (x.op == "qsa_block_key") CHECK_EQ(pint(&x, "block_size"), 4LL);
+            }
+            /* On: a's ops with each qsa_select replaced by part, gather, join. */
+            std::vector<const RecOp*> rest;
+            int parts = 0, joins = 0, gathers = 0, works = 0, stores = 0;
+            for (const RecOp& y : b.ops) {
+                if (y.op == "qsa_select_part") {
+                    ++parts;
+                    CHECK_EQ(pint(&y, "ranks"), 2LL);
+                    CHECK_EQ(pint(&y, "rank"), (long long)rank);
+                    CHECK_EQ(pint(&y, "topk"), 512LL);
+                    continue;
+                }
+                if (y.op == "qsa_select_join") {
+                    ++joins;
+                    CHECK_EQ(pint(&y, "ranks"), 2LL);
+                    CHECK_EQ(pint(&y, "topk"), 512LL);
+                    continue;
+                }
+                if (y.op == "all_gather" && pint(&y, "row") == 1028) {
+                    ++gathers;
+                    CHECK_EQ(pint(&y, "world_size"), 2LL);
+                    CHECK_EQ(pstr(&y, "dtype"), std::string("f32"));
+                    continue;
+                }
+                rest.push_back(&y);
+            }
+            std::vector<const RecOp*> base;
+            for (const RecOp& x : a.ops) if (x.op != "qsa_select") base.push_back(&x);
+            CHECK_EQ(parts, 3);   /* layers 3 and 7 and the MTP head */
+            CHECK_EQ(joins, 3);
+            CHECK_EQ(gathers, 3);
+            REQUIRE_EQ(rest.size(), base.size());
+            for (size_t i = 0; i < rest.size(); ++i) {
+                const RecOp &x = *base[i], &y = *rest[i];
+                REQUIRE_EQ(x.op, y.op);
+                if (y.op == "qsa_work") {
+                    ++works;
+                    CHECK_EQ(pint(&y, "ranks"), 2LL);
+                    CHECK_EQ(pint(&y, "rank"), (long long)rank);
+                    REQUIRE_EQ(y.p.size(), x.p.size() + 2);
+                    continue;
+                }
+                REQUIRE_EQ(y.p.size(), x.p.size());
+                for (size_t j = 0; j < x.p.size(); ++j) {
+                    CHECK_EQ(y.p[j].key, x.p[j].key);
+                    if (y.op == "qsa_block_key" && y.p[j].key == "block_size") {
+                        ++stores;
+                        CHECK_EQ(y.p[j].ival, 8LL);
+                        continue;
+                    }
+                    CHECK_EQ(y.p[j].ival, x.p[j].ival);
+                    CHECK_EQ(y.p[j].ihi, x.p[j].ihi);
+                    CHECK_EQ(y.p[j].sval, x.p[j].sval);
+                }
+            }
+            CHECK_EQ(works, 3);
+            CHECK_EQ(stores, 3);
+            /* Decode, a prefill after a long history (sparse), a verify and the head's passes. */
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, 2);
+                CHECK_PASSES(b, v);
+                /* The gather moves one 1028-word list a query row; the score plane is the share's
+                 * columns, ceil(live / 2), at the declared pitch. */
+                const auto ga = issues_of(b, *v[0], "all_gather");
+                const auto pa = issues_of(b, *v[0], "qsa_select_part");
+                const auto sc = issues_of(b, *v[0], "qsa_score");
+                REQUIRE(!pa.empty());
+                REQUIRE_EQ(sc.size(), pa.size());
+                int64_t listed = 0;
+                for (const RecIssue* g : ga)
+                    if (const RecOp* o = b.op_of(g->op); o && pint(o, "row") == 1028) {
+                        ++listed;
+                        CHECK_EQ(g->n, g->opd[0].rows * 1028);
+                    }
+                CHECK_EQ(listed, (int64_t)pa.size());
+                for (size_t i = 0; i < pa.size(); ++i) {
+                    CHECK_EQ(pa[i]->opd[0].cols, sc[i]->opd[5].cols);
+                    CHECK(pa[i]->opd[0].cols > 0);
+                }
+            }
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+        }
+    for (int bad : { 1, 2 }) {
+        RadBuildCtx ctx = q4_ctx(0, bad == 1 ? 1 : 2);
+        ctx.qsa_bkey_split = bad;
+        RadBuilder c;
+        c.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&c, &meta, &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        CHECK(err.find("qsa-bkey-split") != std::string::npos);
+    }
+}
+
 /* The rope table has a row for every position a step can name: a verify and the draft rounds run
  * up to max_spec past max_ctx, so a table ending at max_ctx would rotate them by unwritten rows.
  * Every draft pass fills its own rows before anything reads them, since a round's positions are

@@ -204,10 +204,11 @@ extern "C" int r4d_rad_qsa_block_key(const RadArgs* a, RadStream stream) {
     const long long rot   = r4d_geti_or(a, "rotary_dim", 0);
     const long long pos0  = r4d_geti_or(a, "pos0", -1);
     if (n <= 0 || ratio <= 0 || (pos0 < 0 && !bp)) return R4D_NO(RAD_E_INVAL);
-    /* block_size sizes the block-key KV group and must equal the compress ratio, so a page holds
-     * exactly one block. */
+    /* block_size sizes the block-key KV group: the compress ratio, or a multiple of it when the
+     * keys are split across ranks (one page per `ranks` blocks, docs/QSA.md). A page holds one
+     * key either way, which the page-width checks below hold. */
     const long long bs = r4d_geti_or(a, "block_size", ratio);
-    if (bs != ratio) return R4D_NO(RAD_E_SHAPE);
+    if (bs < ratio || bs % ratio) return R4D_NO(RAD_E_SHAPE);
     /* With a page list, M is the number of blocks completing this step, not the store's height
      * (the whole pool). */
     const long long M = pg ? r4d_numel(pg) : o->shape[0];

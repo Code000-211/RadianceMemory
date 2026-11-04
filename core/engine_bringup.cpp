@@ -1002,6 +1002,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.gen_max_refs   = cfg_.image_gen_max_refs;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.qsa_bkey_dtype = cfg_.qsa_bkey_dtype == "i8" ? RAD_I8 : 0;
+    bc.qsa_bkey_split = cfg_.qsa_bkey_split ? 1 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.kv_residency = cfg_.residency_mib > 0;   /* the pager op is declared only when asked for */
@@ -1281,6 +1282,24 @@ int Engine::declare() {
         }
         RAD_INFO("QSA block keys: int8 with an f16 scale a block (--qsa-bkey-dtype), about half "
                  "the indexer's cache; lossy, the selection differs slightly from bf16");
+    }
+    /* Block keys split across the ranks: one rank has nothing to split with, and a plugin that
+     * does not say it splits them would keep every key on every rank under the flag. */
+    if (cfg_.qsa_bkey_split) {
+        if (cfg_.tp < 2) {
+            RAD_ERR("--qsa-bkey-split on needs --tp 2 or more: one rank holds every block key");
+            return RAD_E_INVAL;
+        }
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        if (!pb.qsa_bkey_split_ok) {
+            RAD_ERR("--qsa-bkey-split on: the '%s' plugin does not split a QSA indexer's block keys "
+                    "across ranks for this model", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_INFO("QSA block keys: split across the %d ranks (--qsa-bkey-split), block b on rank "
+                 "b %% %d; the selection is the unsplit one byte for byte, plus one gather a QSA "
+                 "layer a step", cfg_.tp, cfg_.tp);
     }
     /* Resolved here, not at argument parsing: the plugin states its drafter's depth, and it is
      * selected only once the container is open. Every consumer of `n_spec` (buffer sizing, kernel

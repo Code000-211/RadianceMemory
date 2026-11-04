@@ -494,13 +494,26 @@ static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("t
                                            P_INT("ratio"), P_INT("seqs"), P_INTO("signed") };
 static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
                                              OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
+/* The selection with the block keys split across ranks (ref_qsa.cpp, docs/QSA.md): each rank's
+ * own top-k as a list, and the merge of the gathered lists into qsa_select's table. */
+static const RadParamSpec pQsaSelectPart[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
+                                               P_INT("ratio"), P_INT("seqs"), P_INT("ranks"),
+                                               P_INT("rank"), P_INTO("signed") };
+static const RadOperandSpec oQsaSelectPart[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
+                                                 OPD("cu"), OUT("part") };
+static const RadParamSpec pQsaSelectJoin[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
+                                               P_INT("ratio"), P_INT("seqs"), P_INT("ranks") };
+static const RadOperandSpec oQsaSelectJoin[] = { OPD("part"), OPD("bt"), OPD("nc"), OPD("pos"),
+                                                 OPD("cu"), OUT("sel"), OUT("nsel"),
+                                                 OUT("seqused") };
 static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                               P_INT("seqs"), P_STR("dtype") };
 static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"), INOUT("state"),
                                                 OPD("sidx") };
 /* `work` bounds the blocks that can complete; slots past the real count get page -1. */
 static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
-                                         P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
+                                         P_INT("seqs"), P_CAP("work"), P_STR("dtype"),
+                                         P_INTO("ranks"), P_INTO("rank") };
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
@@ -1544,6 +1557,15 @@ static const RadOpSchema kSchemas[] = {
   "index, the blocks above the threshold first and the tied ones after, then the partial page when "
   "(pos + 1) % ratio != 0, then -1 to topk + 1. nsel counts the entries and seqused is the "
   "attention's length over them." },
+{ "qsa_select_part", ARR(pQsaSelectPart), ARR(oQsaSelectPart),
+  "One rank's share of a split selection: over the blocks b < n with b % ranks == rank (score "
+  "column b / ranks, liveness from bt[b]), the topk largest by (order key desc, block asc), written "
+  "in block order as [keys | blocks | count, bit 30 when more than topk were live], a row of "
+  "2 * topk + 1 words rounded up to four, zeros elsewhere." },
+{ "qsa_select_join", ARR(pQsaSelectJoin), ARR(oQsaSelectJoin),
+  "qsa_select's table, nsel and seqused from the ranks' qsa_select_part lists gathered side by "
+  "side: byte for byte the table qsa_select builds over the unsplit scores. A list that is not one "
+  "qsa_select_part writes is refused before any write." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
   "rows of the tail keep what they held." },
@@ -1565,7 +1587,8 @@ static const RadOpSchema kSchemas[] = {
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
-  "past the count get page -1. nc is each sequence's complete-block count." },
+  "past the count get page -1. nc is each sequence's complete-block count. With `ranks` and "
+  "`rank` only blocks b % ranks == rank are stored, at page bt[b / ranks]; the rest get page -1." },
 { "kv_resolve", ARR(pKvResolve), ARR(oKvResolve),
   "Makes every block the selections name resident and rewrites them as ring slots: an epoch bump, "
   "a hit or a single claim per distinct block, a free slot before any resident one and otherwise "
@@ -2532,6 +2555,12 @@ SIMPLE("ref_qsa_score", "qsa_score", "attn",
 SIMPLE("ref_qsa_select", "qsa_select", "attn",
        "QSA selection: the top-k blocks as a page-id table, partial page last",
        "f32 scores, i32 tables", ref_qsa_select),
+SIMPLE("ref_qsa_select_part", "qsa_select_part", "attn",
+       "QSA split selection: one rank's top-k as (order key, block) in block order",
+       "f32 scores, i32 tables", ref_qsa_select_part),
+SIMPLE("ref_qsa_select_join", "qsa_select_join", "attn",
+       "QSA split selection: the ranks' lists merged into qsa_select's page-id table",
+       "i32 lists and tables", ref_qsa_select_join),
 SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
        "QSA tail: the raw keys of open blocks into a per-sequence ring", DT_FLOAT,
        ref_qsa_tail_store),

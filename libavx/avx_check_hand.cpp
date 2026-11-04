@@ -3343,6 +3343,119 @@ void qsa_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
+    /* ---- qsa_select_join ----------------------------------------------------------------- */
+    {
+        /* Two ranks' lists, built here by the rule qsa_select_part states, for a history whose
+         * scores come from nine values (ties at every threshold), with dead pages: row 0 and 1
+         * past topk (a rank over topk, the threshold layout), row 2 under it (every block in
+         * block order), row 3 with each share under topk but the two together over it (no flag
+         * set, the threshold layout still), row 4 mid-block (the partial page). The expected
+         * table is the unsplit rule computed here, so both libraries are held to qsa_select's
+         * bytes and not only to each other. */
+        const int64_t M = 5, nb = 300, topk = 40, ratio = 4, R = 2;
+        const int64_t W = (2 * topk + 1 + 3) / 4 * 4;
+        const int64_t nrow[M] = { 260, 240, 30, 70, 251 };
+        std::vector<float> sc((size_t)(M * nb));
+        std::vector<int32_t> bt((size_t)(M * nb)), nc((size_t)M), pos((size_t)M), cuh((size_t)(M + 1));
+        for (int64_t m = 0; m < M; ++m) {
+            nc[(size_t)m] = (int32_t)nrow[m];
+            cuh[(size_t)m] = (int32_t)m;
+            /* On a block's last token (no partial page), row 4 two tokens into the next. */
+            pos[(size_t)m] = (int32_t)(m == 4 ? nrow[m] * ratio + 1 : nrow[m] * ratio - 1);
+            for (int64_t b = 0; b < nb; ++b) {
+                sc[(size_t)(m * nb + b)] = (b * 7 + m * 3) % 13 == 5 ? -INFINITY
+                                         : 0.5f * (float)((b * 31 + m) % 9);
+                bt[(size_t)(m * nb + b)] = (b * 11 + m) % 23 == 4 ? -1 : (int32_t)(1000 + m * nb + b);
+            }
+        }
+        cuh[(size_t)M] = (int32_t)M;
+        auto key = [](float v) {
+            const float x = v > 0.0f ? v : 0.0f;
+            uint32_t u;
+            std::memcpy(&u, &x, 4);
+            return u + 1u;
+        };
+        auto bound = [&](int64_t m) {
+            return std::min<int64_t>(std::min<int64_t>(nc[(size_t)m], nb), (pos[(size_t)m] + 1) / ratio);
+        };
+        /* (key desc, block asc), then taken as qsa_select takes them. */
+        struct C { uint32_t k; int64_t b; };
+        auto take = [&](std::vector<C> c, bool all) {
+            auto by_b = [](const C& x, const C& y) { return x.b < y.b; };
+            if (all) { std::sort(c.begin(), c.end(), by_b); return c; }
+            std::sort(c.begin(), c.end(), [](const C& x, const C& y) {
+                return x.k != y.k ? x.k > y.k : x.b < y.b; });
+            c.resize((size_t)topk);
+            const uint32_t thr = c.back().k;
+            auto mid = std::stable_partition(c.begin(), c.end(), [&](const C& x) { return x.k > thr; });
+            std::sort(c.begin(), mid, by_b);
+            std::sort(mid, c.end(), by_b);
+            return c;
+        };
+        std::vector<int32_t> lists((size_t)(M * R * W), 0);
+        std::vector<int64_t> want((size_t)(M * (topk + 1)), -1);
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t n = bound(m);
+            std::vector<C> all;
+            for (int64_t r = 0; r < R; ++r) {
+                std::vector<C> live;
+                for (int64_t b = r; b < n; b += R) {
+                    const float v = sc[(size_t)(m * nb + b)];
+                    if (bt[(size_t)(m * nb + b)] < 0 || !(v > -1e30f)) continue;
+                    live.push_back({ key(v), b });
+                    all.push_back({ key(v), b });
+                }
+                const bool over = (int64_t)live.size() > topk;
+                std::vector<C> t = take(live, !over);
+                std::sort(t.begin(), t.end(), [](const C& x, const C& y) { return x.b < y.b; });
+                int32_t* row = &lists[(size_t)((m * R + r) * W)];
+                for (size_t i = 0; i < t.size(); ++i) {
+                    row[i] = (int32_t)t[i].k;
+                    row[(size_t)topk + i] = (int32_t)t[i].b;
+                }
+                row[2 * topk] = (int32_t)t.size() | (over ? (1 << 30) : 0);
+            }
+            int64_t out = 0;
+            for (const C& x : take(all, (int64_t)all.size() <= topk))
+                want[(size_t)(m * (topk + 1) + out++)] = bt[(size_t)(m * nb + x.b)];
+            if (n < nb && (pos[(size_t)m] + 1) % ratio != 0)
+                want[(size_t)(m * (topk + 1) + out++)] = bt[(size_t)(m * nb + n)];
+        }
+        Hand h("two ranks' lists merged: qsa_select's table over the unsplit scores", "qsa_select_join",
+               0.0);
+        h.raw(RAD_I32, { M, R * W }, lists.data())
+         .raw(RAD_I32, { M, nb }, bt.data())
+         .raw(RAD_I32, { M }, nc.data())
+         .raw(RAD_I32, { M }, pos.data())
+         .raw(RAD_I32, { M + 1 }, cuh.data())
+         .dense(RAD_I32, { M, topk + 1 }, sent, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .pi("M", M).pi("blocks", nb).pi("topk", topk).pi("ratio", ratio).pi("seqs", M)
+         .pi("ranks", R)
+         .expect(5, std::move(want));
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Rank 1's list names block 4, which is rank 0's share: no list qsa_select_part writes. */
+        const int64_t topk = 2, W = 8;
+        std::vector<int32_t> lists = { 9, 9, 0, 2, 1, 0, 0, 0,     /* rank 0: block 0 */
+                                       9, 9, 4, 0, 1, 0, 0, 0 };   /* rank 1: block 4 */
+        Hand h("a list naming another rank's block is refused before any write", "qsa_select_join",
+               0.0);
+        h.raw(RAD_I32, { 1, 2 * W }, lists.data())
+         .dense(RAD_I32, { 1, 8 }, [](int64_t i) { return (float)i; })
+         .idx({ 8 })
+         .idx({ 31 })
+         .idx({ 0, 1 })
+         .dense(RAD_I32, { 1, topk + 1 }, sent, true)
+         .dense(RAD_I32, { 1 }, sent, true)
+         .dense(RAD_I32, { 1 }, sent, true)
+         .pi("M", 1).pi("blocks", 8).pi("topk", topk).pi("ratio", 4).pi("seqs", 1).pi("ranks", 2)
+         .refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+
     /* ---- qsa_tail_store ------------------------------------------------------------------ */
     {
         /* Sequence 0 is a 12-token chunk at positions 30..40 and 42: only its last 7 rows write,

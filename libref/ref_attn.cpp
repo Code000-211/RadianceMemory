@@ -1705,7 +1705,10 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
     const int64_t rot = p_int(a, "rotary_dim", 0), pos0 = p_int(a, "pos0", -1);
     if (n <= 0 || n > REF_HD_MAX || ratio <= 0 || (pos0 < 0 && !pos)) return RAD_E_INVAL;
     if (rot < 0 || rot > n || (rot & 1)) return RAD_E_SHAPE;
-    if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
+    /* `block_size` sizes the block-key group: `ratio` tokens a page, or a multiple of it when the
+     * keys are split across ranks (one page per `ranks` blocks, docs/QSA.md). A page holds one key
+     * either way, which the page-width checks below hold. */
+    if (const int64_t bs = p_int(a, "block_size", ratio); bs < ratio || bs % ratio) return RAD_E_SHAPE;
     if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
     const char* kd = p_str(a, "key_dtype", nullptr);
     if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;

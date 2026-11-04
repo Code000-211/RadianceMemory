@@ -16,6 +16,10 @@
 // one straddling block per sequence). Work items past the real count get page = -1, which
 // qsa_block_key skips.
 //
+// With `ranks` R > 1 and `rank` r (block keys split across tensor-parallel ranks, docs/QSA.md)
+// only the blocks b with b % R == r are this rank's: their page is bt[b / R] (the block-key group
+// is paged at R * ratio tokens, one key a page), every other block gets page -1 and no gather.
+//
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
@@ -40,7 +44,7 @@ __global__ __launch_bounds__(kThreads) void qsa_work_kernel(
     int32_t* __restrict__ nc,
     int n, int ratio, int ring, int seqs, int max_work, int k_ld, int s_slot, int s_row,
     int sidx_ld, int bt_ld, int g_ld, const int32_t* __restrict__ rope, int rplane,
-    int bstep) {
+    int bstep, int R, int rk) {
 
     const int w = (int)blockIdx.x;
     /* Complete blocks per sequence (needed by the scorer and the selection), written by the first
@@ -83,9 +87,11 @@ __global__ __launch_bounds__(kThreads) void qsa_work_kernel(
     /* Column 0 is the committed slot; -1 marks a sequence with no state, whose blocks cannot be
      * built (page -1, no gather). */
     const int si = sidx[(size_t)s * sidx_ld];
+    /* Another rank stores this block (always this rank, unsplit). */
+    const bool mine = b % R == rk;
 
     if (threadIdx.x == 0) {
-        page[w] = si < 0 ? -1 : bt[(size_t)s * bt_ld + b];
+        page[w] = si < 0 || !mine ? -1 : bt[(size_t)s * bt_ld + b / R];
         if (!rope) {
             bpos[(size_t)w * bstep] = b * ratio;
         } else {
@@ -100,7 +106,7 @@ __global__ __launch_bounds__(kThreads) void qsa_work_kernel(
                     f >= p0 ? rope[(size_t)c * rplane + t0 + (f - p0)] : f + (rope[t0] - p0);
         }
     }
-    if (si < 0) return;
+    if (si < 0 || !mine) return;
 
     /* The block's raw keys, each from this step or from the tail. */
     for (int i = 0; i < ratio; ++i) {
@@ -131,7 +137,7 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
                                  long stage, long page, long bpos, long nc, int n, int ratio,
                                  int ring, int seqs, int max_work, int k_ld, int s_slot,
                                  int s_row, int sidx_ld, int bt_ld, int g_ld, long rope,
-                                 int rplane, int bstep, RadStream stream) {
+                                 int rplane, int bstep, int R, int rk, RadStream stream) {
     if (!k || !pos || !cu || !state || !sidx || !bt || !stage || !page || !bpos || !nc)
         return R4D_NO(RAD_E_INVAL);
     if (n <= 0 || ratio <= 0 || ring < ratio || seqs <= 0 || max_work <= 0 || seqs > kMaxSeq)
@@ -145,7 +151,7 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
                     (const uint16_t*)state, (const int32_t*)sidx, (const int32_t*)bt,
                     (uint16_t*)stage, (int32_t*)page, (int32_t*)bpos, (int32_t*)nc, n, ratio,
                     ring, seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld,
-                    (const int32_t*)rope, rplane, bstep);
+                    (const int32_t*)rope, rplane, bstep, R, rk);
 }
 
 // ============================================================== the plugin ABI entry point
@@ -178,6 +184,9 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
     const long long ratio = r4d_geti_or(a, "ratio", 0);
     const long long ring  = r4d_geti_or(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return R4D_NO(RAD_E_INVAL);
+    const long long R  = r4d_geti_or(a, "ranks", 1);
+    const long long rk = r4d_geti_or(a, "rank", 0);
+    if (R < 1 || rk < 0 || rk >= R) return R4D_NO(RAD_E_INVAL);
     const long long seqs = r4d_numel(cu) - 1;
     const long long T    = k->shape[0];
     if (seqs < 1 || T < 1 || r4d_numel(po) < T) return R4D_NO(RAD_E_SHAPE);
@@ -216,6 +225,7 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
                                   r4d_addr(bp), r4d_addr(nc), (int)n, (int)ratio, (int)ring,
                                   (int)seqs, (int)mw, (int)kp, (int)tl->stride[0],
                                   (int)tl->stride[2], (int)sxp, (int)bp2, (int)sp,
-                                  r4d_addr(rp), rp ? (int)rp->shape[1] : 0, (int)bstep, stream);
+                                  r4d_addr(rp), rp ? (int)rp->shape[1] : 0, (int)bstep, (int)R,
+                                  (int)rk, stream);
 }
 

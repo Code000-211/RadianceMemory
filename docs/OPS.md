@@ -3115,9 +3115,11 @@ order, not a slow one.
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `key_dtype`/opt | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+| `qsa_select_part` | `M`(range) `blocks` `topk` `ratio` `seqs` `ranks` `rank` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `part` |
+| `qsa_select_join` | `M`(range) `blocks` `topk` `ratio` `seqs` `ranks` | `part`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
 | `kv_resolve` | `M`(range) `blocks` `slots` `sel_pitch` `block_bytes` | `sel`:inout, `nsel`, `res`:inout, `slot_block`:inout, `slot_state`:inout, `ctl`:inout, `host`, `kv_cache`:inout |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
-| `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
+| `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` `ranks`/opt `rank`/opt | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
 | `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` `store_layout`/opt `pool_layout`/opt `head_dim`/opt | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout? |
 
@@ -3315,6 +3317,46 @@ top-k and merges them, so a decode step uses more than `1 + n_spec` workgroups. 
 because a chunk's local top-k contains every global top-k member of that chunk, and identical in
 output layout too: the attention sums the selected pages in table order and float addition is not
 associative. Without scratch, or above 32 rows, one workgroup per query walks the whole list.
+
+### `qsa_select_part` and `qsa_select_join`
+
+The selection when the block keys are split across tensor-parallel ranks (`--qsa-bkey-split on`,
+docs/QSA.md, "Block keys split across ranks"): rank `r` of `ranks` holds the blocks `b` with
+`b % ranks == r` and scores them into column `b / ranks` of its own plane. `qsa_select_part` takes
+that rank's top-k, a row-interleaved `all_gather` (`row` = the list width) puts the ranks' lists
+side by side, and `qsa_select_join` merges them into `qsa_select`'s outputs. **The join's table,
+`nsel` and `seqused` are `qsa_select`'s over the unsplit scores byte for byte**, not only the same
+set: the attention sums pages in table order.
+
+- **Exact** for the reason `qsa_select`'s chunked form is: both stages rank by one total order,
+  order key descending then block index ascending, and a block in the global top-k has fewer than
+  `topk` blocks ahead of it in its own rank's share, so it is in its rank's list. A list cannot
+  show whether its rank had more than `topk` live blocks (a full list may be all of them), so it
+  carries that as a flag; with no flag set and at most `topk` candidates in all, the candidates
+  are every live block, taken in block order as `qsa_select` takes `topk` or fewer.
+- **The list row** is `2 * topk + 1` i32 words rounded up to four (whole 16-byte words, as the
+  gather needs; 1028 at `topk` 512): order keys at `[0, topk)`, global block indices at
+  `[topk, 2 * topk)`, both in block order, the entry count at `[2 * topk]` with bit 30 set when the
+  rank had more than `topk` live blocks, zeros past the count and after the count word.
+- **The order key** is the unsigned 32-bit key libr4d's selection ranks by: `bits(max(score, 0)) + 1`
+  for a live block, or with `signed` 1 the float's total order over all 32 bits with `-0` keyed as
+  `+0`. Keys order exactly as `qsa_select`'s values, so the join takes no `signed`.
+- **The bound is `qsa_select`'s**: `n = min(nc[seq], (pos + 1) / ratio, width)`. For the part the
+  width is `min(bt's, ranks * score's)` (the caller narrows the score columns to
+  `ceil(live / ranks)`); the join has no score and takes `bt`'s. The caller's narrowed width is a
+  generous upper bound on every query's `n` (see `qsa_score`), so both give `qsa_select`'s `n`.
+- **`bt` is the attention group's table** in both, read at the global block index: the part's
+  liveness test and the join's page ids and partial page are `qsa_select`'s.
+- libref refuses, before any write, a join list that `qsa_select_part` would not write: a count
+  past `topk`, a block outside its rank's share or the query's bound, blocks not ascending, key 0.
+  libr4d's join cannot refuse device data; it never reads or writes out of bounds on such a list.
+
+`qsa_work` takes the same `ranks` and `rank`: a completing block `b` is stored only on rank
+`b % ranks`, at page `bt[s][b / ranks]` of the block-key group (paged at `ranks * ratio` tokens, one
+key a page), and every other item gets page `-1`, which `qsa_block_key` skips. `nc` stays the
+sequence's whole complete-block count. `qsa_block_key` accepts a `block_size` that is a multiple of
+`ratio` for that group; the page still holds one key. `qsa_score` is unchanged: it is issued with
+the block-key table and `nc`, and the narrowed score plane bounds it to the rank's columns.
 
 ### `kv_resolve`
 

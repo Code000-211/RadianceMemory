@@ -970,6 +970,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             return RAD_E_UNSUPPORTED;
         }
         m.qsacfg.bkey_i8 = ctx->qsa_bkey_dtype == RAD_I8;
+        /* --qsa-bkey-split on: block b's key stored and scored on rank b % world only, the ranks'
+         * top-k lists gathered and merged (arch/common/rad_qsa.h, docs/QSA.md). Every rank runs
+         * the indexer, an attention-zero one included, so the gather has all its ranks. Off (0) is
+         * today's program. */
+        if (ctx->qsa_bkey_split != 0 && ctx->qsa_bkey_split != 1) {
+            fprintf(stderr, "radiance: --qsa-bkey-split %d; the indexer takes 0 or 1\n",
+                    (int)ctx->qsa_bkey_split);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (ctx->qsa_bkey_split && g.world < 2) {
+            fprintf(stderr, "radiance: --qsa-bkey-split on needs more than one rank; one rank "
+                            "holds every block key\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        m.qsacfg.split      = ctx->qsa_bkey_split ? g.world : 0;
+        m.qsacfg.split_rank = ctx->qsa_bkey_split ? g.rank : 0;
         m.qsacfg.page_block_bytes = m.kv_page_bytes[last_q];
         m.qsacfg.page_store_layout = m.kv_demote[last_q];
         m.qsacfg.page_pool_layout  = m.kv_pool_layout[last_q];
@@ -1141,6 +1157,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             !m.qsaw.bpos || !m.qsaw.nc || !m.qsaw.score || !m.qsaw.sel || !m.qsaw.nsel ||
             !m.qsaw.sequ)
             return RAD_E_INVAL;
+        /* Split block keys: this rank's top-k list a query row and every rank's side by side, as
+         * tall as the score plane (a window of it is selected at a time). 4 KiB and 8 KiB a row
+         * at topk 512 and two ranks. */
+        if (m.qsacfg.split > 1) {
+            const int64_t pw = QsaIndexer::part_width(m.qsacfg.topk);
+            m.qsaw.part = decl_b(b, nm.f("qsa_part"), RAD_I32, { qsa_rows, pw });
+            m.qsaw.gath = decl_b(b, nm.f("qsa_gath"), RAD_I32, { qsa_rows, m.qsacfg.split * pw });
+            if (!m.qsaw.part || !m.qsaw.gath) return RAD_E_INVAL;
+        }
     }
 
     m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, conv_dim + v_dim});
@@ -2037,6 +2062,9 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     /* --qsa-bkey-dtype i8: libr4d's qsa_block_key and qsa_score take `key_dtype` i8 at the
      * indexer's geometry (n a multiple of 32 to 256). */
     out->qsa_bkey_i8_ok = 1;
+    /* --qsa-bkey-split on: qsa_work's `ranks`, qsa_select_part, all_gather and qsa_select_join
+     * (arch/common/rad_qsa.h). */
+    out->qsa_bkey_split_ok = 1;
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;
     return RAD_OK;
