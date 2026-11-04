@@ -5776,6 +5776,56 @@ TEST(the_history_pass_carries_draft_round_one) {
     f.sch.serial_end(2);
 }
 
+/* Every row of a draft pass is a decode row, and the pager (rad_qsa.h) pages exactly the rows
+ * [0, n_tok_decode) into their scratch rows. A draft pass staged with n_tok_decode 0 had the MTP
+ * head's attention read every cold block its selection named as an absent one: drafts degraded,
+ * acceptance fell from 0.63 to 0.41 under --kv-residency-mib, and with an f16 recurrent state
+ * (whose text depends on how many drafts each step accepts) the text changed. The count is
+ * bounded by the scratch rows, max_seqs x (1 + n_spec), in whole sequences. */
+TEST(draft_passes_stage_their_rows_as_decode_rows_within_the_pagers_scratch) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    f.cfg.max_seqs = 2;                        /* scratch rows: 2 x 5 = 10 */
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    {
+        /* After the prompt: its history pass owes ~160 rows, more than the scratch holds. */
+        int rounds = 4;
+        Scheduler::SerialRow rows[4];
+        (void)f.sch.serial_begin(&rounds, rows, 4);
+        const RadBatch* hb = f.sch.serial_batch(0, 1);
+        REQUIRE(hb != nullptr);
+        CHECK(hb->n_tok > 10);
+        CHECK_EQ(hb->n_tok_decode, (int64_t)0);
+        CHECK_EQ(hb->n_seq_decode, (int64_t)0);
+        f.sch.serial_end(0);
+    }
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);
+
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK_EQ(hb->phase, RAD_PHASE_DECODE);
+    CHECK_EQ(hb->n_tok, 5);
+    CHECK_EQ(hb->n_tok_decode, (int64_t)5);
+    CHECK_EQ(hb->n_seq_decode, (int64_t)hb->n_seq);
+    for (int rd = 2; rd <= rounds; ++rd) {
+        const RadBatch* rb = f.sch.serial_batch(rd, 1);
+        REQUIRE(rb != nullptr);
+        CHECK_EQ(rb->n_tok_decode, (int64_t)rb->n_tok);
+        CHECK_EQ(rb->n_seq_decode, (int64_t)rb->n_seq);
+    }
+    f.sch.serial_end(rounds);
+}
+
 /* The serial driver's two shapes over one verify step. A head with its own cache owes the history
  * of every verified position and steps one position per round; a head reading the trunk's cache
  * (rad_drafter_shared_kv) owes nothing, runs one row per drafting sequence and does not step.

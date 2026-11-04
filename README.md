@@ -414,6 +414,7 @@ The checks:
 | a block comes back intact | demoted, the pool overwritten, promoted: byte for byte, and only the named blocks moved | `mem_test` (host backend) |
 | no leaks | slots and blocks across demote, promote, preempt, rollback, fork, eviction, trim, expiry, re-plan | `mem_test` |
 | scheduler | sweep bound, sink and tail never demoted, dense steps see pool ids only, no livelock on a full pool | `sched_test` |
+| drafts page too | the MTP head's draft passes stage their rows as decode rows, so its `qsa_page` runs and it never reads a cold block as absent | `sched_test` |
 
 ---
 

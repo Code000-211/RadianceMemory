@@ -3105,6 +3105,21 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         serial_plan_.n_tok += e.n_tokens;
     }
     if (serial_plan_.e.empty()) return nullptr;
+    /* Every row is a decode row (phase DECODE), and the pager pages only [0, n_tok_decode)
+     * (rad_qsa.h): left 0, the head's attention would read a cold block's entry as absent and
+     * acceptance would collapse under window residency. Bounded to whole entries within the
+     * scratch rows (KVManager::scratch_rows), which a pager row indexes.
+     * shortcut: a history pass longer than the scratch rows (after a prefill chunk) pages only
+     * the entries that fit; drafts only, never a token, and no sweep runs before it unless
+     * every_step. Upgrade by sizing scratch for the history pass if that case matters. */
+    {
+        const int64_t cap = cfg_.max_seqs * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0));
+        for (const StepEntry& e : serial_plan_.e) {
+            if (serial_plan_.n_tok_decode + e.n_tokens > cap) break;
+            serial_plan_.n_tok_decode += e.n_tokens;
+            ++serial_plan_.n_seq_decode;
+        }
+    }
 
     /* RADIANCE_DEBUG_STAGE: splits a draft pass's host staging into the plan loop above and
      * `builder_.build`, reporting the average of each. Both are small next to issuing the pass
