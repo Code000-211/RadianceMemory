@@ -1194,7 +1194,7 @@ byte-identical to libref, and `attn_prefill_h256_gqa12_k4hv4`, `attn_decode_h256
 and their `_gqa6_bs4_` twins (head_dim 256, 4-token pages; the decode rows serve the speculative
 verify too). The attention rows are k6_v4's kernels with K's codes widened as V's; there is no
 `attn_paged_gate_quant` row, because a rotated layer turns its output back before the gate and
-never folds the gate into the merge. `r4d_emu_k4h` holds the store and every attention row to
+never folds the gate into the merge. `r4d_emu_k4h_*` (one test a layout) holds the store and every attention row to
 libref in the host emulator: byte for byte where the softmax is decided, within the attention
 rounding elsewhere. A drawn k4h_v4 cache has no meaningful scales, so rad-kbench describes the
 store's operands and not the attention's.

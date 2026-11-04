@@ -538,7 +538,20 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
 
 }  // namespace
 
-int main() {
+/* [--layout k4h_v4|k4h_v2h|i8h]: one layout's cases only, so ctest runs the three as separate
+ * tests (each takes about a third of the whole, which grew past the per-test limit's reach with every
+ * layout); the bf16_e4m3r experiment's store runs with i8h. Every layout seeds its own generator, so a
+ * layout's cases are the same whether it runs alone or with the others. */
+int main(int argc, char** argv) {
+    const char* only = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--layout" && i + 1 < argc) only = argv[++i];
+        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h]\n", argv[0]); return 2; }
+    }
+    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h")) {
+        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h or i8h\n");
+        return 2;
+    }
     const Fn kst = load_libref("ref_kv_store");
     const Fn att = load_libref("ref_attn_paged");
     if (!kst || !att) {
@@ -575,8 +588,11 @@ int main() {
               r4d_rad_attn_prefill_h256_gqa6_i8h_scratch,
               r4d_rad_attn_decode_h256_gqa6_i8h_scratch, 10 } } },
     };
-    for (const Run& run : runs) {
+    for (size_t ri = 0; ri < sizeof runs / sizeof runs[0]; ++ri) {
+        const Run& run = runs[ri];
+        if (only && std::strcmp(only, run.layout->kv_dtype)) continue;
         L = run.layout;
+        rng.seed(20261104u + (unsigned)ri);
         std::printf("kv_store %s: the emulated kernel against libref\n", L->kv_dtype);
         store_case(kst, run.store, "Flash-Next's two kv heads, a prefill chunk", 37, 2, 0, 1.0, 1.0,
                    false, rng);
@@ -607,9 +623,12 @@ int main() {
         }
     }
 
-    std::printf("kv_store bf16_e4m3r (the experiment): the emulated kernel against libref\n");
-    e4m3r_case(kst, "two kv heads, a prefill chunk", 21, 2, 1.0, 1.0, rng);
-    e4m3r_case(kst, "a descale on each side", 7, 1, 0.75, 1.5, rng);
+    if (!only || !std::strcmp(only, "i8h")) {
+        rng.seed(20261104u + 100u);
+        std::printf("kv_store bf16_e4m3r (the experiment): the emulated kernel against libref\n");
+        e4m3r_case(kst, "two kv heads, a prefill chunk", 21, 2, 1.0, 1.0, rng);
+        e4m3r_case(kst, "a descale on each side", 7, 1, 0.75, 1.5, rng);
+    }
 
     std::printf(g_fails ? "k4h layouts: %d failure(s)\n" : "k4h layouts: all cases pass\n", g_fails);
     return g_fails ? 1 : 0;
