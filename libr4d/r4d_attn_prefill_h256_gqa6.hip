@@ -78,6 +78,7 @@
 // the k4h_v2h cache and with O_I8 the i8h cache (see r4d_attn_decode_h256_gqa6.hip).
 #define O_V2      4
 #define O_I8   8192
+#define O_E2   65536
 #define O_V4    33554432
 #define O_K6    67108864
 #define O_K4    1073741824
@@ -161,6 +162,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     // takes k4h_v4's staging with the codes widened from bytes (r4d_dt16.h); the row (2 * HEAD_DIM
     // + 4) is 4-byte aligned only, so codes are read a dword at a time.
     constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
+    // e2m1h: k4h_v4's staging and row, E2M1 codes looked up, an E4M3 scale a group of 16 halved
+    // into f16 as it is fetched (e2_scale_h in r4d_dt16.h), so the widening is k4h_v4's.
+    constexpr int E2    = ((OPT & O_E2) && K4 && !V2 && !I8) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
     constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : I8 ? 2 * HEAD_DIM + 4
                         : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
@@ -348,7 +352,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     }
                     v4c[r][j] = V2 ? *(const uint16_t*)(base + VOFF + o * 2)
                                    : *(const uint32_t*)(base + VOFF + o * 4);
-                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                    sc[j]     = E2 ? e2_scale_h(base[VSOFF + (o >> 1)])
+                                   : *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
                 else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
@@ -369,12 +374,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 if constexpr (I8) {
                     v8_codes_nm(v4c[r][0], v8c[r][0], n0, m0);
                     v8_codes_nm(v4c[r][1], v8c[r][1], n1, m1);
+                } else if constexpr (E2) {
+                    e2_codes_nm(v4c[r][0], n0, m0);
+                    e2_codes_nm(v4c[r][1], n1, m1);
                 } else {
                     v_codes_nm<V2>(v4c[r][0], n0, m0);
                     v_codes_nm<V2>(v4c[r][1], n1, m1);
                 }
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                constexpr float VB = I8 ? kI8Bias : VBias<V2>::v;
+                constexpr float VB = I8 ? kI8Bias : E2 ? kE2Bias : VBias<V2>::v;
                 const h2 bias = { (_Float16)VB, (_Float16)VB };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
                 uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
@@ -430,6 +438,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     const uint32_t* cw = (const uint32_t*)(rp + ch * 16);
                     kreg[p] = make_uint4(cw[0], cw[1], cw[2], cw[3]);
                     ksc[I8 ? p : 0] = *(const uint16_t*)(rp + KSOFF);
+                } else if (E2) {
+                    // e2m1h: the chunk's sixteen codes and its group's (the chunk's) scale, halved
+                    // into f16 here so storeK widens it as k4h_v4's.
+                    const uint8_t* rp = (const uint8_t*)a.kv + o;
+                    const uint2 lo = *(const uint2*)(rp + ch * 8);
+                    kreg[p] = make_uint4(lo.x, lo.y, 0u, e2_scale_h(rp[KSOFF + ch]));
                 } else if (K4) {
                     // k4h_v4: the chunk's sixteen codes and its group's scale; no high bits.
                     const uint8_t* rp = (const uint8_t*)a.kv + o;
@@ -482,6 +496,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                         uint32_t w4[4];
                         if constexpr (I8) k8x8_to_f16x4w(q ? r.z : r.x, q ? r.w : r.y,
                                                          ksc[I8 ? p : 0] | (ksc[I8 ? p : 0] << 16), w4);
+                        else if constexpr (E2) e2x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
                         else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
                         else k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         *(uint2*)(&sK8[key * KSTR8 + ch * KEL + 8 * q]) =
@@ -505,6 +520,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                         if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         else if constexpr (I8) k8x8_to_f16x4w(q ? r.z : r.x, q ? r.w : r.y,
                                                               ksc[I8 ? p : 0] | (ksc[I8 ? p : 0] << 16), w4);
+                        else if constexpr (E2) e2x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
                         else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
                         else fp8x8_to_16x4w<D>(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y), w4);
                     }

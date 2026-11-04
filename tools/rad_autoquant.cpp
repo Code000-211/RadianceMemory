@@ -136,7 +136,8 @@ void usage() {
         "  --no-knobs          try none\n"
         "  --vmean FILE        a V mean file (radiance --calib-dir): the variants that\n"
         "                      subtract it join the candidates\n"
-        "  --layouts L,L,...   only these layouts' variants (default every recipe layout)\n"
+        "  --layouts L,L,...   only these layouts' variants (default every recipe layout but\n"
+        "                      the opt-in e2m1h, which naming here or in --variants offers)\n"
         "  --variants V,V,...  only these variants, a variant's words joined by '+'\n"
         "                      (k6_v4+rotated+vmean)\n"
         "  --keep-dominated    per-layer runs for the variants screening would drop too\n"
@@ -639,8 +640,10 @@ int main(int argc, char** argv) {
 
     /* The candidates: the variants, widest first so that a tie keeps the wider one, restricted by
      * --layouts and --variants. */
-    const std::vector<KvVariant> every = kv_autoquant_variants(true);
-    std::vector<KvVariant> variants = kv_autoquant_variants(!vmean.empty());
+    /* An opt-in layout (e2m1h) is a candidate only where --layouts or --variants names it. */
+    const std::vector<KvVariant> every = kv_autoquant_variants(true, true);
+    std::vector<KvVariant> variants =
+        kv_autoquant_variants(!vmean.empty(), !layouts_arg.empty() || !variants_arg.empty());
     if (!layouts_arg.empty()) {
         std::set<int> want;
         for (const std::string& s : split(layouts_arg, ',')) {

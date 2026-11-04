@@ -1236,6 +1236,22 @@ their `_gqa6_bs4_` twins, k4h_v4's kernels with the codes widened from bytes (`0
 0x80)` less 1152 is c in f16) and read a 4-byte word at a time, since a 516-byte row is not
 16-byte aligned. `r4d_emu_k4h` and r4d_selftest hold them to libref as k4h_v4's.
 
+**`e2m1h` is FP4 E2M1 under an E4M3 scale a group of 16** (`RAD_KVQ_E2M1H`, ABI 43, an
+experiment: DeepSeek-V4.1-Flash's KV format, emulated with integer codes and a lookup since gfx1201
+has no FP4): k4h_v4's row geometry (`18 * head_dim / 16` bytes) -- K's codes (dim d in the nibble at
+bit `4 * (d % 2)` of byte `d / 2`), V's, then one E4M3 byte a group of 16 for K and for V. A code is
+E2M1's bits: bit 3 the sign, bits 0-2 an index into 0, 0.5, 1, 1.5, 2, 3, 4, 6. For each group x of
+16 (bf16 times `1 / k_scale` or `1 / v_scale`): `amax` by `fmax` (drops a NaN), `scale =
+E4M3(fmin(amax / 6, 448))` rounded to nearest even (no rounding up; a value past 6 times it clamps),
+`y = fmin(fmax(x / scale, -6), 6)` (a NaN is -6), the code the nearest magnitude of |y| with ties to
+the even index, signed where y < 0 and the index is not 0; a group at scale 0 stores codes 0.
+`attn_paged` reads the magnitude times the scale, exact in f16. Rotated always, as k4h_v4. libr4d:
+`kv_store_e2m1h` (a wave a token and head), byte-identical to libref, and
+`attn_prefill_h256_gqa12_e2m1h`, `attn_decode_h256_gqa12_e2m1h` and their `_gqa6_bs4_` twins,
+k4h_v4's kernels (option `O_E2`) with each nibble looked up by `v_perm_b32` into `12 + 2 * value` and
+the scale halved into f16 as it is fetched. `r4d_emu_k4h --layout e2m1h` and r4d_selftest hold them
+to libref as k4h_v4's. Not a demote layout, and not in rad-autoquant's default candidates.
+
 **`kv_dtype` `bf16_e4m3r` is an experiment, not a layout**: `kv_store` into a bf16 cache of the
 shared layout, each value `x / k_scale` clamped to ±448 (a NaN to -448), rounded to E4M3 to
 nearest even, decoded and multiplied by `k_scale` (V likewise), then rounded to bf16 (exact at the

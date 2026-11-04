@@ -1,5 +1,5 @@
-/* tests/r4d_emu: the k4h_v4, k4h_v2h and i8h caches (RAD_KVQ_K4H, RAD_KVQ_K4HV2H, RAD_KVQ_I8H,
- * abi/rad_builder.h) on the host SIMT emulator, held to libref's kv_store and attn_paged at their
+/* tests/r4d_emu: the k4h_v4, k4h_v2h, i8h and e2m1h caches (RAD_KVQ_K4H, RAD_KVQ_K4HV2H,
+ * RAD_KVQ_I8H, RAD_KVQ_E2M1H, abi/rad_builder.h) on the host SIMT emulator, held to libref's kv_store and attn_paged at their
  * kv_dtype. libref is the
  * oracle (docs/OPS.md), so the test needs it: ctest sets $RADIANCE_HOME, and without one the test
  * fails rather than checking nothing. Every case below runs once for each layout.
@@ -13,7 +13,9 @@
  * edges, plus a group whose values sit on its quantiser's boundaries (whole multiples of its root
  * mean square), since its variance normalisation sums, divides and floors where k4h_v4 takes a max.
  * i8h's scale is a whole head's, so its edges are a head each: all zero, ties of rint, past the
- * cap, an infinity, a NaN, and a head of NaNs. The bf16_e4m3r experiment's store is held to
+ * cap, an infinity, a NaN, and a head of NaNs. e2m1h takes k4h_v4's edges (its groups of 16 halve
+ * them) plus a group whose scale is 0.25 exactly and whose values sit on every midpoint of E2M1's
+ * magnitudes, both signs, so each tie to the even index is checked. The bf16_e4m3r experiment's store is held to
  * libref's bytes the same way.
  *
  * The attention (Flash-Next's QSA layers: head_dim 256, 4-token pages, gqa 12 at one and two ranks
@@ -76,6 +78,15 @@ int64_t r4d_rad_attn_prefill_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_i8h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
+int     r4d_rad_kv_store_e2m1h(const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_gqa12_e2m1h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_e2m1h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_e2m1h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_e2m1h_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_e2m1h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_e2m1h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_e2m1h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_e2m1h_scratch(const RadArgs*);
 }
 extern int emu_grids;
 
@@ -85,15 +96,16 @@ constexpr int HD = 256, BS = 4;
 
 /* The layout under test: its kv_dtype, a token's row (288, 224 or 516 bytes), where the scales
  * start (after K's and V's codes), whether V is k4h_v2h's int2, and whether the codes are i8h's
- * bytes under one scale a head. */
+ * bytes under one scale a head, and whether they are e2m1h's E2M1 codes under an E4M3 scale a 16. */
 struct Layout {
     const char* kv_dtype;
     int row, scales;
-    bool v2, i8;
+    bool v2, i8, e2 = false;
 };
 const Layout kK4hv4  = { "k4h_v4", 18 * HD / 16, HD, false, false };
 const Layout kK4hv2h = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true, false };
 const Layout kI8h    = { "i8h", 2 * HD + 4, 2 * HD, false, true };
+const Layout kE2m1h  = { "e2m1h", 18 * HD / 16, HD, false, false, true };
 const Layout* L = &kK4hv4;
 
 int g_fails = 0;
@@ -232,6 +244,18 @@ void store_case(Fn ref, Fn kernel, const char* name, int64_t T, int64_t kvh, int
             for (int i = 0; i < 160; ++i) v[(size_t)i] = k[(size_t)i];
             for (int i = 0; i < 32; ++i) v[(size_t)(160 + i)] = rad_f32_to_bf16(i & 1 ? -2.0f : 2.0f);
         }
+        if (L->e2) {
+            /* K group 11 (dims 176-191): amax 1.5, scale E4M3(0.25) = 0.25 exactly, then every
+             * midpoint of E2M1's magnitudes over the scale (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5),
+             * each with either sign: 0.25 -> 0, 0.75 -> 1, 1.25 -> 1, 1.75 -> 2, 2.5 -> 2,
+             * 3.5 -> 4, 5 -> 4, the even index each time. V group 11 of row 0 takes them too. */
+            const float mid[8] = { 0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f, 6.0f };
+            for (int i = 0; i < 16; ++i) {
+                const uint16_t b = rad_f32_to_bf16((i & 1 ? -0.25f : 0.25f) * mid[i / 2]);
+                r0[176 + i] = b;
+                v[(size_t)(176 + i)] = b;
+            }
+        }
     }
     /* Distinct slots over the cache, one token dropped (-1), the rest of each page untouched. */
     std::vector<int32_t> slot((size_t)T);
@@ -364,10 +388,14 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
      * kernel that reads a slot no visible key lives in turns its row NaN. */
     const int ROW = L->row;
     const size_t bytes = (size_t)nblocks * kvh * BS * ROW;
-    /* i8h's never-stored code is -128. */
+    /* i8h's never-stored code is -128; e2m1h's 0x88 is -0, never stored, and its scales are E4M3
+     * bytes whose NaN is 0x7f. */
     Buf cache(bytes, L->i8 ? 0x80 : 0x88);
     for (size_t r = 0; r < bytes / ROW; ++r)
-        for (int i = L->scales; i < ROW; i += 2) { cache.p[r * ROW + i] = 0x00; cache.p[r * ROW + i + 1] = 0x7e; }
+        for (int i = L->scales; i < ROW; i += 2) {
+            cache.p[r * ROW + i] = L->e2 ? 0x7f : 0x00;
+            cache.p[r * ROW + i + 1] = L->e2 ? 0x7f : 0x7e;
+        }
 
     /* Every sequence's keys, stored by libref's kv_store, a token at a time in key order. */
     std::normal_distribution<float> nrm(0.f, 1.f);
@@ -431,6 +459,15 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
                         for (int x = 0; x < HD; ++x) {
                             const size_t at = ((size_t)j * kvh + kh) * HD + (size_t)x;
                             kt[at] = rad_f32_to_bf16(x == d ? 28.0f : 0.0f);
+                            /* e2m1h: E2M1 magnitudes in halves (0..12), dim 0 of each 16 at
+                             * +-12 (6), so the scale is 2^(e-1) and each value exact. */
+                            if (L->e2) {
+                                static const int half[8] = { 0, 1, 2, 3, 4, 6, 8, 12 };
+                                const int hv = (rng() & 1 ? 1 : -1) *
+                                               (x % 16 == 0 ? 12 : half[rng() % 8]);
+                                vt[at] = rad_f32_to_bf16(std::ldexp((float)hv, e - 1));
+                                continue;
+                            }
                             const int cv = L->v2 ? (rng() & 1 ? 1 : -1) * (x % 2 ? 1 : 3)
                                          : x % (L->i8 ? HD : 32) == 0
                                              ? (rng() & 1 ? 1 : -1) * (L->i8 ? 127 : 7) : code(rng);
@@ -538,7 +575,7 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
 
 }  // namespace
 
-/* [--layout k4h_v4|k4h_v2h|i8h]: one layout's cases only, so ctest runs the three as separate
+/* [--layout k4h_v4|k4h_v2h|i8h|e2m1h]: one layout's cases only, so ctest runs them as separate
  * tests (each takes about a third of the whole, which grew past the per-test limit's reach with every
  * layout); the bf16_e4m3r experiment's store runs with i8h. Every layout seeds its own generator, so a
  * layout's cases are the same whether it runs alone or with the others. */
@@ -546,10 +583,11 @@ int main(int argc, char** argv) {
     const char* only = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--layout" && i + 1 < argc) only = argv[++i];
-        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h]\n", argv[0]); return 2; }
+        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h|e2m1h]\n", argv[0]); return 2; }
     }
-    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h")) {
-        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h or i8h\n");
+    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h") &&
+        std::strcmp(only, "e2m1h")) {
+        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h, i8h or e2m1h\n");
         return 2;
     }
     const Fn kst = load_libref("ref_kv_store");
@@ -587,6 +625,13 @@ int main(int argc, char** argv) {
             { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_i8h, r4d_rad_attn_decode_h256_gqa6_i8h,
               r4d_rad_attn_prefill_h256_gqa6_i8h_scratch,
               r4d_rad_attn_decode_h256_gqa6_i8h_scratch, 10 } } },
+        { &kE2m1h, r4d_rad_kv_store_e2m1h,
+          { { "gqa12", 12, r4d_rad_attn_prefill_h256_gqa12_e2m1h, r4d_rad_attn_decode_h256_gqa12_e2m1h,
+              r4d_rad_attn_prefill_h256_gqa12_e2m1h_scratch,
+              r4d_rad_attn_decode_h256_gqa12_e2m1h_scratch, 5 },
+            { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_e2m1h, r4d_rad_attn_decode_h256_gqa6_e2m1h,
+              r4d_rad_attn_prefill_h256_gqa6_e2m1h_scratch,
+              r4d_rad_attn_decode_h256_gqa6_e2m1h_scratch, 10 } } },
     };
     for (size_t ri = 0; ri < sizeof runs / sizeof runs[0]; ++ri) {
         const Run& run = runs[ri];

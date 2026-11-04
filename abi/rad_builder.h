@@ -85,6 +85,11 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [HD, 2HD)          V's int8 codes
  *     [2HD, 2HD + 2)     K's scale, one for the token's whole head (absmax / 127)
  *     [2HD + 2, 2HD + 4) V's scale, likewise
+ *   RAD_KVQ_E2M1H (e2m1h, ABI 43), 18 * HD / 16 bytes (k4h_v4's), K and V both stored rotated:
+ *     [0, HD/2)          K's E2M1 codes, dim d in the nibble at bit 4 * (d % 2) of byte d / 2
+ *     [HD/2, HD)         V's E2M1 codes
+ *     [HD, 17HD/16)      K's scales, one E4M3 byte a group of 16 dims (absmax / 6)
+ *     [17HD/16, 18HD/16) V's scales, likewise
  *
  * k4h_v4 is k6_v4 without K's high-bit words, K's codes and scales read as V's. Four-bit K holds
  * only where the rotation has spread K's outlier channels, so a k4h_v4 layer is always a rotated
@@ -105,6 +110,12 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  * Rotated always, as k4h_v4. Its row is 516 bytes at head_dim 256, a multiple of four but not of
  * sixteen, so its kernels read codes as 4-byte words.
  *
+ * e2m1h is OCP MX's FP4 without the hardware: a code is E2M1's bits (bit 3 the sign, bits 0-2
+ * the magnitude 0, 0.5, 1, 1.5, 2, 3, 4, 6), widened by a lookup, under an E4M3 scale a group of
+ * 16 -- NVFP4's grouping, 4.5 bits an element as k4h_v4 and in k4h_v4's byte geometry, the scale
+ * a float of three mantissa bits instead of an f16 one a group of 32. libref's kv_store is the
+ * contract (libref/ref_attn.cpp). Rotated always, as k4h_v4.
+ *
  * Codes are two's complement (int4 -7..7, int6 -31..31, int8 -127..127). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
  * it.
@@ -122,7 +133,8 @@ enum {
     RAD_KVQ_K4H  = 3,
     RAD_KVQ_K4HV2H = 4,
     RAD_KVQ_I8H  = 5,
-    RAD_KVQ_BF16 = 6
+    RAD_KVQ_BF16 = 6,
+    RAD_KVQ_E2M1H = 7
 };
 
 /* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):
@@ -137,7 +149,7 @@ enum {
  * rotation (RadBuildCtx::kv_vmean holds the vectors). A row of attention weights sums to one, so
  * P (V - mu) + mu = P V: exact but for the rounding of the two adds, while the integer V layouts
  * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
- * k6_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged.
+ * k6_v4, k4h_v4, k4h_v2h, i8h, e2m1h); K, the cache layout and the attention rows are unchanged.
  *
  * RAD_KVQ_DEMOTE (ABI 42, --kv-recipe `demote LAYOUT`): bits 16-23 hold a second layout, the one a
  * block of this layer takes in the window-residency store (spec §7.3) when the sweep demotes it;

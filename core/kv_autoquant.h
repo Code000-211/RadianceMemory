@@ -70,8 +70,9 @@ struct KvVariant {
  * by rules kept here: a combination it refuses (`fp8 vmean`) is no variant, and one it reads as
  * another (`k4h_v4 rotated` is `k4h_v4`, rotated by its name) is listed once, in its fewest
  * words. So a layout or recipe word added to the table and the parser is a candidate with no
- * change here or in rad-autoquant. */
-std::vector<KvVariant> kv_autoquant_variants(bool vmean);
+ * change here or in rad-autoquant. An opt-in layout (kv_layout_opt_in: e2m1h) is a variant only
+ * with `opt_in`, which rad-autoquant passes where --layouts or --variants names one. */
+std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in = false);
 
 /* One limit a measured assignment is checked against, both sides measured from the base (the
  * most accurate recipe): for the mean KL the run's minus the base's and the limit minus the

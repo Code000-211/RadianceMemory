@@ -96,7 +96,9 @@ static const Flag g_flags[] = {
     { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, k4h_v4\n"
                                         "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
                                         "(int8, a scale a token and head, 1.01; all rotated,\n"
-                                        "Flash-Next) or bf16 (2; Flash-Next), a 'layer N\n"
+                                        "Flash-Next), e2m1h (FP4 E2M1 under an E4M3 scale a\n"
+                                        "16, 0.56, rotated; an experiment) or bf16 (2;\n"
+                                        "Flash-Next), a 'layer N\n"
                                         "LAYOUT [rotated] [demote LAYOUT] [vmean]' line a layer\n"
                                         "(docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
@@ -532,7 +534,7 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
  * calibration candidate at once: rad-autoquant's variants are each row as kv_recipe_parse reads it
  * plain, `rotated` and `vmean` (kv_autoquant_variants), so a new layout's rules (rotation implied,
  * no V mean) belong in the parser below and nowhere else. */
-struct KvLayout { const char* name; int kvq; int group_bits; };
+struct KvLayout { const char* name; int kvq; int group_bits; bool opt_in = false; };
 static const KvLayout kKvLayouts[] = {
     /* The cache --kv-cache-dtype bf16 keeps, for one layer: nothing rounded but bf16's own. Twice
      * fp8; what a layer too sensitive for any 8-bit layout keeps (rad-autoquant's base). */
@@ -549,6 +551,12 @@ static const KvLayout kKvLayouts[] = {
     { "k6_v4",  RAD_KVQ_K6V4, (32 * 6 + 16) + (32 * 4 + 16) },
     /* K int4 as well, stored rotated: 18/32. The rotation is part of the layout (below). */
     { "k4h_v4", RAD_KVQ_K4H,  (32 * 4 + 16) + (32 * 4 + 16) },
+    /* K and V as FP4 E2M1 codes (+-0, 0.5, 1, 1.5, 2, 3, 4, 6) under an E4M3 scale a group of 16,
+     * stored rotated: two 8-bit scales a group of 32, so k4h_v4's 18/32 and its byte geometry.
+     * An experiment (DeepSeek-V4.1-Flash's KV format, which that model was trained for): opt-in,
+     * so rad-autoquant offers it only where --layouts or --variants names it. After k4h_v4,
+     * whose bits it ties: a tie keeps the earlier, k4h_v4. */
+    { "e2m1h",  RAD_KVQ_E2M1H, (32 * 4 + 16) + (32 * 4 + 16), true },
     /* V int2 under KVarN's variance normalisation, rotated as k4h_v4: 14/32. */
     { "k4h_v2h", RAD_KVQ_K4HV2H, (32 * 4 + 16) + (32 * 2 + 16) },
 };
@@ -564,6 +572,12 @@ const char* kv_layout_name(int kvq) {
     for (const KvLayout& l : kKvLayouts)
         if (l.kvq == kvq) return l.name;
     return nullptr;
+}
+
+bool kv_layout_opt_in(int kvq) {
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.opt_in;
+    return false;
 }
 
 int kv_layout_group_bits(int kvq) {
@@ -596,8 +610,8 @@ std::vector<int> kv_layouts() {
 /* One `layer N LAYOUT` line per attention layer, `layer N LAYOUT rotated` for a layer that stores
  * its K and V rotated (RAD_KVQ_ROTATED: the normalised Hadamard over head_dim, its query rotated
  * before the attention and the output back after it); `#` starts a comment, blank lines are
- * skipped. k4h_v4, k4h_v2h and i8h are rotated layouts (RAD_KVQ_K4H, RAD_KVQ_K4HV2H,
- * RAD_KVQ_I8H): a line of any of them marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
+ * skipped. k4h_v4, k4h_v2h, i8h and e2m1h are rotated layouts (RAD_KVQ_K4H, RAD_KVQ_K4HV2H,
+ * RAD_KVQ_I8H, RAD_KVQ_E2M1H): a line of any of them marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
  * (the h is the Hadamard), a k4h or i8h layer without the rotation is not a deployment anyone can ask
  * for, and rad-autoquant writes every layout as `layer N LAYOUT` from the table above.
  * `bf16` is the plain bf16 cache (RAD_KVQ_BF16) and takes neither word, nor `demote`: it rounds
@@ -673,7 +687,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         const int q = kv_layout_of(layout.c_str());
         if (q < 0) {
             RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, "
-                    "k4h_v4, k4h_v2h or i8h", name, ln, l, layout.c_str());
+                    "k4h_v4, k4h_v2h, i8h or e2m1h", name, ln, l, layout.c_str());
             return RAD_E_INVAL;
         }
         if (q == RAD_KVQ_BF16 && (rot_word || vmean)) {
@@ -714,7 +728,7 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
          * its store, so the resident and the demoted bytes are both centred. */
         if (vmean && q == RAD_KVQ_NONE && dq == 0) {
             RAD_ERR("%s line %d: layer %ld: 'vmean' is for a layout with integer V (fp8_v4, "
-                    "k6_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
+                    "k6_v4, k4h_v4, k4h_v2h, i8h, e2m1h); fp8 keeps V in E4M3", name, ln, l);
             return RAD_E_INVAL;
         }
         if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);
@@ -722,7 +736,8 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
             RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
             return RAD_E_INVAL;
         }
-        const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
+        const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H ||
+                                    q == RAD_KVQ_E2M1H;
         r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
                        (vmean ? RAD_KVQ_VMEAN : 0) | (dq << RAD_KVQ_DEMOTE_SHIFT);
         vmean_layers += vmean;

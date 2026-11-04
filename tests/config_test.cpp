@@ -996,7 +996,8 @@ TEST(a_k4h_v4_recipe_line_is_rotated_whether_or_not_it_says_so) {
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v4'"));
     std::vector<int32_t> out;
     err = stderr_of([&] { CHECK_EQ(kv_recipe_parse("layer 0 k4h\n", "r.txt", &out), RAD_E_INVAL); });
-    CHECK(has(err, "'k4h' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h or i8h"));
+    CHECK(has(err, "'k4h' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, k4h_v4, k4h_v2h, i8h or "
+                   "e2m1h"));
 }
 
 /* k4h_v2h (int4 K, KVarN-normalised int2 V) is rotated as k4h_v4 is: its line loads rotated with
@@ -1042,6 +1043,39 @@ TEST(an_i8h_recipe_line_is_rotated_takes_a_v_mean_and_is_priced_just_over_fp8) {
         CHECK(parse_fresh({ "--kv-cache-dtype", "i8h" }) < 0);
     });
     CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'i8h'"));
+}
+
+/* e2m1h (FP4 E2M1 K and V under an E4M3 scale a group of 16, issue #18's experiment) is rotated as
+ * the k4h layouts are: its line loads rotated with or without the word, it takes `vmean`, it is
+ * priced at k4h_v4's 288 bits a 32 + 32 group (4.5 bits an element), it is opt-in for rad-autoquant
+ * (kv_layout_opt_in) and the only opt-in layout, and it is a recipe word only, never a
+ * --kv-cache-dtype nor a demote layout, nor a tiered layer's resident one. */
+TEST(an_e2m1h_recipe_line_is_rotated_takes_a_v_mean_and_is_priced_as_k4h_v4) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 0 e2m1h\nlayer 1 k4h_v4\nlayer 2 e2m1h rotated vmean\n",
+                             "r.txt", &r), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_E2M1H | rot, RAD_KVQ_K4H | rot,
+                                      RAD_KVQ_E2M1H | rot | RAD_KVQ_VMEAN }));
+    CHECK_EQ(kv_layout_of("e2m1h"), (int)RAD_KVQ_E2M1H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_E2M1H)), std::string("e2m1h"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_E2M1H), 288);
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_E2M1H, 256), (int64_t)288);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_E2M1H, 288), (int64_t)256);
+    for (int q : kv_layouts()) CHECK_EQ(kv_layout_opt_in(q), q == RAD_KVQ_E2M1H);
+    std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "e2m1h" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'e2m1h'"));
+    std::vector<int32_t> out;
+    err = stderr_of([&] {
+        CHECK_EQ(kv_recipe_parse("layer 0 i8h demote e2m1h\n", "r.txt", &out), RAD_E_INVAL);
+    });
+    CHECK(has(err, "a demote layout is k4h_v4 or k4h_v2h"));
+    err = stderr_of([&] {
+        CHECK_EQ(kv_recipe_parse("layer 0 e2m1h demote k4h_v4\n", "r.txt", &out), RAD_E_INVAL);
+    });
+    CHECK(has(err, "the resident layout of a tiered layer is i8h or fp8"));
 }
 
 /* bf16 is a recipe layout too (RAD_KVQ_BF16): the layer keeps the unquantised cache, beside fp8

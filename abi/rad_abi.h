@@ -58,8 +58,12 @@ extern "C" {
  * (RAD_KVQ_DEMOTE, rad_builder.h; --kv-recipe `demote LAYOUT`), and the optional `store_layout`,
  * `pool_layout` and `head_dim` of `qsa_page` with the new op `kv_transcode` (docs/OPS.md); no
  * struct moved. A plugin built at 41 would read a tiered layer's entry as a layout it does not
- * know and refuse it. */
-#define RAD_ABI_VERSION 42u
+ * know and refuse it.
+ *
+ * 43: an eighth kv_recipe layout, RAD_KVQ_E2M1H (e2m1h: rotated E2M1 K and V, one E4M3 scale a
+ * group of 16; rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built at 42
+ * would read an e2m1h layer as a layout it does not know and refuse it. */
+#define RAD_ABI_VERSION 43u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

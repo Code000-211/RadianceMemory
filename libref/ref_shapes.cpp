@@ -1391,6 +1391,7 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
      * is held to this reference over stored caches instead (tests/r4d_emu/test_k4h.cpp). */
     const char* kvs = gs(p, n_p, "kv_dtype");
     if (kvs && (!std::strcmp(kvs, "k4h_v4") || !std::strcmp(kvs, "k4h_v2h") ||
+                !std::strcmp(kvs, "e2m1h") ||
                 !std::strcmp(kvs, "i8h")))
         return RAD_E_UNSUPPORTED;
     /* `q_dtype` and `kv_dtype` are read separately: the engine issues fp8 caches beside bf16
@@ -1554,7 +1555,7 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     /* k4h_v4 / k4h_v2h / i8h: a token's row is 18 / 14 * head_dim / 16 or 2 * head_dim + 4 bytes
      * of an E4M3-declared cache (ref_attn.cpp). bf16_e4m3r is a bf16 cache (dt_parse refuses the
      * name, so KV falls back on bf16). */
-    const int64_t row = !kvs ? 0 : !std::strcmp(kvs, "k4h_v4") ? 18 * hd / 16
+    const int64_t row = !kvs ? 0 : !std::strcmp(kvs, "k4h_v4") || !std::strcmp(kvs, "e2m1h") ? 18 * hd / 16
                       : !std::strcmp(kvs, "k4h_v2h") ? 14 * hd / 16
                       : !std::strcmp(kvs, "i8h") ? 2 * hd + 4 : 0;
     const bool k4h = row != 0;

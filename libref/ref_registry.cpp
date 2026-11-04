@@ -2452,7 +2452,8 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales, or the "
     "k4h_v4 cache (int4 K and V in groups of 32 with f16 scales), the k4h_v2h cache (int2 V) or the "
-    "i8h cache (int8 K and V, one f16 scale a token and head)",
+    "i8h cache (int8 K and V, one f16 scale a token and head) or the e2m1h cache (E2M1 K and V, "
+    "an E4M3 scale a group of 16)",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
 ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
@@ -2473,7 +2474,7 @@ SIMPLE("ref_sam_attn", "sam_attn", "attn",
 ROW("ref_kv_store", "kv_store", "attn",
     "scatter k and v into the paged cache; kv_dtype k4h_v4 quantises each group of 32 to int4 "
     "with an f16 absmax / 7 scale, k4h_v2h V to KVarN-normalised int2, i8h each head to int8 with "
-    "an f16 absmax / 127 scale, bf16_e4m3r a bf16 cache rounded through E4M3 (ref_attn.cpp)", DT_ANY,
+    "an f16 absmax / 127 scale, e2m1h each group of 16 to E2M1 with an E4M3 absmax / 6 scale, bf16_e4m3r a bf16 cache rounded through E4M3 (ref_attn.cpp)", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_kv_store, nullptr),
 ROW("ref_kv_store_streamed", "kv_store_streamed", "attn",

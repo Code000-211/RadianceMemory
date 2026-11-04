@@ -85,6 +85,22 @@
  *   values are spread evenly enough that the measured attention error of int8 at a scale a head
  *   is within 0.0007 of int8 at a scale a 32-group (prep kvstat, 8.06 against 8.5 bits).
  *
+ * `kv_dtype` e2m1h (RAD_KVQ_E2M1H) is FP4 E2M1 under an E4M3 scale a group of 16, rotated, in
+ * k4h_v4's byte geometry: a row of 18 * head_dim / 16 bytes, K's codes (dim d in the nibble at bit
+ * 4 * (d % 2) of byte d / 2), V's, then one E4M3 byte a group of 16 for K and for V. A code is
+ * E2M1's bits: bit 3 the sign, bits 0-2 an index into the magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+ * A group x[0..15] (the bf16 value times 1 / k_scale or 1 / v_scale, in f32):
+ *     amax  = the largest |x[i]|, by fmax, which drops a NaN (a group of NaNs is NaN, then capped)
+ *     scale = E4M3(fmin(amax / 6, 448)), the f32 quotient rounded once to nearest even (no
+ *             rounding up: a value rounded past 6 times the scale clamps to 6); 0 where it
+ *             underflows, and a group at scale 0 stores codes 0
+ *     y     = fmin(fmax(x[i] / scale, -6), 6), so a NaN element is -6 and an infinity +-6
+ *     code  = the magnitude nearest |y|, a tie to the even index (E2M1's mantissa bit 0):
+ *             (a > 0.25) + (a >= 0.75) + (a > 1.25) + (a >= 1.75) + (a > 2.5) + (a >= 3.5) + (a > 5),
+ *             with the sign bit where y < 0 and the index is not 0 (no -0 is stored)
+ *   and a read is the magnitude, signed, times the scale -- exact in f32 and in f16 (two E2M1
+ *   values and an E4M3 one keep within f16's eleven bits, 2^-10 to 2688).
+ *
  * `kv_dtype` bf16_e4m3r is not a layout but an experiment: a bf16 cache whose stored values are
  * rounded through E4M3 as the fp8 cache's store rounds them (x / k_scale clamped to +-448, then
  * E4M3 to nearest even), decoded and multiplied back by k_scale, then rounded to bf16 (exact at
@@ -144,12 +160,12 @@ struct KvDyn  {
 };
 
 /* ---- k4h_v4 and k4h_v2h (see the file header) */
-/* The cache's packed layout: 0 none, 1 k4h_v4, 2 k4h_v2h, 3 i8h; a token's row in bytes at
- * head_dim hd, and where K's scales start in it. */
+/* The cache's packed layout: 0 none, 1 k4h_v4, 2 k4h_v2h, 3 i8h, 4 e2m1h (k4h_v4's geometry);
+ * a token's row in bytes at head_dim hd, and where K's scales start in it. */
 inline int kv_k4h(const RadArgs* a) {
     const char* s = p_str(a, "kv_dtype", nullptr);
     return !s ? 0 : std::strcmp(s, "k4h_v4") == 0 ? 1 : std::strcmp(s, "k4h_v2h") == 0 ? 2
-                  : std::strcmp(s, "i8h") == 0 ? 3 : 0;
+                  : std::strcmp(s, "i8h") == 0 ? 3 : std::strcmp(s, "e2m1h") == 0 ? 4 : 0;
 }
 inline int64_t k4h_row(int k4h, int64_t hd) {
     return k4h == 3 ? 2 * hd + 4 : (k4h == 2 ? 14 : 18) * hd / 16;
@@ -176,6 +192,34 @@ inline void i8h_head(const float* x, int64_t hd, uint8_t* codes, uint8_t* scale)
         codes[i] = (uint8_t)(int8_t)(int)std::fmin(std::fmax(r, -127.0f), 127.0f);
     }
     std::memcpy(scale, &s16, 2);
+}
+
+/* e2m1h (the file header): E2M1's eight magnitudes, and dim d of the codes at `codes` under the
+ * group scales at `scales`. */
+constexpr float kE2m1[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+inline float e2m1_at(const uint8_t* codes, const uint8_t* scales, int64_t d) {
+    const int nib = (codes[d / 2] >> (4 * (d & 1))) & 0xF;
+    return (nib & 8 ? -kE2m1[nib & 7] : kE2m1[nib & 7]) * fp8e4m3_to_f32(scales[d / 16]);
+}
+
+/* e2m1h: one group of 16 values into 8 bytes of codes and its E4M3 scale (the file header). */
+inline void e2m1_group(const float* x, uint8_t* codes, uint8_t* scale) {
+    float amax = std::fabs(x[0]);
+    for (int i = 1; i < 16; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint8_t s8 = f32_to_fp8e4m3(std::fmin(amax / 6.0f, 448.0f));
+    const float sc = fp8e4m3_to_f32(s8);
+    for (int i = 0; i < 16; i += 2) {
+        int q[2];
+        for (int e = 0; e < 2; ++e) {
+            const float y = sc > 0.0f ? std::fmin(std::fmax(x[i + e] / sc, -6.0f), 6.0f) : 0.0f;
+            const float m = std::fabs(y);
+            const int c = (m > 0.25f) + (m >= 0.75f) + (m > 1.25f) + (m >= 1.75f) + (m > 2.5f) +
+                          (m >= 3.5f) + (m > 5.0f);
+            q[e] = c | (y < 0.0f && c ? 8 : 0);
+        }
+        codes[i / 2] = (uint8_t)(q[0] | (q[1] << 4));
+    }
+    *scale = s8;
 }
 
 /* bf16_e4m3r (the file header): one value as the fp8 store rounds it and back, at descale s. The
@@ -565,6 +609,11 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
             } else if (k4h == 2) {
                 unit([&](int64_t b, int64_t d) { return k4h_int4(kb8 + b, kb8 + b + kso, d); },
                      [&](int64_t b, int64_t d) { return v2h_at(kb8 + b, head_dim, d); });
+            } else if (k4h == 4) {
+                unit([&](int64_t b, int64_t d) { return e2m1_at(kb8 + b, kb8 + b + kso, d); },
+                     [&](int64_t b, int64_t d) {
+                         return e2m1_at(kb8 + b + head_dim / 2, kb8 + b + head_dim * 17 / 16, d);
+                     });
             } else if (k4h == 3) {
                 unit([&](int64_t b, int64_t d) { return i8h_at(kb8 + b, kb8 + b + kso, d); },
                      [&](int64_t b, int64_t d) {
@@ -932,6 +981,15 @@ int ref_kv_store(const RadArgs* a, RadStream) {
                     for (int i = 0; i < 32; ++i) {
                         kx[i] = ldt(k, t * k_rs + h * k_hs + (g + i) * k_ds) * kin;
                         vx[i] = ldt(v, t * v_rs + h * v_hs + (g + i) * v_ds) * vin;
+                    }
+                    if (k4h == 4) {
+                        /* e2m1h: two groups of 16 a group of 32, an E4M3 byte each. */
+                        for (int u = 0; u < 32; u += 16) {
+                            e2m1_group(kx + u, row + (g + u) / 2, row + head_dim + (g + u) / 16);
+                            e2m1_group(vx + u, row + head_dim / 2 + (g + u) / 2,
+                                       row + head_dim * 17 / 16 + (g + u) / 16);
+                        }
+                        continue;
                     }
                     k4h_group(kx, row + g / 2, row + k4h_ksoff(k4h, head_dim) + (g / 32) * 2);
                     if (k4h == 2)

@@ -982,6 +982,55 @@ __global__ __launch_bounds__(32) void kv_store_i8h_kernel(
     }
 }
 
+// The e2m1h store (RAD_KVQ_E2M1H): one wave a (token, head), lane l a group of 16 dims (l, l + 32,
+// ...), K's and V's. A group's scale is E4M3(fminf(absmax / 6, 448)) by v_cvt_pk_fp8_f32 (round to
+// nearest even, the clamp keeping it in range), its codes E2M1's nearest magnitude of x / scale
+// clamped to +-6 (a NaN to -6), ties to the even index, as the comparisons below count them.
+// The absmax is a serial fmaxf from NaN, which drops a NaN in any order, so a group of NaNs takes
+// the cap. libref's kv_store at kv_dtype e2m1h holds it byte for byte (libref/ref_attn.cpp's header
+// is the contract).
+__global__ __launch_bounds__(32) void kv_store_e2m1h_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
+    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
+    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
+    const int32_t s = slot[t];
+    if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    const size_t row = (size_t)head_dim * 18 / 16;
+    uint8_t* __restrict__ c = kv + (((size_t)blk * kv_heads + h) * block_size + off) * row;
+    for (int w = 0; w < 2; ++w) {
+        const uint16_t* x = (w ? v + (size_t)t * v_ld : k + (size_t)t * k_ld) + (size_t)h * head_dim;
+        const float inv = w ? v_inv : k_inv;
+        for (uint32_t g = lane; g < head_dim / 16; g += 32) {
+            float f[16];
+            float amax = __builtin_nanf("");
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                f[e] = bf16_to_f32(x[16 * g + e]) * inv;
+                amax = fmaxf(amax, fabsf(f[e]));
+            }
+            const uint32_t s8 =
+                (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(fminf(amax / 6.0f, 448.0f), 0.0f, 0, false) & 0xFFu;
+            const float sc = __builtin_amdgcn_cvt_pk_f32_fp8((int)s8, false)[0];
+            uint32_t q[2] = { 0, 0 };
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float y = sc > 0.0f ? fminf(fmaxf(f[e] / sc, -6.0f), 6.0f) : 0.0f;
+                const float m = fabsf(y);
+                const uint32_t ci = (uint32_t)(m > 0.25f) + (m >= 0.75f) + (m > 1.25f) + (m >= 1.75f) +
+                                    (m > 2.5f) + (m >= 3.5f) + (m > 5.0f);
+                q[e / 8] |= (ci | (y < 0.0f && ci ? 8u : 0u)) << (4 * (e % 8));
+            }
+            uint8_t* cw = c + (size_t)w * (head_dim / 2) + 8 * g;
+            *(uint32_t*)cw = q[0];
+            *(uint32_t*)(cw + 4) = q[1];
+            c[head_dim + (size_t)w * (head_dim / 16) + g] = (uint8_t)s8;
+        }
+    }
+}
+
 // The bf16_e4m3r store, an experiment (libref/ref_attn.cpp): a bf16 cache holding each value as the
 // fp8 store rounds it (kv_store_fp8_kernel's clamp and conversion, bit for bit), decoded exactly and
 // multiplied back by the descale, rounded to bf16. The bf16 attention then reads the values the
@@ -2588,6 +2637,26 @@ extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { retu
 extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }
 extern "C" int r4d_rad_kv_store_k4hv4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 2); }
 extern "C" int r4d_rad_kv_store_k4hv2h(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 3); }
+
+/* The e2m1h store: a token's row is 18 * head_dim / 16 bytes; one wave a (token, head). */
+extern "C" int r4d_rad_kv_store_e2m1h(const RadArgs* a, RadStream stream) {
+    KvStoreGeom g{};
+    const int rc = kv_store_geom(a, &g, 18);
+    if (rc != RAD_OK) return rc;
+    if (g.kv->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    if (g.head_dim % 32) return R4D_NO(RAD_E_SHAPE);
+    const double ks = r4d_getf(a, "k_scale", 1.0);
+    const double vs = r4d_getf(a, "v_scale", 1.0);
+    if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
+    const long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
+    const long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
+    return R4D_EMIT(stream, kv_store_e2m1h_kernel, dim3((uint32_t)g.T, (uint32_t)g.kv_heads), dim3(32),
+                    0, (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
+                    (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
+                    (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                    (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
+                    (float)(1.0 / vs)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+}
 
 /* The i8h store: a token's row is 2 * head_dim + 4 bytes; one wave a (token, head). */
 extern "C" int r4d_rad_kv_store_i8h(const RadArgs* a, RadStream stream) {

@@ -158,6 +158,49 @@ __device__ __forceinline__ void k8x8_to_f16x4w(uint32_t lo, uint32_t hi, uint32_
     }
 }
 
+// The e2m1h cache (RAD_KVQ_E2M1H): a code is E2M1's bits, the sign in bit 3, bits 0-2 an index
+// into the magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6. Each byte of `x` holds one code (0..15); each
+// byte of the result is u = 12 + 2 * value (0..24), looked up in two 8-byte tables (perm takes
+// selector bytes 0-3 from its second operand and 4-7 from its first) and chosen by the sign, so
+// 0x6400 | u is the f16 1024 + u and less kE2Bias it is twice the value, exact. The group's scale
+// goes in halved (e2_scale_h), so (1024 + u - 1036) * s / 2 is the value times s, also exact (an
+// E2M1 and an E4M3 significand together keep within f16's, 2^-10 to 2688).
+__device__ __forceinline__ uint32_t e2_codes_u(uint32_t x) {
+    const uint32_t i = x & 0x07070707u;
+    const uint32_t pos = __builtin_amdgcn_perm(0x18141210u, 0x0F0E0D0Cu, i);   // 12 + 2 * mag
+    const uint32_t neg = __builtin_amdgcn_perm(0x00040608u, 0x090A0B0Cu, i);   // 12 - 2 * mag
+    const uint32_t m = ((x >> 3) & 0x01010101u) * 0xFFu;
+    return (pos & ~m) | (neg & m);
+}
+constexpr float kE2Bias = 1036.0f;
+// An e2m1h group's E4M3 scale byte as the f16 bits of half its value (exact: E4M3's least
+// subnormal halved, 2^-10, is an f16 normal).
+__device__ __forceinline__ uint32_t e2_scale_h(uint32_t b) {
+    const float f = __builtin_amdgcn_cvt_pk_f32_fp8((int)(b & 0xFFu), false)[0] * 0.5f;
+    return (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)f);
+}
+// V's eight dims of one key from its code word `w`, as v_codes_nm's two words (dims 0, 2, 4, 6 in
+// `n`, 1, 3, 5, 7 in `m`), each byte e2_codes_u's u, against kE2Bias.
+__device__ __forceinline__ void e2_codes_nm(uint32_t w, uint32_t& n, uint32_t& m) {
+    n = e2_codes_u(w & 0x0F0F0F0Fu);
+    m = e2_codes_u((w >> 4) & 0x0F0F0F0Fu);
+}
+// Eight K dims of the e2m1h cache as four f16 dwords, dims (2i, 2i+1) in dword i, from their code
+// word `lo` and the group's halved scale `s2` (e2_scale_h in both halves), as k4x8_to_f16x4w.
+__device__ __forceinline__ void e2x8_to_f16x4w(uint32_t lo, uint32_t s2, uint32_t* w4) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    uint32_t ev, od;
+    e2_codes_nm(lo, ev, od);
+    const h2 s = __builtin_bit_cast(h2, s2);
+    const h2 bias = { (_Float16)kE2Bias, (_Float16)kE2Bias };
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
+        const uint32_t x = __builtin_amdgcn_perm(od, ev, sel) | 0x64006400u;
+        w4[b] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(h2, x) - bias) * s);
+    }
+}
+
 template<class D>
 __device__ __forceinline__ void fp8x8_to_16x4w(uint2 raw, uint32_t* w4) {
     #pragma unroll

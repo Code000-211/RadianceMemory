@@ -62,6 +62,10 @@
 // (abi/rad_builder.h).
 #define O_V2    4
 #define O_I8    8192
+// O_K4 with O_E2: the e2m1h cache (RAD_KVQ_E2M1H): k4h_v4's row with E2M1 codes widened by a
+// lookup (e2_codes_u in r4d_dt16.h) and an E4M3 scale a group of 16 where k4h_v4 has an f16 one a
+// group of 32. Shared with r4d_attn_prefill_h256_gqa6.hip.
+#define O_E2    65536
 #define O_V4    33554432
 #define O_K6    67108864
 #define O_K4    1073741824
@@ -118,6 +122,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // i8h: k4h_v4's walk with a byte a code and one scale a token for each of K and V. Its row
     // (2 * HEAD_DIM + 4) is 4-byte aligned only, so its codes are read a dword at a time.
     constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
+    constexpr int E2    = ((OPT & O_E2) && K4 && !V2 && !I8) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
     constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : I8 ? 2 * HEAD_DIM + 4
                         : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
@@ -316,7 +321,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     }
                     v4c[r][j] = V2 ? *(const uint16_t*)(base + VOFF + o * 2)
                                    : *(const uint32_t*)(base + VOFF + o * 4);
-                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                    sc[j]     = E2 ? e2_scale_h(base[VSOFF + (o >> 1)])
+                                   : *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
                 else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
@@ -339,12 +345,15 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 if constexpr (I8) {
                     v8_codes_nm(v4c[r][0], v8c[r][0], n0, m0);
                     v8_codes_nm(v4c[r][1], v8c[r][1], n1, m1);
+                } else if constexpr (E2) {
+                    e2_codes_nm(v4c[r][0], n0, m0);
+                    e2_codes_nm(v4c[r][1], n1, m1);
                 } else {
                     v_codes_nm<V2>(v4c[r][0], n0, m0);
                     v_codes_nm<V2>(v4c[r][1], n1, m1);
                 }
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                constexpr float VB = I8 ? kI8Bias : VBias<V2>::v;
+                constexpr float VB = I8 ? kI8Bias : E2 ? kE2Bias : VBias<V2>::v;
                 const h2 bias = { (_Float16)VB, (_Float16)VB };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
                                       + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];
@@ -534,6 +543,13 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                         const uint32_t sb = *(const uint16_t*)(grow + KSOFF);
                         const uint8_t* kp = grow + 16 * t + 8 * h;
                         k8x8_to_f16x4w(*(const uint32_t*)kp, *(const uint32_t*)(kp + 4), sb | (sb << 16), w4);
+                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
+                    } else if constexpr (E2) {
+                        // e2m1h: this lane's eight dims (16t + 8h ..) from their codes and the
+                        // scale of group t (16 dims).
+                        uint32_t w4[4];
+                        const uint32_t sb = e2_scale_h(grow[KSOFF + t]);
+                        e2x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h), sb | (sb << 16), w4);
                         kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     } else if constexpr (K4) {
                         // k4h_v4: this lane's eight dims from their codes and the group's scale.

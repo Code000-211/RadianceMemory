@@ -3689,6 +3689,143 @@ TEST(an_i8h_cache_of_the_wrong_shape_is_refused) {
     CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
 }
 
+/* ================================================================== the e2m1h cache */
+
+/* Worked by hand at head_dim 32 (two groups of 16 for K and two for V). The row is K's 16 code
+ * bytes, V's 16, K's two E4M3 scales, V's two: 36 bytes, k4h_v4's geometry.
+ *   K group 0: absmax 6, scale E4M3(1.0) = 0x38, so the codes are the values themselves on E2M1's
+ *     grid; the midpoints 0.25, 0.75, 1.25, 1.75, 2.5, 3.5 and 5 go to the even index (0, 1, 1,
+ *     2, 2, 4, 4: codes 0, 2, 2, 4, 4, 6, 6), -0.1 to code 0 (no -0 stored), -3 to 0xD (sign and
+ *     index 5), 0.5 to 1, 6 to 7 and -6 to 0xF; dim 2i in the low nibble.
+ *   K group 1: absmax 1e6 caps the scale at 448 (0x7e), so 1e6 clamps to 6 (7); a NaN drops out of
+ *     the absmax and is the clamp's -6 (0xF); 100 / 448 = 0.22 is 0, 200 / 448 = 0.45 is 0.5 (1).
+ *   V group 0: absmax 1e-4 / 6 underflows E4M3 (its least step is 2^-9), so the scale is 0 and its
+ *     codes 0. V group 1: +inf and -inf take the cap's 448 and are +-6 (7, 0xF).
+ * The other slot of the block keeps its bytes, a slot of -1 writes nothing. */
+TEST(an_e2m1h_store_writes_e2m1_codes_and_an_e4m3_absmax_over_six_scale_a_group_of_16) {
+    T k(RAD_F32, {2, 1, 32}), v(RAD_F32, {2, 1, 32});
+    std::vector<float> kx(64, 1000.0f), vx(64, 0.0f);   /* token 1 (dropped) all 1000 */
+    const float g0[16] = { 6, -6, 0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5, -0.1f, -3, 0.5f,
+                           0, 0, 0, 0 };
+    for (int i = 0; i < 16; ++i) kx[(size_t)i] = g0[i];
+    for (int i = 16; i < 32; ++i) kx[(size_t)i] = 0.0f;
+    kx[16] = 1e6f; kx[17] = std::nanf(""); kx[18] = 100.0f; kx[19] = 200.0f;
+    for (int i = 0; i < 16; ++i) vx[(size_t)i] = i % 2 ? -1e-4f : 1e-4f;
+    vx[16] = INFINITY; vx[17] = -INFINITY;
+    k.f(kx); v.f(vx);
+    T sm(RAD_I32, {2}); sm.n({1, -1});
+    T kv(RAD_F8E4M3, {1, 1, 2, 36});
+    std::vector<uint8_t> fill(72, 0x5a);
+    kv.raw(fill);
+    CHECK_OK(store_k4h(k, v, sm, kv, 2, 32, 1, 2, "e2m1h"));
+    const uint8_t* b = kv.mem.data();
+    for (int i = 0; i < 36; ++i) CHECK_EQ((int)b[i], 0x5a);          /* slot 0: untouched */
+    const uint8_t* r = b + 36;                                        /* slot 1: token 0 */
+    const int kc[16] = { 0xF7, 0x20, 0x42, 0x64, 0x06, 0x1D, 0x00, 0x00,
+                         0xF7, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    for (int i = 0; i < 16; ++i) CHECK_EQ((int)r[i], kc[i]);
+    for (int i = 16; i < 24; ++i) CHECK_EQ((int)r[i], 0);           /* V group 0: scale 0 */
+    CHECK_EQ((int)r[24], 0xF7);                                       /* +inf, -inf */
+    for (int i = 25; i < 32; ++i) CHECK_EQ((int)r[i], 0);
+    CHECK_EQ((int)r[32], 0x38); CHECK_EQ((int)r[33], 0x7e);         /* K's scales, 1.0 and 448 */
+    CHECK_EQ((int)r[34], 0x00); CHECK_EQ((int)r[35], 0x7e);         /* V's, 0 and 448 */
+}
+
+/* An e2m1h read is the magnitude, signed, times the group's E4M3 scale, and then the fp8 path's
+ * arithmetic, so attention over a stored cache is attention over its dequantised values, bit for
+ * bit: an f32 cache built from the stored bytes by the layout's own statement (E2M1's eight
+ * magnitudes, abi/rad_builder.h) gives the same output. */
+TEST(attention_over_an_e2m1h_cache_is_attention_over_its_dequantised_values) {
+    const int64_t Tn = 7, hd = 64, nh = 4, nkv = 2, bs = 4, nb = 2, row = 18 * hd / 16;
+    std::mt19937 rng(13);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    T tq(RAD_F32, {Tn, nh, hd}), tk(RAD_F32, {Tn, nkv, hd}), tv(RAD_F32, {Tn, nkv, hd});
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) st_dt(RAD_F32, tq.t.data, i, nd(rng));
+    for (int64_t i = 0; i < Tn * nkv * hd; ++i) {
+        st_dt(RAD_F32, tk.t.data, i, nd(rng) * (i % hd == 9 ? 20.0f : 1.0f));
+        st_dt(RAD_F32, tv.t.data, i, nd(rng));
+    }
+    T sm(RAD_I32, {Tn}); sm.n({4, 5, 6, 7, 0, 1, 2});   /* block 1, then block 0 */
+    T kv(RAD_F8E4M3, {nb, nkv, bs, row});
+    CHECK_OK(store_k4h(tk, tv, sm, kv, Tn, hd, nkv, bs, "e2m1h"));
+    const float mag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    T f(RAD_F32, {nb, nkv, bs, 2 * hd});
+    const uint8_t* c = kv.mem.data();
+    int64_t signed_codes = 0;
+    for (int64_t s = 0; s < nb * nkv * bs; ++s)
+        for (int which = 0; which < 2; ++which)
+            for (int64_t d = 0; d < hd; ++d) {
+                const uint8_t* r = c + s * row;
+                const int nib = (r[which * hd / 2 + d / 2] >> (4 * (d & 1))) & 0xF;
+                const uint8_t sc = r[hd + which * hd / 16 + d / 16];
+                signed_codes += (nib & 8) != 0;
+                st_dt(RAD_F32, f.t.data, s * 2 * hd + which * hd + d,
+                      (nib & 8 ? -mag[nib & 7] : mag[nib & 7]) * rad_fp8e4m3_to_f32(sc));
+            }
+    CHECK(signed_codes > 0);
+    T bt(RAD_I32, {1, 2}); bt.n({1, 0});
+    T su(RAD_I32, {1});    su.n({Tn});
+    T oe(RAD_F32, {Tn, nh, hd}), of(RAD_F32, {Tn, nh, hd});
+    A ae; ae.t(tq).t(kv).t(bt).t(su).tnull().tnull().tnull().t(oe)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "e2m1h");
+    CHECK_OK(run("attn_paged", ae));
+    A af; af.t(tq).t(f).t(bt).t(su).tnull().tnull().tnull().t(of)
+             .i("q_len", Tn).i("head_dim", hd).i("gqa", nh / nkv).i("block_size", bs)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", af));
+    int64_t same = 0;
+    for (int64_t i = 0; i < Tn * nh * hd; ++i) same += oe.at(i) == of.at(i);
+    CHECK_EQ(same, Tn * nh * hd);
+    CHECK(oe.at(0) != 0.0f);
+}
+
+/* What the reference says of e2m1h on outlier keys (V a one-hot 6, exact either way: 6 at scale 1,
+ * and rotated +-6/16 at scale 2^-4, so the error is K's alone): its groups of 16 and FP4's
+ * non-uniform grid already hold an outlier channel unrotated far better than k4h_v4 does (0.084
+ * against 0.145 here), and the rotation does not help it on these keys (0.101 rotated), while
+ * rotated k4h_v4 is better still (0.069). So e2m1h stays rotated only because the issue asks for the
+ * rotated form and the card's real K/V decide; the KL measurement must include it unrotated too
+ * (a recipe can not ask for that today: the layout implies the rotation). Checked: the unrotated
+ * comparison, which is the layout's grouping and grid at work. */
+TEST(e2m1h_holds_outlier_keys_unrotated_better_than_k4h_v4_does) {
+    const int64_t Tn = 9, hd = 256, nh = 4, nkv = 2;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> q((size_t)(Tn * nh * hd)), k((size_t)(Tn * nkv * hd)),
+                       v((size_t)(Tn * nkv * hd), 0.0f);
+    for (auto& x : q) x = nd(rng);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = nd(rng) * (i % hd == 5 ? 30.0f : 1.0f);
+    for (int64_t t = 0; t < Tn; ++t)
+        for (int64_t h = 0; h < nkv; ++h) v[(size_t)((t * nkv + h) * hd + 40 + t)] = 6.0f;
+    for (auto* w : { &q, &k, &v })
+        for (auto& x : *w) x = rad_bf16_to_f32(rad_f32_to_bf16(x));
+    const std::vector<double> exact = attend_f64(q, k, v, Tn);
+    const double e_plain = rel_l2(attend_k4h(q, k, v, Tn, false, "e2m1h"), exact);
+    const double e_rot = rel_l2(attend_k4h(q, k, v, Tn, true, "e2m1h"), exact);
+    const double k_plain = rel_l2(attend_k4h(q, k, v, Tn, false, "k4h_v4"), exact);
+    const double k_rot = rel_l2(attend_k4h(q, k, v, Tn, true, "k4h_v4"), exact);
+    std::printf("    e2m1h: unrotated vs exact %.3g, rotated %.3g; k4h_v4: unrotated %.3g, rotated %.3g\n",
+                e_plain, e_rot, k_plain, k_rot);
+    CHECK(e_plain < 0.75 * k_plain);
+    CHECK(e_rot > 0.0);
+}
+
+/* A cache whose last extent is not 18 * head_dim / 16 bytes is refused, store and attention alike. */
+TEST(an_e2m1h_cache_of_the_wrong_shape_is_refused) {
+    T k(RAD_F32, {1, 1, 32}), v(RAD_F32, {1, 1, 32});
+    T sm(RAD_I32, {1}); sm.n({0});
+    T plain(RAD_F8E4M3, {1, 1, 1, 64});
+    CHECK_EQ(store_k4h(k, v, sm, plain, 1, 32, 1, 1, "e2m1h"), RAD_E_SHAPE);
+    T q(RAD_F32, {1, 1, 32}), out(RAD_F32, {1, 1, 32});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({1});
+    A at; at.t(q).t(plain).t(bt).t(su).tnull().tnull().tnull().t(out)
+             .i("q_len", 1).i("head_dim", 32).i("gqa", 1).i("block_size", 1)
+             .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "e2m1h");
+    CHECK_EQ(run("attn_paged", at), RAD_E_SHAPE);
+}
+
 /* ================================================================== kv_transcode: the demote layout */
 namespace {
 

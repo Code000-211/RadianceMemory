@@ -94,7 +94,8 @@ std::vector<int> kvq_of(const std::vector<std::vector<KvCandidate>>& layers,
 
 TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
     CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_BF16, RAD_KVQ_I8H, RAD_KVQ_NONE, RAD_KVQ_V4,
-                                             RAD_KVQ_K6V4, RAD_KVQ_K4H, RAD_KVQ_K4HV2H }));
+                                             RAD_KVQ_K6V4, RAD_KVQ_K4H, RAD_KVQ_E2M1H,
+                                             RAD_KVQ_K4HV2H }));
     /* fp8's 8 bits an element, and the 25/32, 22/32, 18/32 and 14/32 of it docs/GUIDE.md §4.4
      * states; i8h at 258/256 of it (an f16 scale a 256-dim head is 2 bits a group of 32); bf16 at
      * twice it, 16 bits an element and no scale. */
@@ -105,6 +106,8 @@ TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K6V4), 352);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4H), 288);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4HV2H), 224);
+    /* e2m1h (issue #18's experiment): k4h_v4's 288, an E4M3 byte a 16 where k4h_v4 has an f16 a 32. */
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_E2M1H), 288);
     CHECK_EQ(kv_layout_group_bits(99), -1);
     for (int q : kv_layouts()) CHECK_EQ(kv_layout_of(kv_layout_name(q)), q);
 }
@@ -539,6 +542,22 @@ TEST(the_interval_from_the_rows_is_batch_means_with_the_documents_as_strata) {
  * neither word, so it is one variant; fp8 has no integer V to centre; i8h, k4h_v4 and k4h_v2h are
  * rotated by their names. Each is a recipe line
  * config_parse loads, with its means, as the flags the variant names. */
+/* e2m1h is opt-in: without opt_in no variant of it exists (so rad-autoquant's default candidates,
+ * and every test of them below, are the table's other layouts as before); with it, `e2m1h` (rotated
+ * by its name) and `e2m1h vmean` join, right after k4h_v4's two, at k4h_v4's bits. */
+TEST(e2m1h_is_a_variant_only_when_asked_for) {
+    const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
+    for (const KvVariant& v : kv_autoquant_variants(true))
+        CHECK((v.kvq & RAD_KVQ_LAYOUT) != RAD_KVQ_E2M1H);
+    const std::vector<KvVariant> all = kv_autoquant_variants(true, true);
+    REQUIRE_EQ(all.size(), (size_t)19);
+    CHECK_EQ(all[15].kvq, (int32_t)(RAD_KVQ_E2M1H | R));
+    CHECK_EQ(all[15].words, std::string("e2m1h"));
+    CHECK_EQ(all[15].bits, 288);
+    CHECK_EQ(all[16].kvq, (int32_t)(RAD_KVQ_E2M1H | R | M));
+    CHECK_EQ(all[16].words, std::string("e2m1h vmean"));
+}
+
 TEST(every_variant_is_a_recipe_line_the_server_loads_as_that_variant) {
     const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
     std::vector<int32_t> plain, centred;

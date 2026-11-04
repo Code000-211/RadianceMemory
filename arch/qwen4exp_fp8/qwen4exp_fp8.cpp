@@ -116,10 +116,10 @@ struct Layer {
     HcProject    proj;
 };
 
-/* A trunk layer's KV group key: its resident RAD_KVQ_* (0..RAD_KVQ_BF16) plus kKvqN times its
+/* A trunk layer's KV group key: its resident RAD_KVQ_* (0..RAD_KVQ_E2M1H) plus kKvqN times its
  * demote tier, 0 none, 1 k4h_v4, 2 k4h_v2h (RAD_KVQ_DEMOTE). The stride is the layout count, so
  * a layout added to the enum moves it with no key colliding; bf16 takes no demote layout. */
-constexpr int kKvqN   = RAD_KVQ_BF16 + 1;
+constexpr int kKvqN   = RAD_KVQ_E2M1H + 1;
 constexpr int kKvKeys = 3 * kKvqN;
 constexpr int kv_key(int q, int dq) {
     return q + kKvqN * (dq == RAD_KVQ_K4H ? 1 : dq == RAD_KVQ_K4HV2H ? 2 : 0);
@@ -713,7 +713,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * every layer's kv_quant, is refused rather than store unrotated keys in four bits.
          * k4h_v2h (int4 K, variance-normalised int2 V, 14 * head_dim / 16 bytes; RAD_KVQ_K4HV2H)
          * and i8h (int8 K and V, one f16 scale a token and head, 2 * head_dim + 4 bytes;
-         * RAD_KVQ_I8H) likewise.
+         * RAD_KVQ_I8H) likewise, and e2m1h (FP4 E2M1 K and V under an E4M3 scale a group of
+         * 16, k4h_v4's 18 * head_dim / 16 bytes; RAD_KVQ_E2M1H, an experiment).
          *
          * `vmean` (RAD_KVQ_VMEAN) centres a layer's V on a static mean before an integer V
          * layout stores it (AttnGatedFP8::vmean_sub); it needs the engine's table and a layout
@@ -728,10 +729,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         auto kvq_name = [](int q) -> const char* {
             return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4"
                  : q == RAD_KVQ_K4H ? "k4h_v4" : q == RAD_KVQ_K4HV2H ? "k4h_v2h"
-                 : q == RAD_KVQ_I8H ? "i8h" : q == RAD_KVQ_BF16 ? "bf16" : nullptr;
+                 : q == RAD_KVQ_I8H ? "i8h" : q == RAD_KVQ_BF16 ? "bf16"
+                 : q == RAD_KVQ_E2M1H ? "e2m1h" : nullptr;
         };
         auto kvq_rotated = [](int q) {
-            return q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
+            return q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H ||
+                   q == RAD_KVQ_E2M1H;
         };
         const bool f8 = fd.dtype == RAD_F8E4M3;
         std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
@@ -852,7 +855,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* A token's row in a head, in bytes of the E4M3-declared group. */
             const int64_t row = q == RAD_KVQ_V4     ? g.head_dim * 25 / 16
                               : q == RAD_KVQ_K6V4   ? g.head_dim * 22 / 16
-                              : q == RAD_KVQ_K4H    ? g.head_dim * 18 / 16
+                              : q == RAD_KVQ_K4H || q == RAD_KVQ_E2M1H ? g.head_dim * 18 / 16
                               : q == RAD_KVQ_K4HV2H ? g.head_dim * 14 / 16
                               : q == RAD_KVQ_I8H    ? 2 * g.head_dim + 4 : 2 * g.head_dim;
             RadKVGroupDecl qd = fd;
@@ -880,6 +883,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (q == RAD_KVQ_I8H)
                 rad_note(b, "kv cache i8h: rotated int8 K and V, one f16 scale a token and head "
                             "each, %lld bytes a token and head instead of %lld", (long long)row,
+                         (long long)(2 * g.head_dim));
+            else if (q == RAD_KVQ_E2M1H)
+                rad_note(b, "kv cache e2m1h: rotated E2M1 K and V, an E4M3 scale a group of 16, "
+                            "%lld bytes a token and head instead of %lld", (long long)row,
                          (long long)(2 * g.head_dim));
             else if (name && q != RAD_KVQ_BF16)   /* the flag's bf16 cache has no note either */
                 rad_note(b, "kv cache %s: %s K, %s V, in groups of 32 with f16 scales, %lld "
@@ -1972,7 +1979,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0)
         out->draft_depth = 3;
     out->shape_probe_ok = 1;      /* declare() writes scratch under shape_probe */
-    /* --kv-cache-dtype fp8_v4 / k6_v4, and k4h_v4, k4h_v2h and i8h (a recipe's, rotated): libr4d has their rows
+    /* --kv-cache-dtype fp8_v4 / k6_v4, and k4h_v4, k4h_v2h, i8h and e2m1h (a recipe's, rotated): libr4d has their rows
      * for the QSA layers' geometry (head_dim 256, twelve queries per KV head; gqa6 with 4-token
      * pages at four ranks), so other geometries are refused at startup rather than in declare. */
     {
@@ -1981,7 +1988,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H) |
-                               (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H);
+                               (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H) | (1 << RAD_KVQ_E2M1H);
         /* bf16 is served wherever --kv-cache-dtype bf16 is: every geometry. */
         out->kv_quant_ok |= 1 << RAD_KVQ_BF16;
     }
