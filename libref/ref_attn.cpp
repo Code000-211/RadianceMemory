@@ -33,6 +33,7 @@
  * an fp8 element. Rotation is not the cache's business: the layer rotates (had_rotate) before the
  * store and after the attention.
  * fp8_v4 and k6_v4 have no reference here; their rows are checked on the card (r4d_selftest).
+ * k5_v4 has (below).
  *
  * `kv_dtype` k4h_v2h (RAD_KVQ_K4HV2H) is k4h_v4 with V in two bits: a row of 14 * head_dim / 16
  * bytes, K's int4 codes as above, V's int2 codes (dim d in bits 2 * (d % 4) of byte d / 4), K's
@@ -84,6 +85,20 @@
  *   and a read is code * scale. One scale a head rather than a group: after the rotation a head's
  *   values are spread evenly enough that the measured attention error of int8 at a scale a head
  *   is within 0.0007 of int8 at a scale a 32-group (prep kvstat, 8.06 against 8.5 bits).
+ *
+ * `kv_dtype` k5_v4 (RAD_KVQ_K5V4) is k6_v4 with one high bit a K dim instead of two, unrotated or
+ * rotated as the layer says: a row of 20 * head_dim / 16 bytes, K's low four bits (as V's codes),
+ * K's fifth bits (a 4-byte word per group of 32 dims, dim 16c + 8h + 2j + p at bit 4c + 2h + p of
+ * the word's byte j, c, h, p in 0..1, j in 0..3), V's int4 codes, K's f16 scales, V's. V is
+ * k4h_v4's V. A K group x[0..31] (the bf16 value times 1 / k_scale, in f32):
+ *     amax  = the largest |x[i]|, by fmax, which drops a NaN (a group of NaNs is NaN, then capped)
+ *     scale = f16(fmin(amax / 15, 4364))   (the f32 quotient rounded once; 4364 is the largest
+ *             f16 with 15 times it an f16, so an infinity or a NaN group decodes finite)
+ *     code  = clamp(rint(x[i] / scale), -15, 15) where scale > 0, else 0, the clamp fmin(fmax(.)),
+ *             so a NaN element is -15 and an infinity +-15; -16 is never stored
+ *   rint rounds half to even. The code's low four bits go where V's would, bit 4 to the word. A
+ *   read is code * scale. The kernels widen the code to f16 as (1024 + (code ^ 16) - 1040) *
+ *   scale, rounded once to f16, where this reads it in f32.
  *
  * `kv_dtype` bf16_e4m3r is not a layout but an experiment: a bf16 cache whose stored values are
  * rounded through E4M3 as the fp8 cache's store rounds them (x / k_scale clamped to +-448, then
@@ -144,18 +159,51 @@ struct KvDyn  {
 };
 
 /* ---- k4h_v4 and k4h_v2h (see the file header) */
-/* The cache's packed layout: 0 none, 1 k4h_v4, 2 k4h_v2h, 3 i8h; a token's row in bytes at
- * head_dim hd, and where K's scales start in it. */
+/* The cache's packed layout: 0 none, 1 k4h_v4, 2 k4h_v2h, 3 i8h, 4 k5_v4; a token's row in bytes
+ * at head_dim hd, and where K's scales start in it. */
 inline int kv_k4h(const RadArgs* a) {
     const char* s = p_str(a, "kv_dtype", nullptr);
     return !s ? 0 : std::strcmp(s, "k4h_v4") == 0 ? 1 : std::strcmp(s, "k4h_v2h") == 0 ? 2
-                  : std::strcmp(s, "i8h") == 0 ? 3 : 0;
+                  : std::strcmp(s, "i8h") == 0 ? 3 : std::strcmp(s, "k5_v4") == 0 ? 4 : 0;
 }
 inline int64_t k4h_row(int k4h, int64_t hd) {
-    return k4h == 3 ? 2 * hd + 4 : (k4h == 2 ? 14 : 18) * hd / 16;
+    return k4h == 3 ? 2 * hd + 4 : (k4h == 2 ? 14 : k4h == 4 ? 20 : 18) * hd / 16;
 }
 inline int64_t k4h_ksoff(int k4h, int64_t hd) {
-    return k4h == 3 ? 2 * hd : k4h == 2 ? hd * 3 / 4 : hd;
+    return k4h == 3 ? 2 * hd : k4h == 2 ? hd * 3 / 4 : k4h == 4 ? hd * 9 / 8 : hd;
+}
+
+/* k5_v4: dim d of K in a row of head_dim hd, its 5-bit code (low nibble and high bit, the file
+ * header) times its group's scale. */
+inline float k5_at(const uint8_t* row, int64_t hd, int64_t d) {
+    const int lo = (row[d / 2] >> (4 * (d & 1))) & 0xF;
+    const int x = (int)(d % 32), c = x / 16, h = (x % 16) / 8, j = (x % 8) / 2, p = x & 1;
+    const int hi = (row[hd / 2 + (d / 32) * 4 + j] >> (4 * c + 2 * h + p)) & 1;
+    uint16_t s;
+    std::memcpy(&s, row + hd * 9 / 8 + (d / 32) * 2, 2);
+    return (float)(((lo | (hi << 4)) ^ 16) - 16) * f16_to_f32(s);
+}
+
+/* k5_v4: K's group g (dims g .. g + 31) of a row of head_dim hd from its 32 values (the file
+ * header): low nibbles, the group's high-bit word, its scale. */
+inline void k5_group(const float* x, uint8_t* row, int64_t hd, int64_t g) {
+    float amax = std::fabs(x[0]);
+    for (int i = 1; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint16_t s16 = f32_to_f16(std::fmin(amax / 15.0f, 4364.0f));
+    const float sc = f16_to_f32(s16);
+    uint8_t* const hb = row + hd / 2 + (g / 32) * 4;
+    std::memset(hb, 0, 4);
+    for (int i = 0; i < 32; i += 2) {
+        int q[2];
+        for (int e = 0; e < 2; ++e) {
+            const float r = sc > 0.0f ? std::rint(x[i + e] / sc) : 0.0f;
+            q[e] = (int)std::fmin(std::fmax(r, -15.0f), 15.0f) & 0x1F;
+            const int y = i + e, c = y / 16, h = (y % 16) / 8, j = (y % 8) / 2;
+            hb[j] = (uint8_t)(hb[j] | ((q[e] >> 4) << (4 * c + 2 * h + e)));
+        }
+        row[(g + i) / 2] = (uint8_t)((q[0] & 0xF) | ((q[1] & 0xF) << 4));
+    }
+    std::memcpy(row + hd * 9 / 8 + (g / 32) * 2, &s16, 2);
 }
 
 /* i8h: dim d of the int8 codes at `codes` with the head's scale at `scale`. */
@@ -397,7 +445,7 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
     const int64_t q_len = cus ? 0 : rows / n_seq;
     if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
-    /* k4h_v4 / k4h_v2h / i8h: a byte row of 18 / 14 * head_dim / 16 or 2 * head_dim + 4 a token,
+    /* k4h_v4 / k4h_v2h / k5_v4 / i8h: a byte row of 18 / 14 / 20 * head_dim / 16 or 2 * head_dim + 4 a token,
      * its groups whole. */
     const int k4h = kv_k4h(a);
     if (k4h && (kv->rank != 4 || kv->dtype != RAD_F8E4M3 || head_dim % 32 ||
@@ -565,6 +613,11 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
             } else if (k4h == 2) {
                 unit([&](int64_t b, int64_t d) { return k4h_int4(kb8 + b, kb8 + b + kso, d); },
                      [&](int64_t b, int64_t d) { return v2h_at(kb8 + b, head_dim, d); });
+            } else if (k4h == 4) {
+                unit([&](int64_t b, int64_t d) { return k5_at(kb8 + b, head_dim, d); },
+                     [&](int64_t b, int64_t d) {
+                         return k4h_int4(kb8 + b + head_dim * 5 / 8, kb8 + b + head_dim * 19 / 16, d);
+                     });
             } else if (k4h == 3) {
                 unit([&](int64_t b, int64_t d) { return i8h_at(kb8 + b, kb8 + b + kso, d); },
                      [&](int64_t b, int64_t d) {
@@ -868,7 +921,7 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     const int64_t block_size = p_int(a, "block_size", 0);
     int64_t kv_heads = p_int(a, "n_head_kv", kv->rank == 4 ? kv->shape[1] : 0);
     if (head_dim <= 0 || block_size <= 0 || kv_heads <= 0) return RAD_E_SHAPE;
-    /* k4h_v4 / k4h_v2h / i8h: a byte row of 18 / 14 * head_dim / 16 or 2 * head_dim + 4 a token
+    /* k4h_v4 / k4h_v2h / k5_v4 / i8h: a byte row of 18 / 14 / 20 * head_dim / 16 or 2 * head_dim + 4 a token
      * (the file header), at the shape the plugin declares the group, rows dense. */
     const int k4h = kv_k4h(a);
     if (k4h && (kv->rank != 4 || kv->dtype != RAD_F8E4M3 || head_dim % 32 ||
@@ -932,6 +985,12 @@ int ref_kv_store(const RadArgs* a, RadStream) {
                     for (int i = 0; i < 32; ++i) {
                         kx[i] = ldt(k, t * k_rs + h * k_hs + (g + i) * k_ds) * kin;
                         vx[i] = ldt(v, t * v_rs + h * v_hs + (g + i) * v_ds) * vin;
+                    }
+                    if (k4h == 4) {
+                        k5_group(kx, row, head_dim, g);
+                        k4h_group(vx, row + head_dim * 5 / 8 + g / 2,
+                                  row + head_dim * 19 / 16 + (g / 32) * 2);
+                        continue;
                     }
                     k4h_group(kx, row + g / 2, row + k4h_ksoff(k4h, head_dim) + (g / 32) * 2);
                     if (k4h == 2)

@@ -438,6 +438,15 @@ int     r4d_rad_attn_prefill_h256_gqa6_i8h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_prefill_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_i8h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_i8h_scratch(const RadArgs*);
+/* The k5_v4 cache (int5 K, int4 V, f16 scales a group of 32; rotated or not), the same four. */
+int     r4d_rad_attn_prefill_h256_gqa12_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k5v4_scratch(const RadArgs*);
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);
@@ -888,6 +897,7 @@ int r4d_rad_kv_store_k6v4   (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k4hv4  (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k4hv2h (const RadArgs*, RadStream);
 int r4d_rad_kv_store_i8h    (const RadArgs*, RadStream);
+int r4d_rad_kv_store_k5v4   (const RadArgs*, RadStream);
 int r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_cols(const RadArgs*, RadStream);

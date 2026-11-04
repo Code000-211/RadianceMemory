@@ -490,6 +490,10 @@ G8_V4_GQ_ENTRY(k6v4, 352, O_V4 | O_K6)
 G8_V4_ENTRIES(k4hv4, 288, O_V4 | O_K4)
 G8_V4_ENTRIES(k4hv2h, 224, O_V4 | O_K4 | O_V2)
 G8_V4_ENTRIES(i8h, 516, O_V4 | O_K4 | O_I8)
+/* The k5_v4 cache (320 bytes: int5 K, int4 V; rotated or not as the layer says), prefill and
+ * decode: k6_v4's kernels with one high bit a K dim. No gated-merge entry: an unrotated k5_v4
+ * layer takes the separate gate (the gq op does not resolve at its kv_dtype). */
+G8_V4_ENTRIES(k5v4, 320, O_V4 | O_K6 | O_K5)
 #undef G8_V4_ENTRIES
 #undef G8_V4_GQ_ENTRY
 #endif

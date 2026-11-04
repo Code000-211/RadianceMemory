@@ -3526,6 +3526,83 @@ void kvx_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== the k5_v4 cache
+ *
+ * kv_dtype k5_v4 (RAD_KVQ_K5V4: int5 K, int4 V, f16 scales a group of 32, 20 * head_dim / 16 bytes
+ * a token and head) at Flash-Next's head_dim. libref's description refuses a packed cache (drawn
+ * bytes would be NaN scales), so only hand cases reach it.
+ *
+ *   - the store: k and v as column slices of a fused row, a descale on each side, a dropped slot,
+ *     and K's quantiser edges at five bits (a zero group, ties of rint at scale 0.25, a group past
+ *     the scale cap, an infinity, a NaN; V a group of NaNs). Compared exactly (tolerance 0) over
+ *     the whole cache, whose untouched slots hold 1.0.
+ *   - the attention: a decode step and a uniform 32-row chunk (the panel form) over a cache of
+ *     random codes and finite scales; both libraries read each code times its scale in f32, so the
+ *     outputs differ only by summation order. */
+void k5_cases(std::vector<Hand>& hs) {
+    const int64_t HD = 256, ROW = 20 * HD / 16;
+    {
+        const int64_t T = 9, KVH = 2, W = 3 * KVH * HD + 64, BS = 4, NB = 5;
+        auto kf = [=](int64_t i) -> float {
+            const int64_t t = i / W, x = i % W;   /* x < KVH * HD is k's slice of row t */
+            if (t == 0 && x < 32) return 0.0f;                                    /* zero group */
+            if (t == 0 && x >= 32 && x < 64) {                                    /* ties at 0.25 */
+                const float tie[9] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f,
+                                       0.875f, 3.75f };
+                return x - 32 < 9 ? tie[x - 32] : 0.0f;
+            }
+            if (t == 0 && x >= 64 && x < 96) return (x & 1 ? -1.f : 1.f) * 1e5f * (float)(x - 63);
+            if (t == 2 && x == 99) return INFINITY;
+            if (t == 3 && x == 133) return NAN;
+            return hfill(120, 3.0f)(i) * (x % 32 == 17 ? 30.0f : 1.0f);
+        };
+        auto vf = [=](int64_t i) -> float {
+            const int64_t t = i / W, x = i % W;
+            if (t == 4 && x >= 160 && x < 192) return NAN;
+            return hfill(121, 2.0f)(i);
+        };
+        Hand h("k5_v4 store: slices, descales, int5 edges", "kv_store", 0.0);
+        h.view(RAD_BF16, { T, KVH * HD }, { W, 1 }, T * W, kf)
+         .view(RAD_BF16, { T, KVH * HD }, { W, 1 }, T * W, vf)
+         .idx({ 3, -1, 9, 14, 6, 0, 19, 12, 5 })
+         .dense(RAD_F8E4M3, { NB, KVH, BS, ROW }, [](int64_t) { return 1.0f; }, true)
+         .pi("M", T).pi("head_dim", HD).pi("n_head_kv", KVH).pi("block_size", BS)
+         .ps("kv_dtype", "k5_v4").pf("k_scale", 0.75).pf("v_scale", 1.5);
+        hs.push_back(std::move(h));
+    }
+    /* A cache of random codes, each group's scale finite in [1/64, 1/8]. */
+    auto cache = [=](int64_t nb, int64_t kvh, int64_t bs, uint64_t seed) {
+        std::vector<uint8_t> b((size_t)(nb * kvh * bs * ROW));
+        uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
+        for (size_t r = 0; r < b.size() / (size_t)ROW; ++r)
+            for (int64_t i = 0; i < ROW; ++i) {
+                x = x * 6364136223846793005ull + 1442695040888963407ull;
+                uint8_t* p = &b[r * (size_t)ROW + (size_t)i];
+                if (i < HD * 9 / 8) { *p = (uint8_t)(x >> 56); continue; }
+                if ((i - HD * 9 / 8) % 2) continue;   /* the scale's high byte, written below */
+                const uint16_t h = rad_f32_to_f16(std::ldexp(1.0f + (float)((x >> 40) & 7) / 8.0f,
+                                                             -6 - (int)((x >> 50) % 3)));
+                std::memcpy(p, &h, 2);
+            }
+        return b;
+    };
+    for (int64_t ql : { 1, 32 }) {
+        const int64_t S = 2, KVH = 2, G = 2, BS = 4, MB = 10, NB = S * MB + 2;
+        const std::vector<uint8_t> c = cache(NB, KVH, BS, 7 + (uint64_t)ql);
+        Hand h(ql == 1 ? "k5_v4 cache, decode of two sequences" : "k5_v4 cache, a 32-row chunk each",
+               "attn_paged", 1e-4);
+        h.dense(RAD_BF16, { S * ql, KVH * G, HD }, hfill(130 + (uint64_t)ql))
+         .raw(RAD_F8E4M3, { NB, KVH, BS, ROW }, c.data())
+         .dense(RAD_I32, { S, MB }, [](int64_t i) { return (float)((i * 7 + 3) % 22); })
+         .idx({ 37, 33 })
+         .none().none().none()
+         .dense(RAD_BF16, { S * ql, KVH * G, HD }, [](int64_t) { return 0.0f; }, true)
+         .pi("q_len", ql).pi("head_dim", HD).pi("gqa", G).pi("block_size", BS).pi("causal", 1)
+         .pi("window", 0).ps("q_dtype", "bf16").ps("kv_dtype", "k5_v4").pf("scale", 0.0625);
+        hs.push_back(std::move(h));
+    }
+}
+
 void kv_cases(std::vector<Hand>& hs) {
     using namespace kvhand;
 
@@ -5150,6 +5227,7 @@ bool hand_cases(const Check& ck) {
     qsa_cases(hs);
     kv_cases(hs);
     kvx_cases(hs);
+    k5_cases(hs);
     kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);

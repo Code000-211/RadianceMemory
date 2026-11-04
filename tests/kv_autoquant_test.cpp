@@ -94,7 +94,8 @@ std::vector<int> kvq_of(const std::vector<std::vector<KvCandidate>>& layers,
 
 TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
     CHECK(kv_layouts() == std::vector<int>({ RAD_KVQ_BF16, RAD_KVQ_I8H, RAD_KVQ_NONE, RAD_KVQ_V4,
-                                             RAD_KVQ_K6V4, RAD_KVQ_K4H, RAD_KVQ_K4HV2H }));
+                                             RAD_KVQ_K6V4, RAD_KVQ_K5V4, RAD_KVQ_K4H,
+                                             RAD_KVQ_K4HV2H }));
     /* fp8's 8 bits an element, and the 25/32, 22/32, 18/32 and 14/32 of it docs/GUIDE.md §4.4
      * states; i8h at 258/256 of it (an f16 scale a 256-dim head is 2 bits a group of 32); bf16 at
      * twice it, 16 bits an element and no scale. */
@@ -103,6 +104,7 @@ TEST(the_layout_table_prices_each_recipe_layout_widest_first) {
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_NONE), 512);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_V4), 400);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K6V4), 352);
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K5V4), 320);   /* 20/32 of fp8, 5.0 bits */
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4H), 288);
     CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4HV2H), 224);
     CHECK_EQ(kv_layout_group_bits(99), -1);
@@ -628,7 +630,7 @@ struct Bench {
             "r=$(awk -v t='" + table + "' -v args=\"$args\" 'BEGIN { na = split(args, x, \" \");\n"
             "    for (i = 1; i <= na; ++i) fl[x[i]] = 1;\n"
             "    b[\"bf16\"] = 1024; b[\"i8h\"] = 516; b[\"fp8\"] = 512; b[\"fp8_v4\"] = 400;\n"
-            "    b[\"k6_v4\"] = 352; b[\"k4h_v4\"] = 288; b[\"k4h_v2h\"] = 224;\n"
+            "    b[\"k6_v4\"] = 352; b[\"k5_v4\"] = 320; b[\"k4h_v4\"] = 288; b[\"k4h_v2h\"] = 224;\n"
             "    while ((getline l < t) > 0) { split(l, a, \" \");\n"
             "    if (a[1] == \"fail\") f[a[2] \" \" a[3]] = 1; else if (a[1] == \"pair\") p = a[2];\n"
             "    else if (a[1] == \"all\") u[a[2]] = a[3];\n"
@@ -806,6 +808,62 @@ TEST(the_driver_refuses_a_short_reference_unless_the_bound_is_lowered) {
 
 /* What the driver refuses up front, and a run that fails stopping it with the run's log: no
  * recipe is written from a partial measurement. */
+/* k5_v4 is in the layout table but opt-in (kv_layout_opt_in): the default variants leave it out,
+ * so a calibration that names no layout runs exactly what it ran before k5_v4 existed, while
+ * --layouts or --variants naming it makes it a candidate like any other, plain, `rotated` (it is
+ * not rotated by its name, as k6_v4 is not) and `vmean`, in the table's place after k6_v4. A recipe
+ * the driver writes from it loads as k5_v4. */
+TEST(the_driver_calibrates_k5_v4_only_where_layouts_or_variants_name_it) {
+    const int R = RAD_KVQ_ROTATED, M = RAD_KVQ_VMEAN;
+    for (const KvVariant& v : kv_autoquant_variants(true))
+        CHECK((v.kvq & RAD_KVQ_LAYOUT) != RAD_KVQ_K5V4);
+    std::vector<int32_t> k5;
+    const std::vector<KvVariant> every = kv_autoquant_variants(true, true);
+    for (size_t i = 0; i < every.size(); ++i)
+        if ((every[i].kvq & RAD_KVQ_LAYOUT) == RAD_KVQ_K5V4) {
+            k5.push_back(every[i].kvq);
+            CHECK_EQ((every[i - 1].kvq & RAD_KVQ_LAYOUT) == RAD_KVQ_K6V4 ||
+                     (every[i - 1].kvq & RAD_KVQ_LAYOUT) == RAD_KVQ_K5V4, true);
+            CHECK_EQ(every[i].bits, 320);
+        }
+    CHECK(k5 == std::vector<int32_t>({ RAD_KVQ_K5V4, RAD_KVQ_K5V4 | M, RAD_KVQ_K5V4 | R,
+                                       RAD_KVQ_K5V4 | R | M }));
+    REQUIRE_EQ(every.size(), kv_autoquant_variants(true).size() + 4);
+
+    Bench b;
+    REQUIRE(b.dir.ok());
+    REQUIRE(tiny::write_text(b.table, "3 fp8_v4 0.004\n7 fp8_v4 0.0001\n3 k6_v4 0.009\n"
+                                      "7 k6_v4 0.0002\n3 k5_v4 0.0001\n7 k5_v4 0.0003\n"));
+    std::string log;
+    REQUIRE_EQ(b.run({ "--layers", "3,7", "--bits", "6", "--", "--model", "/m/x.rad" }, &log), 0);
+    CHECK(!has(tiny::read_text(b.calls), "k5_v4"));
+    CHECK(!has(tiny::read_text(b.out), "k5_v4"));
+
+    /* Named, it is measured: both layers fit 5.0 bits only in it, and its plain variant wins the
+     * tie with `rotated` (priced alike here, the earlier kept). */
+    std::remove(b.calls.c_str());
+    log.clear();
+    const int rc = b.run({ "--layers", "3,7", "--bits", "5", "--layouts", "fp8,k5_v4", "--",
+                           "--model", "/m/x.rad" }, &log);
+    if (rc != 0) fprintf(stderr, "    exited %d:\n%s\n", rc, log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(has(tiny::read_text(b.calls), "uniform_k5_v4"));
+    CHECK(has(tiny::read_text(b.out), "layer 3 k5_v4\n"));
+    CHECK(has(tiny::read_text(b.out), "layer 7 k5_v4\n"));
+    Config c;
+    Argv a({ "--model", "/m/x.rad", "--kv-cache-dtype", "fp8", "--kv-recipe", b.out });
+    REQUIRE_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_OK);
+    REQUIRE_EQ(c.kv_recipe.size(), (size_t)8);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)RAD_KVQ_K5V4);
+    CHECK_EQ(c.kv_recipe[7], (int32_t)RAD_KVQ_K5V4);
+
+    /* --variants reaches its rotated form too. */
+    log.clear();
+    REQUIRE_EQ(b.run({ "--layers", "3,7", "--bits", "5", "--variants", "fp8,k5_v4+rotated", "--",
+                       "--model", "/m/x.rad" }, &log), 0);
+    CHECK(has(tiny::read_text(b.out), "layer 3 k5_v4 rotated\n"));
+}
+
 TEST(the_driver_refuses_bad_arguments_and_stops_at_a_failed_run) {
     Bench b;
     REQUIRE(b.dir.ok());

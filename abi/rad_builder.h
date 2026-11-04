@@ -85,6 +85,13 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [HD, 2HD)          V's int8 codes
  *     [2HD, 2HD + 2)     K's scale, one for the token's whole head (absmax / 127)
  *     [2HD + 2, 2HD + 4) V's scale, likewise
+ *   RAD_KVQ_K5V4 (k5_v4, ABI 43), 20 * HD / 16 bytes:
+ *     [0, HD/2)          K's low four bits, as V's codes below
+ *     [HD/2, 5HD/8)      K's fifth (high) bits, a 4-byte word per group of 32 dims whose byte j
+ *                        holds dim 16c + 8h + 2j + p (c, h, p in 0..1) at bit 4c + 2h + p
+ *     [5HD/8, 9HD/8)     V's int4 codes, as k6_v4's
+ *     [9HD/8, 19HD/16)   K's scales (absmax / 15)
+ *     [19HD/16, 20HD/16) V's scales (absmax / 7)
  *
  * k4h_v4 is k6_v4 without K's high-bit words, K's codes and scales read as V's. Four-bit K holds
  * only where the rotation has spread K's outlier channels, so a k4h_v4 layer is always a rotated
@@ -105,7 +112,13 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  * Rotated always, as k4h_v4. Its row is 516 bytes at head_dim 256, a multiple of four but not of
  * sixteen, so its kernels read codes as 4-byte words.
  *
- * Codes are two's complement (int4 -7..7, int6 -31..31, int8 -127..127). The group is declared at RAD_F8E4M3 with
+ * k5_v4 is k6_v4 with one high bit a K dim instead of two (5.0 bits an element): unrotated or
+ * rotated as k6_v4 (RAD_KVQ_ROTATED is the recipe's choice), V and its scales as k6_v4's. A kernel
+ * lane's eight dims (16c + 8h ..) of a group take their high bits as one shift and mask of the
+ * group's word, byte j's bit 4c + 2h for the even dim and the next bit for the odd one. libref's
+ * kv_store is the contract (libref/ref_attn.cpp).
+ *
+ * Codes are two's complement (int4 -7..7, int5 -15..15, int6 -31..31, int8 -127..127). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
  * it.
  *
@@ -122,7 +135,8 @@ enum {
     RAD_KVQ_K4H  = 3,
     RAD_KVQ_K4HV2H = 4,
     RAD_KVQ_I8H  = 5,
-    RAD_KVQ_BF16 = 6
+    RAD_KVQ_BF16 = 6,
+    RAD_KVQ_K5V4 = 7
 };
 
 /* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 35):
@@ -137,7 +151,7 @@ enum {
  * rotation (RadBuildCtx::kv_vmean holds the vectors). A row of attention weights sums to one, so
  * P (V - mu) + mu = P V: exact but for the rounding of the two adds, while the integer V layouts
  * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
- * k6_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged.
+ * k6_v4, k5_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged.
  *
  * RAD_KVQ_DEMOTE (ABI 42, --kv-recipe `demote LAYOUT`): bits 16-23 hold a second layout, the one a
  * block of this layer takes in the window-residency store (spec §7.3) when the sweep demotes it;

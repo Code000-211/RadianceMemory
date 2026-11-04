@@ -1,5 +1,5 @@
-/* tests/r4d_emu: the k4h_v4, k4h_v2h and i8h caches (RAD_KVQ_K4H, RAD_KVQ_K4HV2H, RAD_KVQ_I8H,
- * abi/rad_builder.h) on the host SIMT emulator, held to libref's kv_store and attn_paged at their
+/* tests/r4d_emu: the k4h_v4, k4h_v2h, i8h and k5_v4 caches (RAD_KVQ_K4H, RAD_KVQ_K4HV2H,
+ * RAD_KVQ_I8H, RAD_KVQ_K5V4, abi/rad_builder.h) on the host SIMT emulator, held to libref's kv_store and attn_paged at their
  * kv_dtype. libref is the
  * oracle (docs/OPS.md), so the test needs it: ctest sets $RADIANCE_HOME, and without one the test
  * fails rather than checking nothing. Every case below runs once for each layout.
@@ -13,7 +13,9 @@
  * edges, plus a group whose values sit on its quantiser's boundaries (whole multiples of its root
  * mean square), since its variance normalisation sums, divides and floors where k4h_v4 takes a max.
  * i8h's scale is a whole head's, so its edges are a head each: all zero, ties of rint, past the
- * cap, an infinity, a NaN, and a head of NaNs. The bf16_e4m3r experiment's store is held to
+ * cap, an infinity, a NaN, and a head of NaNs. k5_v4's K takes k4h_v4's edges at five bits (a
+ * 3.75 in the ties' group makes its scale 0.25, so they stay ties), its fifth bits laid out across
+ * a group's word by eight lanes at once; its V is k4h_v4's. The bf16_e4m3r experiment's store is held to
  * libref's bytes the same way.
  *
  * The attention (Flash-Next's QSA layers: head_dim 256, 4-token pages, gqa 12 at one and two ranks
@@ -76,6 +78,15 @@ int64_t r4d_rad_attn_prefill_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_i8h(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_i8h_scratch(const RadArgs*);
 int     r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
+int     r4d_rad_kv_store_k5v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_gqa12_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k5v4_scratch(const RadArgs*);
 }
 extern int emu_grids;
 
@@ -83,17 +94,19 @@ namespace {
 
 constexpr int HD = 256, BS = 4;
 
-/* The layout under test: its kv_dtype, a token's row (288, 224 or 516 bytes), where the scales
- * start (after K's and V's codes), whether V is k4h_v2h's int2, and whether the codes are i8h's
- * bytes under one scale a head. */
+/* The layout under test: its kv_dtype, a token's row (288, 224, 516 or 320 bytes), where the
+ * scales start (after K's and V's codes), whether V is k4h_v2h's int2, whether the codes are i8h's
+ * bytes under one scale a head, and whether K is k5_v4's int5 (low nibbles and a high-bit word a
+ * group). */
 struct Layout {
     const char* kv_dtype;
     int row, scales;
-    bool v2, i8;
+    bool v2, i8, k5;
 };
-const Layout kK4hv4  = { "k4h_v4", 18 * HD / 16, HD, false, false };
-const Layout kK4hv2h = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true, false };
-const Layout kI8h    = { "i8h", 2 * HD + 4, 2 * HD, false, true };
+const Layout kK4hv4  = { "k4h_v4", 18 * HD / 16, HD, false, false, false };
+const Layout kK4hv2h = { "k4h_v2h", 14 * HD / 16, 3 * HD / 4, true, false, false };
+const Layout kI8h    = { "i8h", 2 * HD + 4, 2 * HD, false, true, false };
+const Layout kK5v4   = { "k5_v4", 20 * HD / 16, 9 * HD / 8, false, false, true };
 const Layout* L = &kK4hv4;
 
 int g_fails = 0;
@@ -220,6 +233,9 @@ void store_case(Fn ref, Fn kernel, const char* name, int64_t T, int64_t kvh, int
         /* group 1: scale 7 * 0.25 / 7 = 0.25 exactly, then x.5 steps: rint ties to even */
         const float tie[8] = { 0.125f, 0.375f, 0.625f, -0.125f, -0.375f, 1.75f, -1.75f, 0.875f };
         for (int i = 0; i < 32; ++i) r0[32 + i] = rad_f32_to_bf16(i < 8 ? tie[i] : 0.0f);
+        /* k5_v4: 3.75 makes K's scale 3.75 / 15 = 0.25 exactly, so the steps above stay ties at
+         * five bits (0.875 / 0.25 = 3.5 rounds to 4, 0.625 / 0.25 = 2.5 to 2). */
+        if (L->k5) r0[32 + 8] = rad_f32_to_bf16(3.75f);
         /* group 2: past the cap (8188 * 7), so codes clamp at +-7 */
         for (int i = 0; i < 32; ++i) r0[64 + i] = rad_f32_to_bf16((i & 1 ? -1.f : 1.f) * 1e5f * (1 + i));
         r0[96 + 3] = 0x7f80;                                             /* group 3: +inf */
@@ -538,7 +554,7 @@ void attn_case(Fn ref, const Geo& g, const Case& c, std::mt19937& rng) {
 
 }  // namespace
 
-/* [--layout k4h_v4|k4h_v2h|i8h]: one layout's cases only, so ctest runs the three as separate
+/* [--layout k4h_v4|k4h_v2h|i8h|k5_v4]: one layout's cases only, so ctest runs the three as separate
  * tests (each takes about a third of the whole, which grew past the per-test limit's reach with every
  * layout); the bf16_e4m3r experiment's store runs with i8h. Every layout seeds its own generator, so a
  * layout's cases are the same whether it runs alone or with the others. */
@@ -546,10 +562,11 @@ int main(int argc, char** argv) {
     const char* only = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--layout" && i + 1 < argc) only = argv[++i];
-        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h]\n", argv[0]); return 2; }
+        else { std::fprintf(stderr, "usage: %s [--layout k4h_v4|k4h_v2h|i8h|k5_v4]\n", argv[0]); return 2; }
     }
-    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h")) {
-        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h or i8h\n");
+    if (only && std::strcmp(only, "k4h_v4") && std::strcmp(only, "k4h_v2h") && std::strcmp(only, "i8h") &&
+        std::strcmp(only, "k5_v4")) {
+        std::fprintf(stderr, "--layout takes k4h_v4, k4h_v2h, i8h or k5_v4\n");
         return 2;
     }
     const Fn kst = load_libref("ref_kv_store");
@@ -587,6 +604,13 @@ int main(int argc, char** argv) {
             { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_i8h, r4d_rad_attn_decode_h256_gqa6_i8h,
               r4d_rad_attn_prefill_h256_gqa6_i8h_scratch,
               r4d_rad_attn_decode_h256_gqa6_i8h_scratch, 10 } } },
+        { &kK5v4, r4d_rad_kv_store_k5v4,
+          { { "gqa12", 12, r4d_rad_attn_prefill_h256_gqa12_k5v4, r4d_rad_attn_decode_h256_gqa12_k5v4,
+              r4d_rad_attn_prefill_h256_gqa12_k5v4_scratch,
+              r4d_rad_attn_decode_h256_gqa12_k5v4_scratch, 5 },
+            { "gqa6 ", 6, r4d_rad_attn_prefill_h256_gqa6_k5v4, r4d_rad_attn_decode_h256_gqa6_k5v4,
+              r4d_rad_attn_prefill_h256_gqa6_k5v4_scratch,
+              r4d_rad_attn_decode_h256_gqa6_k5v4_scratch, 10 } } },
     };
     for (size_t ri = 0; ri < sizeof runs / sizeof runs[0]; ++ri) {
         const Run& run = runs[ri];

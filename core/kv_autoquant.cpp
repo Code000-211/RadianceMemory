@@ -115,13 +115,14 @@ int kv_autoquant_solve_kl(const std::vector<std::vector<KvCandidate>>& layers, d
     return RAD_E_NOTFOUND;
 }
 
-std::vector<KvVariant> kv_autoquant_variants(bool vmean) {
+std::vector<KvVariant> kv_autoquant_variants(bool vmean, bool opt_in) {
     std::vector<KvVariant> v;
     std::set<int32_t> seen;
     /* The parser's refusals are the answer here, not errors to print. */
     const Log was = log_level();
     log_set_level((Log)-1);
-    for (int q : kv_layouts())
+    for (int q : kv_layouts()) {
+        if (!opt_in && kv_layout_opt_in(q)) continue;
         for (bool rot : { false, true })
             for (bool vm : { false, true }) {
                 if (vm && !vmean) continue;
@@ -133,6 +134,7 @@ std::vector<KvVariant> kv_autoquant_variants(bool vmean) {
                     continue;
                 if (seen.insert(r[0]).second) v.push_back({ r[0], kv_layout_group_bits(q), words });
             }
+    }
     log_set_level(was);
     return v;
 }

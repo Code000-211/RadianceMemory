@@ -116,15 +116,16 @@ struct Layer {
     HcProject    proj;
 };
 
-/* A trunk layer's KV group key: its resident RAD_KVQ_* (0..RAD_KVQ_BF16) plus kKvqN times its
+/* A trunk layer's KV group key: its resident RAD_KVQ_* (0..RAD_KVQ_K5V4) plus kKvqN times its
  * demote tier, 0 none, 1 k4h_v4, 2 k4h_v2h (RAD_KVQ_DEMOTE). The stride is the layout count, so
- * a layout added to the enum moves it with no key colliding; bf16 takes no demote layout. */
-constexpr int kKvqN   = RAD_KVQ_BF16 + 1;
+ * a layout added to the enum moves it with no key colliding; bf16 takes no demote layout. Groups
+ * are declared in key order, which a new stride keeps for every key that existed before it. */
+constexpr int kKvqN   = RAD_KVQ_K5V4 + 1;
 constexpr int kKvKeys = 3 * kKvqN;
 constexpr int kv_key(int q, int dq) {
     return q + kKvqN * (dq == RAD_KVQ_K4H ? 1 : dq == RAD_KVQ_K4HV2H ? 2 : 0);
 }
-static_assert(kv_key(RAD_KVQ_BF16, 0) < kv_key(RAD_KVQ_NONE, RAD_KVQ_K4H) &&
+static_assert(kv_key(RAD_KVQ_K5V4, 0) < kv_key(RAD_KVQ_NONE, RAD_KVQ_K4H) &&
               kv_key(RAD_KVQ_BF16, RAD_KVQ_K4H) < kv_key(RAD_KVQ_NONE, RAD_KVQ_K4HV2H) &&
               kv_key(RAD_KVQ_BF16, RAD_KVQ_K4HV2H) < kKvKeys, "kv_key: keys must not collide");
 
@@ -715,6 +716,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * and i8h (int8 K and V, one f16 scale a token and head, 2 * head_dim + 4 bytes;
          * RAD_KVQ_I8H) likewise.
          *
+         * k5_v4 (int5 K, int4 V, 20 * head_dim / 16 bytes; RAD_KVQ_K5V4) is recipe-only and, as
+         * k6_v4, rotated or not as the entry says. Its rows are the attention and the plain store:
+         * the prologue's store fold and the gate in the decode merge have none at k5_v4, so those
+         * fused ops do not resolve and the layer takes the unfused ops (the same values).
+         *
          * `vmean` (RAD_KVQ_VMEAN) centres a layer's V on a static mean before an integer V
          * layout stores it (AttnGatedFP8::vmean_sub); it needs the engine's table and a layout
          * with integer V, and is refused, naming the layer, otherwise.
@@ -728,7 +734,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         auto kvq_name = [](int q) -> const char* {
             return q == RAD_KVQ_V4 ? "fp8_v4" : q == RAD_KVQ_K6V4 ? "k6_v4"
                  : q == RAD_KVQ_K4H ? "k4h_v4" : q == RAD_KVQ_K4HV2H ? "k4h_v2h"
-                 : q == RAD_KVQ_I8H ? "i8h" : q == RAD_KVQ_BF16 ? "bf16" : nullptr;
+                 : q == RAD_KVQ_I8H ? "i8h" : q == RAD_KVQ_BF16 ? "bf16"
+                 : q == RAD_KVQ_K5V4 ? "k5_v4" : nullptr;
         };
         auto kvq_rotated = [](int q) {
             return q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
@@ -812,7 +819,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         } else if (f8) {
             if (ctx->kv_quant != RAD_KVQ_NONE &&
                 (!kvq_name(ctx->kv_quant) || kvq_rotated(ctx->kv_quant) ||
-                 ctx->kv_quant == RAD_KVQ_BF16)) {
+                 ctx->kv_quant == RAD_KVQ_BF16 || ctx->kv_quant == RAD_KVQ_K5V4)) {
                 fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n",
                         ctx->kv_quant);
                 return RAD_E_UNSUPPORTED;
@@ -852,6 +859,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* A token's row in a head, in bytes of the E4M3-declared group. */
             const int64_t row = q == RAD_KVQ_V4     ? g.head_dim * 25 / 16
                               : q == RAD_KVQ_K6V4   ? g.head_dim * 22 / 16
+                              : q == RAD_KVQ_K5V4   ? g.head_dim * 20 / 16
                               : q == RAD_KVQ_K4H    ? g.head_dim * 18 / 16
                               : q == RAD_KVQ_K4HV2H ? g.head_dim * 14 / 16
                               : q == RAD_KVQ_I8H    ? 2 * g.head_dim + 4 : 2 * g.head_dim;
@@ -884,7 +892,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             else if (name && q != RAD_KVQ_BF16)   /* the flag's bf16 cache has no note either */
                 rad_note(b, "kv cache %s: %s K, %s V, in groups of 32 with f16 scales, %lld "
                             "bytes a token and head instead of %lld", name,
-                         q == RAD_KVQ_V4 ? "E4M3" : q == RAD_KVQ_K6V4 ? "int6" : "rotated int4",
+                         q == RAD_KVQ_V4 ? "E4M3" : q == RAD_KVQ_K6V4 ? "int6"
+                         : q == RAD_KVQ_K5V4 ? "int5" : "rotated int4",
                          q == RAD_KVQ_K4HV2H ? "variance-normalised int2" : "int4",
                          (long long)row, (long long)(2 * g.head_dim));
         }
@@ -1972,7 +1981,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0)
         out->draft_depth = 3;
     out->shape_probe_ok = 1;      /* declare() writes scratch under shape_probe */
-    /* --kv-cache-dtype fp8_v4 / k6_v4, and k4h_v4, k4h_v2h and i8h (a recipe's, rotated): libr4d has their rows
+    /* --kv-cache-dtype fp8_v4 / k6_v4, k5_v4 (a recipe's), and k4h_v4, k4h_v2h and i8h (a recipe's, rotated): libr4d has their rows
      * for the QSA layers' geometry (head_dim 256, twelve queries per KV head; gqa6 with 4-token
      * pages at four ranks), so other geometries are refused at startup rather than in declare. */
     {
@@ -1981,7 +1990,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H) |
-                               (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H);
+                               (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H) | (1 << RAD_KVQ_K5V4);
         /* bf16 is served wherever --kv-cache-dtype bf16 is: every geometry. */
         out->kv_quant_ok |= 1 << RAD_KVQ_BF16;
     }

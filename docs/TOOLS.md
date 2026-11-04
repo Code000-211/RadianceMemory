@@ -951,7 +951,7 @@ flags after `--` go to every run unchanged; the cache and KL flags are the tool'
 (`--kv-cache-dtype`, `--kv-recipe`, `--kld-*` there are refused). Each run's recipe, `--kld-out`
 report with its `.rows`, and log stay in the work directory, and a failed run stops the tool with
 its log's last lines and no recipe written. Bits count a group of 32 K and 32 V elements with
-their scales: `bf16` 16 an element, `i8h` 8.06, `fp8` 8, `fp8_v4` 6.25, `k6_v4` 5.5, `k4h_v4` 4.5, `k4h_v2h`
+their scales: `bf16` 16 an element, `i8h` 8.06, `fp8` 8, `fp8_v4` 6.25, `k6_v4` 5.5, `k5_v4` 5, `k4h_v4` 4.5, `k4h_v2h`
 3.5; rotation and the V mean cost none.
 
 **Candidates.** Every layout of the recipe table (`kKvLayouts`, core/config.cpp) as the recipe
@@ -961,7 +961,10 @@ V has no group scale) is no variant, and one it reads as another (`k4h_v4 rotate
 listed once, so a layout or recipe word added to the table and the parser is a candidate with no
 change to the tool. Today that is 10 variants, 17 with `--vmean`: `bf16` (plain only), `i8h`, `fp8`, `fp8 rotated`,
 `fp8_v4` and `k6_v4` plain and rotated, `k4h_v4`, `k4h_v2h`, and with `--vmean` the `vmean` form of
-every one but the two `fp8`s. `--layouts` keeps only some layouts' variants, `--variants` only the
+every one but the two `fp8`s. `k5_v4` is in the table but opt-in (`kv_layout_opt_in`): it is no
+default candidate, and its four variants (plain, `rotated`, each with `vmean`) join only where
+`--layouts` or `--variants` names it, so a calibration that names no layout runs what it ran
+before. `--layouts` keeps only some layouts' variants, `--variants` only the
 named variants; given both, what both allow. `bf16`, `k4h_v4`, `k4h_v2h`, `i8h` and the V mean are
 served only by `qwen4exp_fp8`, so on another model the first run of one stops the calibration,
 refused at startup: pass `--layouts fp8,fp8_v4,k6_v4` there.

@@ -12,7 +12,8 @@
  * The candidates are the variants (kv_autoquant_variants): every layout of the recipe table
  * (core/config.cpp, kKvLayouts), each plain, `rotated` and, with --vmean FILE, `vmean`, as far as
  * the recipe parser takes the words. So a layout or recipe word added there is calibrated with no
- * change here. --layouts and --variants restrict the set.
+ * change here. --layouts and --variants restrict the set; a layout the table marks opt-in (k5_v4)
+ * is a candidate only where one of them names it.
  *
  *   1. Every variant uniform, one run each. The base is the one of least mean KL (bf16, the
  *      unquantised cache, whose KL against the bf16 reference is about zero; i8h with --layouts
@@ -114,8 +115,8 @@ void usage() {
         "  --kld-ref DIR       a KL reference recorded by this model with a bf16 cache\n"
         "  --layers N,N,...    the model's attention layers, as the checkpoint numbers them\n"
         "  --bits B            the average bits a cached K or V element may cost, scales\n"
-        "                      included (bf16 16, i8h 8.06, fp8 8, fp8_v4 6.25, k6_v4 5.5, k4h_v4 4.5,\n"
-        "                      k4h_v2h 3.5): the least KL within them, predicted\n"
+        "                      included (bf16 16, i8h 8.06, fp8 8, fp8_v4 6.25, k6_v4 5.5, k5_v4 5,\n"
+        "                      k4h_v4 4.5, k4h_v2h 3.5): the least KL within them, predicted\n"
         "  --max-kl K          the mean KL against the reference a recipe may measure: the\n"
         "                      fewest bits measured within it\n"
         "  --max-dkl D         the mean KL a recipe may measure above the noise floor (the base\n"
@@ -136,7 +137,9 @@ void usage() {
         "  --no-knobs          try none\n"
         "  --vmean FILE        a V mean file (radiance --calib-dir): the variants that\n"
         "                      subtract it join the candidates\n"
-        "  --layouts L,L,...   only these layouts' variants (default every recipe layout)\n"
+        "  --layouts L,L,...   only these layouts' variants (default every recipe layout\n"
+        "                      but the opt-in k5_v4, 5.0 bits, which only this or\n"
+        "                      --variants adds)\n"
         "  --variants V,V,...  only these variants, a variant's words joined by '+'\n"
         "                      (k6_v4+rotated+vmean)\n"
         "  --keep-dominated    per-layer runs for the variants screening would drop too\n"
@@ -639,8 +642,11 @@ int main(int argc, char** argv) {
 
     /* The candidates: the variants, widest first so that a tie keeps the wider one, restricted by
      * --layouts and --variants. */
-    const std::vector<KvVariant> every = kv_autoquant_variants(true);
-    std::vector<KvVariant> variants = kv_autoquant_variants(!vmean.empty());
+    /* An opt-in layout (kv_layout_opt_in, k5_v4) is a candidate only where --layouts or --variants
+     * names it: both filter `variants` below, so with either given every layout starts in it. */
+    const std::vector<KvVariant> every = kv_autoquant_variants(true, true);
+    std::vector<KvVariant> variants =
+        kv_autoquant_variants(!vmean.empty(), !layouts_arg.empty() || !variants_arg.empty());
     if (!layouts_arg.empty()) {
         std::set<int> want;
         for (const std::string& s : split(layouts_arg, ',')) {

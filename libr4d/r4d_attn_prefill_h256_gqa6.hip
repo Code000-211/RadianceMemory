@@ -75,8 +75,10 @@
 // longer fits the 64 MB Infinity Cache.
 #define O_KLATE 4194304
 // O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache, O_V4 | O_K4 the k4h_v4 cache, with O_V2
-// the k4h_v2h cache and with O_I8 the i8h cache (see r4d_attn_decode_h256_gqa6.hip).
+// the k4h_v2h cache and with O_I8 the i8h cache, O_V4 | O_K6 | O_K5 the k5_v4 cache (see
+// r4d_attn_decode_h256_gqa6.hip).
 #define O_V2      4
+#define O_K5    256
 #define O_I8   8192
 #define O_V4    33554432
 #define O_K6    67108864
@@ -151,6 +153,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int BTS   = (OPT & O_BTS)   ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // k5_v4: k6_v4's staging with K's fifth bits a word a group of 32 (RAD_KVQ_K5V4); the word,
+    // shifted to the chunk's half, takes k6_v4's high-bit slot in kreg.
+    constexpr int K5    = ((OPT & O_K5) && K6) ? 1 : 0;
     // k4h_v4: K's int4 codes where k6_v4 keeps its low nibbles, no high-bit words, K's scales
     // after V's codes (RAD_KVQ_K4H). It takes k6_v4's staging with V's nibble widening on K.
     constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
@@ -162,12 +167,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     // + 4) is 4-byte aligned only, so codes are read a dword at a time.
     constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16 : I8 ? 2 * HEAD_DIM + 4
+    constexpr int ROWB  = K5 ? HEAD_DIM * 20 / 16 : K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16
+                        : I8 ? 2 * HEAD_DIM + 4
                         : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM : K4 ? HEAD_DIM / 2 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16 : I8 ? 2 * HEAD_DIM + 2
-                        : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int VOFF  = K5 ? HEAD_DIM * 5 / 8 : K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM
+                        : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = K5 ? HEAD_DIM * 19 / 16 : K6 ? HEAD_DIM * 21 / 16 : V2 ? HEAD_DIM * 13 / 16
+                        : I8 ? 2 * HEAD_DIM + 2 : K4 ? HEAD_DIM * 17 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = K5 ? HEAD_DIM * 9 / 8 : V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM
+                        : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
@@ -422,7 +430,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     // k6_v4: the chunk's sixteen low nibbles, its high-bit word, its group's scale.
                     const uint8_t* rp = (const uint8_t*)a.kv + o;
                     const uint2 lo = *(const uint2*)(rp + ch * 8);
-                    kreg[p] = make_uint4(lo.x, lo.y, *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4),
+                    const uint32_t hb = K5 ? *(const uint32_t*)(rp + HEAD_DIM / 2 + (ch >> 1) * 4)
+                                                 >> (4 * (ch & 1))
+                                           : *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4);
+                    kreg[p] = make_uint4(lo.x, lo.y, hb,
                                          *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
                 } else if (I8) {
                     // i8h: the chunk's sixteen codes in four dwords, the token's scale apart.
@@ -483,6 +494,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                         if constexpr (I8) k8x8_to_f16x4w(q ? r.z : r.x, q ? r.w : r.y,
                                                          ksc[I8 ? p : 0] | (ksc[I8 ? p : 0] << 16), w4);
                         else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
+                        else if constexpr (K5) k5x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         else k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         *(uint2*)(&sK8[key * KSTR8 + ch * KEL + 8 * q]) =
                             make_uint2(pk_fp8x4_h(w4[0], w4[1]), pk_fp8x4_h(w4[2], w4[3]));
@@ -502,7 +514,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                         w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
                     } else {
                         const uint4 r = kreg[p];
-                        if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        if constexpr (K5) k5x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        else if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         else if constexpr (I8) k8x8_to_f16x4w(q ? r.z : r.x, q ? r.w : r.y,
                                                               ksc[I8 ? p : 0] | (ksc[I8 ? p : 0] << 16), w4);
                         else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
