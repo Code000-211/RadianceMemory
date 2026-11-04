@@ -149,11 +149,19 @@ enum {
  * (RAD_KVQ_VMEAN): the transcode decodes and encodes values and never rotates or centres. Served
  * today as i8h or fp8 (rotated) resident with k4h_v4 or k4h_v2h demoted; a RAD_KVQ_BF16 entry takes
  * none. A plugin keys its KV groups by the pair, since a store slot holds one group's block at one
- * width. */
+ * width.
+ *
+ * RAD_KVQ_REUSE (ABI 43, --kv-recipe `reuse`): the layer is a sparse-attention layer that scores
+ * no selection of its own and attends over the selection of the previous such layer (DeepSeek's
+ * CSA2 "Reuse"): it declares no indexer, so it stores no block keys and no indexer tail (those
+ * groups hold one layer fewer). Its layout is unchanged. A plugin refuses it on the first sparse
+ * layer, where the previous one keeps another attention group, and wherever the selection is
+ * rewritten per layer (window residency's pager, a streamed cache's resolve). */
 enum {
     RAD_KVQ_LAYOUT  = 0xff,
     RAD_KVQ_ROTATED = 0x100,
     RAD_KVQ_VMEAN   = 0x200,
+    RAD_KVQ_REUSE   = 0x400,
     RAD_KVQ_DEMOTE  = 0xff0000,
     RAD_KVQ_DEMOTE_SHIFT = 16
 };
@@ -391,7 +399,8 @@ typedef struct RadBuildCtx {
     /* --kv-recipe: the trunk's attention layer l keeps its cache in layout kv_recipe[l], a
      * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, with RAD_KVQ_ROTATED set where that layer runs
      * rotated (from ABI 35), RAD_KVQ_VMEAN where it subtracts a V mean (from ABI 38, the means
-     * in kv_vmean) and a RAD_KVQ_DEMOTE layout for its demoted blocks (from ABI 42), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
+     * in kv_vmean) and a RAD_KVQ_DEMOTE layout for its demoted blocks (from ABI 42) and RAD_KVQ_REUSE where it reuses the previous sparse
+     * layer's selection (from ABI 43), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
      * there is no entry either). Null without a recipe, and then
      * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
      * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has

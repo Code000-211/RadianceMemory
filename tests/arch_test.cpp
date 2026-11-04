@@ -10746,6 +10746,110 @@ TEST(a_tiered_recipe_on_flashnext_keys_its_groups_by_the_pair_and_its_pagers_exp
         }
 }
 
+/* Selection reuse (RAD_KVQ_REUSE, issue #18 part 1) on Flash-Next, at one, two and four ranks.
+ * q4_small's QSA layers are 3 and 7, and the MTP head has its own indexer. `layer 7 fp8 reuse`
+ * declares no indexer on layer 7: its projection, query norm and rope, block-key, tail, score and
+ * select ops are gone (one indexer fewer: the head and layer 3 keep theirs), and neither the
+ * block-key group nor the tail group is bound to layer 7, so the core sizes both for the two
+ * layers left. The KV groups are the plain fp8 recipe's, and layer 7 still binds its attention
+ * group, whose attention reads `qsa_sel` as layer 3's select wrote it.
+ * Decode and prefill steps lint clean (every read has a writer before it). */
+TEST(a_reuse_recipe_layer_on_flashnext_declares_no_indexer_and_binds_no_block_keys) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            std::vector<int32_t> r(8, -1);
+            r[3] = r[7] = (int)RAD_KVQ_NONE;
+            const RadBuildCtx base_ctx = with_recipe(q4_ctx(rank, world), r);
+            RadBuilder base;
+            base.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&base, &meta, &base_ctx), RAD_OK);
+            r[7] |= RAD_KVQ_REUSE;
+            const RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+
+            auto count = [](const RadBuilder& x, const char* op) {
+                int n = 0;
+                for (const auto& o : x.ops) n += o.op == op;
+                return n;
+            };
+            /* One indexer fewer, each of its ops once fewer. */
+            for (const char* op : { "qsa_work", "qsa_block_key", "qsa_tail_store", "qsa_score",
+                                    "qsa_select" }) {
+                CHECK_EQ(count(base, op), 3);
+                CHECK_EQ(count(b, op), 2);
+            }
+            /* Outside the qsa_* ops, only layer 7's indexer projection, norms and rope go. */
+            std::vector<std::string> ob, oc;
+            for (const auto& o : base.ops)
+                if (o.op.rfind("qsa_", 0) != 0) ob.push_back(o.op);
+            for (const auto& o : b.ops)
+                if (o.op.rfind("qsa_", 0) != 0) oc.push_back(o.op);
+            CHECK(ob.size() > oc.size());   /* layer 7's projection, norms and rope are gone */
+            /* The same groups by name and declaration. */
+            REQUIRE_EQ(b.kv_groups.size(), base.kv_groups.size());
+            for (size_t i = 0; i < b.kv_groups.size(); ++i) {
+                CHECK_EQ(b.kv_groups[i].name, base.kv_groups[i].name);
+                CHECK_EQ(b.kv_groups[i].d.head_dim, base.kv_groups[i].d.head_dim);
+            }
+            /* The block-key and tail groups: bound to layer 3 and the head, not to 7; the
+             * attention group still to 7. */
+            auto bound = [](const RadBuilder& x, const char* group) {
+                std::vector<int> ls;
+                for (size_t i = 0; i < x.kv_groups.size(); ++i)
+                    if (x.kv_groups[i].name == group)
+                        for (const auto& [l, g] : x.binds)
+                            if (g == (rad_kvgroup)(i + 1)) ls.push_back(l);
+                return ls;
+            };
+            for (const char* grp : { "kv_qsa_bkey", "kv_qsa_tail" }) {
+                const std::vector<int> lb = bound(base, grp), lc = bound(b, grp);
+                CHECK_EQ(lb.size(), (size_t)3);
+                CHECK_EQ(lc.size(), (size_t)2);
+                CHECK(std::find(lb.begin(), lb.end(), 7) != lb.end());
+                CHECK(std::find(lc.begin(), lc.end(), 7) == lc.end());
+                CHECK(std::find(lc.begin(), lc.end(), 3) != lc.end());
+            }
+            const std::vector<int> la = bound(b, "kv_attn");
+            CHECK(std::find(la.begin(), la.end(), 7) != la.end());
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+        }
+}
+
+/* Reuse is refused naming the layer where the previous QSA layer's selection is not this layer's
+ * to read: on the first QSA layer (nothing before it), behind a layer of another layout (its page
+ * ids are another group's), under window residency (`qsa_page` rewrites `sel` into the previous
+ * layer's scratch pages) and under a streamed cache (`kv_resolve` rewrites it into ring slots). */
+TEST(a_reuse_layer_whose_previous_selection_is_not_its_own_to_read_is_refused) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    auto refusal = [&](std::vector<int32_t> r, int residency, int64_t resident) {
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        ctx.kv_residency = residency;
+        ctx.kv_resident_blocks = resident;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    const int32_t f = RAD_KVQ_NONE, re = RAD_KVQ_REUSE;
+    CHECK(has(refusal({ -1, -1, -1, f | re, -1, -1, -1, f }, 0, 0),
+              "layer 3 cannot reuse the previous QSA layer's selection: it is the first QSA"));
+    CHECK(has(refusal({ -1, -1, -1, (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED, -1, -1, -1, f | re }, 0, 0),
+              "layer 7 cannot reuse the previous QSA layer's selection: the previous QSA layer "
+              "keeps another KV layout"));
+    CHECK(has(refusal({ -1, -1, -1, f, -1, -1, -1, f | re }, 1, 0), "window residency"));
+    CHECK(has(refusal({ -1, -1, -1, f, -1, -1, -1, f | re }, 0, 8192), "streamed cache"));
+}
+
 /* A demote layout the plugin does not serve is refused naming the layer: fp8_v4 as a demote layout
  * (a hand-built entry; the recipe parser refuses it first), a k6_v4 resident layout, and an fp8
  * layer without its rotation. */

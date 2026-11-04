@@ -97,7 +97,7 @@ static const Flag g_flags[] = {
                                         "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
                                         "(int8, a scale a token and head, 1.01; all rotated,\n"
                                         "Flash-Next) or bf16 (2; Flash-Next), a 'layer N\n"
-                                        "LAYOUT [rotated] [demote LAYOUT] [vmean]' line a layer\n"
+                                        "LAYOUT [rotated] [demote LAYOUT] [vmean] [reuse]' line a layer\n"
                                         "(docs/GUIDE.md); needs\n"
                                         "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
@@ -611,6 +611,9 @@ std::vector<int> kv_layouts() {
  * layer's demoted blocks are stored in that second layout (k4h_v4 or k4h_v2h, of an i8h or a
  * rotated fp8 layer) and expanded back on the card when read, so the store holds more blocks a
  * MiB and every paged block moves fewer bytes; `vmean` then needs integer V in either layout.
+ * `reuse`, last (RAD_KVQ_REUSE): the layer takes the previous QSA layer's selection instead of
+ * scoring its own and stores no block keys; which layer that is, and whether it qualifies, only
+ * the plugin knows.
  * Layer numbers are the checkpoint's (blk.N), so a recipe reads against the model's own config.
  * Strict: a word the format does not have, a layer named twice, or a layout outside the set is a
  * refusal with its line, never a skipped line, since a recipe that loads short is a different
@@ -645,21 +648,24 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
                     kw.c_str());
             return RAD_E_INVAL;
         }
-        /* After the layout: `rotated`, then `demote LAYOUT`, then `vmean`, each at most once and
-         * in that order. */
-        bool rot_word = false, vmean = false, bad = !(words >> num >> layout);
+        /* After the layout: `rotated`, then `demote LAYOUT`, then `vmean`, then `reuse`, each at
+         * most once and in that order. */
+        bool rot_word = false, vmean = false, reuse = false, bad = !(words >> num >> layout);
         std::string demote;
         for (std::string w; !bad && (words >> w);) {
-            if (w == "rotated" && !rot_word && demote.empty() && !vmean) rot_word = true;
+            if (reuse) bad = true;
+            else if (w == "rotated" && !rot_word && demote.empty() && !vmean) rot_word = true;
             else if (w == "demote" && demote.empty() && !vmean) bad = !(words >> demote);
             else if (w == "vmean" && !vmean) vmean = true;
+            else if (w == "reuse") reuse = true;
             else bad = true;
         }
         if (bad) {
             RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words, or 'layer N "
                     "LAYOUT rotated', then 'demote LAYOUT' where window residency stores the "
-                    "layer's demoted blocks narrower, and 'vmean' last where the layer subtracts "
-                    "its V mean", name, ln);
+                    "layer's demoted blocks narrower, 'vmean' where the layer subtracts its V "
+                    "mean, and 'reuse' last where it takes the previous QSA layer's selection",
+                    name, ln);
             return RAD_E_INVAL;
         }
         char* end = nullptr;
@@ -724,7 +730,8 @@ int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32
         }
         const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
         r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
-                       (vmean ? RAD_KVQ_VMEAN : 0) | (dq << RAD_KVQ_DEMOTE_SHIFT);
+                       (vmean ? RAD_KVQ_VMEAN : 0) | (reuse ? RAD_KVQ_REUSE : 0) |
+                       (dq << RAD_KVQ_DEMOTE_SHIFT);
         vmean_layers += vmean;
     }
     if (r.empty()) {
@@ -756,7 +763,7 @@ std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
                 const int key = q | rot | (dq << RAD_KVQ_DEMOTE_SHIFT);
                 std::string layers;
                 for (size_t l = 0; l < recipe.size(); ++l)
-                    if (recipe[l] >= 0 && (recipe[l] & ~RAD_KVQ_VMEAN) == key)
+                    if (recipe[l] >= 0 && (recipe[l] & ~(RAD_KVQ_VMEAN | RAD_KVQ_REUSE)) == key)
                         layers += (layers.empty() ? "" : ", ") + std::to_string(l);
                 if (layers.empty()) continue;
                 s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
@@ -770,6 +777,12 @@ std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
             vm += (vm.empty() ? "" : ", ") + std::to_string(l);
     if (!vm.empty())
         s += "; V mean subtracted at layer" + std::string(vm.find(',') != std::string::npos ? "s " : " ") + vm;
+    std::string ru;
+    for (size_t l = 0; l < recipe.size(); ++l)
+        if (recipe[l] >= 0 && (recipe[l] & RAD_KVQ_REUSE))
+            ru += (ru.empty() ? "" : ", ") + std::to_string(l);
+    if (!ru.empty())
+        s += "; QSA selection reused at layer" + std::string(ru.find(',') != std::string::npos ? "s " : " ") + ru;
     return s;
 }
 

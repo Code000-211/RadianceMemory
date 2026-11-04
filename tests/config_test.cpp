@@ -1101,6 +1101,44 @@ TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_v_mea
     unlink(path.c_str());
 }
 
+/* `reuse` (RAD_KVQ_REUSE, issue #18 part 1): the layer takes the previous QSA layer's selection.
+ * It is the last word of a line, at most once, beside any layout and any other word; the entry
+ * keeps its layout and other bits, so the layout summary groups it with its layout and a reuse
+ * clause names the layers apart. Which layer is "previous" and whether it qualifies is the
+ * plugin's to say (arch_test), so the parser refuses only the line's grammar. */
+TEST(a_kv_recipe_line_ending_in_reuse_marks_that_layer_and_nothing_else) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 3 fp8\nlayer 7 fp8 reuse\nlayer 11 i8h demote k4h_v4 reuse\n",
+                             "r.txt", &r), RAD_OK);
+    REQUIRE_EQ(r.size(), (size_t)12);
+    CHECK_EQ(r[3], (int32_t)RAD_KVQ_NONE);
+    CHECK_EQ(r[7], (int32_t)(RAD_KVQ_NONE | RAD_KVQ_REUSE));
+    CHECK_EQ(r[11], (int32_t)(RAD_KVQ_I8H | RAD_KVQ_ROTATED | RAD_KVQ_REUSE |
+                              (RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT)));
+    CHECK_EQ(r[7] & RAD_KVQ_LAYOUT, (int)RAD_KVQ_NONE);
+    CHECK_EQ(RAD_KVQ_DEMOTE_OF(r[11]), (int)RAD_KVQ_K4H);
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("fp8 at layers 3, 7; i8h rotated demote k4h_v4 at layer 11; QSA selection "
+                         "reused at layers 7, 11"));
+    /* Without the word every entry is bit for bit what it was. */
+    std::vector<int32_t> plain;
+    CHECK_EQ(kv_recipe_parse("layer 3 fp8\nlayer 7 fp8\n", "r.txt", &plain), RAD_OK);
+    for (int32_t e : plain) CHECK(e < 0 || !(e & RAD_KVQ_REUSE));
+    CHECK_EQ(kv_recipe_summary(plain), std::string("fp8 at layers 3, 7"));
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 7 fp8 reuse reuse\n"), "'reuse' last"));
+    CHECK(has(refusal("layer 7 fp8 reuse rotated\n"), "'reuse' last"));
+    CHECK(has(refusal("layer 7 i8h reuse vmean\nvmean m.txt\n"), "'reuse' last"));
+}
+
 /* `demote LAYOUT` (RAD_KVQ_DEMOTE, bits 16-23 of the entry): window residency stores the layer's
  * demoted blocks in that layout. It comes after `rotated` and before `vmean`; the demote layout is
  * k4h_v4 or k4h_v2h, the resident one i8h or fp8, and fp8 must say `rotated`, since the demoted

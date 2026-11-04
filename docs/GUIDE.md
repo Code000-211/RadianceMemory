@@ -1053,6 +1053,12 @@ kv_vmean 1 head_dim 256 kv_heads 2 rows 126945
 layer 3 head 0  0.257125914 0.17772831 ...           # head_dim values
 ```
 
+**Selection reuse: `reuse`** (experimental, Flash-Next). A line ending in `reuse` (`layer 7
+fp8 reuse`, after every other word) makes that QSA layer attend over the previous QSA layer's
+selection instead of scoring its own, and store no block keys (docs/QSA.md, "Selection reuse").
+Refused on the first QSA layer, where the previous one keeps another layout, and with window
+residency or `--kv-resident`.
+
 The recipe is refused, the file and line named, for `vmean` on `fp8`, a `vmean` word with no
 `vmean FILE` line or the other way round, and in the file a wrong header, a line of other than
 head_dim values, a value that is not a finite number, a head outside the header's or twice, a layer

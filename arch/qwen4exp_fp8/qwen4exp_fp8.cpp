@@ -162,6 +162,9 @@ struct Model {
     /* Each trunk layer's RAD_KVQ_VMEAN (a `vmean` recipe line): AttnGatedFP8::vmean_sub/add from
      * RadBuildCtx::kv_vmean. */
     std::vector<char> kvmean;
+    /* Each trunk layer's RAD_KVQ_REUSE (a `reuse` recipe line): the layer declares no indexer and
+     * its attention reads the selection the previous QSA layer left in the shared `qsa_sel`. */
+    std::vector<char> qsareuse;
     /* The V means' calibration tap under --calib-dir (rad_calib_vmean.h). */
     CalibVMean vcal;
     /* PLE lives on exactly one layer; -1 when the checkpoint has none or this build does not
@@ -737,6 +740,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         std::vector<int> kvq_of((size_t)g.n_layer, RAD_KVQ_NONE);   /* per trunk layer */
         std::vector<char> rot_of((size_t)g.n_layer, 0);
         std::vector<char> vmean_of((size_t)g.n_layer, 0);
+        std::vector<char> reuse_of((size_t)g.n_layer, 0);
         if (ctx->kv_recipe) {
             if (!f8) {
                 fprintf(stderr, "radiance: a KV recipe chooses layouts of the fp8 cache, and this "
@@ -747,7 +751,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (ctx->kv_recipe[l] < 0) continue;
                 /* The layout, and apart from it whether the layer runs rotated, which any layout
                  * can: the rotation is an op of its own beside the layout's rows. */
-                const int q = ctx->kv_recipe[l] & ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN | RAD_KVQ_DEMOTE);
+                const int q = ctx->kv_recipe[l] &
+                              ~(RAD_KVQ_ROTATED | RAD_KVQ_VMEAN | RAD_KVQ_DEMOTE | RAD_KVQ_REUSE);
                 /* Its demote layout (RAD_KVQ_DEMOTE): k4h_v4 or k4h_v2h of an i8h or rotated fp8
                  * layer, which the pager expands (arch/common/rad_qsa.h). Both share the layer's
                  * basis and V mean, so the rotation and the centring below are the layer's. */
@@ -801,6 +806,34 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 kvq_of[(size_t)l] = kv_key(q, dq);
                 rot_of[(size_t)l] = (ctx->kv_recipe[l] & RAD_KVQ_ROTATED) != 0;
                 vmean_of[(size_t)l] = vm;
+                /* Selection reuse (RAD_KVQ_REUSE, docs/QSA.md "Selection reuse"): the layer takes
+                 * the selection the previous QSA layer left in the shared `qsa_sel`, so that layer
+                 * must exist, and the selection's page ids are its attention group's, so both layers
+                 * must share the group. The pager and a streamed group's resolve rewrite `sel` in
+                 * place into the previous layer's scratch pages or ring slots, which hold that
+                 * layer's K and V, not this one's: refused under window residency and streaming
+                 * rather than read another layer's cache. */
+                if (ctx->kv_recipe[l] & RAD_KVQ_REUSE) {
+                    int64_t prev = l - 1;
+                    while (prev >= 0 && !is_full_attention(prev, interval)) --prev;
+                    const char* why =
+                        m.qsacfg.topk <= 0 ? "this checkpoint has no QSA indexer"
+                      : prev < 0 ? "it is the first QSA layer, with no selection before it"
+                      : (prev >= ctx->n_kv_recipe || ctx->kv_recipe[prev] < 0) ? nullptr
+                      : kvq_of[(size_t)prev] != kvq_of[(size_t)l]
+                          ? "the previous QSA layer keeps another KV layout, so its selection names "
+                            "pages of another group"
+                      : ctx->kv_residency ? "window residency pages `sel` per layer (qsa_page)"
+                      : ctx->kv_resident_blocks > 0
+                          ? "a streamed cache resolves `sel` per layer (kv_resolve)"
+                      : nullptr;
+                    if (why) {
+                        fprintf(stderr, "radiance: KV recipe: layer %lld cannot reuse the previous "
+                                        "QSA layer's selection: %s\n", (long long)l, why);
+                        return RAD_E_UNSUPPORTED;
+                    }
+                    reuse_of[(size_t)l] = 1;
+                }
             }
             for (int64_t l = 0; l < g.n_layer; ++l)
                 if (is_full_attention(l, interval) &&
@@ -899,6 +932,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.kvq     = std::move(kvq_of);
         m.kvrot   = std::move(rot_of);
         m.kvmean  = std::move(vmean_of);
+        m.qsareuse = std::move(reuse_of);
         m.kv_full = m.kv_q[last_q];
         /* A k4h_v4, k4h_v2h or i8h group holds rotated K and V only, so the MTP head behind such a
          * layer rotates as the trunk's layers in it do; any other group keeps the head unrotated.
@@ -1377,7 +1411,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* The indexer, after the attention block so its ops sit where the sparse attention
              * reads them. It reads the same normed fp8 input as the projections
              * (arch/common/rad_qsa.h, docs/QSA.md). */
-            if (m.qsaw.qk) {
+            /* A reuse layer (RAD_KVQ_REUSE) declares no indexer: no projection, block keys or tail
+             * (the block-key and tail groups are not bound to it, so they hold one layer fewer),
+             * and its step is a no-op, leaving the previous QSA layer's `sel` for its attention. */
+            if (m.qsaw.qk && !m.qsareuse[(size_t)l]) {
                 QsaIndexer::Config qc = m.qsacfg;
                 qc.mode    = lay.attn.mode;
                 qc.qk_proj = nm.ckpt("%s.%lld.self_attn.indexer.index_qk_proj.weight",

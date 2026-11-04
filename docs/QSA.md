@@ -178,6 +178,25 @@ nothing is allocated past the sequence, so `bt[n] >= 0` would work there. Mid-ch
 query finds a later token's live page in `bt[n]`, which `seqused` would then cover. The partial
 page is appended only when `(pos + 1) % ratio != 0`.
 
+## Selection reuse (experimental)
+
+A `reuse` recipe line (`layer 7 fp8 reuse`, RAD_KVQ_REUSE, `--kv-recipe` in GUIDE.md §4.4) makes
+a QSA layer attend over the selection the previous QSA layer chose (DeepSeek-V4.1's CSA2 "Reuse";
+Flash-Next was not trained for it, so it is a measurement, not a default). The layer declares no
+indexer: no projection, score or select, and it is bound to neither `kv_qsa_bkey` nor
+`kv_qsa_tail`, so both groups are sized for the layers that remain (the core sizes a group by its
+bound layers; a 4-token block's 3.25 KiB of block keys shrinks by one QSA layer's 1/13 for each
+reuse line, the MTP head keeping its own). Its step issues nothing there; `qsa_sel`, `qsa_nsel`
+and `qsa_sequ` are one buffer for the whole model, so the attention reads them as the previous QSA
+layer left them, and its declared reads keep them alive across the delta-net layers between.
+
+Refused, naming the layer: on the first QSA layer; where the previous QSA layer keeps another
+attention group (the selection holds that group's page ids); under window residency (`qsa_page`
+rewrites `sel` into the previous layer's scratch pages) and a streamed cache (`kv_resolve`
+rewrites it into ring slots), both of which hold the previous layer's K and V. The prefix cache
+is unaffected: it checkpoints the groups whatever layers they hold. With no `reuse` line the
+program is today's.
+
 ## Cost
 
 The indexer is the only part of a decode step that grows with context: `qsa_score` and
