@@ -916,6 +916,16 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * entry per schema operand, the trailing optional ones the issue left out null. */
     ip.args.n_t = std::max(n_opd, (int)p.n_opd_schema);
     ip.args.kv_used_max_h = issue_kv_used_max_h(batch_, t, ip.args.n_t);
+    /* A plugin with no pass-key callback has its decode, verify and draft passes recorded
+     * (pass_key), and a played pass keeps the arguments it was recorded with, so a launch there
+     * must not read a bound the key does not: it gets the step's context bound plus its longest
+     * query, both keyed, which crosses a bucket every 1024 tokens or more (batch.cpp) instead of
+     * moving with every token. Its prefill and mixed passes are never recorded and keep the
+     * exact maximum. */
+    if (ip.args.kv_used_max_h > 0 && !arch_pass_key_ && batch_ &&
+        batch_->phase != RAD_PHASE_PREFILL && batch_->phase != RAD_PHASE_MIXED)
+        ip.args.kv_used_max_h = (int32_t)std::min<int64_t>(
+            INT32_MAX, (int64_t)batch_->max_ctx_len + batch_->max_q_len);
     p.issued    = true;
     ++n_issues_;
 

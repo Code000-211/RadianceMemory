@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -318,6 +319,8 @@ Engine::~Engine() {
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
     table_copies_.clear();
+    for (TableCopy& c : table_files_) ::munmap(c.base, c.bytes);
+    table_files_.clear();
     for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
     card_copies_.clear();
     for (TableShare& t : table_shares_) table_share_close(&t);
@@ -374,6 +377,10 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     }
     sc.max_seqs      = cfg_.max_seqs;
     sc.max_spec      = cfg_.n_spec;
+    /* The real step bound, not the sizing declare's level: the sampler's planes must be the same
+     * buffers in every declare of the program (plan_level compares them), and a step can sample
+     * no more rows than the real bound lets it carry tokens. */
+    sc.max_tok       = cfg_.max_tok;
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
@@ -381,11 +388,14 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
      * same chain against its own buffer. PERSIST, since the step loop copies it back after the
-     * step, when a transient's storage may belong to another buffer. */
+     * step, when a transient's storage may belong to another buffer. One id per sampler row,
+     * capped as the rows are (SamplerConfig::max_tok). */
     RadBufDecl d{};
     d.dtype    = RAD_I32;
     d.rank     = 1;
     d.shape[0] = cfg_.max_seqs * (cfg_.n_spec > 0 ? cfg_.n_spec + 1 : 1);
+    if (cfg_.max_tok > 0)
+        d.shape[0] = std::min<int64_t>(d.shape[0], std::max<int64_t>(cfg_.max_tok, cfg_.max_seqs));
     d.kind     = RAD_BUF_PERSIST;
     tok = rad_decl_buffer(b, "sampler.tokens", &d);
     return tok ? RAD_OK : RAD_E_STATE;
@@ -3482,8 +3492,8 @@ int Engine::run_server() {
         in.decoder_max_area = pg.vgen_str.decoder_max_area;
         if (in.image_cond && in.image_crf > 0 && !mm::h264_roundtrip_available())
             RAD_WARN("video: '%s' prepares a first frame with an H.264 round trip at crf %d, which "
-                     "needs libx264; this build's libavcodec has none, so input_reference is "
-                     "refused", in.name.c_str(), (int)in.image_crf);
+                     "needs an H.264 encoder and decoder; this build's libavcodec lacks one, so "
+                     "input_reference is refused", in.name.c_str(), (int)in.image_crf);
         in.max_lanes = vd.max_lanes;
         in.max_ref_images = vd.max_ref_images;
         in.max_ref_videos = vd.max_ref_videos;

@@ -450,8 +450,10 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     if (g.w_bf16) {
         RAD_ARCH_TRY(gate_pair(w.gate));
     } else {
-        if (rad_op_declared(b, "gate_quant_fp8"))
-            op_gq = rw(b, RAD_OP(b, "gate_quant_fp8",
+        /* Rotated int8 codes (ActFP8::q8_rot): gate_had_quant_i8g, had_quant_act_i8g's codes. */
+        const char* gq = w.attn.q8_rot ? "gate_had_quant_i8g" : "gate_quant_fp8";
+        if (rad_op_declared(b, gq))
+            op_gq = rw(b, RAD_OP(b, gq,
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * g.n_head),
                                       RAD_INT("n", g.head_dim), RAD_INT("group", RAD_FP8_BLOCK),
                                       RAD_STR("dtype", g.dtype), RAD_STR("act", "sigmoid")),
@@ -470,7 +472,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * and quantiser read, so one op merges, gates, rounds and quantises (byte-identical to the
      * pair). Declared only with a selection: the dense path also uses the prefill kernel, which
      * has no merge. */
-    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 &&
+    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !w.attn.q8_rot &&
         rad_op_declared(b, "attn_paged_gate_quant")) {
         op_attn_gq = RAD_OP(b, "attn_paged_gate_quant",
                             RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),

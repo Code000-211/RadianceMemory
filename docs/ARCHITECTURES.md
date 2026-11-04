@@ -196,12 +196,10 @@ does not implement these semantics refuses the graph rather than resolving a sim
 The drafter is declared only at one rank: its `fc` is unsharded and its head scores the full
 vocabulary, so a `--tp` above 1 is refused at declaration rather than served half-sharded.
 
-The earlier DSpark throughput figures were measured with the approximate window and candidate-pruned
-walk; they are not a performance claim for the corrected graph. Run the reproducible runtime QoS
-harness below against the corrected BF16 path before publishing new acceptance, latency or
-throughput results. This branch's existing W8A8 caller shares the corrected BF16 drafter graph, but
-remains a separate release/measurement follow-up to restack after #363. Target verification does
-not establish that drafting preserves acceptance rate, latency, or generated text under every
+DSpark's acceptance, latency and throughput on this exact graph are not measured yet (figures taken
+with an approximate window and a candidate-pruned walk do not carry over); run the QoS harness below
+before quoting any. The W8A8 caller shares the bf16 drafter graph. Verification against the target
+does not by itself show that drafting keeps acceptance, latency or the generated text under every
 serving schedule.
 
 `scripts/dspark_qos_regression.py` is an unvalidated two-server QoS harness, not evidence that
@@ -1567,8 +1565,7 @@ tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces the
   transformers' mask (the window AND (causal OR the same picture)): it bounds the keys behind a row.
   A run longer than the window (1120 soft tokens against 1024) is read with `attn_paged_ahead`, whose
   window bounds the keys behind only, so its first rows see the run's far end. Read causally, the 12B answers pictures differently and often wrongly (on DocVQA, "The image does not
-  provide information" for an answer it reads off the page). `RADIANCE_MEDIA_BIDI=0` keeps every
-  layer causal.
+  provide information" for an answer it reads off the page).
 
 NVIDIA's DFlash drafter states `dflash_config.causal: false`, with every layer sliding; that flag
 sets the sliding layers' causality. The recipes are `gemma4-e4b-bf16-df`, `-w8a8-df`, `-w4a8` and

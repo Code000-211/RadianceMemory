@@ -913,6 +913,12 @@ static const RadParamSpec pDflashSelect[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                  OPD("anchor"), WGT("pred"), WGT("succ"),
                                                  OUT("tokens") };
+static const RadParamSpec pDflashMarkov[]    = { P_INT("M"), P_INT("steps"), P_INT("rank"),
+                                                 P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                                 P_STR("dtype") };
+static const RadOperandSpec oDflashMarkov[]  = { OPD("logits"), OPD("anchor"), WGT("pred"),
+                                                 WGT("succ"), OUT("tile_scores"),
+                                                 OUT("tile_tokens"), OUT("tokens") };
 static const RadParamSpec pDflashTree[]      = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                                  P_INT("rank"), P_INT("n_vocab"),
                                                  P_INTO("anchor_stride"), P_INT("nodes"),
@@ -1110,6 +1116,9 @@ static const RadOpSchema kSchemas[] = {
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "paged causal / sliding-window attention, any query length, online-softmax so one pass over the "
   "cache suffices." },
+{ "attn_paged_anchor_window", ARR(pAttnPaged), ARR(oAttnPaged),
+  "attn_paged with one window anchor at each sequence's first query position: every row keeps keys "
+  "with anchor - key < window, and a causal row none after the anchor." },
 { "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
   "attn_paged over a tree verify (rad_drafter_tree): spec_parent is -2 for an ordinary causal row, "
   "else the row's parent's index within its sequence's rows (-1 for the block's first). Inside the "
@@ -1457,6 +1466,11 @@ static const RadOpSchema kSchemas[] = {
 { "dflash_conv", ARR(pDflashConv), ARR(oDflashConv),
   "DFlash2's grouped dynamic depthwise convolution: out[t][h] = sum over taps j, j == 0 or "
   "t % block_size >= j, of (base[j][h] + delta[t][j][h / group_size]) * x[t - j][h]." },
+{ "dflash_markov_greedy", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "DSpark's walk: every vocabulary id scores draft_logit[token] + sum_r pred[previous][r] * "
+  "succ[token][r], the greatest wins (lower id on a tie) and is the next predecessor." },
+{ "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "dflash_markov_greedy with f32 draft logits and bf16 codebooks." },
 { "dflash_select", ARR(pDflashSelect), ARR(oDflashSelect),
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
@@ -1770,6 +1784,11 @@ ROW("avx_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged)),
+ROW("avx_attn_paged_anchor_window", "attn_paged_anchor_window", "attn",
+    "paged attention with one shared anchor-aligned sliding window a sequence",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    L(attn_paged_anchor_window)),
 ROW("avx_attn_paged_tree", "attn_paged_tree", "attn",
     "paged causal / sliding-window attention with a tree verify block (spec_parent)",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
@@ -2082,6 +2101,13 @@ SIMPLE("avx_dflash_conv", "dflash_conv", "draft",
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),
+SIMPLE("avx_dflash_markov_greedy", "dflash_markov_greedy", "draft",
+       "DSpark's full-vocabulary greedy Markov walk",
+       "bf16 logits and codebooks, f32/i32 tile winners, i32 tokens out", L(dflash_markov_greedy)),
+SIMPLE("avx_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
+       "Full-vocabulary greedy Markov walk with f32 draft logits",
+       "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
+       L(dflash_markov_greedy_f32)),
 SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, tokens and parents, float unary and codebooks", L(dflash_tree)),

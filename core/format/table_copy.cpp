@@ -3,7 +3,10 @@
 
 #include "../rad_internal.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +91,69 @@ int table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t 
     }
     out->base = m;
     out->bytes = sz;
+    return RAD_OK;
+}
+
+int table_file_open(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
+                    const std::string& path, TableCopy* out, bool* filled, std::string* why) {
+    if (!out || !filled || !why || !src || n <= 0 || path.empty()) return RAD_E_INVAL;
+    *out = TableCopy{};
+    *filled = false;
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0 || st.st_size != n) {
+        const std::string tmp = path + ".part";
+        const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            *why = fmt("creating %s: %s", tmp.c_str(), std::strerror(errno));
+            return RAD_E_IO;
+        }
+        void* m = MAP_FAILED;
+        if (::ftruncate(fd, (off_t)n) == 0)
+            m = ::mmap(nullptr, (size_t)n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            *why = fmt("sizing %s to %s: %s", tmp.c_str(), humanb(n).c_str(), std::strerror(errno));
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return RAD_E_IO;
+        }
+        int rc = table_copy_fill(file, src, n, foff, static_cast<uint8_t*>(m), why);
+        if (rc == RAD_OK && (::msync(m, (size_t)n, MS_SYNC) != 0 || ::fsync(fd) != 0)) {
+            *why = fmt("writing %s: %s", tmp.c_str(), std::strerror(errno));
+            rc = RAD_E_IO;
+        }
+        ::munmap(m, (size_t)n);
+        ::close(fd);
+        if (rc == RAD_OK && ::rename(tmp.c_str(), path.c_str()) != 0) {
+            *why = fmt("renaming %s: %s", tmp.c_str(), std::strerror(errno));
+            rc = RAD_E_IO;
+        }
+        if (rc != RAD_OK) {
+            ::unlink(tmp.c_str());
+            return rc;
+        }
+        *filled = true;
+    }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        *why = fmt("opening %s: %s", path.c_str(), std::strerror(errno));
+        return RAD_E_IO;
+    }
+    void* m = ::mmap(nullptr, (size_t)n, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (m == MAP_FAILED) {
+        *why = fmt("mapping %s: %s", path.c_str(), std::strerror(errno));
+        return RAD_E_IO;
+    }
+    if (!*filled) {
+        const int rc = table_copy_check(src, n, static_cast<const uint8_t*>(m), why);
+        if (rc != RAD_OK) {
+            ::munmap(m, (size_t)n);
+            *why = fmt("%s does not match the container (%s); remove it and it is filled again",
+                       path.c_str(), why->c_str());
+            return rc;
+        }
+    }
+    *out = TableCopy{ m, (size_t)n };
     return RAD_OK;
 }
 

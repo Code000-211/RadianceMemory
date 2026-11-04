@@ -332,10 +332,11 @@ public:
     /* Called by the drain, so the ring knows which banks are still unread. */
     void              mark_credited(int layer, int bank);
     const RadRouting* last_routing(int layer) const;
-    /* The device pointer of `layer`'s expert counts for the current step, with `n_expert` set,
-     * or null when the layer has not reported this step (a routing-aware file stager then
-     * reads the layer whole). The pointer is stream-ordered behind the router: a copy on the
-     * compute stream at the stager's trigger sees this pass's counts. */
+    /* The device pointer of the buffer `layer`'s router writes its expert counts to, as the
+     * layer last reported it, with `n_expert` set; null when the layer has not reported yet, or
+     * when the buffer is a transient one (a routing-aware file stager then reads the layer
+     * whole). The router rewrites it every pass before the layer's first expert op, so a copy on
+     * the compute stream at the stager's trigger sees the counts of the rows about to run. */
     const int32_t*    route_counts_device(int layer, int64_t* n_expert) const;
 
     /* ---------------------------------------------------------- the placement seam */
@@ -778,6 +779,8 @@ private:
 
     std::vector<RouteSlot> route_;
     int64_t                route_n_expert_ = 0;
+    /* route_counts_device has said once that a layer's counts are a transient buffer. */
+    mutable bool           route_transient_noted_ = false;
     /* A bank is one step's histograms for every layer: [kRouteBanks][n_layer][n_expert] in pinned
      * host memory. A report copies a layer's counts into its row of the card-side
      * [n_layer][n_expert] (an on-card copy that orders nothing else); the end of the pass copies

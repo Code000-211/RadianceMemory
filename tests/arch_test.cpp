@@ -9699,9 +9699,11 @@ int w8a8_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx
 
 }  /* namespace */
 
-/* The `_had_quant_i8g` producers, which libr4d serves and libref does not. */
+/* The `_had_quant_i8g` producers and the ops that write those codes in their epilogue (the
+ * attention gate's, the delta net's decode conv fold's), which libr4d serves and libref does not. */
 const char* const kW8a8Fused[] = { "rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g",
-                                   "gated_had_quant_i8g" };
+                                   "gated_had_quant_i8g", "gate_had_quant_i8g",
+                                   "gdn_conv_recurrent_update_had" };
 
 /* Where the `_had_quant_i8g` producers are not served, every trunk linear of a rotated int8
  * container is an i8a8h GEMM right behind its own had_quant_act_i8g, at one rank and two: 2
@@ -9736,11 +9738,13 @@ TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
     }
 }
 
-/* Where they are served, the norms and the gated product write had_quant_act_i8g's codes into the
- * int8 pair, and the projections reading them declare no quantiser: had_quant_act_i8g is left only
- * before the attention and delta-net output projections (2 + 6), every norm is the rotated twin (at
- * two ranks with its fused all-reduce form beside it), and every feed-forward's product is
- * gated_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are unchanged. */
+/* Where they are served, the norms, the gated product, the attention gate and the delta net's
+ * decode conv fold write had_quant_act_i8g's codes into the int8 pair, and the projections reading
+ * them declare no quantiser: had_quant_act_i8g is left only as the delta net's quantiser of the
+ * rows its decode fold does not serve (6), every norm is the rotated twin (at two ranks with its
+ * fused all-reduce form beside it), every feed-forward's product is gated_had_quant_i8g and every
+ * attention gate gate_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are
+ * unchanged. */
 TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_them) {
     MetaKV mk = q35w8a8_meta();
     for (int world : { 1, 2 }) {
@@ -9751,9 +9755,11 @@ TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_
         int rot = 0;
         for (const RecOp& o : b.ops) rot += o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
         CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
-        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 2 + 6);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 6);
         CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), 8 + 8);
         CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 8);
+        CHECK_EQ(count_op(b, "gate_had_quant_i8g"), 2);
+        CHECK_EQ(count_op(b, "gdn_conv_recurrent_update_had"), 6);
         for (const char* op : { "rmsnorm_quant_fp8", "ar_rmsnorm_quant_fp8", "gated_quant_fp8",
                                 "quant_act_i8g" })
             CHECK_EQ(count_op(b, op), 0);
@@ -10767,7 +10773,7 @@ TEST(the_gemma4_12b_embeds_images_and_audio_without_an_encoder) {
  * bound (its window two-sided), the encoder says so to the core (RadEncoderDecl::bidirectional),
  * and on a pass with a run (RadBatch::n_bidi) each sliding layer attends the run's rows again over
  * their sequence's cache up to the run's end, written over the causal result in the same rows.
- * Without the config key, or with RADIANCE_MEDIA_BIDI=0, nothing of it. */
+ * Without the config key, nothing of it. */
 TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
     std::vector<const char*> keys(std::begin(k_gem12_keys), std::end(k_gem12_keys));
     std::vector<const char*> vals(std::begin(k_gem12_vals), std::end(k_gem12_vals));
@@ -10784,7 +10790,7 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
     const int32_t run = 10;
     static const int32_t rows[] = { run };
     for (const int win : { 1024, 8 })
-    for (int mode = 0; mode < 3; ++mode) {          /* 0 on, 1 no key, 2 RADIANCE_MEDIA_BIDI=0 */
+    for (int mode = 0; mode < 2; ++mode) {          /* 0 on, 1 no key */
         std::vector<const char*> wvals = vals;
         for (size_t k = 0; k < keys.size(); ++k)
             if (!std::strcmp(keys[k], "sliding_window")) wvals[k] = win == 8 ? "8" : "1024";
@@ -10802,9 +10808,7 @@ TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
                     meta.kv_key = keys.data(); meta.kv_val = wvals.data();
                     RadBuildCtx ctx = build_ctx(rank, world);
                     ctx.max_enc_patches = 1120;
-                    if (mode == 2) setenv("RADIANCE_MEDIA_BIDI", "0", 1);
                     const int rc = gemma4_bf16::declare(&b, &meta, &ctx);
-                    unsetenv("RADIANCE_MEDIA_BIDI");
                     REQUIRE_EQ(rc, RAD_OK);
                     const bool on = mode == 0;
                     CHECK_EQ(b.encoder.bidirectional, on ? 1 : 0);
@@ -11518,22 +11522,22 @@ struct ArchCases {
             qwen35_bf16::step, 0, {}, 0xf82117051023e608ull);
         add("qwen35_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            qwen35_fp8::step, 3, {}, 0x20ab9ed24e409329ull);
+            qwen35_fp8::step, 3, {}, 0x958b83102809266bull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x5b52afb1706a954eull);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x91408682a38a1754ull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0x365e4cbb415ac284ull);
+            qwen35_fp8::step, 7, {}, 0x60d33ded99aa451eull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x742a596708bbda1dull);
+            qwen35_w8a8::step, 7, {}, 0x570d3bc8fc15f701ull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x93b6390d30e59953ull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x6c5267846652829full);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
-            qwen35moe_fp8::step, 3, {}, 0x4c7e42e71f167042ull);
+            qwen35moe_fp8::step, 3, {}, 0x325d0299495a0dd8ull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
             qwen4exp_fp8::step, 3, {}, 0x9454e9dff6db286bull);
@@ -12276,10 +12280,10 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0x959ef6b7c6f57d8bull },
         { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
-        { "qwen35_fp8", 1, 0, 0xc56a518087e3f4b4ull, 0xa7ec3cf6252cd441ull },
-        { "qwen35_fp8", 2, 1, 0x6e644b3d13bac619ull, 0xdd5d65ef158c4136ull },
-        { "qwen35moe_fp8", 1, 0, 0x7a9330e0da08f97cull, 0x2b5989b2a6dbc7dfull },
-        { "qwen35moe_fp8", 2, 0, 0x3a2761e9546797f1ull, 0x4a597c66b5868eeeull },
+        { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
+        { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
+        { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },
+        { "qwen35moe_fp8", 2, 0, 0x46d061a0de9a8933ull, 0x4a597c66b5868eeeull },
     };
     for (const Case& cs : cases) {
         RadBuilder b;

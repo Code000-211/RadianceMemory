@@ -243,7 +243,12 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     mw.ids = decl_b(b, nm.f("expert_ids"), RAD_I32, { T, 8 });
     mw.ew = decl_b(b, nm.f("expert_weights"), RAD_F32, { T, 8 });
     mw.eoff = decl_b(b, nm.f("expert_offsets"), RAD_I32, { 289 });
-    mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 });
+    /* PERSIST, as every other MoE here declares it: the router writes the counts and no declared
+     * op reads them (rad_route_report is a handoff), so as a transient a later buffer could share
+     * their bytes and an arena level would move them, while the core copies them at the block's
+     * end and the file stager reads them, through the address the last pass reported, at the
+     * layer's first expert op. */
+    mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { T * 8 });
     mw.inv = decl_b(b, nm.f("expert_inverse"), RAD_I32, { T * 8 });
     // FE: the routed experts' WHOLE intermediate (2048). Under expert parallelism a rank owns

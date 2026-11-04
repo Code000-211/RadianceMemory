@@ -746,6 +746,42 @@ TEST(route_report_is_asynchronous_and_drains_oldest_first) {
     CHECK_EQ(f.ctx.route_report(99, &r), RAD_E_INVAL);
 }
 
+/* The file stager reads a layer's counts through the address the layer's last report named, at
+ * the layer's next trigger. That holds for a buffer in the arena's fixed region or outside the
+ * arena. A transient buffer is at another offset at another arena level, and a later transient
+ * may share its bytes since no declared op reads the counts, so the source declines it and the
+ * stager reads that layer whole. */
+TEST(the_counts_source_declines_a_transient_buffer) {
+    Fixture f;
+    f.P.arena_fixed_bytes = 4096;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    CHECK_OK(f.start());
+    char* const base = (char*)f.ctx.arena_base();
+    REQUIRE(base != nullptr);
+    int64_t n = -1;
+    CHECK(f.ctx.route_counts_device(0, &n) == nullptr);      /* nothing reported yet */
+    CHECK_EQ(n, (int64_t)0);
+
+    RadRouting r{};
+    r.n_expert = 4;
+    r.top_k = 2;
+    r.expert_count = (const int32_t*)(base + 256);            /* the fixed region */
+    CHECK_OK(f.step(1, 0, [&](Ctx& c) { CHECK_OK(c.route_report(0, &r)); }));
+    CHECK(f.ctx.route_counts_device(0, &n) == r.expert_count);
+    CHECK_EQ(n, (int64_t)4);
+
+    r.expert_count = (const int32_t*)(base + 4096 + 512);     /* a transient */
+    CHECK_OK(f.step(1, 1, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    CHECK(f.ctx.route_counts_device(1, &n) == nullptr);
+    CHECK_EQ(n, (int64_t)0);
+
+    static const int32_t outside[4] = { 1, 2, 3, 4 };         /* not the arena's */
+    r.expert_count = outside;
+    CHECK_OK(f.step(1, 2, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    CHECK(f.ctx.route_counts_device(1, &n) == outside);
+    CHECK_OK(rad_stream_sync(f.ctx.stream()));
+}
+
 /* A step that drafts reports the same layer once per pass, all into the step's one bank. The drain
  * runs before every pass, so it must not take that bank until the step is over; taken early, it
  * would cover only the passes so far and miss the rest. */
@@ -2373,12 +2409,14 @@ TEST(legacy_prefill_keying_only_fails_closed_for_dynamic_split_rows) {
         CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
         b.phase = RAD_PHASE_MIXED;
         CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        /* Decode, verify and draft passes stay recordable: their launches read the keyed
+         * context bound, not the live maximum (issue_passes_only_proven_kv_host_summaries). */
         b.phase = RAD_PHASE_DECODE; b.n_spec = 1;
-        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        CHECK(f.ctx.pass_key(&b) != 0);
         b.n_spec = 0; b.draft_pass = -1;
-        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        CHECK(f.ctx.pass_key(&b) != 0);
         b.draft_pass = 0;
-        CHECK(f.ctx.pass_key(&b) != 0);  // Ordinary decode remains recordable.
+        CHECK(f.ctx.pass_key(&b) != 0);
     }
 }
 
@@ -2427,6 +2465,14 @@ TEST(issue_passes_only_proven_kv_host_summaries) {
     CHECK_EQ(issue(positions_device + 128, 1, 1, RAD_PHASE_PREFILL, 0), -1); // past step end
     CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_MIXED, 0), -1);
     CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_PREFILL, 1), -1);
+    /* A plugin with no pass-key callback records its decode passes, so a launch there reads the
+     * step's context bound plus its longest query, which the key holds, never the live maximum. */
+    f.batch.max_ctx_len = 2048;
+    f.batch.max_q_len = 2;
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_DECODE, 1), 2050);
+    CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_DECODE, 0), 2050);
+    CHECK_EQ(issue(used_device, 3, 2, RAD_PHASE_DECODE, 1), -1);   // still nothing to bound
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 0), 1152); // prefill keeps the exact one
 }
 
 TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {

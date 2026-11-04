@@ -61,7 +61,9 @@ typedef struct RadArgs {
     int              rank;          /* tensor-parallel rank and world size, for collectives */
     int              world_size;
     /* ABI 35: host-side maximum KV length represented by this exact launch operand (a seqused
-     * span or a supported one-sequence prefill boundary), or -1 when it cannot be proven. Plugins
+     * span or a supported one-sequence prefill boundary), or -1 when it cannot be proven. In a
+     * decode, verify or draft pass of an architecture with no rad_arch_pass_key it is instead the
+     * step's context bound plus its longest query, which the recorded pass's key holds. Plugins
      * must not infer it from a device pointer or synchronously read device memory to get it. */
     int32_t          kv_used_max_h;
     /* The current rank's WGP count (HIP multiProcessorCount on RDNA); lets split launchers use

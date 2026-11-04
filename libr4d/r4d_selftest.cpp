@@ -40,6 +40,7 @@
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
+#include "r4d_iqr.h"
 #include "rad_encoding.h"
 #include "rad_philox.h"
 #include "rad_sample.h"
@@ -4431,11 +4432,15 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  * codes to quant_act_i8g over its `o`. `f32w` hands the fold the conv weight in f32, as a GGUF
  * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change. */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
-                              bool i8 = false, bool f32w = false) {
-    const RadKernelInfo* rf = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
+                              bool i8 = false, bool f32w = false, bool had = false) {
+    /* `had`: the rotated row, against the pair writing `o` and had_quant_act_i8g over it. */
+    if (had) i8 = true;
+    const RadKernelInfo* rf = find(pl, had ? "gdn_conv_recurrent_update_had_k128_v128_bf16"
+                                           : "gdn_conv_recurrent_update_k128_v128_bf16");
     const RadKernelInfo* rc = find(pl, "gdn_conv_update_w4_h128_bf16");
     const RadKernelInfo* rr = find(pl, "gdn_recurrent_update_k128_v128_bf16_fp32state");
-    if (!rf || !rc || !rr) { ok(nm, false, "a row is absent"); return; }
+    const RadKernelInfo* rh = had ? find(pl, "had_quant_act_i8g") : nullptr;
+    if (!rf || !rc || !rr || (had && !rh)) { ok(nm, false, "a row is absent"); return; }
 
     const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 4, W = 4, MQ = 4, SL = W - 2 + MQ;
     const int64_t conv_dim = (2 * Hg * K + H * V), in_w = conv_dim + H * V;
@@ -4553,15 +4558,24 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
         int e = run(rc, { tx, tw, none, cs(0), tci, tna, tcu, tq, tk, tv }, pc);
         if (e == RAD_OK)
             e = run(rr, { tq, tk, tv, ta, tb, tal, tdt, st(0), tsi, tna, tcu, tz, tnw, to(0),
-                          toq(0), tos(0) }, pr);
+                          had ? none : toq(0), had ? none : tos(0) }, pr);
+        if (e == RAD_OK && had) {
+            std::vector<RadParam> ph = { PI("M", Td), PI("n", H * V), PI("group", 128), PS("dtype", "bf16") };
+            e = run(rh, { T(d_o[0], RAD_BF16, { Td, H * V }), toq(0), tos(0) }, ph);
+        }
         if (e != RAD_OK) { why = "pair rc=" + std::to_string(e); break; }
         e = run(rf, { tx, tfw, none, cs(1), tci, ta, tb, tal, tdt, st(1), tsi, tna, tcu, tz, tnw,
                       to(1), toq(1), tos(1) }, pf);
         if (e != RAD_OK) { why = "fold rc=" + std::to_string(e); break; }
 
+        /* had_quant_act_i8g also quantises the padded last sequence's row, which the fold skips
+         * (a zero row, scale 1 against unwritten 0): the codes over the real sequences' tokens. */
+        const size_t real = (size_t)cu[(size_t)N - 1];
         const struct { const char* what; void* a; void* b; size_t n; } cmp[] = {
-            { "o", d_o[0], d_o[1], o_b }, { "o_q", d_oq[0], d_oq[1], oq_b },
-            { "o_scale", d_os[0], d_os[1], os_b }, { "state", d_st[0], d_st[1], st_b },
+            { "o", d_o[0], d_o[1], o_b },
+            { "o_q", d_oq[0], d_oq[1], had ? real * (size_t)(H * V) : oq_b },
+            { "o_scale", d_os[0], d_os[1], had ? real * (size_t)H * 4 : os_b },
+            { "state", d_st[0], d_st[1], st_b },
             { "conv_state", d_cs[0], d_cs[1], cs_b },
         };
         for (const auto& c : cmp) {
@@ -4576,7 +4590,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
         }
         /* At int8 codes, the real sequences' tokens (all but the padded last) against
          * quant_act_i8g over the pair's `o`. A (token, head) row is one group. */
-        if (i8 && why.empty()) {
+        if (i8 && !had && why.empty()) {
             const std::vector<uint8_t> O = fetch(d_o[0], o_b), Q = fetch(d_oq[0], oq_b),
                                        S = fetch(d_os[0], os_b);
             const int64_t rows = (int64_t)cu[(size_t)N - 1] * H;
@@ -4611,6 +4625,12 @@ static void gdn_conv_fold(const Plugin& pl) {
                           "per_candidate", true);
     }
     if (sel(row) || sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
+    if (sel(row) || sel("gdn_conv_recurrent_update_had")) {
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had is byte-identical to the pair then "
+                              "had_quant_act_i8g, per_candidate", "per_candidate", true, false, true);
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had is byte-identical to the pair then "
+                              "had_quant_act_i8g, anchor", "anchor", true, false, true);
+    }
     if (sel(row) || sel(nmf)) gdn_conv_fold_run(pl, nmf, "per_candidate", false, true);
 }
 
@@ -6816,10 +6836,11 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     std::vector<uint16_t> y((size_t)(M * N)), yr((size_t)(M * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
     st_memcpy(yr.data(), d_yr, yr.size() * 2, hipMemcpyDeviceToHost);
-    /* M <= 8 is the GEMV, which folds per lane before summing across lanes: the product within
-     * f32 rounding, so bf16 outputs a rounding apart. Above, the int8 tiles' bytes. */
+    /* M <= 16 is the GEMV or the 16-token tile, which sum per wave before summing across waves:
+     * the product within f32 rounding, so bf16 outputs a rounding apart. Above, the int8 tiles'
+     * bytes. */
     /* kRowF32 scales its sums in the epilogue, not a block at a time: to a rounding too. */
-    const bool exact = M > 8 && !f.rowf;
+    const bool exact = M > 16 && !f.rowf;
     /* An output's rounding is bounded by its sum's magnitude, not its own: a row that cancels to
      * near zero keeps the error of its terms. The bound is a bf16 step of the output plus 2^-8 of
      * the outputs' rms. */
@@ -14750,6 +14771,214 @@ static void iqr_head_case(const Plugin& pl, int TB, int64_t N, int64_t K, int64_
     dfree_all();
 }
 
+/* logits_gemm_vocab_iqr against the f64 product it computes: each class a computed trellis
+ * (tcq_code=mad, runs of 256 rows, one f32 scale a row under a factor a 128-K block, fwht128) of
+ * random codes, its rows' vocabulary ids a random permutation of the rank's share (`off` = the
+ * share for a second rank's, whose rows are the second half of each class's tensor), the activation
+ * random bf16, at token counts on both sides of the staging plane's 32. The reference rotates the activation in
+ * f32 and quantises it to sixteen bits a (token, 128) as the kernel does, then multiplies the
+ * host's decode of every class in f64: the kernel's f32 folds keep the logits within 2^-18 of their
+ * rms. Every logit must be written once: the output starts as NaN. The classes' planes also go back
+ * through the hooks' inverse. */
+struct VocabClass { int B; int64_t rows; };
+
+static void vocab_head_case(const Plugin& pl, const std::vector<VocabClass>& cls, int64_t M,
+                            int64_t K, int64_t off) {
+    const char* row = "logits_gemm_vocab_iqr";
+    if (!sel(row)) return;
+    int64_t V = 0;
+    std::string ws;
+    for (const auto& c : cls) { V += c.rows; ws += (ws.empty() ? "" : ",") + std::to_string(c.B) + "x" + std::to_string(c.rows); }
+    char nm[200];
+    std::snprintf(nm, sizeof nm, "%s classes %s K=%lld M=%lld off=%lld", row, ws.c_str(),
+                  (long long)K, (long long)M, (long long)off);
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || !r->relayout || !r->scratch) { ok(nm, false, "row or hooks absent"); return; }
+    const int64_t nkb = K / 128;
+    uint64_t z = 0x9E3779B97F4A7C15ull * (uint64_t)(V + M * 7 + K + off);
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7 };
+    std::vector<int32_t> perm((size_t)V);
+    for (int64_t i = 0; i < V; ++i) perm[(size_t)i] = (int32_t)i;
+    for (int64_t i = V - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[(size_t)(rnd() % (uint64_t)(i + 1))]);
+
+    std::vector<RadParam> gp = { PI("M", M), PI("n_vocab", V), PI("n_embd", K), PS("dtype", "bf16"),
+                                 PI("vocab_offset", off) };
+    static const char* kRows[] = { "rows0", "rows1", "rows2", "rows3" };
+    for (size_t i = 0; i < cls.size(); ++i) gp.push_back(PI(kRows[i], cls[i].rows));
+
+    /* the decoded head in vocabulary order, f64 */
+    std::vector<double> Wd((size_t)(V * K));
+    std::vector<RadTensor> ts(1 + 3 * 4 + 2);
+    std::vector<std::vector<uint8_t>> keep;
+    /* the inverse map: each id's class width and its row in the class's whole tensor, this rank
+     * being the second of a share `off` (the classes' tensors then twice its rows) when off > 0 */
+    const int64_t rank = off > 0 ? 1 : 0;
+    std::vector<int32_t> vrow((size_t)V, -1);
+    int64_t base = 0;
+    for (size_t ci = 0; ci < cls.size(); ++ci) {
+        const VocabClass& vc = cls[ci];
+        const int64_t N = vc.rows;
+        Planes p;
+        rad_enc_clear(&p.enc);
+        rad_enc_copy_str(p.enc.scheme, "trellis");
+        rad_enc_add_plane(&p.enc, "codes", kU[vc.B], 1, 1);
+        rad_enc_add_plane(&p.enc, "scale", RAD_F32, 1, 0);
+        const int t = rad_enc_add_table(&p.enc, "trellis", RAD_I8, (int64_t)1 << 16, 1);
+        p.enc.plane[t].block[0] = 256;
+        p.enc.plane[t].block[1] = 0;
+        rad_enc_add_table(&p.enc, "trellis.mad", RAD_U32, 2, 1);
+        rad_enc_add_plane(&p.enc, "scale.col", RAD_F32, 0, 128);
+        rad_enc_copy_str(p.enc.transform, "fwht128");
+        p.size(N, K);
+        const int ic = p.find("codes"), is = p.find("scale"), ia = p.find("trellis");
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t c = 0; c < K; ++c)
+                rad_store_bits(p.data[(size_t)ic].data() + n * p.row_bytes(ic), vc.B, c,
+                               (uint32_t)(rnd() & ((1ull << vc.B) - 1)));
+        const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+        uint32_t* ab = (uint32_t*)p.data[(size_t)p.find("trellis.mad")].data();
+        ab[0] = A;
+        ab[1] = Bc;
+        for (uint32_t st = 0; st < (1u << 16); ++st) {
+            const uint32_t h = ((st & 0xFFFFFFu) * A + Bc) & 0x3F3F3F3Fu;
+            p.data[(size_t)ia][st] = (uint8_t)(int8_t)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) +
+                                                             ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+        }
+        std::vector<float> rs((size_t)N), cf((size_t)nkb);
+        for (int64_t n = 0; n < N; ++n) rs[(size_t)n] = std::ldexp(1.0f + (float)(rnd() % 1000) / 1000.0f, -9 - (int)(rnd() % 3));
+        for (int64_t g = 0; g < nkb; ++g) cf[(size_t)g] = 0.5f + (float)(rnd() % 1000) / 1000.0f;
+        for (int64_t n = 0; n < N; ++n) ((float*)p.data[(size_t)is].data())[n] = rs[(size_t)n];
+        for (int64_t g = 0; g < nkb; ++g) ((float*)p.data[(size_t)p.find("scale.col")].data())[g] = cf[(size_t)g];
+        const int C = (16 + vc.B - 1) / vc.B;
+        const int8_t* aux = (const int8_t*)p.data[(size_t)ia].data();
+        for (int64_t n = 0; n < N; ++n) {
+            const int64_t id = perm[(size_t)(base + n)];
+            for (int64_t k = 0; k < K; ++k) {
+                uint32_t st = 0;
+                for (int q = C - 1; q >= 0; --q) {
+                    const int64_t rr = n / 256 * 256 + (n % 256 - q + 256) % 256;
+                    st = ((st << vc.B) | rad_load_bits(p.data[(size_t)ic].data() + rr * p.row_bytes(ic), vc.B, k)) & 0xFFFFu;
+                }
+                Wd[(size_t)(id * K + k)] = (double)aux[st] * rs[(size_t)n] * cf[(size_t)(k / 128)];
+            }
+        }
+        const int op = 1 + 3 * (int)ci;
+        std::vector<uint8_t> wq, wsc;
+        RadLayout lw, ls;
+        const int rw = stored(r, gp, op, p, { "codes", "trellis", "trellis.mad" }, &wq, &lw);
+        const int rsc = stored(r, gp, op + 1, p, { "scale", "scale.col" }, &wsc, &ls);
+        if (rw != RAD_OK || rsc != RAD_OK) {
+            ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rsc));
+            return;
+        }
+        std::string why;
+        const bool back = restores(r, gp, op, p, { "codes", "trellis", "trellis.mad" }, wq, &why) &&
+                          restores(r, gp, op + 1, p, { "scale", "scale.col" }, wsc, &why);
+        ok((std::string(nm) + ": class " + std::to_string(ci) + "'s planes invert").c_str(), back, why);
+        ok((std::string(nm) + ": class " + std::to_string(ci) + " holds its codes' bits").c_str(),
+           lw.bytes <= N * K * vc.B / 8 + ((int64_t)1 << 16) + 1024,
+           std::to_string(lw.bytes) + " B for " + std::to_string(N * K * vc.B / 8) + " B of codes");
+        std::vector<int32_t> ids((size_t)N);
+        for (int64_t n = 0; n < N; ++n) {
+            ids[(size_t)n] = perm[(size_t)(base + n)] + (int32_t)off;
+            vrow[(size_t)perm[(size_t)(base + n)]] = (int32_t)((uint32_t)vc.B << 28) | (int32_t)(n + rank * N);
+        }
+        void* d_w = dalloc(wq.size());
+        void* d_s = dalloc(wsc.size());
+        void* d_r = dalloc(ids.size() * 4);
+        if (!d_w || !d_s || !d_r) { ok(nm, false, "hipMalloc failed"); return; }
+        st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_s, wsc.data(), wsc.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_r, ids.data(), ids.size() * 4, hipMemcpyHostToDevice);
+        ts[(size_t)op] = T(d_w, lw.dtype, { N, K });
+        ts[(size_t)op + 1] = T(d_s, ls.dtype, { N, nkb });
+        ts[(size_t)op + 2] = T(d_r, RAD_I32, { N });
+        base += N;
+    }
+    for (size_t ci = cls.size(); ci < 4; ++ci)
+        for (int j = 0; j < 3; ++j) {
+            ts[1 + 3 * ci + (size_t)j] = T(nullptr, RAD_U8, { 1 });
+            absent(ts[1 + 3 * ci + (size_t)j]);
+        }
+    void* d_m = dalloc(vrow.size() * 4);
+    if (!d_m) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_m, vrow.data(), vrow.size() * 4, hipMemcpyHostToDevice);
+    ts[13] = T(d_m, RAD_I32, { V, 1 });
+
+    std::vector<uint16_t> hx((size_t)(M * K));
+    for (auto& v : hx) v = h_to_bf16((float)((double)(int64_t)(rnd() % 20001 - 10000) / 4000.0));
+    /* The activation as the kernel holds it: rotated in f32 (h_fwht's butterflies are
+     * r4d_fwht_wave's, in its order), then q = rint(x * 16256 / amax) a (token, 128) under the
+     * scale amax / 16256. */
+    std::vector<double> xr((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t g = 0; g < nkb; ++g) {
+            float v[128];
+            for (int j = 0; j < 128; ++j) v[j] = h_bf16(hx[(size_t)(m * K + g * 128 + j)]);
+            h_fwht(v, 128);
+            float a = 0.0f;
+            for (int j = 0; j < 128; ++j) a = std::max(a, std::fabs(v[j]));
+            const float inv = a > 0.0f ? 16256.0f / a : 0.0f, sc = a / 16256.0f;
+            for (int j = 0; j < 128; ++j) {
+                const float q = std::fmin(std::fmax(rintf(v[j] * inv), -16256.0f), 16256.0f);
+                xr[(size_t)(m * K + g * 128 + j)] = (double)q * (double)sc;
+            }
+        }
+    std::vector<double> ref((size_t)(M * V));
+    double r2 = 0.0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t v = 0; v < V; ++v) {
+            double s = 0.0;
+            for (int64_t k = 0; k < K; ++k) s += Wd[(size_t)(v * K + k)] * xr[(size_t)(m * K + k)];
+            ref[(size_t)(m * V + v)] = s;
+            r2 += s * s;
+        }
+    const double rms = std::sqrt(r2 / (double)(M * V));
+
+    void* d_x = dalloc(hx.size() * 2);
+    void* d_y = dalloc((size_t)(M * V) * 4);
+    if (!d_x || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+    std::vector<float> nan((size_t)(M * V), std::nanf(""));
+    st_memcpy(d_y, nan.data(), nan.size() * 4, hipMemcpyHostToDevice);
+    ts[0] = T(d_x, RAD_BF16, { M, K });
+    ts[14] = T(d_y, RAD_F32, { M, V });
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = gp.data(); a.n_p = (int)gp.size();
+    a.world_size = 1;
+    const int64_t need = r->scratch(&a);
+    if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    const int rc = r->launch(&a, (RadStream) nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc " + std::to_string(rc)); dfree_all(); return; }
+    std::vector<float> y((size_t)(M * V));
+    st_memcpy(y.data(), d_y, y.size() * 4, hipMemcpyDeviceToHost);
+    int64_t bad = 0, first = -1, unset = 0;
+    double e2 = 0.0;
+    for (size_t i = 0; i < y.size(); ++i) {
+        if (std::isnan(y[i])) { ++unset; if (first < 0) first = (int64_t)i; continue; }
+        const double d = (double)y[i] - ref[i];
+        e2 += d * d;
+        if (!(std::fabs(d) <= std::ldexp(rms, -18))) { if (first < 0) first = (int64_t)i; ++bad; }
+    }
+    const double rel = std::sqrt(e2 / (r2 > 0 ? r2 : 1.0));
+    ok(nm, bad == 0 && unset == 0,
+       bad || unset ? std::to_string(bad) + " off, " + std::to_string(unset) + " unwritten of " +
+                          std::to_string(y.size()) + ", first [" + std::to_string(first / V) + "][" +
+                          std::to_string(first % V) + "] " + std::to_string(y[(size_t)first]) + " vs " +
+                          std::to_string(ref[(size_t)first]) + ", rms " + std::to_string(rms)
+                    : "rel_l2 " + std::to_string(rel));
+    dfree_all();
+}
+
 /* embed_lookup_iqr against the table its forms stood for when libr4d widened them to bf16 at
  * load: each value the form's int8 times its row's bf16 scale in f32, the fwht128 rotation undone
  * in libquant's butterfly order, rounded to bf16 to nearest even, then times `mult` with one
@@ -14764,7 +14993,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
                   (double)mult);
     const RadKernelInfo* r = find(pl, "embed_lookup_iqr");
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
-    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6 };
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7, RAD_U8 };
     const int64_t nkb = dim / 128;
     uint64_t z = 0xABCDEFull * (uint64_t)(f.kind * 31 + f.B + f.rot);
     auto rnd = [&]() {
@@ -14786,7 +15015,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
     } else {
         p.enc = rad_enc_affine(kU[f.B], RAD_BF16, 1, 128);
         if (f.kind == 3) rad_enc_add_table(&p.enc, "table", RAD_I8, 1, (int64_t)1 << f.B);
-        else rad_enc_add_plane(&p.enc, "zero", RAD_U6, 1, 128);
+        else rad_enc_add_plane(&p.enc, "zero", f.B == 8 ? RAD_U8 : f.B == 7 ? RAD_U7 : RAD_U6, 1, 128);
     }
     if (f.rot) rad_enc_copy_str(p.enc.transform, "fwht128");
     p.size(rows, dim);
@@ -14799,7 +15028,8 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
     if (f.kind == 2)
         for (int64_t n = 0; n < rows; ++n)
             for (int64_t g = 0; g < nkb; ++g)
-                rad_store_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), 6, g, (uint32_t)(24 + rnd() % 17));
+                rad_store_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), std::max(f.B, 6), g,
+                               (uint32_t)((1 << (std::max(f.B, 6) - 1)) - 8 + rnd() % 17));
     else
         for (auto& v : p.data[(size_t)ia]) v = (uint8_t)(int8_t)((int)(rnd() % 255) - 127);
     for (int64_t i = 0; i < rows * nkb; ++i) {
@@ -14827,7 +15057,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
         for (int64_t k = 0; k < dim; ++k) {
             int q;
             if (f.kind == 3) q = ((const int8_t*)p.data[(size_t)ia].data())[code(n, k)];
-            else if (f.kind == 2) q = (int)code(n, k) - (int)rad_load_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), 6, k / 128);
+            else if (f.kind == 2) q = (int)code(n, k) - (int)rad_load_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), std::max(f.B, 6), k / 128);
             else {
                 uint32_t st = 0;
                 for (int qq = C - 1; qq >= 0; --qq) {
@@ -15927,6 +16157,14 @@ static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> 
         const int64_t need = r->scratch(&a);
         if (need < 0) { std::printf("  %-22s scratch %lld\n", name, (long long)need); return; }
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        /* R4D_PERF_RAND_SCRATCH: random scratch bytes, so a variant that skips writing its
+         * scratch still multiplies operands of real entropy (WMMA power tracks the data) */
+        if (need > 0 && std::getenv("R4D_PERF_RAND_SCRATCH")) {
+            std::vector<uint8_t> h((size_t)need);
+            uint64_t z = 0x2545F4914F6CDD1Dull;
+            for (auto& v : h) { z ^= z << 13; z ^= z >> 7; z ^= z << 17; v = (uint8_t)z; }
+            st_memcpy(a.scratch, h.data(), h.size(), hipMemcpyHostToDevice);
+        }
     }
 
     /* One warm launch, which also checks the row serves this shape; a refusal is reported, not
@@ -16038,6 +16276,312 @@ static void mx_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
     }
 }
 
+
+/* gate_had_quant_i8g against gate_quant_fp8's bf16 product and had_quant_act_i8g over it, byte for
+ * byte: the codes, the scales and the product. The gate is a column view of a [q|gate] row (pitch
+ * 2n), as a gated attention lays it out; M rows of n, each a (token, head). */
+static void gate_had_case(const Plugin& pl, int64_t M, int64_t n) {
+    if (!sel("gate_had_quant_i8g")) return;
+    char nm[120];
+    std::snprintf(nm, sizeof nm, "gate_had_quant_i8g is gate_quant_fp8 then had_quant_act_i8g, M=%lld n=%lld",
+                  (long long)M, (long long)n);
+    const RadKernelInfo* rh = find(pl, "gate_had_quant_i8g");
+    const RadKernelInfo* rg = find(pl, "gate_quant_fp8");
+    const RadKernelInfo* rq = find(pl, "had_quant_act_i8g");
+    if (!rh || !rg || !rq) { ok(nm, false, "rows absent"); return; }
+    uint32_t z = 0x1234567u + (uint32_t)(M * 7 + n);
+    auto rnd = [&](float span) {
+        z = z * 1664525u + 1013904223u;
+        return ((float)(z >> 8) / 16777216.0f * 2.0f - 1.0f) * span;
+    };
+    std::vector<uint16_t> hg((size_t)(M * 2 * n)), hx((size_t)(M * n));
+    for (auto& v : hg) v = h_to_bf16(rnd(6.0f));
+    for (auto& v : hx) v = h_to_bf16(rnd(3.0f));
+    void* d_g = dalloc(hg.size() * 2);
+    void* d_x = dalloc(hx.size() * 2);
+    void* d_q = dalloc((size_t)(M * n));
+    void* d_s = dalloc((size_t)(M * (n / 128)) * 4);
+    void* d_y = dalloc((size_t)(M * n) * 2);
+    void* d_q2 = dalloc((size_t)(M * n));
+    void* d_s2 = dalloc((size_t)(M * (n / 128)) * 4);
+    void* d_y2 = dalloc((size_t)(M * n) * 2);
+    void* d_f8 = dalloc((size_t)(M * n));
+    void* d_f8s = dalloc((size_t)(M * (n / 128)) * 4);
+    if (!d_g || !d_x || !d_q || !d_s || !d_y || !d_q2 || !d_s2 || !d_y2 || !d_f8 || !d_f8s) {
+        ok(nm, false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_g, hg.data(), hg.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+    RadTensor gate = T((uint8_t*)d_g + n * 2, RAD_BF16, { M, n });
+    gate.stride[0] = 2 * n;
+    auto run = [&](const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int rc = r->launch(&a, (RadStream) nullptr);
+        return rc != RAD_OK ? rc : (st_stream_sync(nullptr) != hipSuccess ? -1000 : RAD_OK);
+    };
+    const std::vector<RadParam> pg = { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"),
+                                       PS("act", "sigmoid") };
+    int e = run(rh, { gate, T(d_x, RAD_BF16, { M, n }), T(d_q, RAD_I8, { M, n }),
+                      T(d_s, RAD_F32, { M, n / 128 }), T(d_y, RAD_BF16, { M, n }) }, pg);
+    if (e == RAD_OK)
+        e = run(rg, { gate, T(d_x, RAD_BF16, { M, n }), T(d_f8, RAD_F8E4M3, { M, n }),
+                      T(d_f8s, RAD_F32, { M, n / 128 }), T(d_y2, RAD_BF16, { M, n }) }, pg);
+    if (e == RAD_OK)
+        e = run(rq, { T(d_y2, RAD_BF16, { M, n }), T(d_q2, RAD_I8, { M, n }), T(d_s2, RAD_F32, { M, n / 128 }) },
+                { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16") });
+    if (e != RAD_OK) { ok(nm, false, "rc " + std::to_string(e)); return; }
+    auto fetch = [](void* d, size_t b) {
+        std::vector<uint8_t> h(b);
+        st_memcpy(h.data(), d, b, hipMemcpyDeviceToHost);
+        return h;
+    };
+    const bool same = fetch(d_q, (size_t)(M * n)) == fetch(d_q2, (size_t)(M * n)) &&
+                      fetch(d_s, (size_t)(M * (n / 128)) * 4) == fetch(d_s2, (size_t)(M * (n / 128)) * 4) &&
+                      fetch(d_y, (size_t)(M * n) * 2) == fetch(d_y2, (size_t)(M * n) * 2);
+    ok(nm, same, same ? "" : "codes, scales or product differ");
+}
+
+/* The V4 trunk's IQR planes for an [N, K] weight: a 2^16-state computed trellis of B-bit codes in
+ * 256-row runs, one f32 scale a row (each its own, 7 significant bits), a power of two a 128-K block,
+ * fwht128; random codes from `z`. */
+static Planes iqr_v4_planes(int64_t N, int64_t K, int B, uint64_t z, bool bf16s = false) {
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7, RAD_U8 };
+    constexpr int L = 16;
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "trellis");
+    rad_enc_add_plane(&p.enc, "codes", kU[B], 1, 1);
+    if (bf16s) rad_enc_add_plane(&p.enc, "scale", RAD_BF16, 1, 128);
+    else rad_enc_add_plane(&p.enc, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&p.enc, "trellis", RAD_I8, (int64_t)1 << L, 1);
+    p.enc.plane[t].block[0] = 256;
+    p.enc.plane[t].block[1] = 0;
+    rad_enc_add_table(&p.enc, "trellis.mad", RAD_U32, 2, 1);
+    if (!bf16s) rad_enc_add_plane(&p.enc, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(p.enc.transform, "fwht128");
+    p.size(N, K);
+    for (auto& v : p.data[(size_t)p.find("codes")]) v = (uint8_t)rnd();
+    const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+    uint32_t* ab = (uint32_t*)p.data[(size_t)p.find("trellis.mad")].data();
+    ab[0] = A;
+    ab[1] = Bc;
+    uint8_t* tab = p.data[(size_t)t].data();
+    for (uint32_t st = 0; st < (1u << L); ++st) {
+        const uint32_t h = ((st & 0xFFFFFFu) * A + Bc) & 0x3F3F3F3Fu;
+        tab[st] = (uint8_t)(int8_t)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+    }
+    if (bf16s) {
+        for (int64_t i = 0; i < N * (K / 128); ++i)
+            rad_store_f32(p.data[(size_t)p.find("scale")].data(), RAD_BF16, i,
+                          std::ldexp(1.0f + (float)(rnd() % 64) / 64.0f, -9 - (int)(rnd() % 4)));
+    } else {
+        for (int64_t n = 0; n < N; ++n)
+            ((float*)p.data[(size_t)p.find("scale")].data())[n] =
+                std::ldexp(1.0f + (float)(rnd() % 64) / 64.0f, -9 - (int)(rnd() % 4));
+        for (int64_t g = 0; g < K / 128; ++g)
+            ((float*)p.data[(size_t)p.find("scale.col")].data())[g] = std::ldexp(1.0f, (int)(rnd() % 4) - 1);
+    }
+    return p;
+}
+
+/* gemm_iqr_gated against its chain, gemm_iqr_nt_m64 then gated_had_quant_i8g, byte for byte: the
+ * codes, the scales and the bf16 product, on the V4 trunk's form; and the gated row stores the
+ * weight as the GEMM row does, so the two read one copy. */
+static void iqr_gated_case(const Plugin& pl, int B, int64_t M, int64_t n, int64_t K) {
+    if (!sel("gemm_iqr_gated") && !sel("gemm_iqr")) return;
+    const int64_t N = 2 * n, nkb = K / 128;
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "gemm_iqr_gated trellis-mad B=%d row-f32 M=%lld n=%lld K=%lld", B,
+                  (long long)M, (long long)n, (long long)K);
+    const RadKernelInfo* rg = find(pl, "gemm_iqr_gated");
+    const RadKernelInfo* rm = find(pl, "gemm_iqr_nt_m64");
+    const RadKernelInfo* rq = find(pl, "gated_had_quant_i8g");
+    if (!rg || !rm || !rq) { ok(nm, false, "rows absent"); return; }
+    Planes p = iqr_v4_planes(N, K, B, 0x6A7ED00Du + (uint64_t)(B * 97 + M));
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h") };
+    std::vector<uint8_t> wq, wsc, wq2, wsc2;
+    RadLayout lw, ls;
+    if (stored(rg, lp, 2, p, { "codes", "trellis", "trellis.mad" }, &wq, &lw) != RAD_OK ||
+        stored(rg, lp, 3, p, { "scale", "scale.col" }, &wsc, &ls) != RAD_OK ||
+        stored(rm, lp, 2, p, { "codes", "trellis", "trellis.mad" }, &wq2) != RAD_OK ||
+        stored(rm, lp, 3, p, { "scale", "scale.col" }, &wsc2) != RAD_OK) {
+        ok(nm, false, "relayout refused");
+        return;
+    }
+    ok((std::string(nm) + ": the weight stored as gemm_iqr_nt_m64 stores it").c_str(), wq == wq2 && wsc == wsc2);
+    uint64_t z = 0xA5A5F00Du + (uint64_t)M;
+    auto rnd = [&]() { z ^= z << 13; z ^= z >> 7; z ^= z << 17; return z; };
+    std::vector<int8_t> ha((size_t)(M * K));
+    std::vector<float> has((size_t)(M * nkb));
+    for (auto& v : ha) v = (int8_t)((int)(rnd() % 255) - 127);
+    for (auto& v : has) v = std::ldexp(1.0f + (float)(rnd() % 256) / 256.0f, -5);
+    void* d_a = dalloc(ha.size());
+    void* d_as = dalloc(has.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_s = dalloc(wsc.size());
+    void* d_q = dalloc((size_t)(M * n));
+    void* d_sc = dalloc((size_t)(M * (n / 128)) * 4);
+    void* d_yb = dalloc((size_t)(M * n) * 2);
+    void* d_y = dalloc((size_t)(M * N) * 2);
+    void* d_q2 = dalloc((size_t)(M * n));
+    void* d_sc2 = dalloc((size_t)(M * (n / 128)) * 4);
+    void* d_yb2 = dalloc((size_t)(M * n) * 2);
+    if (!d_a || !d_as || !d_w || !d_s || !d_q || !d_sc || !d_yb || !d_y || !d_q2 || !d_sc2 || !d_yb2) {
+        ok(nm, false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, wsc.data(), wsc.size(), hipMemcpyHostToDevice);
+    auto launch = [&](const RadKernelInfo* k, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (k->scratch) {
+            const int64_t need = k->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = k->launch(&a, (RadStream) nullptr);
+        return rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess ? RAD_OK : (rc ? rc : -1);
+    };
+    const RadTensor tw = T(d_w, lw.dtype, { N, K }), ts = T(d_s, ls.dtype, { N, nkb });
+    int r1 = RAD_OK;
+    /* Twice: the second call finds the group counters the first left at zero. */
+    for (int rep = 0; rep < 2 && r1 == RAD_OK; ++rep)
+        r1 = launch(rg, { T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, nkb }), tw, ts,
+                          T(d_q, RAD_I8, { M, n }), T(d_sc, RAD_F32, { M, n / 128 }),
+                          T(d_yb, RAD_BF16, { M, n }) },
+                    { PI("M", M), PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h"),
+                      PS("act", "silu") });
+    std::vector<RadTensor> tm = { T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, nkb }), tw, ts,
+                                  T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }),
+                                  T(nullptr, RAD_U8, { 1 }) };
+    absent(tm[5]); absent(tm[6]);
+    const int r2 = launch(rm, tm, { PI("M", M), PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h") });
+    const int r3 = r2 == RAD_OK
+        ? launch(rq, { T(d_y, RAD_BF16, { M, N }), T(d_q2, RAD_I8, { M, n }),
+                       T(d_sc2, RAD_F32, { M, n / 128 }), T(d_yb2, RAD_BF16, { M, n }) },
+                 { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") })
+        : r2;
+    if (r1 != RAD_OK || r3 != RAD_OK) {
+        ok(nm, false, "rc " + std::to_string(r1) + " (chain " + std::to_string(r3) + ")");
+        return;
+    }
+    std::vector<uint8_t> q((size_t)(M * n)), q2(q.size()), sc((size_t)(M * (n / 128)) * 4), sc2(sc.size()),
+        yb((size_t)(M * n) * 2), yb2(yb.size());
+    st_memcpy(q.data(), d_q, q.size(), hipMemcpyDeviceToHost);
+    st_memcpy(q2.data(), d_q2, q2.size(), hipMemcpyDeviceToHost);
+    st_memcpy(sc.data(), d_sc, sc.size(), hipMemcpyDeviceToHost);
+    st_memcpy(sc2.data(), d_sc2, sc2.size(), hipMemcpyDeviceToHost);
+    st_memcpy(yb.data(), d_yb, yb.size(), hipMemcpyDeviceToHost);
+    st_memcpy(yb2.data(), d_yb2, yb2.size(), hipMemcpyDeviceToHost);
+    size_t dq = 0, ds = 0, dy = 0;
+    for (size_t i = 0; i < q.size(); ++i) dq += q[i] != q2[i];
+    for (size_t i = 0; i < sc.size(); i += 4) ds += std::memcmp(&sc[i], &sc2[i], 4) != 0;
+    for (size_t i = 0; i < yb.size(); i += 2) dy += std::memcmp(&yb[i], &yb2[i], 2) != 0;
+    char d[160];
+    std::snprintf(d, sizeof d, "%zu codes, %zu scales, %zu products differ", dq, ds, dy);
+    ok(nm, dq == 0 && ds == 0 && dy == 0, d);
+}
+
+/* --perfiqr: the IQR row at one shape over the V4 trunk's form (a 2^16-state computed trellis of
+ * B-bit codes in 256-row runs, one f32 scale a row, fwht128) with random codes, the weight streamed
+ * from DRAM (rotated copies), then the MXFP4 rows at the same shape (--perfmxd). Timing only. */
+static void iqr_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int B, int iters) {
+    /* B >= 10: the head-fed form (V4's v4h grids), B - 10 bits under a bf16 scale a (row, 128). */
+    const bool bf16s = B >= 10;
+    if (bf16s) B -= 10;
+    if (N % 256 || K % 256 || M < 1 || B < 2 || B > 8) {
+        std::printf("--perfiqr: N and K multiples of 256, M >= 1, 2 <= B <= 8 (+10: bf16 scales)\n");
+        return;
+    }
+    const char* row = M <= 64 ? "gemm_iqr_nt_m64" : "gemm_iqr_tiled";
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || !r->relayout) { std::printf("  %-22s row or hooks absent\n", row); return; }
+    const int64_t nkb = K / 128;
+    uint64_t z = 0x51ED2701u + (uint64_t)B;
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    Planes p = iqr_v4_planes(N, K, B, z, bf16s);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h") };
+    std::vector<uint8_t> wq, wsc;
+    RadLayout lw, ls;
+    if (stored(r, lp, 2, p, { "codes", "trellis", "trellis.mad" }, &wq, &lw) != RAD_OK ||
+        (bf16s ? stored(r, lp, 3, p, { "scale" }, &wsc, &ls)
+               : stored(r, lp, 3, p, { "scale", "scale.col" }, &wsc, &ls)) != RAD_OK) {
+        std::printf("  %-22s relayout refused\n", row);
+        return;
+    }
+    std::vector<int8_t> ha((size_t)(M * K));
+    std::vector<float> has((size_t)(M * nkb));
+    for (auto& v : ha) v = (int8_t)((int)(rnd() % 255) - 127);
+    for (auto& v : has) v = std::ldexp(1.0f + (float)(rnd() % 256) / 256.0f, -7);
+    const int copies = (int)std::max<int64_t>(2, (256ll << 20) / (int64_t)wq.size() + 1);
+    void* d_a = dalloc(ha.size());
+    void* d_as = dalloc(has.size() * 4);
+    void* d_w = dalloc(wq.size() * (size_t)copies);
+    void* d_s = dalloc(wsc.size());
+    void* d_y = dalloc((size_t)(M * N) * 2);
+    if (!d_a || !d_as || !d_w || !d_s || !d_y) { std::printf("  %-22s hipMalloc failed\n", row); return; }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+    for (int c = 0; c < copies; ++c)
+        st_memcpy((uint8_t*)d_w + (size_t)c * wq.size(), wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, wsc.data(), wsc.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> tq = {
+        T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, nkb }), T(d_w, lw.dtype, { N, K }),
+        T(d_s, ls.dtype, { N, nkb }), T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }),
+        T(nullptr, RAD_U8, { 1 }),
+    };
+    absent(tq[5]); absent(tq[6]);
+    std::vector<RadParam> gp = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h") };
+    char nm[64];
+    std::snprintf(nm, sizeof nm, "iqr k%d%s %s", B, bf16s ? "h" : "", M <= 64 ? "m64" : "tiled");
+    std::printf("\nN=%lld K=%lld M=%lld\n", (long long)N, (long long)K, (long long)M);
+    perf_row(pl, row, tq, gp, d_w, wq.size(), copies, (double)(wq.size() + wsc.size()), iters, 2, nm);
+    /* At a gate_up shape to 16 tokens: the gated fold, and the quantiser it replaces. */
+    if (N % 256 == 0 && M <= 16) {
+        const int64_t n = N / 2;
+        void* d_q = dalloc((size_t)(M * n));
+        void* d_sc = dalloc((size_t)(M * (n / 128)) * 4);
+        if (d_q && d_sc) {
+            perf_row(pl, "gemm_iqr_gated",
+                     { T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, nkb }), T(d_w, lw.dtype, { N, K }),
+                       T(d_s, ls.dtype, { N, nkb }), T(d_q, RAD_I8, { M, n }), T(d_sc, RAD_F32, { M, n / 128 }),
+                       T(nullptr, RAD_BF16, {}) },
+                     { PI("M", M), PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h"),
+                       PS("act", "silu") },
+                     d_w, wq.size(), copies, (double)(wq.size() + wsc.size()), iters, 2);
+            RadTensor nob = T(nullptr, RAD_BF16, { M, n });
+            absent(nob);
+            perf_row(pl, "gated_had_quant_i8g",
+                     { T(d_y, RAD_BF16, { M, N }), T(d_q, RAD_I8, { M, n }), T(d_sc, RAD_F32, { M, n / 128 }), nob },
+                     { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") },
+                     d_y, (size_t)(M * N * 2), 1, (double)(M * N * 2), iters, 0);
+        }
+    }
+    dfree_all();
+    mx_perf(pl, N, K, M, iters);
+}
 
 /* ------------------------------------------------------------------ the small ops, timed
  *
@@ -20634,6 +21178,118 @@ static void fp8f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int 
                     bytes / (us * 1e3), flop / (us * 1e6));
         ts[2].data = d_w;
     }
+}
+
+/* The vocabulary-weighted head at one shape against the int8 head (logits_gemm_i8) and the 6-bit
+ * table head (logits_gemm_iqr) over the same rows: `spec` its classes as B:rows,B:rows (a rank's
+ * share), K n_embd, M tokens. Codes and scales are random bytes (the time does not depend on
+ * them), the vocabulary ids a random permutation, ascending within each class as the converter
+ * stores them. GB/s is on each head's stored bytes. */
+static void vocab_perf(const Plugin& pl, const char* spec, int64_t K, int64_t M, int iters) {
+    using namespace r4d_iqr;
+    std::vector<std::pair<int, int64_t>> cls;
+    for (const char* p = spec; *p;) {
+        const int B = (int)std::strtol(p, (char**)&p, 10);
+        if (*p != ':') break;
+        const int64_t n = std::strtoll(p + 1, (char**)&p, 10);
+        cls.emplace_back(B, n);
+        if (*p == ',') ++p;
+    }
+    int64_t N = 0;
+    for (auto& c : cls) N += c.second;
+    if (cls.empty() || cls.size() > 4 || K % 256 || M < 1 || N % 16) {
+        std::printf("--perfvocab: B:rows[,B:rows..] (1-4 classes, rows a multiple of 256) K M\n");
+        return;
+    }
+    const RadKernelInfo* rv = find(pl, "logits_gemm_vocab_iqr");
+    const RadKernelInfo* ri = find(pl, "logits_gemm_i8");
+    const RadKernelInfo* rq = find(pl, "logits_gemm_iqr");
+    if (!rv || !ri || !rq) { std::printf("--perfvocab: rows absent\n"); return; }
+    uint64_t z = 12345;
+    auto fill = [&](void* d, size_t n) {
+        std::vector<uint8_t> h(n);
+        for (auto& b : h) { z = z * 6364136223846793005ull + 1442695040888963407ull; b = (uint8_t)(z >> 56) & 0x3Fu; }
+        st_memcpy(d, h.data(), n, hipMemcpyHostToDevice);
+    };
+    void* d_x = dalloc((size_t)(M * K) * 2);
+    void* d_y = dalloc((size_t)(M * N) * 4);
+    fill(d_x, (size_t)(M * K) * 2);
+    std::vector<RadTensor> ts(15);
+    std::vector<RadParam> gp = { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("dtype", "bf16"),
+                                 PI("vocab_offset", 0) };
+    std::vector<int32_t> vrow((size_t)N);
+    static const char* kRows[] = { "rows0", "rows1", "rows2", "rows3" };
+    std::vector<int32_t> perm((size_t)N);
+    for (int64_t i = 0; i < N; ++i) perm[(size_t)i] = (int32_t)i;
+    for (int64_t i = N - 1; i > 0; --i) {
+        z = z * 6364136223846793005ull + 1442695040888963407ull;
+        std::swap(perm[(size_t)i], perm[(size_t)((z >> 33) % (uint64_t)(i + 1))]);
+    }
+    double vbytes = 0;
+    int64_t base = 0;
+    for (size_t i = 0; i < cls.size(); ++i) {
+        const Form f{ kTrellisMad, (uint32_t)cls[i].first, 0, 16, 0, kRowF32, 8, 0 };
+        const int64_t n = cls[i].second, wb = weight_bytes(f, n, K), sb = scale_bytes(f, n, K);
+        void* d_w = dalloc((size_t)wb);
+        void* d_s = dalloc((size_t)sb);
+        fill(d_w, (size_t)wb);
+        std::vector<float> sc((size_t)(sb / 4), 1e-3f);
+        st_memcpy(d_s, sc.data(), (size_t)sb, hipMemcpyHostToDevice);
+        /* a class's ids ascending, as the converter writes them */
+        std::sort(perm.begin() + base, perm.begin() + base + n);
+        for (int64_t j = 0; j < n; ++j)
+            vrow[(size_t)perm[(size_t)(base + j)]] = (int32_t)((uint32_t)cls[i].first << 28) | (int32_t)j;
+        void* d_r = dalloc((size_t)n * 4);
+        st_memcpy(d_r, perm.data() + base, (size_t)n * 4, hipMemcpyHostToDevice);
+        ts[1 + 3 * i] = T(d_w, R4D_DT_IQR_W | word(f), { n, K });
+        ts[2 + 3 * i] = T(d_s, R4D_DT_IQR_S | word(f), { n, K / 128 });
+        ts[3 + 3 * i] = T(d_r, RAD_I32, { n });
+        gp.push_back(PI(kRows[i], n));
+        vbytes += (double)(wb + sb + n * 4);
+        base += n;
+    }
+    for (size_t i = cls.size(); i < 4; ++i)
+        for (int j = 0; j < 3; ++j) { ts[1 + 3 * i + (size_t)j] = T(nullptr, RAD_U8, { 1 }); absent(ts[1 + 3 * i + (size_t)j]); }
+    void* d_m = dalloc((size_t)N * 4);
+    st_memcpy(d_m, vrow.data(), (size_t)N * 4, hipMemcpyHostToDevice);
+    vbytes += (double)N * 4;
+    ts[0] = T(d_x, RAD_BF16, { M, K });
+    ts[13] = T(d_m, RAD_I32, { N, 1 });
+    ts[14] = T(d_y, RAD_F32, { M, N });
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = gp.data(); a.n_p = (int)gp.size(); a.world_size = 1;
+    const int64_t need = rv->scratch(&a);
+    a.scratch = dalloc((size_t)need); a.scratch_bytes = need;
+    if (rv->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("--perfvocab: launch failed\n"); return; }
+    const double tv = st_time_us([&](int) { rv->launch(&a, nullptr); }, iters, nullptr);
+
+    /* the int8 head and the 6-bit table head over N rows */
+    const int64_t ib = N * r4d_fp8::lm_row_bytes(K);
+    const Form ft{ kTable, 6, 0, 0, 0, kBf16, 0, 0 };
+    const int64_t qb = lm_bytes(ft, N, K);
+    void* d_i = dalloc((size_t)ib);
+    void* d_q = dalloc((size_t)qb);
+    fill(d_i, (size_t)ib);
+    fill(d_q, (size_t)qb);
+    std::vector<RadParam> lp = { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("dtype", "bf16") };
+    std::vector<RadTensor> ti = { T(d_x, RAD_BF16, { M, K }), T(d_i, RAD_I8, { N, K }), T(d_y, RAD_F32, { M, N }) };
+    std::vector<RadTensor> tq = { T(d_x, RAD_BF16, { M, K }), T(d_q, R4D_DT_IQR_W | word(ft), { N, K }), T(d_y, RAD_F32, { M, N }) };
+    auto timed = [&](const RadKernelInfo* r, std::vector<RadTensor>& t) {
+        RadArgs b;
+        std::memset(&b, 0, sizeof(b));
+        b.t = t.data(); b.n_t = (int)t.size(); b.p = lp.data(); b.n_p = (int)lp.size(); b.world_size = 1;
+        if (r->scratch) { const int64_t s = r->scratch(&b); if (s > 0) { b.scratch = dalloc((size_t)s); b.scratch_bytes = s; } }
+        if (r->launch(&b, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return -1.0;
+        return st_time_us([&](int) { r->launch(&b, nullptr); }, iters, nullptr);
+    };
+    const double t8 = timed(ri, ti), t6 = timed(rq, tq);
+    std::printf("\nlm_head N=%lld K=%lld M=%lld, %d iters\n", (long long)N, (long long)K, (long long)M, iters);
+    std::printf("  %-26s %9.1f us  %7.1f MiB  %6.1f GB/s  %.3f b a weight\n", ("vocab " + std::string(spec)).c_str(), tv,
+                vbytes / (1 << 20), vbytes / (tv * 1e3), vbytes * 8 / (double)(N * K));
+    std::printf("  %-26s %9.1f us  %7.1f MiB  %6.1f GB/s\n", "int8 (logits_gemm_i8)", t8, ib / 1048576.0, ib / (t8 * 1e3));
+    std::printf("  %-26s %9.1f us  %7.1f MiB  %6.1f GB/s\n", "6-bit table (logits_gemm_iqr)", t6, qb / 1048576.0, qb / (t6 * 1e3));
+    dfree_all();
 }
 
 /* The block-quantised trunk GEMMs GLM's checkpoints resolve to, at one shape: E4M3 with F32
@@ -31523,9 +32179,10 @@ static void device_phase(const Plugin& pl) {
         i8a8_numeric(pl, "gemm_i8a8_rb32_tiled", 200, 256, 640, 32);
         i8a8_numeric(pl, "gemm_i8a8_rb32_tiled", 300, 256, 5120, 32);
         /* The IQR forms, decoded where they are read, against the int8 rows on their values: V1's
-         * tables, grids and zero; V2's 4096-state trellis; V3's 16384-state one on tcq_rb=32. M 1,
-         * 4 and 8 reach the GEMV (split over K at N 512), 9 and 64 the narrow tile (64 a split at N
-         * 512), 300 the prefill decode. */
+         * tables, grids and zero; V2's 4096-state trellis; V3's 16384-state one on tcq_rb=32. M 1
+         * reaches the GEMV, 2 the GEMV on 2- and 3-bit computed codes under one f32 scale a row, 4
+         * and 8 the GEMV off the computed trellis; else to 16 the 16-token tile; 17 and 64 the
+         * narrow tile (64 a split at N 512), 300 the prefill decode. */
         {
             const IqrCase fs[] = {
                 { 3, 2, 0, 0, 1, false, false }, { 3, 3, 0, 0, 1, false, true }, { 3, 4, 0, 0, 1, false, true },
@@ -31538,16 +32195,27 @@ static void device_phase(const Plugin& pl) {
                 { 6, 2, 0, 16, 32, true, true }, { 6, 3, 0, 16, 32, true, true }, { 6, 4, 0, 16, 32, true, true },
                 { 6, 5, 0, 16, 32, true, true }, { 6, 6, 0, 16, 32, true, true }, { 6, 7, 0, 16, 32, true, true },
                 { 6, 2, 0, 16, 1, true, true }, { 6, 4, 0, 16, 1, true, true },
+                { 6, 5, 0, 16, 1, true, true }, { 6, 6, 0, 16, 1, true, true }, { 6, 7, 0, 16, 1, true, true },
+                { 6, 4, 0, 16, 1, false, true }, { 6, 5, 0, 16, 1, false, true },
+                { 6, 6, 0, 16, 1, false, true }, { 6, 7, 0, 16, 1, false, true },
                 { 6, 2, 0, 16, 1, false, true, true }, { 6, 3, 0, 16, 1, false, true, true },
                 { 6, 4, 0, 16, 1, false, true, true }, { 6, 5, 0, 16, 1, false, true, true },
                 { 6, 6, 0, 16, 1, false, true, true }, { 6, 7, 0, 16, 1, false, true, true },
                 { 6, 2, 0, 15, 1, false, true, true },
             };
+            for (const int b : { 2, 3, 4, 6 })
+                for (const int64_t m : { (int64_t)1, (int64_t)2, (int64_t)5, (int64_t)16 })
+                    iqr_gated_case(pl, b, m, 1024, 1280);
+            iqr_gated_case(pl, 4, 1, 17408, 5120);
+            iqr_gated_case(pl, 4, 9, 17408, 5120);
             for (const IqrCase& f : fs) {
                 iqr_gemm_case(pl, f, 1, 512, 1024);
+                iqr_gemm_case(pl, f, 2, 4096, 1024);
                 iqr_gemm_case(pl, f, 4, 2048, 2560);
                 iqr_gemm_case(pl, f, 8, 512, 1024);
                 iqr_gemm_case(pl, f, 9, 512, 1024);
+                iqr_gemm_case(pl, f, 16, 4096, 2560);
+                iqr_gemm_case(pl, f, 17, 512, 1024);
                 iqr_gemm_case(pl, f, 64, 512, 2560);
                 iqr_gemm_case(pl, f, 300, 512, 1024);
             }
@@ -32805,11 +33473,21 @@ static void device_phase(const Plugin& pl) {
         iqr_head_case(pl, 5, 4096, 5120, 1);
         iqr_head_case(pl, 4, 4096, 5120, 8);
     }
+    if (sel("logits_gemm_vocab_iqr")) {
+        const std::vector<VocabClass> four = { { 4, 768 }, { 5, 512 }, { 6, 256 }, { 7, 256 } };
+        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)16, (int64_t)37, (int64_t)64, (int64_t)100 })
+            vocab_head_case(pl, four, M, 512, 0);
+        vocab_head_case(pl, { { 3, 512 }, { 2, 256 } }, 9, 1024, 768);
+        vocab_head_case(pl, { { 3, 512 }, { 2, 256 } }, 40, 1024, 768);
+        vocab_head_case(pl, { { 5, 1024 } }, 8, 5120, 0);
+    }
     if (sel("embed_lookup_iqr")) {
         const IqrEmbedCase es[] = {
             { 3, 2, 0, false, false }, { 3, 3, 0, false, false }, { 3, 4, 0, false, true },
-            { 3, 5, 0, false, false }, { 2, 6, 0, false, false }, { 5, 2, 12, true, true },
+            { 3, 5, 0, false, false }, { 2, 6, 0, false, false }, { 2, 7, 0, false, false },
+            { 2, 8, 0, false, false }, { 5, 2, 12, true, true },
             { 5, 3, 12, true, true }, { 5, 4, 12, true, true }, { 5, 5, 12, true, true },
+            { 5, 6, 12, true, true }, { 5, 7, 12, true, true },
         };
         for (const IqrEmbedCase& f : es) {
             iqr_embed_case(pl, f, 512, 640, 1.0f);
@@ -32824,6 +33502,8 @@ static void device_phase(const Plugin& pl) {
             fp8_logits_numeric(pl, 2560, 2560, M, true);
     }
 
+    gate_had_case(pl, 37, 256);
+    gate_had_case(pl, 4, 128);
     /* The fused quantisers are checked against the kernels they replace, gated on their own
      * rows. */
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8") ||
@@ -33079,11 +33759,15 @@ static void usage(void) {
                 "             N a gate_up's width) and print the weight bandwidth each reaches.\n"
                 "  --perfwpa N K M [iters] [pb1]:  the int5 and int4 x int8 tiled GEMMs (gemm_w5a8i8_tiled,\n"
                 "             gemm_w4a8i8_tiled), warmed, min / median time and a hash of the output.\n"
+                "  --perfiqr N K M B [iters]:  the IQR row over a B-bit V4 trunk form (B + 10: the head-fed\n"
+                "             form, a bf16 scale a (row, 128)), then --perfmxd\n"
                 "  --perfmxd N K M [iters]:  the dense MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
                 "             one shape, with the weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
                 "  --perff32 N K M [iters]:  gemm_nt_f32 at the tile form its rule picks, compared\n"
                 "             byte for byte with the host arithmetic, with GB/s and TFLOP/s.\n"
+                "  --perfvocab B:rows,.. K M [iters]:  the vocabulary-weighted head against the int8\n"
+                "             and 6-bit table heads over the same rows\n"
                 "  --perfq N K M [iters]:  the block-quantised trunk rows GLM resolves to: E4M3 with\n"
                 "             F32 block scales and the three OCP-MXFP4 rows, GB/s on weight + scales.\n"
                 "  --perfw4 N K M [iters]:  a tuning sweep of the asymmetric W4 x F16 GEMM;\n"
@@ -33204,7 +33888,8 @@ int main(int argc, char** argv) {
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
     int perf_it = 50, perf_w2 = 0, perf_w4 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0,
-        perf_q = 0, perf_mx = 0, perf_wpa = 0;
+        perf_q = 0, perf_mx = 0, perf_wpa = 0, perf_vocab = 0, perf_iqr = 0;
+    const char* vocab_spec = nullptr;
     long long perf_pb1 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
@@ -33277,6 +33962,13 @@ int main(int argc, char** argv) {
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_pb1 = std::strtoll(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfiqr")) {
+            if (i + 4 >= argc) { usage(); return 2; }
+            perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            perf_iqr = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfmxd")) {
             if (i + 3 >= argc) { usage(); return 2; }
             perf_mx = 1;
@@ -33297,6 +33989,15 @@ int main(int argc, char** argv) {
             if (i + 3 >= argc) { usage(); return 2; }
             perf_f32 = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfvocab")) {
+            /* the vocabulary-weighted head against the int8 and table heads (see vocab_perf) */
+            if (i + 3 >= argc) { usage(); return 2; }
+            perf_vocab = 1;
+            perf_n = 1;
+            vocab_spec = argv[++i];
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
@@ -33728,7 +34429,9 @@ int main(int argc, char** argv) {
 #ifdef RAD_HAVE_HIP
         if (perf_f32)     f32_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
         else if (perf_q)  q_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        else if (perf_vocab) vocab_perf(pl, vocab_spec, perf_k, perf_m, perf_it);
         else if (perf_wpa) wpa_perf(pl, perf_n, perf_k, perf_m, perf_it, perf_pb1);
+        else if (perf_iqr) iqr_perf(pl, perf_n, perf_k, perf_m, perf_iqr, perf_it);
         else if (perf_mx) mx_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_bf) bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w4) w5a16_perf(pl, 4, perf_m, perf_n, perf_k, perf_it,

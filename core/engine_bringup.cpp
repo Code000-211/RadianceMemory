@@ -482,6 +482,35 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     return RAD_OK;
 }
 
+/* --ngram-placement disk=DIR: the container's [src, src + n) at file offset `foff` read from its own
+ * file, DIR/ngram-<id>.bin (the table's bytes and nothing else, the id table_share_id's: the
+ * container's path, size and mtime and the table's place in it). The first start fills it from the
+ * container through a temporary name and renames it, so a file under the real name is complete; a
+ * later start checks samples of it against the container. Mapped read-only in place of the
+ * container's range, which is all the disk gather needs: it finds the file behind the mapping and
+ * reads it directly (libavx avx_ngram.cpp, table_file). */
+int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
+                           std::string* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string id = table_share_id(file_->path(), foff, n);
+    if (id.empty()) {
+        *why = fmt("the container %s cannot be stat'ed, which names the table's file", file_->path());
+        return RAD_E_IO;
+    }
+    const std::string& dir = cfg_.ngram_disk_dir;
+    const std::string path = dir + (dir.back() == '/' ? "" : "/") + "ngram-" + id + ".bin";
+    TableCopy c;
+    bool filled = false;
+    const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
+    if (rc != RAD_OK) return rc;
+    table_files_.push_back(c);
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+             filled ? ", filled from the container" : "",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    *out = c.base;
+    return RAD_OK;
+}
+
 /* When --ngram-placement auto chose a pinned copy for a card and it could not be made, move the
  * gather to the host. Every rank's n-gram weights take the host site, in both the WeightInfo
  * Ctx::init reads and the plan, so the gather and its scale move together; a copy already
@@ -3056,6 +3085,26 @@ int Engine::load_weights() {
                                "rows are read from the container%s", into, why.c_str(),
                                card ? " by the host gather" : ""));
                 }
+                /* --ngram-placement disk=DIR: the table's own file instead of the container. */
+                if (cfg_.ngram_resolved == TablePlacement::Disk && !cfg_.ngram_disk_dir.empty() &&
+                    is_ngram_table(r->program, (rad_weight)i) && n >= kTableShareMin) {
+                    void* m = nullptr;
+                    for (size_t k = 0; k < table_files_.size() && !m; ++k)
+                        if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;
+                    std::string why;
+                    if (!m) {
+                        const int fs = table_file_map((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
+                                                      &m, &why);
+                        if (fs != RAD_OK) {
+                            RAD_ERR("--ngram-placement disk=%s: '%s': %s",
+                                    cfg_.ngram_disk_dir.c_str(), w.name.c_str(), why.c_str());
+                            return fs;
+                        }
+                        table_file_src_.push_back(w.host_ptr);
+                    }
+                    w.ptr = m;
+                    w.host_ptr = m;
+                }
                 /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
                  * too large to be resident, so the default 128 KiB readahead would read 32 pages
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
@@ -3913,10 +3962,15 @@ int Engine::start() {
                                 },
                                 &r->ctx));
         if (r->fstager.enabled() && r->index == 0)
-            RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
-                     "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+            RAD_INFO("file stager: it covers %zu routed layers (a pool-cached unit of one may "
+                     "be read from the container); each pass reads a layer's (up to %s) into one "
+                     "of two VRAM buffers before its first expert op, so every step is paced by the drive%s",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
+                     r->fstager.whole_rows() > 0
+                         ? fmt("; a pass of %lld tokens or more reads its layers whole, each "
+                               "while the card computes the one before",
+                               (long long)r->fstager.whole_rows()).c_str()
+                         : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);

@@ -9,7 +9,9 @@
  * a time, and the assembly must equal the buffered body built by the same server.
  */
 #include "server_fakes.h"
+#include "work_counter.h"
 
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -558,12 +560,12 @@ Text text_streamed(const std::string& path, const std::string& body) {
 
 }  /* namespace */
 
-/* What the server holds back while a reply runs (the longest stop string less a byte, an unfinished
- * character, a half-written escape) and releases at the end: for every split into two drains and
- * one byte a drain, the streamed text of chat, completions and llama-server's native completion is
- * the buffered text, and the finish agrees. A stop string's bytes never reach the wire, or the
- * concatenation would hold them. On chat a reply that starts inside its reasoning block applies
- * its stop strings only after the closer. */
+/* What the server holds back while a reply runs (a tail that may still become a stop string, an
+ * unfinished character, a half-written escape) and releases at the end: for every split into two
+ * drains and one byte a drain, the streamed text of chat, completions and llama-server's native
+ * completion is the buffered text, and the finish agrees. A stop string's bytes never reach the
+ * wire, or the concatenation would hold them. On chat a reply that starts inside its reasoning
+ * block applies its stop strings only after the closer. */
 TEST(a_streamed_text_is_the_buffered_text_at_every_drain_boundary) {
     struct Case {
         const char* name;
@@ -578,6 +580,8 @@ TEST(a_streamed_text_is_the_buffered_text_at_every_drain_boundary) {
         { "characters around a stop", "\xC3\xA9STOP\xC3\xA9", "STOP", false },
         { "escapes", "q\\u12\\\\\"x\\", "", false },
         { "a stop longer than the reply's tail", "abcZZ", "ZZZ", false },
+        { "a tail that stops being a stop's start", "abSTxSTOPy", "STOP", false },
+        { "a stop's start that starts it again", "xSTASTARy", "STAR", false },
     };
     for (const char* path : { "/v1/chat/completions", "/v1/completions", "/completion" }) {
         for (const Case& c : cases) {
@@ -606,6 +610,147 @@ TEST(a_streamed_text_is_the_buffered_text_at_every_drain_boundary) {
             }
         }
     }
+}
+
+/* A running choice holds back only a tail that may still become a stop string: what precedes it is
+ * on the wire after the drain that produced it, on chat, completions and llama-server's native
+ * completion. The hold-back this replaced kept the longest stop string less a byte off the wire
+ * whatever the tail was, so with a ten-byte stop every delta trailed by nine bytes and a short
+ * reply showed nothing before its end. */
+TEST(a_running_choice_holds_back_only_what_may_still_become_a_stop_string) {
+    struct Step {
+        const char* piece;   /* the drain's new bytes */
+        const char* wire;    /* everything on the wire after it */
+    };
+    const Step steps[] = {
+        { "Hello", "Hello" },
+        { " ENDOF", "Hello " },              /* "ENDOF" may still become "ENDOFREPLY" */
+        { "X\n", "Hello ENDOFX" },           /* it cannot now, but "\n" may become "\n\n" */
+        { "ENDO", "Hello ENDOFX\n" },        /* "\nE" cannot, "ENDO" may become "ENDOFREPLY" */
+        { "FREPLY tail", "Hello ENDOFX\n" }, /* the stop is cut, and nothing of it went out */
+    };
+    for (const char* path : { "/v1/chat/completions", "/v1/completions", "/completion" }) {
+        Fixture f;
+        const std::string stop = R"(,"stop":["ENDOFREPLY","\n\n"],"stream":true})";
+        const std::string body = std::string(path) == "/v1/chat/completions"
+            ? R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":1000)" + stop
+            : R"({"prompt":"hi","max_tokens":1000)" + stop;
+        f.sched.manual = true;
+        HttpResponse r = f.post(path, body);
+        f.sched.manual = false;
+        REQUIRE(r.status == 200);
+        REQUIRE(r.streaming());
+        const size_t i = f.sched.seen.size() - 1;
+        std::string out, c;
+        r.next(c);
+        out += c;
+        for (const Step& s : steps) {
+            f.sched.push(i, s.piece);
+            c.clear();
+            r.next(c);
+            out += c;
+            const Text got = text_streamed(path, out);
+            if (got.text == s.wire) continue;
+            CHECK_EQ(got.text, std::string(s.wire));
+            fprintf(stderr, "    %s, after \"%s\"\n", path, s.piece);
+        }
+        f.sched.finish(i, Finish::Stop);
+        for (int k = 0; k < 64; ++k) {
+            c.clear();
+            const bool more = r.next(c);
+            out += c;
+            if (!more) break;
+        }
+        r.on_close(true);
+        const Text all = text_streamed(path, out);
+        CHECK_EQ(all.text, std::string("Hello ENDOFX\n"));
+        CHECK_EQ(all.finish, std::string(std::string(path) == "/completion" ? "word" : "stop"));
+    }
+}
+
+namespace {
+
+/* The work of 24 drains of a streamed completion, in radtest::Work's unit, each after a short
+ * piece of text, once the text is longer than any stop string: what each drain holds back is then
+ * looked for in as many tails as the longest stop string is long. 20 pieces of 300 bytes, each
+ * the next byte of `fill`, come first. Also checks the text arrives. */
+uint64_t drains_work(const std::string& stops, const std::string& fill = "the quick brown ") {
+    Fixture f;
+    f.sched.manual = true;
+    HttpResponse r = f.post("/v1/completions", R"({"prompt":"hi","max_tokens":100000,"stream":true,)"
+                                               R"("stop":)" + stops + "}");
+    f.sched.manual = false;
+    CHECK_EQ(r.status, 200);
+    CHECK(r.streaming());
+    if (r.status != 200 || !r.streaming()) return 0;
+    const size_t i = f.sched.seen.size() - 1;
+    std::string out, c;
+    r.next(c);
+    out += c;
+    std::string sent;
+    for (int k = 0; k < 20; ++k) {
+        const std::string part(300, fill[(size_t)k % fill.size()]);
+        sent += part;
+        f.sched.push(i, part);
+        c.clear();
+        r.next(c);
+        out += c;
+    }
+    uint64_t w = 0;
+    for (int k = 0; k < 24; ++k) {
+        const std::string piece = "word " + std::to_string(k) + ", ";
+        sent += piece;
+        f.sched.push(i, piece);
+        c.clear();
+        w += radtest::work().of([&] { r.next(c); });
+        out += c;
+    }
+    f.sched.finish(i, Finish::Stop);
+    for (int k = 0; k < 64; ++k) {
+        c.clear();
+        const bool more = r.next(c);
+        out += c;
+        if (!more) break;
+    }
+    r.on_close(true);
+    CHECK_EQ(text_streamed("/v1/completions", out).text, sent);
+    return w;
+}
+
+}  /* namespace */
+
+/* A request may send 64 stop strings of 4 KiB, and a running choice's hold-back looks at the tails
+ * of what it has not sent, up to the longest stop string, on each drain. A tail is compared only
+ * where it starts with a byte some stop string starts with, so stop strings the text cannot start
+ * cost a drain a lookup per tail: such a drain costs about as much as one with a single two-byte
+ * stop. Comparing every tail with every stop string, 262 080 calls a drain, cost three hundred
+ * times. */
+TEST(a_drain_looks_for_long_stop_strings_only_where_they_can_start) {
+    json many = json::array();
+    for (int k = 0; k < 64; ++k) many.push_back("~" + std::string(4095, (char)('a' + k % 26)));
+    const uint64_t one = drains_work(R"(["~~"])"), all = drains_work(many.dump());
+    std::fprintf(stderr, "    one stop %llu, 64 of 4 KiB %llu %s, ratio %.2f\n",
+                 (unsigned long long)one, (unsigned long long)all, radtest::work().unit(),
+                 (double)all / (double)one);
+    CHECK((double)all / (double)one < (radtest::work().exact() ? 20.0 : 40.0));
+}
+
+/* The client sets the stop strings and steers the text: 64 stop strings of 4 KiB that all begin
+ * with 4093 'a', and a reply that is thousands of 'a' and then something else, matches them for
+ * as long as there are 'a' and then no more, at every one of the 4095 tails of every one of the
+ * 64 strings, which is 500 million bytes compared on a drain with no bound. The comparisons share
+ * a budget past which a drain holds back all it has not sent, so the cost of a drain is bounded
+ * whatever the text. */
+TEST(a_drain_that_almost_matches_long_stop_strings_costs_a_bounded_amount) {
+    json many = json::array();
+    for (int k = 0; k < 64; ++k)
+        many.push_back(std::string(4093, 'a') + (char)('0' + k / 8) + (char)('0' + k % 8));
+    const uint64_t one = drains_work(R"(["~~"])");
+    const uint64_t all = drains_work(many.dump(), "aaaaaaaaaaaaaaaaaaax");
+    std::fprintf(stderr, "    one stop %llu, 64 of 4 KiB almost matched %llu %s, ratio %.2f\n",
+                 (unsigned long long)one, (unsigned long long)all, radtest::work().unit(),
+                 (double)all / (double)one);
+    CHECK((double)all / (double)one < (radtest::work().exact() ? 40.0 : 80.0));
 }
 
 /* ================================================================== Anthropic's stop reasons */

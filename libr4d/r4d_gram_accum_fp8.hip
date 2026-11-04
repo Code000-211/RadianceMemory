@@ -1,5 +1,5 @@
-// H += X^T X, in f32, over an E4M3 activation with a per-(row, group) scale, or over a plain bf16
-// one.
+// H += X^T X, in f32, over an E4M3 or int8 activation with a per-(row, group) scale, or over a plain
+// bf16 one.
 //
 // Purpose: the device half of GPTQ's Gram matrix `H = sum_t x_t x_t^T` over a calibration corpus,
 // for the 4-bit expert format (docs/MOE-W4.md).
@@ -38,6 +38,9 @@ constexpr int kThreads = 256;
 constexpr int kMB      = 32;    // M rows staged a pass; 2 * 32 * 64 * 4 = 16 KiB of LDS
 constexpr int kTT      = 4;
 
+// I8: the codes are int8 (an int8 trunk's activation, quant_act_i8g's), otherwise E4M3; both carry an f32
+// scale per (row, group).
+template <bool I8>
 __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
     const void* __restrict__ qv, const float* __restrict__ sc, float* __restrict__ h,
     uint32_t M, uint32_t K, uint32_t q_ld, uint32_t s_ld, uint32_t h_ld, uint32_t grp,
@@ -79,14 +82,24 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
                     // contract), so a dword load at c1 < K stays inside the allocation.
                     const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c1);
                     const float s = sc[(size_t)m * s_ld + g1];
-                    const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
-                    a0 = lo.x * s; a1 = lo.y * s; a2 = hi.x * s; a3 = hi.y * s;
+                    if constexpr (I8) {
+                        a0 = (float)(int8_t)(w & 0xffu) * s;         a1 = (float)(int8_t)(w >> 8) * s;
+                        a2 = (float)(int8_t)(w >> 16) * s;           a3 = (float)(int8_t)(w >> 24) * s;
+                    } else {
+                        const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
+                        a0 = lo.x * s; a1 = lo.y * s; a2 = hi.x * s; a3 = hi.y * s;
+                    }
                 }
                 if (c2 < K) {
                     const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c2);
                     const float s = sc[(size_t)m * s_ld + g2];
-                    const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
-                    b0 = lo.x * s; b1 = lo.y * s; b2 = hi.x * s; b3 = hi.y * s;
+                    if constexpr (I8) {
+                        b0 = (float)(int8_t)(w & 0xffu) * s;         b1 = (float)(int8_t)(w >> 8) * s;
+                        b2 = (float)(int8_t)(w >> 16) * s;           b3 = (float)(int8_t)(w >> 24) * s;
+                    } else {
+                        const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
+                        b0 = lo.x * s; b1 = lo.y * s; b2 = hi.x * s; b3 = hi.y * s;
+                    }
                 }
             }
             // Columns past K stage as zeros and contribute nothing; the store masks them anyway.
@@ -216,8 +229,9 @@ extern "C" int r4d_gram_accum_fp8_tile(void) { return kTile; }
 //   s  [M][ceil(K/grp)]      f32,  `s_ld` elements a row (0 = ceil(K/grp))
 //   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written; with `upper`
 //                            only the 64-wide tiles on or above the diagonal are added to
-extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
-                                  int q_ld, int s_ld, int h_ld, int upper, long stream) {
+namespace {
+int gram_accum_codes(bool i8, long q, long s, long h, int M, int K, int grp, int q_ld, int s_ld,
+                     int h_ld, int upper, long stream) {
     if (!q || !s || !h) return -1;
     if (M <= 0 || K <= 0) return -2;
     if (K % 4) return -3;                       // a staging slot is one dword of four codes
@@ -227,11 +241,29 @@ extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
     if (!s_ld) s_ld = (K + grp - 1) / grp;
     if (!h_ld) h_ld = K;
     const uint32_t nt = (uint32_t)((K + kTile - 1) / kTile);
-    hipLaunchKernelGGL(gram_accum_kernel, dim3(nt, nt), dim3(kThreads), 0,
-                       (hipStream_t)stream, (const void*)q, (const float*)s, (float*)h,
-                       (uint32_t)M, (uint32_t)K, (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)h_ld,
-                       (uint32_t)grp, (uint32_t)(upper != 0));
+    if (i8)
+        hipLaunchKernelGGL(gram_accum_kernel<true>, dim3(nt, nt), dim3(kThreads), 0,
+                           (hipStream_t)stream, (const void*)q, (const float*)s, (float*)h,
+                           (uint32_t)M, (uint32_t)K, (uint32_t)q_ld, (uint32_t)s_ld,
+                           (uint32_t)h_ld, (uint32_t)grp, (uint32_t)(upper != 0));
+    else
+        hipLaunchKernelGGL(gram_accum_kernel<false>, dim3(nt, nt), dim3(kThreads), 0,
+                           (hipStream_t)stream, (const void*)q, (const float*)s, (float*)h,
+                           (uint32_t)M, (uint32_t)K, (uint32_t)q_ld, (uint32_t)s_ld,
+                           (uint32_t)h_ld, (uint32_t)grp, (uint32_t)(upper != 0));
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+}  // namespace
+
+extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
+                                  int q_ld, int s_ld, int h_ld, int upper, long stream) {
+    return gram_accum_codes(false, q, s, h, M, K, grp, q_ld, s_ld, h_ld, upper, stream);
+}
+
+//   q  [M][K]                int8, otherwise as r4d_gram_accum_fp8
+extern "C" int r4d_gram_accum_i8(long q, long s, long h, int M, int K, int grp,
+                                 int q_ld, int s_ld, int h_ld, int upper, long stream) {
+    return gram_accum_codes(true, q, s, h, M, K, grp, q_ld, s_ld, h_ld, upper, stream);
 }
 
 //   a  [M][K]                bf16, `a_ld` elements a row (0 = K)
@@ -260,7 +292,8 @@ extern "C" int r4d_rad_gram_accum(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, GA_S);
     const RadTensor* h = r4d_opt(a, GA_H);
     if (!q || !sc || !h) return R4D_NO(RAD_E_INVAL);
-    if (q->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32 || h->dtype != RAD_F32)
+    if ((q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) || sc->dtype != RAD_F32 ||
+        h->dtype != RAD_F32)
         return R4D_NO(RAD_E_DTYPE);
     /* Rows are dim 0 and everything after is the row, as in r4d_rad_quant_act_fp8; `sc` and `h`
      * are rank 2 by definition. */
@@ -274,9 +307,9 @@ extern "C" int r4d_rad_gram_accum(const RadArgs* a, RadStream s) {
     if (h->shape[0] != K || h->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
     const long long qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc), hp = r4d_row_pitch(h);
     if (qp < 0 || sp < 0 || hp < 0) return R4D_NO(RAD_E_STRIDE);
-    const int e = r4d_gram_accum_fp8(r4d_addr(q), r4d_addr(sc), r4d_addr(h), (int)M, (int)K,
-                                     (int)grp, (int)qp, (int)sp, (int)hp,
-                                     (int)r4d_geti_or(a, "upper", 0), (long)(uintptr_t)s);
+    const int e = gram_accum_codes(q->dtype == RAD_I8, r4d_addr(q), r4d_addr(sc), r4d_addr(h),
+                                   (int)M, (int)K, (int)grp, (int)qp, (int)sp, (int)hp,
+                                   (int)r4d_geti_or(a, "upper", 0), (long)(uintptr_t)s);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

@@ -887,7 +887,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             const int e = mm::h264_roundtrip(f, info.image_crf, &rt, &why);
             if (e < 0) {
                 ApiError err = err_bad("input_reference", "the picture could not be prepared: " + why);
-                if (e != RAD_E_INVAL) { err.status = 503; err.type = "server_error"; }
+                /* A build without an H.264 codec cannot prepare one at all: 501, not a transient 503. */
+                if (e != RAD_E_INVAL) { err.status = e == RAD_E_UNSUPPORTED ? 501 : 503; err.type = "server_error"; }
                 return error_response(err, req.peer);
             }
             f = std::move(rt);

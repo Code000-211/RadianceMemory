@@ -141,8 +141,9 @@ inline int QuantFP8::declare(RadBuilder* b, const Geom& g, const ActFP8& act, in
     if (g.w_bf16) { op = 0; return a.x ? RAD_OK : RAD_E_INVAL; }
     if (!a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* `dtype` is the input's (bf16); the op name gives the output format. An input fed at int8
-     * codes is quantised by quant_act_i8g into its int8 pair. */
-    op = rw(b, RAD_OP(b, a.q8_fed ? "quant_act_i8g" : "quant_act_fp8",
+     * codes is quantised by quant_act_i8g into its int8 pair, or by had_quant_act_i8g where they
+     * are rotated (ActFP8::q8_rot). */
+    op = rw(b, RAD_OP(b, a.q8_fed ? (a.q8_rot ? "had_quant_act_i8g" : "quant_act_i8g") : "quant_act_fp8",
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
@@ -729,6 +730,13 @@ struct LinearFP8 {
      * writes E4M3. Read from the weight's encoding. */
     bool       i8 = false;
     rad_op     op_q = 0;
+    /* An int8 weight stored rotated (i8a8h, or a rotated four- or five-bit one): its activation
+     * codes are in the 128-wide Hadamard domain, whoever wrote them (had_quant_act_i8g or a
+     * rotating producer). */
+    bool       i8_rot = false;
+    /* With i8_rot: an IQR weight (libr4d's r4d_iqr.h), whose codes decode where they are read: a
+     * u6 code under a zero, a table, a grid or a trellis. Read from the weight's encoding. */
+    bool       iqr = false;
     /* OCP-MXFP4 weight read by `gemm_nt_q` at dtype mxfp4a8 against the usual E4M3 activation pair:
      * e2m1 codes with one E8M0 exponent per 32 of K (libquant `codes=fp4_e2m1 group=32
      * scale=e8m0`). libr4d folds each block's exponent into the e4m3 operand against a per-row
@@ -1254,6 +1262,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     const bool asym = known && linear_is_wnh(enc);
     const bool rot8 = known && (linear_is_w8h(enc) || asym);
     i8 = known && (linear_is_w8(enc) || rot8);
+    i8_rot = i8 && rot8;
     if (i8) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
@@ -1284,6 +1293,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         const char* sn = nm.f("%s.scale", base);
         /* A narrower i8a8h weight's codes view takes the plane that decodes it too. */
         const W8hForm form = linear_w8h_form(enc);
+        iqr = rot8 && !asym && (form == W8hForm::Zero || form == W8hForm::Table ||
+                                form == W8hForm::Grid || form == W8hForm::Trellis);
         const RadEncPlane* tpl = rad_enc_plane(&enc, "trellis");
         const bool trb = form == W8hForm::Trellis && tpl && tpl->block[1] > 1;
         const char* cv = form == W8hForm::Zero    ? "codes,zero"
@@ -1910,6 +1921,27 @@ inline rad_op decl_gated_fold_mx(RadBuilder* b, int64_t rows, int64_t N, int64_t
         if (hi <= 8) break;
     }
     return 0;
+}
+
+/* The same fold over an IQR [2n, K] gate_up weight under the rotated int8 trunk (`gemm_nt_q_gated`
+ * at i8a8h: the codes and scale views gemm_nt_q reads, the input's and the output's int8 pairs, both
+ * in the Hadamard domain), declared for M up to min(rows, 16): libr4d's gemm_iqr_gated serves its
+ * GEMV and 16-token tile, each byte-identical to the GEMM row of its band followed by
+ * gated_had_quant_i8g. Optional like decl_gated_fold, and asked for only when a loaded library
+ * declares the op at that dtype: a CPU-only engine takes the pair. */
+inline rad_op decl_gated_fold_iqr(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
+                                  rad_weight ws, std::initializer_list<rad_buf> reads,
+                                  std::initializer_list<rad_buf> writes, int64_t* gated_rows) {
+    if (rows <= 0 || N % 256 || K % 256) return 0;
+    const int64_t hi = rows < 16 ? rows : 16;
+    const rad_op op = rw(b, RAD_OP(b, "gemm_nt_q_gated",
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                        RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8h"),
+                                        RAD_STR("act", "silu")),
+                             RAD_WEIGHTS(w, ws)),
+                         reads, writes);
+    if (op) *gated_rows = hi;
+    return op;
 }
 
 /* ================================================== a calibration tap */

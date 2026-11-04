@@ -144,6 +144,7 @@ the cards the engine runs on.
 | `sage-a1.5-mxfp4-df2.yaml` | `sage-a1.5-mxfp4-df2.rad` | The same with the trunk, the experts and the drafter at MXFP4; ten 262,144-token sessions |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
+| `qwen3.8-27b-iqr-v4.yaml` | `qwen3.8-27b-${IQR_V4}.rad` | Qwen3.8-27B in IQR-V4 at the size `IQR_V4` names (default `iq4r-s-v4`), its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-paro.yaml` | `qwen3.8-27b-paro-int4.rad` | Qwen3.8-27B ParoQuant int4 (learned rotations) with its DFlash2 drafter and vision tower, on one card; the int5 and MXFP4 containers serve from it too |
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
 | `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |

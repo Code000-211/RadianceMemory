@@ -532,6 +532,29 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
     { "o_scale",      RAD_OPD_OUT,    1 },
 };
 
+/* gdn_conv_recurrent_update with had_quant_act_i8g's codes of `o` (a rotated int8 out projection's
+ * input): the same operands, the codes required. libr4d's alone; no reference serves it. */
+static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "conv_w",       RAD_OPD_WEIGHT, 0 },
+    { "conv_b",       RAD_OPD_WEIGHT, 1 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "conv_idx",     RAD_OPD_IN,     0 },
+    { "a",            RAD_OPD_IN,     0 },
+    { "b",            RAD_OPD_IN,     0 },
+    { "A_log",        RAD_OPD_WEIGHT, 0 },
+    { "dt_bias",      RAD_OPD_WEIGHT, 0 },
+    { "state",        RAD_OPD_INOUT,  0 },
+    { "state_idx",    RAD_OPD_IN,     0 },
+    { "num_accepted", RAD_OPD_IN,     0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "z",            RAD_OPD_IN,     0 },
+    { "norm_w",       RAD_OPD_WEIGHT, 0 },
+    { "o",            RAD_OPD_OUT,    0 },
+    { "o_q",          RAD_OPD_OUT,    0 },
+    { "o_scale",      RAD_OPD_OUT,    0 },
+};
+
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
@@ -1250,7 +1273,8 @@ static const RadOperandSpec oGivensDense[] = {
  *
  * `h` is inout: a caller zeroes it once and each launch adds its block. The operands are named `a`
  * and `a_scale` as in `gemm_nt_q`, whose activation this characterises. `a_scale` is optional:
- * dtype "bf16" reads a plain activation with no scale (a model served at bf16). */
+ * dtype "bf16" reads a plain activation with no scale (a model served at bf16); "i8a8" reads an
+ * int8 trunk's codes. */
 static const RadParamSpec pGramAccum[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -2338,6 +2362,38 @@ static const RadOperandSpec oLogits[] = {
     { "logits",  RAD_OPD_OUT,    0 },
 };
 
+/* The lm_head as width classes of the vocabulary's rows: up to four (codes, scales, ids) triples,
+ * a class's rows on this rank in `rows<i>`, ids global (`vocab_offset` is this rank's first), and
+ * `vrow`, the inverse: each of the rank's ids' class width and row. */
+static const RadParamSpec pLogitsVocab[] = {
+    { "M",            RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",      RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",       RAD_P_INT, RAD_REQUIRED },
+    { "dtype",        RAD_P_STR, RAD_REQUIRED },
+    { "vocab_offset", RAD_P_INT, RAD_REQUIRED },
+    { "rows0",        RAD_P_INT, RAD_REQUIRED },
+    { "rows1",        RAD_P_INT, RAD_OPTIONAL },
+    { "rows2",        RAD_P_INT, RAD_OPTIONAL },
+    { "rows3",        RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oLogitsVocab[] = {
+    { "x",      RAD_OPD_IN,     0 },
+    { "w0",     RAD_OPD_WEIGHT, 0 },
+    { "s0",     RAD_OPD_WEIGHT, 0 },
+    { "ids0",   RAD_OPD_WEIGHT, 0 },
+    { "w1",     RAD_OPD_WEIGHT, 1 },
+    { "s1",     RAD_OPD_WEIGHT, 1 },
+    { "ids1",   RAD_OPD_WEIGHT, 1 },
+    { "w2",     RAD_OPD_WEIGHT, 1 },
+    { "s2",     RAD_OPD_WEIGHT, 1 },
+    { "ids2",   RAD_OPD_WEIGHT, 1 },
+    { "w3",     RAD_OPD_WEIGHT, 1 },
+    { "s3",     RAD_OPD_WEIGHT, 1 },
+    { "ids3",   RAD_OPD_WEIGHT, 1 },
+    { "vrow",   RAD_OPD_WEIGHT, 0 },
+    { "logits", RAD_OPD_OUT,    0 },
+};
+
 /* Every sampler scalar is per row and arrives in `params`, an array of RadSampleParams
  * (abi/rad_sample.h). Parameters are geometry, frozen at declare, so only the two extents are
  * parameters. */
@@ -3223,6 +3279,15 @@ static const RadOpSchema kSchemas[] = {
            "present: `tok` holds its row count more tokens after the step's, continuing the LAST "
            "sequence, and their ids -- as the step that runs them will compute them -- go there; "
            "the window is the step's own."),
+    SCHEMA("logits_gemm_vocab", pLogitsVocab, oLogitsVocab,
+           "logits[M, n_vocab] = x[M, n_embd] @ lm_head^T over a head stored as width classes of "
+           "the vocabulary's rows: class i is a weight of rows<i> rows on this rank (w<i> its "
+           "codes, s<i> its scales) and ids<i> the global vocabulary id of each, whose logit it "
+           "writes; ids outside [vocab_offset, vocab_offset + n_vocab) are dropped. The classes "
+           "cover the rank's share of the vocabulary once; ascending ids within a class keep the "
+           "stores together. vrow[n_vocab] is the inverse, each of the rank's ids' class width in "
+           "the top four bits and its row in the class's whole tensor below, which must fall in "
+           "this rank's rows (vocab_offset / n_vocab is the rank)."),
     SCHEMA("logits_gemm", pLogits, oLogits,
            "the lm_head projection. gemm_nt's arithmetic under the vocabulary edge's parameter "
            "spelling; M is one row per SAMPLED position, `gather_rows` having run first."),
@@ -3355,6 +3420,11 @@ static const RadOpSchema kSchemas[] = {
            "gdn_conv_update followed by gdn_recurrent_update, with the convolution computed in "
            "the recurrent update's prologue: q, k and v never reach memory. Byte-identical to "
            "the two ops it replaces."),
+    SCHEMA("gdn_conv_recurrent_update_had", pGdnConvRecurrentUpdate, oGdnConvRecurrentUpdateHad,
+           "gdn_conv_recurrent_update whose `o_q` / `o_scale` are had_quant_act_i8g's codes of "
+           "`o` (int8, a 128-wide Hadamard before the per-(token, head) amax), for an out "
+           "projection stored rotated (i8a8h). Byte-identical to gdn_conv_recurrent_update "
+           "followed by had_quant_act_i8g."),
     SCHEMA("hc_enter", pHcPlain, oHcEnter,
            "h[s] = x for each of the hc streams -- the wide residual stream's first value."),
     SCHEMA("mhc_pre", pMhcPre, oMhcPre,
@@ -3610,6 +3680,11 @@ static const RadOpSchema kSchemas[] = {
            "epilogue, byte-identical to the two ops it replaces."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
+    SCHEMA("gate_had_quant_i8g", pGateQuantFp8, oGateQuantFp8,
+           "gate_quant_fp8 at int8 codes with a `group`-wide Hadamard before the absmax: "
+           "had_quant_act_i8g's codes of the bf16 product (`out_bf16` the unrotated product), for "
+           "an out projection stored rotated (dtype i8a8h). Byte-identical to gate_quant_fp8's "
+           "product and had_quant_act_i8g over it."),
     SCHEMA("quant_act_fp8", pQuantActFp8, oQuantActFp8,
            "per-(row, `group`-column) symmetric E4M3 quantisation of a token-major activation, in "
            "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
@@ -5030,6 +5105,12 @@ static const RadConstraint cGemmNtIqrM64[] = {
     C_LE("M", 64), C_DIV("K", 256), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
+/* The gated fold over an IQR gate_up weight, to the 16-token tile's band: the gated width a whole
+ * number of 128-column groups, silu only (gated_had_quant_i8g's mode the fold compiles). */
+static const RadConstraint cGemmNtQGatedIqr[] = {
+    C_LE("M", 16), C_DIV("K", 256), C_DIV("N", 256), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8h"), C_IN("act", "silu"),
+};
 static const RadConstraint cGemmNtIqrTiled[] = {
     C_DIV("K", 256), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
@@ -5088,7 +5169,7 @@ static const RadConstraint cQsaBlockKey[] = {
  * `n` a multiple of 4 is the staging slot (one dword of four codes); the 64-wide C tile masks a
  * ragged tile. */
 static const RadConstraint cGramAccum[] = {
-    C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8"),
+    C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8 i8a8"),
 };
 /* The bf16 form has no scale grid, so `group` constrains nothing; the staging slot is four
  * elements of a row. */
@@ -5193,6 +5274,10 @@ static const RadConstraint cGemmNtQGatedMx[] = {
 static const RadConstraint cGemmNtQGatedMxWide[] = {
     C_GE("M", 9), C_LE("M", 64), C_DIV("K", 128), C_GE("K", 2688), C_DIV("N", 256), C_EQ("group", 32),
     C_IN("dtype", "mxfp4a8"), C_IN("act", "silu gelu_tanh"),
+};
+/* The rotated form: whole 128-column groups (a rotation block cannot straddle a row's end). */
+static const RadConstraint cGateHadQuantI8g[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cGateQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -5696,6 +5781,7 @@ static const RadConstraint cLogitsGemmCols[] = { C_EQ("n_embd", 4096), C_IN("dty
  * 2560 the row would win selection and then fail at layout with no fallback. r4d_fp8_lm.h pads the
  * stored row to 16 bytes instead (under 0.3% at K = 2560), so every multiple of 128 is served. */
 static const RadConstraint cLogitsGemmFp8[] = { C_DIV("n_embd", 128), C_IN("dtype", "bf16") };
+static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype", "bf16") };
 
 /* No tunable axes. */
 #define NOTUNE nullptr, 0, nullptr
@@ -6566,6 +6652,21 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_logits_gemm_i8, nullptr,
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
   nullptr, r4d_rad_unrelayout_i8_logits },
+
+{ "logits_gemm_vocab_iqr", "logits_gemm_vocab", "vocab",
+  "the vocabulary-weighted IQR head in one launch over every class: each block decodes its "
+  "class's computed-trellis codes (the class's width) into int8 fragments through LDS and runs "
+  "two int8 WMMA passes against the rotated activation's sixteen bits (hi and lo planes); up to 32 "
+  "tokens into a staging plane in row order gathered through vrow, above that at each row's id",
+  "any M (64 tokens a pass); n_embd a multiple of 256; each class a multiple of 256 rows",
+  "bf16 x, rotated by fwht128 and quantised to 16 bits a (token, 128) in the call's scratch; "
+  "classes of tcq_code=mad codes (2 to 7 bits, runs of 256 rows) under one f32 scale a row; F32 "
+  "LOGITS OUT, int32 block sums folded in fp32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsVocab), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_vocab, r4d_rad_logits_gemm_vocab_scratch,
+  r4d_rad_layout_iqr_vocab, r4d_rad_relayout_iqr_vocab,
+  nullptr, r4d_rad_unrelayout_iqr_vocab },
 
 { "logits_gemm_iqr", "logits_gemm", "vocab",
   "logits_gemm_i8 over an IQR head kept at its codes' width: each lane's sixteen codes read at "
@@ -7814,6 +7915,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_gdn_conv_recurrent_update, nullptr, nullptr, nullptr, nullptr,
   nullptr, r4d_fuse_gdn_conv_recurrent_update },
 
+{ "gdn_conv_recurrent_update_had_k128_v128_bf16", "gdn_conv_recurrent_update_had", "gdn",
+  "gdn_conv_recurrent_update_k128_v128_bf16 with had_quant_act_i8g's pass in its epilogue: the "
+  "workgroup's (token, head) row of `o`, one 128-wide group, rotated in one wave and quantised to "
+  "int8, saving that quantiser's launch per layer",
+  "as gdn_conv_recurrent_update_k128_v128_bf16; int8 codes",
+  "as gdn_conv_recurrent_update_k128_v128_bf16, the codes had_quant_act_i8g's over `o`. "
+  "Byte-identical to that row followed by had_quant_act_i8g (r4d_selftest's gdn conv fold)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGdnConvRecurrentUpdate), NOTUNE,
+  nullptr, nullptr, r4d_rad_gdn_conv_recurrent_update_had },
+
 { "kda_update_k128_v128_bf16", "kda_update", "gdn", "per-channel KDA recurrence and candidate rollback",
   "heads 1..65535, K=V=128, prefill and verify", "bf16 activations, f32 gates and state",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cKdaUpdate), NOTUNE,
@@ -8425,6 +8537,24 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_gemm_iqr_m64, r4d_rad_gemm_iqr_m64_scratch,
   r4d_rad_layout_iqr, r4d_rad_relayout_iqr,
   nullptr, r4d_rad_unrelayout_iqr },
+
+{ "gemm_iqr_gated", "gemm_nt_q_gated", "gemm",
+  "gemm_iqr_nt_m64's GEMV and 16-token tile over a gate_up weight with gated_had_quant_i8g's pass "
+  "in the epilogue: a block per 16-column tile of the gated output, the plain kernel's waves on the "
+  "gate rows' tile and as many on the up rows', the product in the op's scratch and the last of a "
+  "128-column group's blocks to arrive rotating and quantising it, so the [M, 2n] bf16 plane and "
+  "the quantiser's launch are gone",
+  "M <= 16; K a multiple of 256; N a multiple of 256 (the gated width of the 128-column group), "
+  "and of a trellis's run; act silu; an IQR weight's codes, gate rows then up rows",
+  "i8 A with an f32 scale per (row, 128 K), W an IQR form's codes (as gemm_iqr_nt_m64), and the "
+  "QUANTISER's outputs: int8 codes of the rotated product, an f32 scale per (row, 128 columns) and "
+  "an optional bf16 product. Byte-identical to gemm_iqr_nt_m64 followed by gated_had_quant_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQGatedIqr), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_iqr_gated, r4d_rad_gemm_iqr_gated_scratch,
+  r4d_rad_layout_iqr, r4d_rad_relayout_iqr, nullptr, r4d_rad_unrelayout_iqr,
+  /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
+  r4d_fuse_gemm_nt_q_gated_iqr },
 
 { "gemm_iqr_tiled", "gemm_nt_q", "gemm",
   "the prefill GEMM over an IQR weight: the call decodes the weight's codes into the int8 fragment "
@@ -9052,10 +9182,11 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
  * accumulated Hessians at convert time, from a file. So it is unresolved by the serving graph on
  * purpose, not an unwired kernel. */
 { "gram_accum", "gram_accum", "quant",
-  "h += x^T x over an E4M3 activation, in f32 -- the Gram matrix a GPTQ packer needs",
+  "h += x^T x over an E4M3 or int8 activation, in f32 -- the Gram matrix a GPTQ packer needs",
   "n a multiple of 4 and group 128, because a 64-wide output tile must lie inside one scale "
   "group; any M, and the accumulator is READ as well as written",
-  "E4M3 plus an f32 scale per (row, 128 columns) in; an f32 [n][n] accumulator in and out",
+  "E4M3 (dtype fp8a8) or int8 (i8a8) plus an f32 scale per (row, 128 columns) in; an f32 [n][n] "
+  "accumulator in and out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGramAccum), NOTUNE,
   nullptr, nullptr, r4d_rad_gram_accum, nullptr, nullptr, nullptr,
@@ -9164,6 +9295,18 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_shape_gate_quant_fp8, nullptr,
   /* `sigmoid` + `mul` + `quant_act_fp8`, and `mul` + `quant_act_fp8` for act none (r4d_fuse.cpp). */
   r4d_fuse_gate_quant_fp8 },
+
+{ "gate_had_quant_i8g", "gate_had_quant_i8g", "quant",
+  "gate_quant_fp8 with the width-128 Hadamard between the bf16-rounded product and the absmax and "
+  "int8 codes: had_quant_act_i8g's pass folded in, saving that quantiser's launch before a gated "
+  "attention's rotated out projection",
+  "n a multiple of 128; otherwise as gate_quant_fp8",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out; the codes "
+  "are had_quant_act_i8g's over the BF16-ROUNDED product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGateHadQuantI8g), NOTUNE,
+  nullptr, nullptr, r4d_rad_gate_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_gate_quant_fp8, nullptr },
 
 /* ---------------------------------------------------------------------------------- sampling
  *

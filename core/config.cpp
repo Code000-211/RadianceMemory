@@ -645,7 +645,7 @@ int config_parse(int argc, char** argv, Config* c) {
                     RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
                 return RAD_E_INVAL;
             }
-            std::string share_dir;
+            std::string share_dir, disk_dir;
             if (!emb && !std::strncmp(v, "ram=", 4)) {
                 share_dir = v + 4;
                 if (share_dir.empty()) {
@@ -654,11 +654,23 @@ int config_parse(int argc, char** argv, Config* c) {
                     return RAD_E_INVAL;
                 }
                 p = TablePlacement::Ram;
+            } else if (!emb && !std::strncmp(v, "disk=", 5)) {
+                disk_dir = v + 5;
+                if (disk_dir.empty()) {
+                    RAD_ERR("--ngram-placement disk= needs a directory: disk=DIR, where the table "
+                            "is read from its own file");
+                    return RAD_E_INVAL;
+                }
+                p = TablePlacement::Disk;
             } else if (!emb && !parse_table_placement(v, &p)) {
-                RAD_ERR("%s takes auto, vram, ram, ram=DIR or disk, not '%s'", a.c_str(), v);
+                RAD_ERR("%s takes auto, vram, ram, ram=DIR, disk or disk=DIR, not '%s'", a.c_str(),
+                        v);
                 return RAD_E_INVAL;
             }
-            if (!emb) c->ngram_share_dir = share_dir;
+            if (!emb) {
+                c->ngram_share_dir = share_dir;
+                c->ngram_disk_dir = disk_dir;
+            }
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
         }
@@ -1354,7 +1366,8 @@ const ShowRow kShow[] = {
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) {
           std::string v = table_placement_name(c.ngram_placement);
-          return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
+          const std::string& dir = c.ngram_share_dir.empty() ? c.ngram_disk_dir : c.ngram_share_dir;
+          return dir.empty() ? v : v + "=" + dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--prefix-cache-mib",   [](const Config& c) {

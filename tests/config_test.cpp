@@ -902,9 +902,28 @@ TEST(the_ngram_table_takes_a_directory_for_a_shared_ram_copy) {
     CHECK(s.ngram_placement == TablePlacement::Ram);
     CHECK(s.ngram_share_dir.empty());
     Config c;
-    for (const char* bad : { "ram=", "vram=/tmp/x", "disk=/tmp/x", "auto=/tmp/x" })
+    for (const char* bad : { "ram=", "disk=", "vram=/tmp/x", "auto=/tmp/x" })
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--embedding-placement", "ram=/tmp/x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--embedding-placement", "disk=/tmp/x" }, &c), RAD_E_INVAL);
+}
+
+/* disk=DIR is disk read from the table's own file in DIR (#130); it and ram=DIR replace each
+ * other, and a plain placement drops both directories. */
+TEST(the_ngram_table_takes_a_directory_for_its_own_file_on_disk) {
+    Config s;
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Disk);
+    CHECK_EQ(s.ngram_disk_dir, std::string("/mnt/optane"));
+    CHECK(s.ngram_share_dir.empty());
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane", "--ngram-placement", "ram=/dev/shm" },
+                   &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK(s.ngram_disk_dir.empty());
+    CHECK_EQ(s.ngram_share_dir, std::string("/dev/shm"));
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane", "--ngram-placement", "disk" }, &s),
+             RAD_OK);
+    CHECK(s.ngram_disk_dir.empty());
 }
 
 /* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text

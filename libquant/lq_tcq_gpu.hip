@@ -56,12 +56,19 @@ struct TcqArgs {
 
 /* A thread's E states' table values. With PACK they sit four to a register as the int8 they are
  * (the table holds integers in -127..127), for the wide forms. */
-template <int E, bool PACK>
+template <int E, int PACK>
 struct Lut {
+    /* PACK 1: four int8 a register; 2: two int16 a register, for a wide code (tcq_code=mad16,
+     * values past int8); 0: one float a state. */
+    static constexpr int NP = PACK == 2 ? E / 2 : PACK ? E / 4 : 1;
     float    f[PACK ? 1 : E];
-    uint32_t p[PACK ? E / 4 : 1];
+    uint32_t p[NP];
     __device__ void set(int e, float v) {
-        if (PACK) {
+        if (PACK == 2) {
+            const uint32_t b = (uint32_t)(uint16_t)(int16_t)(int)v;
+            if (e % 2 == 0) p[e / 2] = b;
+            else p[e / 2] |= b << 16;
+        } else if (PACK) {
             const uint32_t b = (uint32_t)(uint8_t)(int8_t)(int)v;
             if (e % 4 == 0) p[e / 4] = b;
             else p[e / 4] |= b << (8 * (e % 4));
@@ -70,6 +77,7 @@ struct Lut {
         }
     }
     __device__ float at(int e) const {
+        if (PACK == 2) return (float)(int16_t)(p[e / 2] >> (16 * (e % 2)));
         if (PACK) return (float)(int8_t)(p[e / 4] >> (8 * (e % 4)));
         return f[e];
     }
@@ -97,7 +105,7 @@ __device__ inline bool cheaper(float ac, int ai, float bc, int bi) {
  * tcq_rb, NB the groups' cheapest held in one LDS buffer or two (one: a second barrier a step, for
  * the state counts whose two do not fit). The geometry is compile-time, so a state's LDS address
  * is an immediate offset from the thread's. */
-template <int L, int KB, int M, int SH, bool PACK, int WPE, bool HR, int NB = 2>
+template <int L, int KB, int M, int SH, int PACK, int WPE, bool HR, int NB = 2>
 __global__ void __launch_bounds__((1 << (L - KB)) * SH / M)
 __attribute__((amdgpu_waves_per_eu(WPE))) tcq_block(TcqArgs a) {
     /* SH lanes share a group's predecessors, BT each; a thread holds M groups' worth. */
@@ -166,7 +174,7 @@ __attribute__((amdgpu_waves_per_eu(WPE))) tcq_block(TcqArgs a) {
          * a register a state again. */
         if constexpr (PACK) {
 #pragma unroll
-            for (int q = 0; q < E / 4; ++q) asm volatile("" : "+v"(lv.p[q]));
+            for (int q = 0; q < Lut<E, PACK>::NP; ++q) asm volatile("" : "+v"(lv.p[q]));
         }
 #pragma unroll
         for (int m = 0; m < M; ++m) {
@@ -326,13 +334,15 @@ using BlockKernel = void (*)(TcqArgs);
  * packed table and an occupancy target (R9700, a 96-run weight of 5120 columns): fewer threads a
  * run let more runs share a WGP, until the states a thread holds spill. 1024 threads at most, the
  * wide codes' groups split over lanes. The 2^10-state forms are the default sizing, for tests. */
-struct Form { int L, k; BlockKernel plain, rb; int threads, nb; };
+/* `wide`: the forms for a code whose values pass int8 (tcq_code=mad16), the table packed two int16
+ * a register. */
+struct Form { int L, k; BlockKernel plain, rb; int threads, nb; bool wide; };
 #define LQ_FORM(l, kb, m, sh, pack, wpe)                                                         \
     { l, kb, tcq_block<l, kb, m, sh, pack, wpe, false>, tcq_block<l, kb, m, sh, pack, wpe, true>,  \
-      (1 << (l - kb)) * sh / m, 2 }
+      (1 << (l - kb)) * sh / m, 2, (pack) == 2 }
 #define LQ_FORM1(l, kb, m, sh, pack, wpe)                                                        \
     { l, kb, tcq_block<l, kb, m, sh, pack, wpe, false, 1>,                                        \
-      tcq_block<l, kb, m, sh, pack, wpe, true, 1>, (1 << (l - kb)) * sh / m, 1 }
+      tcq_block<l, kb, m, sh, pack, wpe, true, 1>, (1 << (l - kb)) * sh / m, 1, (pack) == 2 }
 const Form kForms[] = {
     LQ_FORM(10, 2, 1, 1, false, 1), LQ_FORM(10, 3, 2, 1, false, 1), LQ_FORM(10, 4, 1, 1, false, 1),
     LQ_FORM(10, 5, 1, 1, false, 1),
@@ -344,13 +354,16 @@ const Form kForms[] = {
      * states at 2 bits in one; not yet swept */
     LQ_FORM1(15, 2, 8, 1, true, 1), LQ_FORM1(16, 3, 8, 1, true, 1), LQ_FORM(16, 4, 4, 1, true, 1), LQ_FORM(16, 5, 2, 1, true, 1), LQ_FORM(16, 6, 1, 1, true, 1),
     LQ_FORM(16, 7, 1, 2, true, 1),
+    /* the wide code's forms: the sweep's shapes, the table at int16 */
+    LQ_FORM1(16, 3, 8, 1, 2, 1), LQ_FORM(16, 4, 4, 1, 2, 1), LQ_FORM(16, 5, 2, 1, 2, 1),
+    LQ_FORM(16, 6, 1, 1, 2, 1), LQ_FORM(16, 7, 1, 2, 2, 1),
 };
 #undef LQ_FORM
 #undef LQ_FORM1
 
-const Form* pick_form(int L, int k) {
+const Form* pick_form(int L, int k, bool wide) {
     for (const Form& f : kForms)
-        if (f.L == L && f.k == k) return &f;
+        if (f.L == L && f.k == k && f.wide == wide) return &f;
     return nullptr;
 }
 
@@ -577,7 +590,7 @@ bool gpu_enabled() { return !devices().empty(); }
 
 int gptq_tcq_gpu(const Grid& g, float* w, int32_t* codes, Scales& scales, int64_t N, int64_t K,
                  const float* u, bool dynamic, std::string* why) {
-    const Form* f = pick_form(g.tcq_L, g.tcq_k);
+    const Form* f = pick_form(g.tcq_L, g.tcq_k, g.tcq_wide);
     const int64_t T = g.tcq_rows;
     if (!f) {
         *why = "the card has no trellis kernel for tcq=" + std::to_string(g.tcq_L) + " with " +

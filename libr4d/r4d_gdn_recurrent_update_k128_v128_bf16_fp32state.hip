@@ -33,6 +33,7 @@
 #include "r4d_common.h"
 #include "r4d_gdn_conv_tap.h"
 #include "r4d_q8.h"         // the 8-bit codes the folded quantiser writes: E4M3 or int8
+#include "r4d_fwht.h"       // NORM 3: had_quant_act_i8g's rotation before the int8 codes
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -245,6 +246,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   constexpr int THR = NR * 2;
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
   __shared__ float wsum[THR / 32];
+  __shared__ float srot[NORM == 3 ? RU_V : 1];      // NORM 3: the row's bf16 output, for the rotation
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -642,7 +644,32 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     // `on`, with r4d_fused_quant_fp8.hip's quant_group arithmetic (including the clamp that keeps
     // the group maximum from becoming NaN). NORM == 2 writes int8 codes instead (quant_act_i8g:
     // scale amax / 127, round to nearest-even).
-    if (NORM && oq) {
+    // NORM == 3 writes had_quant_act_i8g's codes: the row's 128 stored bf16 values through
+    // r4d_fwht_wave<128> in one wave (a lane four consecutive channels, that function's mapping),
+    // then its amax / 127 scale and round-to-nearest-even, so the bytes are that quantiser's over
+    // `o`.
+    if (NORM == 3 && oq) {
+      if (half == 0) srot[row] = bf2f(ob);
+      __syncthreads();
+      if (tid < 32) {
+        float rv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) rv[j] = srot[4 * tid + j];
+        r4d_fwht_wave<128>(rv, tid);
+        float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+        m = r4d_wave_max(m);
+        const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+        if (tid == 0) os[(size_t)tok * os_ld + hv] = qs;
+        const float inv = 1.0f / qs;
+        uint32_t pk = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+        *(uint32_t*)(oq + (size_t)tok * oq_pitch + (size_t)hv * RU_V + 4 * tid) = pk;
+      }
+      __syncthreads();               // srot is reused by the next token
+    }
+    if ((NORM == 1 || NORM == 2) && oq) {
       const float ov = bf2f(ob);
       float mv = (half == 0) ? fabsf(ov) : 0.0f;
       mv = fmaxf(mv, r4d_xor_lane<16>(mv)); mv = fmaxf(mv, r4d_xor_lane<8>(mv));
@@ -879,7 +906,8 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
 
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
-// factor-block bounds are as in ru_update_launch. `w_f32` is the conv weight's type.
+// factor-block bounds are as in ru_update_launch. `w_f32` is the conv weight's type. `oq_i8`:
+// E4M3 codes (0), int8 (1), or had_quant_act_i8g's rotated int8 (2).
 static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void* b, long ab_stride,
                                     const void* A_log, const void* dt_bias, void* state,
                                     long st_slot, long st_head, void* o, void* oq, void* os,
@@ -896,8 +924,9 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
-  do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                       \
-       else       RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
+  do { if (oq_i8 == 2) RC_LAUNCH_NM(3, NTC, ANCC, SDTC, CVC);                                  \
+       else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
+       else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
   hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC>),     \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
@@ -1044,7 +1073,8 @@ enum { OPD_CR_X = 0, OPD_CR_CW, OPD_CR_CB, OPD_CR_CSTATE, OPD_CR_CIDX, OPD_CR_A,
        OPD_CR_ALOG, OPD_CR_DTB, OPD_CR_STATE, OPD_CR_SIDX, OPD_CR_NACC, OPD_CR_CU, OPD_CR_Z,
        OPD_CR_NORMW, OPD_CR_O, OPD_CR_OQ, OPD_CR_OS };
 
-extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+/* `had`: gdn_conv_recurrent_update_had, whose codes are had_quant_act_i8g's over `o` (required). */
+static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
     if (gdn_dims_ok() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
     const RadTensor* x     = r4d_opt(a, OPD_CR_X);
     const RadTensor* cw    = r4d_opt(a, OPD_CR_CW);
@@ -1070,6 +1100,7 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         !z || !nw || !o)
         return R4D_NO(RAD_E_INVAL);
     if ((oq != nullptr) != (os != nullptr)) return R4D_NO(RAD_E_INVAL);
+    if (had && (!oq || oq->dtype != RAD_I8)) return R4D_NO(RAD_E_INVAL);
     if (x->rank != 2 || cst->rank != 3 || o->rank != 3 || ta->rank != 2 || tb->rank != 2)
         return R4D_NO(RAD_E_SHAPE);
     if (state->rank < 2 || sidx->rank < 1 || cidx->rank < 1) return R4D_NO(RAD_E_SHAPE);
@@ -1147,5 +1178,13 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         os ? (long)r4d_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, cw->dtype == RAD_F32);
+        had ? 2 : oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, cw->dtype == RAD_F32);
+}
+
+extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+    return gdn_conv_recurrent_entry(a, s, false);
+}
+
+extern "C" int r4d_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s) {
+    return gdn_conv_recurrent_entry(a, s, true);
 }

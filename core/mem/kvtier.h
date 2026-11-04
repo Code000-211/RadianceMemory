@@ -404,6 +404,9 @@ private:
      * freed, so ticks do not spin on the queue. */
     bool     wb_stuck_ = false;
     std::unordered_map<uint64_t, Session> sessions_;
+    /* Rows kept under one root (sessions sharing a first block); past it the least recently used
+     * goes (note_session). */
+    static constexpr size_t kRootSessions = 1024;
     /* Sessions by first block. A chain is reachable only from position zero, so once its first
      * block goes (forget(), or a drop here via drop_rooted) its rows go too; this keeps the table
      * bounded. Sessions sharing a system prompt share a root, hence a list. */

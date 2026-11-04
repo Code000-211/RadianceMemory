@@ -254,6 +254,11 @@ std::string calib_stem(const char* name) {
             if (s[i] < '0' || s[i] > '9') { all_digits = false; break; }
         if (all_digits) s.resize(dot);
     }
+    /* A vocabulary-weighted lm_head's width classes (output.k<B>) are rows of one weight: they
+     * read the head's input Gram. */
+    if (s.size() > 8 && s.compare(0, 8, "output.k") == 0 &&
+        s.find_first_not_of("0123456789", 8) == std::string::npos)
+        s.resize(6);
     return s;
 }
 

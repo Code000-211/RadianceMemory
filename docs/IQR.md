@@ -169,3 +169,54 @@ int8 grid both share.
 
 The design, the per-weight and GEMM measurements and the comparison with V1 and V2 are in the
 IQR-V3 technical report (radiance.stilldeadco.de/whitepapers/iqr-v3.pdf).
+
+## IQR-V4: measured widths, a vocabulary-weighted head and faster kernels
+
+IQR-V4 keeps V3's computed trellis and its one f32 scale a row, and changes how the bits are spent and
+how the GEMMs read them. GPTQ runs in act order inside the column trellis (`tcq_order=1`: the columns
+are fitted in descending Hessian diagonal and the codes stored in column order), and the FFN weights'
+trellis runs grow to 512 or 1024 rows (`tcq_rows`). The projections the attention heads feed
+(`attn_output`, `ssm_out`) take a bf16 scale a (row, 128) block from five bits up (`group=128
+scale=bf16 dyn=1`), where V3's code reached its resolution first. The widths come from measured
+prices: each band of eight layers and projection is priced by the KL a width step costs it, measured
+at the 2/3-, 3/4- and 4/5-bit boundaries and shrunk halfway to the model's prices, and layer 63's
+`ffn_gate_up`, the one tensor whose price is several times its band's, sits one width up (the V4S
+entries, to IQ3R-L); from IQ4R-S up the model's prices are as good and are kept (V4W).
+
+The vocabulary edges carry about a tenth of every entry's bytes. The lm_head's KL weighs each
+vocabulary row by its token's probability, so below IQ6R-L the head is vocabulary-weighted: its rows
+are four width classes of the computed trellis (`output.k<B>`, a 256-row run a class, chosen by the
+row's probability-weighted output error at a 4.0, 4.5 or 5.0 b mean; `data/vhead/`, `tools/vhead.py`),
+decoded in one launch by `logits_gemm_vocab` with the head input held at 16 bits and the logits
+gathered back into vocabulary order. At 1 to 16 tokens it is faster than the int8 head it replaces.
+IQ6R-L-V4 to IQ8R-V4 keep the int8 head, now GPTQ'd against the head's input Hessian, which costs no
+bytes and lowers the median KL about 10%.
+
+The kernels: the one-token GEMV gives each 16-row tile a block whose waves split K, so a GEMM's tiles
+finish together instead of trailing off on a few long waves; a 16-token tile without block barriers serves 2 to 16 tokens; and
+the activation quantisers after `gate_up`, the delta net's decode fold and the attention gate are folded
+into the kernels that produce their input. On Qwen3.8-27B at TP1 IQ4R-S-V4 decodes one stream 4% faster
+than the MXFP4 checkpoint at 5x lower KL, and IQ3R-S-V4 is faster at every concurrency.
+
+| recipe | bpw | KL mean | top-1 | V3 at that size | its bpw | its KL | KL |
+|---|---:|---:|---:|---|---:|---:|---:|
+| `q38-27b-iq8r-v4` | 8.040 | 0.00046 | 99.22% | IQ8R-V3 | 8.040 | 0.00047 | -2% |
+| `q38-27b-iq7r-v4` | 7.420 | 0.00059 | 99.15% | IQ7R-V3 | 7.420 | 0.00060 | -2% |
+| `q38-27b-iq6r-l-v4` | 6.939 | 0.00068 | 99.08% | IQ6R-L-V3 | 6.939 | 0.00072 | -6% |
+| `q38-27b-iq6r-v4` | 6.439 | 0.00081 | 98.96% | IQ6R-V3 | 6.372 | 0.00088 | -8% |
+| `q38-27b-iq6r-s-v4` | 6.063 | 0.00100 | 98.86% | IQ6R-S-V3 | 6.049 | 0.00106 | -6% |
+| `q38-27b-iq5r-v4` | 5.433 | 0.00154 | 98.60% | IQ5R-V3 | 5.422 | 0.00182 | -15% |
+| `q38-27b-iq5r-s-v4` | 5.071 | 0.00223 | 98.33% | IQ5R-S-V3 | 5.064 | 0.00249 | -10% |
+| `q38-27b-iq4r-l-v4` | 4.793 | 0.00297 | 98.07% | IQ4R-L-V3 | 4.783 | 0.00342 | -13% |
+| `q38-27b-iq4r-v4` | 4.473 | 0.00444 | 97.69% | IQ4R-V3 | 4.458 | 0.00512 | -13% |
+| `q38-27b-iq4r-s-v4` | 4.142 | 0.00643 | 97.12% | IQ4R-S-V3 | 4.131 | 0.00762 | -16% |
+| `q38-27b-iq3r-l-v4` | 3.804 | 0.00917 | 96.61% | IQ3R-L-V3 | 3.798 | 0.01129 | -19% |
+| `q38-27b-iq3r-v4` | 3.472 | 0.01495 | 95.74% | IQ3R-V3 | 3.459 | 0.01698 | -12% |
+| `q38-27b-iq3r-s-v4` | 3.157 | 0.02241 | 94.75% | IQ3R-S-V3 | 3.145 | 0.02584 | -13% |
+| `q38-27b-iq2r-l-v4` | 2.797 | 0.03602 | 93.29% | IQ2R-L-V3 | 2.786 | 0.04241 | -15% |
+| `q38-27b-iq2r-v4` | 2.470 | 0.06113 | 91.23% | IQ2R-V3 | 2.465 | 0.06807 | -10% |
+
+IQ4R-L-V4 is 24% below the official FP8 checkpoint's KL (8.766 bpw, 0.00389) at 55% of its size, and
+IQ2R-L-V4, at 2.8 bpw, is below the AWQ-tuned MXFP4 checkpoint (4.994 bpw, 0.03824). The design, the
+kernels and the measurements are in the IQR-V4 technical report
+(radiance.stilldeadco.de/whitepapers/iqr-v4.pdf).

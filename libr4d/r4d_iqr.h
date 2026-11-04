@@ -181,7 +181,11 @@ R4D_IQR_HD constexpr int64_t tile_major(int64_t r, int64_t kb, int64_t nkb) {
     X(kTrellisMad, 6, 0, 16, 5, kE4m3Tensor) X(kTrellisMad, 7, 0, 16, 5, kE4m3Tensor)             \
     /* the computed trellis with a scale a row (no rescale a value) */                            \
     X(kTrellisMad, 2, 0, 16, 0, kE4m3Tensor) X(kTrellisMad, 3, 0, 16, 0, kE4m3Tensor)             \
-    X(kTrellisMad, 4, 0, 16, 0, kE4m3Tensor)                                                     \
+    X(kTrellisMad, 4, 0, 16, 0, kE4m3Tensor) X(kTrellisMad, 5, 0, 16, 0, kE4m3Tensor)             \
+    X(kTrellisMad, 6, 0, 16, 0, kE4m3Tensor) X(kTrellisMad, 7, 0, 16, 0, kE4m3Tensor)             \
+    /* the computed trellis under a bf16 scale a (row, 128): the fold reads it in place */        \
+    X(kTrellisMad, 4, 0, 16, 0, kBf16) X(kTrellisMad, 5, 0, 16, 0, kBf16)                         \
+    X(kTrellisMad, 6, 0, 16, 0, kBf16) X(kTrellisMad, 7, 0, 16, 0, kBf16)                         \
     /* the computed trellis under one scale a row and a factor a 128-K block */                  \
     X(kTrellisMad, 2, 0, 16, 0, kRowF32) X(kTrellisMad, 3, 0, 16, 0, kRowF32)                     \
     X(kTrellisMad, 4, 0, 16, 0, kRowF32) X(kTrellisMad, 5, 0, 16, 0, kRowF32)                     \
@@ -212,9 +216,11 @@ R4D_IQR_HD constexpr bool built(uint32_t w) {
     X(kTable, 4, 0, 0, 0, kBf16, 0) X(kTable, 5, 0, 0, 0, kBf16, 0)                              \
     X(kTable, 2, 0, 0, 0, kBf16, 1) X(kTable, 3, 0, 0, 0, kBf16, 1)                              \
     X(kTable, 4, 0, 0, 0, kBf16, 1) X(kTable, 5, 0, 0, 0, kBf16, 1)                              \
-    X(kZero, 6, 0, 0, 0, kBf16, 0)                                                               \
+    X(kZero, 6, 0, 0, 0, kBf16, 0) X(kZero, 7, 0, 0, 0, kBf16, 0)                                \
+    X(kZero, 8, 0, 0, 0, kBf16, 0)                                                               \
     X(kTrellis, 2, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 3, 0, 12, 0, kE4m3Tensor, 1)             \
-    X(kTrellis, 4, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 5, 0, 12, 0, kE4m3Tensor, 1)
+    X(kTrellis, 4, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 5, 0, 12, 0, kE4m3Tensor, 1)             \
+    X(kTrellis, 6, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 7, 0, 12, 0, kE4m3Tensor, 1)
 
 R4D_IQR_HD constexpr bool embed_built(uint32_t w) {
 #define R4D_IQR_EIS(k, b, lv, l, lrb, sc, r) \

@@ -37,6 +37,14 @@ int  table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t
  * another process filled. */
 int  table_copy_check(const uint8_t* src, int64_t n, const uint8_t* buf, std::string* why);
 
+/* --ngram-placement disk=DIR: [src, src + n) read from its own file `path` (the table's bytes and
+ * nothing else), mapped read-only in `out` (`bytes` = n). A missing file, or one of another size, is
+ * filled from the container under `path`.part and renamed, so a file under `path` is complete
+ * (`*filled` true); an existing one is checked as table_copy_check checks. The disk gather finds the
+ * file behind the mapping and reads it directly. Release with munmap(out->base, out->bytes). */
+int  table_file_open(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
+                     const std::string& path, TableCopy* out, bool* filled, std::string* why);
+
 /* Unlock and unmap; a no-op for a copy never made. */
 void table_copy_free(TableCopy* c);
 

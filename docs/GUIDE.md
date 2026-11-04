@@ -862,15 +862,29 @@ the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap
 and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
 cgroup of the engine that filled them.
 
+`--ngram-placement disk=DIR` reads the table from its own file, `DIR/ngram-<id>.bin`, instead of from
+the container: a table on a faster or separate drive (an Optane beside a model on a large NVMe, or a
+model on a hard disk with its table on an SSD) at no host memory. The first start fills the file from
+the container (the table's size free in `DIR`, written under `.part` and renamed, so the real name is
+always complete); later starts check samples of it against the container and reuse it. The `<id>` is
+`ram=DIR`'s, so a file never serves another model; remove the file to have it filled again. Reads go
+to it as `disk` reads the container, through the row cache with direct I/O, so `DIR`'s filesystem must
+support `O_DIRECT` (tmpfs since Linux 6.6 does, but a tmpfs is what `ram` is for).
+
 **`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
-routed layer's first expert op, on every pass, the engine reads all that layer's on-disk experts into
-one of two VRAM buffers (a router's picks are not known on the host, and a prefill chunk routes to
-nearly all of them). The buffers come out of the weight budget (the plan's `file buffers` line), and
-the reads go through four 32 MiB pinned windows out of `--host-pool-mib`, as long runs that skip
-resident experts. It is meant for running a checkpoint as shipped, to calibrate or compare against.
-The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two cards at about 28 s a step, the same at one token as
-at 32K, so use large prefill steps:
+routed layer's first expert op, on every pass, the engine reads the layer's on-disk experts that its
+rows route to into one of two VRAM buffers: the layer's router has run by then, and its counts are
+copied back first (one wait on the card per routed layer), so an expert no row routes stays on the
+drive. A step whose rows route nearly every expert, 64 rows an expert on average (3277 tokens for
+Qwen3.8-Flash-Next's 512 experts at top-10), reads its layers whole instead, each one while the card
+computes the one before, with no wait on the card. The buffers come out of the weight budget (the
+plan's `file buffers` line), and the reads go through four 32 MiB pinned windows out of
+`--host-pool-mib`, as long runs that skip resident experts. Without `--deterministic` the host pool
+is also a cache of the drive: an expert read from it is kept in a free pool slot, and a full pool
+gives its coldest expert back to the drive for a warmer one. It is meant for running a checkpoint
+as shipped, to calibrate or compare against. The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two
+cards at about 28 s a 32K-token step, so use large prefill steps:
 
 ```sh
 rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o flashnext-bf16.rad --max-ctx 4096   # no recipe: bf16
@@ -2069,7 +2083,7 @@ by 0.002-0.003 nats.
 | `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`--checkpoint-slots`, §4.8) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
-| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
+| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
@@ -3985,7 +3999,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.16.0
+I STARTUP REPORT -- radiance 1.17.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

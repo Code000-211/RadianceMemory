@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <fstream>
 #include <functional>
 #include <signal.h>
 #include <string>
@@ -26,6 +27,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cstring>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -450,6 +452,70 @@ TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
     CHECK_EQ(table_copy_make(f, src, n, (int64_t)pl.offset + 16, &bad, &bwhy), (int)RAD_E_IO);
     CHECK(bad.base == nullptr);
     CHECK(bwhy.find("does not match") != std::string::npos);
+    f.close();
+}
+
+/* --ngram-placement disk=DIR (#130): the first open fills the table's own file from the container,
+ * renamed into place whole; the mapping holds the container's bytes and is that file's (the disk
+ * gather finds the file behind its mapping); a second open reuses it unfilled; a file that is not
+ * this table is refused rather than served. */
+TEST(a_table_file_on_another_disk_is_filled_once_and_mapped_in_place_of_the_container) {
+    const std::string p = radtest::tmp_path("tfile");
+    RadWriter w;
+    REQUIRE(w.begin(p.c_str()) >= 0);
+    w.set_arch("radtest");
+    const RadWriter::Weight x = mkw("ngram.weight", plain_bf16(), 1500, 999, -1, -1, 0);
+    const Planes want = planes_of(x, 7);
+    REQUIRE(w.add_weight(x, want.ptr.data()) >= 0);
+    REQUIRE(w.finish() >= 0);
+    RadFile f;
+    REQUIRE(f.open(p.c_str()) >= 0);
+    const RadFilePlane& pl = f.plane(*f.find("ngram.weight"), 0);
+    const uint8_t* src = f.data(pl);
+    const int64_t n = (int64_t)pl.bytes;
+    const std::string tab = radtest::tmp_path("tfile-table");
+    ::unlink(tab.c_str());
+
+    TableCopy a;
+    bool filled = false;
+    std::string why;
+    REQUIRE_EQ(table_file_open(f, src, n, (int64_t)pl.offset, tab, &a, &filled, &why), (int)RAD_OK);
+    CHECK(filled);
+    CHECK_EQ(a.bytes, (size_t)n);
+    CHECK(std::memcmp(a.base, src, (size_t)n) == 0);
+    CHECK(::access((tab + ".part").c_str(), F_OK) != 0);
+    /* The mapping is the file's, as /proc/self/maps names it. */
+    {
+        std::ifstream maps("/proc/self/maps");
+        bool backed = false;
+        for (std::string line; std::getline(maps, line);) {
+            unsigned long long lo = 0, hi = 0;
+            if (std::sscanf(line.c_str(), "%llx-%llx", &lo, &hi) != 2) continue;
+            if ((uintptr_t)a.base >= lo && (uintptr_t)a.base < hi)
+                backed = line.size() >= tab.size() && line.compare(line.size() - tab.size(), tab.size(), tab) == 0;
+        }
+        CHECK(backed);
+    }
+    ::munmap(a.base, a.bytes);
+
+    TableCopy b;
+    REQUIRE_EQ(table_file_open(f, src, n, (int64_t)pl.offset, tab, &b, &filled, &why), (int)RAD_OK);
+    CHECK(!filled);
+    CHECK(std::memcmp(b.base, src, (size_t)n) == 0);
+    ::munmap(b.base, b.bytes);
+
+    /* Same size, other bytes: refused, and left for the operator to remove. */
+    {
+        std::fstream t(tab, std::ios::in | std::ios::out | std::ios::binary);
+        t.seekp(0);
+        const char junk[16] = "not the table..";
+        t.write(junk, sizeof junk);
+    }
+    TableCopy c;
+    CHECK_EQ(table_file_open(f, src, n, (int64_t)pl.offset, tab, &c, &filled, &why), (int)RAD_E_IO);
+    CHECK(c.base == nullptr);
+    CHECK(why.find("does not match") != std::string::npos);
+    ::unlink(tab.c_str());
     f.close();
 }
 

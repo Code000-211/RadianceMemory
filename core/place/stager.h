@@ -214,47 +214,92 @@ private:
  * GEMM is handed every expert's pointer at issue. So on every pass, decode included, each routed
  * layer's file-tier units are read into one of the mover's two file buffers before the layer's
  * first expert op and published there, then published as null when the next routed layer starts.
- * The router's picks are not known on the host without a round trip, so the layer's whole
- * file-tier part is read; decode is then paced by the drive, which is the trade the flag makes.
  *
- *   the pass's first op      read the first routed layer the pass issues
- *   a layer's first op       release the layer before (record its buffer free on the stream, publish
- *                            null), wait on this layer's copies, and read the next layer into the
- *                            buffer just released -- its copies queue behind that free event
+ * ---- which experts -------------------------------------------------------------------------------
+ *
+ * Only the experts the layer's rows route to are read. Their counts are known only once the
+ * layer's router has run, so a layer is read at its own trigger, its first expert op: the counts
+ * are copied back behind the router on the same stream (one drain of the stream), and a unit
+ * counted zero is published at the mover's zero region instead of being read. The read cannot
+ * start earlier: counts taken before the router are another layer's, or the last pass's, and a
+ * truly routed expert they count zero would be computed from zeros. The card waits for every
+ * read either way, so reading at the trigger costs what reading the next layer ahead behind the
+ * same drain did.
+ *
+ * A layer the count source cannot give counts for (the first pass, before any report) is read
+ * whole, and since that read needs no counts it goes ahead of time as before: at the pass's
+ * first op for the first routed layer, at a layer's trigger for the next one, into the buffer
+ * just released.
+ *
+ * So is every layer of a pass large enough that its rows route nearly every expert, kWholeRows
+ * rows an expert on average by the model's expert count and top-k (whole_rows()). An exact read
+ * takes the same bytes there, and each layer costs the card's work plus the drive's, since the
+ * card idles behind the drain while the drive reads. A whole read needs no counts, so nothing
+ * drains the stream, and the drive reads the next layer while the card computes the one before.
+ * At 64 rows an expert, one routed an eighth as often as the average is left out of about one
+ * pass in 3000, and read for nothing then. Smaller passes skip enough to pay for the drain: at
+ * decode nearly every file-tier expert.
+ *
+ *   the pass's first op      read the first routed layer the pass issues, if it is read whole
+ *   a layer's first op       release the layer before (record its buffer free on the stream,
+ *                            publish null), read this layer unless read ahead, wait on its
+ *                            copies, and read the next layer ahead if it is read whole -- its
+ *                            copies queue behind the free event of the buffer it takes
+ *   a repeat of that op      another slice of rows: read what its counts route that the earlier
+ *                            slices' did not, and wait on those copies
  *   the pass's end           release whatever is still held
  *
  * A layer is released when the next one starts, not at its own last op: a routed block that slices
  * a large step into passes of `rows` tokens issues its expert ops once per slice, so a release at
- * the last op would leave the next slice reading null. Repeats of the current layer's first op do
- * nothing.
+ * the last op would leave the next slice reading null. Each slice routes its own rows, which is
+ * why a repeat reads again.
  *
- * The read blocks the issuing thread while the card runs what was issued before it. A layer's
- * file-tier part is gigabytes against milliseconds of compute, so the step is drive-bound either
- * way; a reader thread would gain little and add a second writer of the residency table.
+ * Every read that issued a copy is waited on, a hot-cache admission's or a pool deposit's as much
+ * as a staged unit's: all are published settled, so the wait is the only thing between the GEMM
+ * and the slot's previous bytes.
+ *
+ * The read blocks the issuing thread while the card runs what was issued before it; a reader
+ * thread would gain little and add a second writer of the residency table.
  *
  * A layer is read ahead only when the pass will issue it (a bound learned per draft_pass from the
- * last pass of that kind), so a trunk pass does not read the MTP head's layer. */
+ * last pass of that kind), so a trunk pass does not read the MTP head's layer.
+ *
+ * ---- which units -------------------------------------------------------------------------------
+ *
+ * Under a dynamic plan the pool is a cache of the file tier: a deposit may relabel a pooled unit
+ * back to the file tier (Mover::stage_file_units). A pooled unit the plan put in the pool is then
+ * on the file tier too, so the stager covers every movable routed unit of a class with file-tier
+ * units, not only the plan's file-tier ones, and tells the mover so (Mover::cover_file_units); a
+ * trigger whose layer has nothing on the file tier skips the read and its drain. Where covering
+ * them would interleave two layers' spans, only the plan's file-tier units are covered, and the
+ * mover relabels none of the others. */
 class FileStager final : public OpStager {
 public:
     ~FileStager() override;
 
-    /* Routing-aware reads: the engine binds a source of the layer's per-expert routing
-     * counts for the current pass (the router reports them to the Ctx before the layer's
-     * first expert op, which is the stager's trigger). Returns the device pointer of
-     * `n_expert` i32 counts, or null when the layer has not reported this pass — the
-     * caller then reads the whole layer. Null `routes` reads whole layers. */
+    /* Routing-aware reads: the engine binds a source of a layer's per-expert routing counts
+     * (Ctx::route_counts_device). It returns the device pointer of `n_expert` i32 counts that the
+     * layer's router rewrites every pass before the layer's first expert op, which is the
+     * stager's trigger, or null when it has none (the layer has not reported yet) -- the stager
+     * then reads the whole layer. Null `routes` reads whole layers. */
     using RouteCounts = const int32_t* (*)(void* ud, int32_t layer, int64_t* n_expert);
 
     /* Binds the routed layers with file-tier units and the ops that read them, over the mover's
      * two file buffers. Leaves enabled() false when no routed unit is on the file tier. Refuses a
-     * plan whose routed layers are read by interleaved ops, since a file-tier unit has no other
-     * address to fall back on. */
+     * plan whose routed file-tier layers are read by interleaved ops, since a file-tier unit has
+     * no other address to fall back on. */
     int init(const Program& prog, const Plan& plan, Mover* mover,
              RouteCounts routes = nullptr, void* routes_ud = nullptr);
 
     bool    enabled() const { return !layers_.empty(); }
     size_t  n_layers() const { return layers_.size(); }
     int64_t buffer_bytes() const { return cap_; }
+    /* Stream waits on the stager's copies so far, one per read that issued any. Tests read it. */
+    int64_t waits() const { return waits_; }
+    /* The smallest pass, in tokens, whose layers are read whole and ahead (see "which experts"),
+     * or 0 when every pass is read exactly (no routing source, or the model's top-k unknown). */
+    int64_t whole_rows() const { return whole_rows_; }
+    static constexpr int64_t kWholeRows = 64;
 
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
@@ -262,7 +307,8 @@ public:
 
 private:
     using Layer = StagedLayer;
-    std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */
+    int64_t              waits_ = 0;
+    std::vector<Layer>   layers_;      /* the routed layers the stager covers, in first-op order */
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
 
     Mover*   mover_ = nullptr;
@@ -272,16 +318,15 @@ private:
     void*    routes_ud_ = nullptr;
     int32_t* scratch_ = nullptr;        /* pinned, for the trigger's blocking counts copy */
     int64_t  scratch_n_ = 0;
-    std::vector<int32_t> skipped_[2];   /* per buffer: units not read, nulled at release */
-    /* Per buffer: units the stager read into hot-cache slots. Unlike the
-     * staged ones they keep their publications when the buffer is released — the slot is
-     * their address from here on, until heat evicts one. */
-    std::vector<int32_t> promoted_[2];
+    /* Per buffer: what its layer's reads staged (nulled at release), skipped (likewise) and read
+     * into hot-cache slots (whose publications outlive the buffer -- the slot is their address
+     * until heat evicts one). */
+    Mover::FileRead rd_[2];
+    std::vector<int32_t> again_;        /* a repeat's candidates: the layer's skipped units */
     RadEvent done_[2] = { nullptr, nullptr };   /* behind a buffer's copies, on the mover stream */
     RadEvent free_[2] = { nullptr, nullptr };   /* behind the ops that read a buffer's layer */
     bool     free_rec_[2] = { false, false };
-    std::vector<int32_t> staged_[2];
-    int  start(int32_t li, RadStream s);
+    bool     pending_[2] = { false, false };     /* copies no stream has waited on yet */
     int32_t  holds_[2] = { -1, -1 };             /* the layer a buffer holds, or -1 */
     int32_t  cur_ = -1;                          /* the layer whose ops are being issued */
 
@@ -290,9 +335,18 @@ private:
     int32_t  pass_kind_ = 0;
     int32_t  last_issued_ = -1;
     std::map<int32_t, int32_t> pass_last_;   /* by draft_pass: the last op such a pass issued */
+    int64_t  whole_rows_ = 0;
+    bool     whole_ = false;                 /* this pass reads every layer whole (whole_rows) */
 
     bool will_issue(int32_t li) const;
-    int  start(int32_t li);
+    /* Whether layer `li` is read with counts, at its own trigger; otherwise it is read whole,
+     * and may be read ahead. */
+    bool counted(int32_t li) const;
+    /* The counts of the rows about to run, copied back behind the router on `s`, or null. */
+    int  counts(int32_t li, RadStream s, const int32_t** ecnt, int32_t* n_expert);
+    int  start(int32_t li, RadStream s, bool* resync);
+    int  top_up(int32_t li, RadStream s, bool* resync);
+    int  wait(int32_t b, RadStream s);
     int  finish(int32_t b, RadStream s);
 };
 

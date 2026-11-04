@@ -2604,12 +2604,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Pictures read both ways where the model was trained so, on the sliding layers alone: the
      * global layers stay causal (transformers' create_masks_for_vision_model, "Gemma 4 explicitly
      * disables bidirectional attention on global attention layers"; KerasHub's Gemma 4 decoder
-     * block and vLLM agree). RADIANCE_MEDIA_BIDI=0 reads them causally on every layer. */
+     * block and vLLM agree). */
     const char* bidi_cfg = meta_text_gets(meta, "use_bidirectional_attention", "");
-    const char* bidi_env = std::getenv("RADIANCE_MEDIA_BIDI");
     const bool want_bidi = bidi_cfg && !std::strcmp(bidi_cfg, "vision") && ctx->max_enc_patches > 0 &&
-                           (Gemma4Vision::present(meta) || Gemma4UnifiedVision::present(meta)) &&
-                           !(bidi_env && !std::strcmp(bidi_env, "0"));
+                           (Gemma4Vision::present(meta) || Gemma4UnifiedVision::present(meta));
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];

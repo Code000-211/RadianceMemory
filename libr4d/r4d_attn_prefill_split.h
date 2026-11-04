@@ -63,9 +63,10 @@ static inline int r4d_prefill_splits_law(int bq, int tile, int q_len, int total_
 // tells r4d_selftest a split launch from an unsplit one with the same bytes. Not atomic.
 static int g_prefill_last_splits = 0;
 
-/* The runtime supplies the live group maximum only when it can prove that the launch's full
- * seqused operand is the just-built, non-speculative prefill batch. Other shapes use max_ctx below;
- * never synchronously copy device seqused from a HIP queue independent of the AQL upload queue. */
+/* RadArgs::kv_used_max_h is the host maximum of the launch's seqused operand (Ctx::issue_body),
+ * -1 where it cannot be proven, which uses max_ctx below. In a recorded pass of a plugin with no
+ * pass-key callback (decode, verify, draft) it is the step's keyed context bound instead. Never
+ * synchronously copy device seqused from a HIP queue independent of the AQL upload queue. */
 
 /* The KV split's count before the scratch bound: the case's `splits` parameter when it names one
  * (r4d_selftest; the prefill rows declare no such axis, so the engine passes none), else the law,

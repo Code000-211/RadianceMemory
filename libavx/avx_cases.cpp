@@ -376,6 +376,13 @@ std::vector<Case> build_cases() {
                                     HI("block_size", 16), HI("causal", 1), HI("window", window),
                                     HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
                                     HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* One anchor a sequence (DSpark's drafter): a window of 8 measured from the first query row. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 17 })
+            add("attn_paged_anchor_window", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
+                                              HI("block_size", 16), HI("causal", 1), HI("window", 8),
+                                              HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
+                                              HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
     /* The tree form over the same shapes (its described parents are ordinary rows, -2). */
     for (const char* dt : { "f32", "bf16" })
         for (int qlen : { 1, 17 })
@@ -787,6 +794,13 @@ std::vector<Case> build_cases() {
                            HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
     add("dflash_select", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
                            HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
+    /* DSpark's full-vocabulary walk: a ragged last tile (V % 64), rank 37 not whole vectors. */
+    for (const char* op : { "dflash_markov_greedy", "dflash_markov_greedy_f32" }) {
+        add(op, { HI("M", 3), HI("steps", 4), HI("rank", 64), HI("n_vocab", 300),
+                  HI("anchor_stride", 1), HS("dtype", "bf16") });
+        add(op, { HI("M", 2), HI("steps", 3), HI("rank", 37), HI("n_vocab", 97),
+                  HI("anchor_stride", 2), HS("dtype", "bf16") });
+    }
     /* The same lattices grown into trees: more nodes than steps, and fewer. */
     add("dflash_tree", { HI("M", 3), HI("steps", 4), HI("top_k", 8), HI("rank", 64),
                          HI("n_vocab", 300), HI("anchor_stride", 1), HI("nodes", 6),

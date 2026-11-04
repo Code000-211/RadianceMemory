@@ -666,6 +666,57 @@ static std::vector<LogprobEntry> kept_logprobs(const std::vector<LogprobEntry>& 
     return std::vector<LogprobEntry>(lp.begin(), lp.begin() + (long)lp_before_cut(lp, 0, cut));
 }
 
+/* How many trailing bytes of a running choice's text are held back for its stop strings: the
+ * longest tail that is a proper prefix of one of them (core/text's Detokenizer holds back the
+ * same in what it has not returned). Every byte before that tail is final. A stop string that
+ * began there would already be complete in `text`, and pump() would have cut it, or it can no
+ * longer be completed, since the text only grows at its end. So this holds back exactly what
+ * pump() may yet cut, for any decoder: one that leaves stop strings to the server (iface.h), and
+ * core/text's, which cannot see a stop the server's scan can find in the U+FFFD it returned for
+ * a byte that was not UTF-8. A blanket (longest stop - 1) bytes, which this replaced, delayed
+ * every delta, the first one included, by up to a 4 KiB stop's worth of text.
+ *
+ * Run on every drain of every running choice, so its cost is bounded three ways:
+ *
+ *   - Only the bytes not yet on the wire (`emitted` on) can be held back, and the tail never
+ *     starts before them: a tail that began earlier would have been a longer one at the drain
+ *     that sent those bytes. So the tails looked at are the ones in what the drain adds to what
+ *     it held back, however long the stop strings are.
+ *   - A tail is compared only where it starts with a byte some stop string starts with.
+ *   - The comparisons share a budget (kStopTailBudget: a stop string looked at costs one, and
+ *     each byte compared one more). A client sets its stop strings (64 of up to 4 KiB) and
+ *     steers the text, and text that keeps almost matching long stop strings would cost a drain
+ *     up to 4095 tails times 64 strings times their length. Past the budget the whole unsent
+ *     window, up to the longest stop less a byte, is held back: more than the tail, never less,
+ *     so nothing of a stop string is sent, and as late as the blanket hold-back this replaced.
+ *     The next drain tries again. */
+constexpr size_t kStopTailBudget = size_t(1) << 14;
+
+static size_t stop_prefix_tail(std::string_view text, size_t emitted,
+                               const std::vector<std::string>& stops, size_t maxstop) {
+    const size_t unsent = text.size() > emitted ? text.size() - emitted : 0;
+    const size_t limit = std::min(unsent, maxstop > 0 ? maxstop - 1 : 0);
+    bool starts[256] = {};
+    for (const std::string& s : stops)
+        if (s.size() > 1) starts[(unsigned char)s[0]] = true;
+    size_t budget = kStopTailBudget;
+    for (size_t n = limit; n > 0; --n) {
+        const char* tail = text.data() + text.size() - n;
+        if (!starts[(unsigned char)*tail]) continue;
+        for (const std::string& s : stops) {
+            if (budget == 0) return limit;
+            --budget;
+            if (s.size() <= n || s[0] != *tail) continue;
+            size_t i = 1;   /* s[0] is known to match */
+            while (i < n && s[i] == tail[i]) ++i;
+            if (i == n) return n;
+            if (budget < i) return limit;
+            budget -= i;
+        }
+    }
+    return 0;
+}
+
 bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
     bool progress = false;
     SinkToken buf[128];
@@ -1228,15 +1279,16 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 }
             }
             if (g.delta && g.sink->n_produced() > 0) out += g.delta->started();
-            /* While the choice runs, hold back the longest stop string minus one byte, or the
-             * start of a stop sequence would already be on the wire when it is recognised.
+            /* While the choice runs, hold back a tail that may still become a stop string
+             * (stop_prefix_tail), or its start would already be on the wire when it is
+             * recognised.
              *
              * Only while running: a closed choice has no more bytes coming, so its whole text is
              * the answer, including a trailing `\` or partial `\uXXXX` the escape rule would
              * otherwise hold back. */
             size_t safe = g.text.size();
             if (!g.closed) {
-                if (maxstop > 1) safe = safe > maxstop - 1 ? safe - (maxstop - 1) : 0;
+                if (maxstop > 1) safe -= stop_prefix_tail(g.text, g.emitted, st->r.stop, maxstop);
                 safe = json_stable_prefix(std::string_view(g.text.data(), safe));
                 if (safe <= g.emitted) continue;
             }

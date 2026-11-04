@@ -119,8 +119,13 @@ static RadOperand opd_none() {
 
 static int64_t rows_for(const SamplerConfig& c) {
     /* One row per sampled position: a verify samples n_spec+1 positions per sequence, each with
-     * its own RNG coordinate. Sized for the worst step, as the arena is (spec §3.1). */
-    return c.max_seqs * (int64_t)(c.max_spec + 1);
+     * its own RNG coordinate. Sized for the worst step, as the arena is (spec §3.1). A step
+     * carries at most max_tok tokens and samples at most one row per token, so a deep drafter
+     * at the default 256 sequences no longer sizes every plane for 256 * (depth + 1) rows; a
+     * drafter's greedy pass stages one row per drafting sequence, so never below max_seqs. */
+    const int64_t want = c.max_seqs * (int64_t)(c.max_spec + 1);
+    if (c.max_tok <= 0) return want;
+    return std::min(want, std::max(c.max_tok, c.max_seqs));
 }
 
 /* ================================================================== declare */
@@ -331,8 +336,9 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     RAD_TRY(stage_alloc());
     declared_ = true;
 
-    RAD_INFO("sampler: %lld-token vocabulary (%lld this rank), %lld rows, %lld mask words "
+    RAD_INFO("sampler: %lld-token vocabulary (%lld this rank), %lld rows%s, %lld mask words "
              "(%s per row)", (long long)cfg_.n_vocab, (long long)nv, (long long)rows,
+             rows < cfg_.max_seqs * (int64_t)(cfg_.max_spec + 1) ? " (the step's token bound)" : "",
              (long long)mask_words_, humanb(mask_words_ * 4).c_str());
     return RAD_OK;
 }
@@ -1068,13 +1074,11 @@ int Sampler::build_greedy(int64_t n) {
     any_ngram_wl_ = false;
     any_couple_ = false;
     cur_stage_ = greedy_stage_;
-    /* A drafter's rows run the argmax only, so the n-gram plane is cleared: `run` reads it from
-     * the staging, and a stale pair from an earlier request's build must not issue the ban over
-     * history that was not staged this step. The exemption plane needs no clear: `run` uploads
-     * it only beside an issued ban, every row that runs the ban has its words rewritten in full
-     * by the build that staged the pair (build_step), and rows below a zeroed pair are skipped
-     * by the op before they read a word. */
-    std::memset(ngram_stage_, 0, (size_t)cap * 2 * sizeof(int32_t));
+    /* Nothing a step's build staged is written here: a drafter's pass is built right after the
+     * step's chain was issued, whose uploads read the pinned staging only when the stream reaches
+     * them, behind the step's forward. So the n-gram pairs stay as the step staged them and the
+     * ban is gated on any_ngram_, which this clears; before, the pairs were zeroed here and a
+     * banning step with drafter passes uploaded the zeros, so the ban never ran on the card. */
     if (greedy_ready_) return RAD_OK;
     for (int64_t i = 0; i < cap; ++i) {
         DeviceSampleParams& p = greedy_stage_[i];
@@ -1097,27 +1101,32 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadStream s = rad_stream(c);
 
     bool any_mask = false, any_greedy = false, any_chain = false;
-    bool any_penalty = false, any_dry = false, any_xtc = false, any_ngram = false;
+    bool any_penalty = false, any_dry = false, any_xtc = false;
     bool any_topp = false, any_minp = false, any_typ = false, any_temp = false;
     for (int64_t i = 0; i < n_seq_; ++i) {
         const DeviceSampleParams& p = cur_stage_[i];
         any_mask    |= (p.flags & RAD_SP_MASK)    != 0;
         any_penalty |= (p.flags & RAD_SP_PENALTY) != 0;
         any_dry     |= (p.flags & RAD_SP_DRY)     != 0;
-        any_xtc     |= (p.flags & RAD_SP_XTC)     != 0;
-        /* The pair plane is read directly, not through cur_stage_: it is per-step staging the
-         * LAST builder filled (build_step writes a row's pair, build_greedy zeroes every pair),
-         * so it agrees with cur_stage_ by builder contract. A new builder must keep that
-         * contract: stage the pair with the params, zero it with the greedy ones. */
-        any_ngram   |= ngram_stage_[2 * i] > 0;
         if (p.flags & RAD_SP_GREEDY) any_greedy = true;
         else {
             any_chain = true;
             /* sample_temp leaves a row at temperature <= 0 or exactly 1 as it is */
             any_temp |= p.temp > 0.0f && p.temp != 1.0f;
-            any_topp |= p.top_p < 1.0f;
-            any_minp |= p.min_p > 0.0f;
-            any_typ  |= p.typical_p < 1.0f;
+            /* The cuts only remove candidates, and a top-1 row has one: a greedy row over a split
+             * vocabulary or asking for logprobs, and every row of a drafter's greedy pass. Every
+             * implementation keeps it (top-p and min-p keep the best, typical keeps a lone
+             * candidate, XTC needs two above its threshold), so such a row issues none of them;
+             * nor does a top_p or typical_p outside (0, 1), which every kernel skips. A drafter's
+             * greedy pass under a split vocabulary, whose rows are zeroed, issued top-p and
+             * typical every round: two launches with a max and a sum over the candidate width a
+             * row, for nothing. */
+            if (p.top_k != 1) {
+                any_topp |= p.top_p > 0.0f && p.top_p < 1.0f;
+                any_minp |= p.min_p > 0.0f;
+                any_typ  |= p.typical_p > 0.0f && p.typical_p < 1.0f;
+                any_xtc  |= (p.flags & RAD_SP_XTC) != 0;
+            }
         }
     }
 
@@ -1128,6 +1137,13 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
                 "returns a column of this rank's shard rather than a token id");
         return RAD_E_STATE;
     }
+
+    /* The ban runs only for a build_step build in which some row's staged history holds a whole
+     * n-gram (any_ngram_; build_greedy clears it). A shorter one bans nothing, however the op is
+     * implemented, so neither the op nor its planes are issued for it. The pair plane is not
+     * scanned for a row with a positive n: a drafter's greedy build leaves it as the step staged
+     * it (see build_greedy). */
+    const bool any_ngram = any_ngram_;
 
     /* Async copies on the compute stream, only of what some row reads. The mask is 19 KiB per
      * constrained sequence at a 151K vocab, which keeps a host-side grammar affordable

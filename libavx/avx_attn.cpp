@@ -250,7 +250,10 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
  * reads it: -2 an ordinary causal row; else the row's parent's index within its sequence's rows
  * (-1 for the block's first). Inside the block such a row sees itself and its ancestors only, and
  * its window is measured from the block's first position plus its depth. */
-AVX_KERNEL(attn_paged) {
+/* `shared_anchor_window` (attn_paged_anchor_window): every row of a sequence measures its window,
+ * and a causal row its last visible key, from the sequence's first query position instead of its
+ * own, as libref does (ref_attn.cpp, ref_attn_paged_impl). */
+static int attn_paged_impl(const RadArgs* a, RadStream stream, bool shared_anchor_window) {
     if (a->n_t < 8) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
     const RadTensor* kdes = rad_arg_in(a, 4);
@@ -266,7 +269,8 @@ AVX_KERNEL(attn_paged) {
     const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
     const int causal = (int)p_int(a, "causal", 1);
     const int64_t window = p_int(a, "window", 0);
-    if (head_dim <= 0 || gqa <= 0 || block_size <= 0) return RAD_E_SHAPE;
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0 || (shared_anchor_window && window <= 0))
+        return RAD_E_SHAPE;
     if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
 
     const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
@@ -299,7 +303,7 @@ AVX_KERNEL(attn_paged) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     /* Uniform long queries take the panel form; ragged (cus) inputs stay here. */
-    if (!cus && q_len >= 32 && !tpar) return attn_paged_prefill(a, stream);
+    if (!cus && q_len >= 32 && !tpar && !shared_anchor_window) return attn_paged_prefill(a, stream);
     /* Work units are (token, kv-head) groups: the gqa query rows of a group share every key and
      * value row, so each is widened once for gqa dots/axpys. Per-row arithmetic is unchanged. */
     const int64_t total = rows * kv_heads;
@@ -415,12 +419,14 @@ AVX_KERNEL(attn_paged) {
             ntile = 0;
         };
 
+        const int64_t mask_pos = shared_anchor_window ? base : pos;
         for (int64_t j = 0; j < ctx; ++j) {
-            if (causal ? (j > pos) : (j >= ctx)) continue;
+            if (causal ? (j > mask_pos) : (j >= ctx)) continue;
             if (tree && j >= base && !((tmask >> (j - base)) & 1)) continue;
             if (window > 0) {
-                const int64_t d = wpos - j;
-                if (causal ? (d >= window) : (d >= window || d <= -window)) continue;
+                const int64_t d = (shared_anchor_window ? base : wpos) - j;
+                if (shared_anchor_window ? (d >= window)
+                    : causal ? (d >= window) : (d >= window || d <= -window)) continue;
             }
             if (j / block_size >= max_blocks) break;   /* past the block table's width */
             const int64_t blk = ldi(bt, s * bt_rs + (j / block_size) * bt_cs);
@@ -745,6 +751,15 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
     return true;
 }
 #endif
+
+AVX_KERNEL(attn_paged) { return attn_paged_impl(a, stream, false); }
+
+/* attn_paged with one window anchor a sequence (DSpark's drafter); no tree operand. */
+AVX_KERNEL(attn_paged_anchor_window) {
+    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    if (a->n_t > 8 && rad_arg_in(a, 8)) return RAD_E_UNSUPPORTED;
+    return attn_paged_impl(a, stream, true);
+}
 
 /* attn_paged with its tree operand present, which attn_paged reads (see there). Refused without
  * one, and for a non-causal layer. */

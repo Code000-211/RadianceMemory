@@ -2024,7 +2024,7 @@ extern "C" int r4d_shape_gram_accum(const RadParam* p, int n_p, int operand, Rad
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
     /* dtype bf16 is a plain activation with no scale operand; fp8a8 is E4M3 codes and a dequant
-     * scale per (row, group). */
+     * scale per (row, group), i8a8 the same with int8 codes. */
     const char* dt = rad_param_gets(p, n_p, "dtype", nullptr);
     if (dt && !std::strcmp(dt, "bf16")) {
         const RadOpdDesc l[] = {
@@ -2035,8 +2035,10 @@ extern "C" int r4d_shape_gram_accum(const RadParam* p, int n_p, int operand, Rad
         R4D_PICK(l);
     }
     if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    /* i8a8: an int8 trunk's codes, with the same scale grid. */
+    const uint32_t q = dt && !std::strcmp(dt, "i8a8") ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
     const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd(q, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
         opd((uint32_t)RAD_F32, n, n),
     };

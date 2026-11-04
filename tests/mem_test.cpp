@@ -4363,6 +4363,31 @@ TEST(the_session_view_says_what_a_return_reuses_and_what_is_off_the_card) {
     }
 }
 
+/* Conversations under one shared first block (a decision model's instructions, which no request
+ * evicts) keep at most 1024 rows: the least recently used row goes, the newest stay. Before, every
+ * request added a row and each insert walked all of them (#375). */
+TEST(a_shared_root_keeps_a_bounded_session_table) {
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 1024)));
+    constexpr uint64_t kRows = 1500;
+    for (uint64_t i = 1; i <= kRows; ++i)
+        t.note_session(i, {bh(1), bh(1000 + i)}, 32, i * SEC);
+    std::vector<IdleTiers::SessionInfo> s = t.sessions();
+    CHECK_EQ(s.size(), 1024u);
+    bool newest = false, oldest = false;
+    for (const auto& r : s) {
+        newest |= r.id == kRows;
+        oldest |= r.id == 1;
+    }
+    CHECK(newest);
+    CHECK(!oldest);
+    /* A later turn of a kept conversation still absorbs its row. */
+    t.note_session(kRows + 1, {bh(1), bh(1000 + kRows), bh(7)}, 48, (kRows + 1) * SEC);
+    s = t.sessions();
+    CHECK_EQ(s.size(), 1024u);
+    for (const auto& r : s) CHECK(r.id != kRows);
+}
+
 TEST(tiers_stay_off_until_a_size_is_given) {
     IdleTiers t;
     CHECK_OK(t.configure(tier_config(0, 1024)));
