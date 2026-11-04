@@ -3073,6 +3073,11 @@ order, not a slow one.
 `qsa_page` is the sixth op of the family and runs only when the attention group declares a
 residency window and the store is open (see "`qsa_page`" below).
 
+| `qsa_pool_mask` | `M`(range) `blocks` `pool` | `pool`, `score`:inout |
+
+`qsa_pool_mask` is the seventh and runs only under `--qsa-pool` (the hierarchical indexer, see
+"`qsa_pool_mask`" below).
+
 Five ops decompose one indexer, which scores blocks of key history against the query and hands
 `attn_paged` a shorter block table. `docs/QSA.md` describes the decomposition and
 `arch/common/rad_qsa.h` issues all five. libref implements all five (the oracle for libr4d's
@@ -3215,6 +3220,28 @@ the store, a scratch id outside the pool, or two cold positions sharing a scratc
   (`RAD_E_INVAL`, `RAD_E_SHAPE`) for one without the other, an unknown or repeated word, or a
   `block_bytes` that is not whole rows of the pool's layout. libr4d's four waves split a
   fragment's rows; `r4d_emu_kvx` and r4d_selftest hold it to libref.
+
+### `qsa_pool_mask`
+
+The hierarchical indexer (`--qsa-pool N`, `docs/QSA.md`): a QSA layer after the first ranks only
+the first QSA layer's top-`N` blocks. libref (`ref_qsa_pool_mask`) is the contract, libavx and
+libr4d's `qsa_pool_mask_f32` give its bytes (`r4d_emu_pool`, `r4d_selftest --case
+qsa_pool_mask_f32`).
+
+- **Inputs:** `pool` `[M, pool + 1]` i32, one row per query: block *indices* (not page ids), `-1`
+  padded. `arch/common/rad_qsa.h` fills it with the first QSA layer's `qsa_select` at `topk` `N`
+  issued over an identity table (an `iota` per step), so it is that layer's top-`N` under the
+  select's exact rule, plus the partial block. `score` `[M, cols]` f32, the later layer's plane,
+  in place.
+- **Output:** in row `m`, every column `b < cols` that no entry of `pool[m]` names becomes `-inf`
+  (dead to `qsa_select` in both rankings); a named column keeps its bytes. Entries `< 0` or
+  `>= cols` name nothing, repeated entries change nothing, columns past `cols` are not touched.
+- **Exactness:** `N >= topk`, so a masked row keeps at least `topk` live blocks whenever it had more,
+  and the select then takes its own top-`topk` among them. When `N` covers the query's history the
+  pool is every live block and the result is the unrestricted selection, entry for entry.
+- **Determinism:** libr4d's kernel saves the named scores in LDS, kills the row and writes them back
+  (one workgroup a row, phases ordered by barriers); a repeated entry restores the same value.
+  `pool + 1` is at most 4096 there.
 
 ### `qsa_select`
 

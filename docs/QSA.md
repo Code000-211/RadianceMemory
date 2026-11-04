@@ -178,6 +178,34 @@ nothing is allocated past the sequence, so `bt[n] >= 0` would work there. Mid-ch
 query finds a later token's live page in `bt[n]`, which `seqused` would then cover. The partial
 page is appended only when `(pos + 1) % ratio != 0`.
 
+## Hierarchical indexer (`--qsa-pool N`, experimental)
+
+DeepSeek-V4.1-Flash's hierarchical indexer, as a switch to measure on a model that was not trained
+for it. Off (`0`, the default) declares and issues nothing new: the program and every byte are
+today's. With `N` blocks (at least the selection's `topk`, 512 on Flash-Next; at most 4095):
+
+- the **first** trunk QSA layer (the one whose `declare` creates `kv_qsa_bkey`) runs its score and
+  select as before, then an `iota` refills `qsa_ident` (`[max_seqs, max_blocks]`, `ident[s][b] =
+  b`) and a second `qsa_select` at `topk` `N` reads its own (unchanged) plane with `qsa_ident` as
+  the table. Its output `qsa_pool` `[max_tok, N + 1]` is therefore that layer's top-`N` *block
+  indices* under the select's exact rule (ties, causal bound, partial block), one row a query;
+- every **later** trunk QSA layer issues `qsa_pool_mask` between its score and its select: the
+  columns of its plane its row of `qsa_pool` does not name become `-inf`, so its select takes its
+  own top-`topk` from the pool. Everything stays on the device: no host sync, no new batch field;
+- the **MTP head** keeps its own selection (no mask): its pass is not the trunk step whose rows
+  wrote the pool.
+
+The selection is exact whenever `N` covers a query's history (the pool is then every live block),
+so below `N * ratio` tokens the text must be byte-identical to `--qsa-pool 0`. Above it, a later
+layer can no longer pick a block the first layer ranked below `N`.
+
+Left out on purpose (the smallest version that measures the quality): a later layer still scores
+every block, so the switch saves no indexer time or memory yet. A pool-only score (`qsa_score`
+over a gathered table of `N` pages) is the follow-up if the KL measurement justifies it. The block
+keys, the tail, the prefix cache and window residency are untouched: the pool is per-step scratch,
+and the select a later layer runs still maps indices to pages (cold entries included) through the
+real table, so `qsa_page` sees the same kind of selection as before.
+
 ## Cost
 
 The indexer is the only part of a decode step that grows with context: `qsa_score` and

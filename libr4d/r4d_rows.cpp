@@ -1458,6 +1458,19 @@ static const RadOperandSpec oKvTranscode[] = {
     { "out", RAD_OPD_OUT, 0 },
 };
 
+/* `qsa_pool_mask`, the hierarchical indexer's restriction (docs/OPS.md): a later QSA layer's score
+ * plane keeps only the columns its row of `pool` names (block indices, the first QSA layer's
+ * top-N), every other column becomes -inf, in place. */
+static const RadParamSpec pQsaPoolMask[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "pool",   RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaPoolMask[] = {
+    { "pool",  RAD_OPD_IN,    0 },
+    { "score", RAD_OPD_INOUT, 0 },
+};
+
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
  * block of key history for one query.
  *
@@ -3691,6 +3704,13 @@ static const RadOpSchema kSchemas[] = {
            "not read the host offset table. `pool` is INOUT and only scratch blocks of cold "
            "entries are written. A device kernel cannot refuse: an entry whose slot or scratch id "
            "is out of range is left as it was."),
+    SCHEMA("qsa_pool_mask", pQsaPoolMask, oQsaPoolMask,
+           "in each row m of `score`, every column that no entry of pool[m][0 .. pool] names "
+           "becomes -inf (qsa_select's dead score); a named column keeps its bytes. `pool` holds "
+           "BLOCK INDICES, not page ids: it is the first QSA layer's qsa_select issued over an "
+           "identity table, and this op runs on a later layer's plane BEFORE that layer's select, "
+           "so the select maps indices to pages itself. -1 and entries outside the row name "
+           "nothing; repeated entries change nothing."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "
@@ -5091,6 +5111,9 @@ static const RadConstraint cQsaWork[] = {
 static const RadConstraint cQsaTailStore[] = {
     C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "bf16"),
 };
+
+/* pool + 1 entries fit the kernel's LDS (r4d_qsa_pool_mask.hip). */
+static const RadConstraint cQsaPoolMask[] = { C_GE("blocks", 1), C_GE("pool", 1), C_LE("pool", 4095) };
 
 static const RadConstraint cQsaPage[] = { C_GE("topk", 1), C_GE("blocks", 1), C_GE("block_bytes", 1) };
 /* The codec's lane map: head_dim a multiple of 128, at most 512. */
@@ -9174,6 +9197,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaTailStore), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
   r4d_shape_qsa_tail_store },
+
+/* One workgroup a row: save the pool's scores, kill the row, restore them. */
+{ "qsa_pool_mask_f32", "qsa_pool_mask", "attn",
+  "set every score of a row that the row's candidate pool does not name to -inf",
+  "any M and width; a pool of up to 4095 entries",
+  "an i32 [M, pool+1] block-index table; the f32 score plane written in place",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaPoolMask), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_pool_mask, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_pool_mask },
 
 /* One workgroup per selection position; those holding a cold entry copy one block fragment. */
 { "qsa_page_u8", "qsa_page", "attn",

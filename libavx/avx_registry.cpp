@@ -423,6 +423,8 @@ static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("block
                                          P_STRO("pool_layout"), P_INTO("head_dim") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
                                            INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+static const RadParamSpec pQsaPoolMask[] = { P_INT("M"), P_INT("blocks"), P_INT("pool") };
+static const RadOperandSpec oQsaPoolMask[] = { OPD("pool"), INOUT("score") };
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
                                              P_STR("to") };
 static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
@@ -1162,6 +1164,10 @@ static const RadOpSchema kSchemas[] = {
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; resident and "
   "empty entries pass through. A byte copy, libref's contract exactly; with store_layout and "
   "pool_layout the fragment's rows are expanded through kv_transcode's codec." },
+{ "qsa_pool_mask", ARR(pQsaPoolMask), ARR(oQsaPoolMask),
+  "the hierarchical indexer's pool: in each row of `score`, every column no entry of pool[m] names "
+  "(block indices, -1 padded, entries outside the row name nothing) becomes -inf; named columns "
+  "keep their bytes. libref's contract exactly." },
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "each row of x, one token's K and V head in layout `from`, decoded exactly and re-encoded in "
   "layout `to` as that layout's store encodes; libref's bytes." },
@@ -1816,6 +1822,9 @@ SIMPLE("avx_qsa_tail_store", "qsa_tail_store", "attn",
 SIMPLE("avx_qsa_page", "qsa_page", "attn",
        "QSA pager: cold selection entries copied from the residency store into scratch pages",
        "i32 tables, u8 bytes", L(qsa_page)),
+SIMPLE("avx_qsa_pool_mask", "qsa_pool_mask", "attn",
+       "QSA hierarchical pool: scores outside a row's candidate blocks set to -inf",
+       "f32 scores, i32 block indices", L(qsa_pool_mask)),
 SIMPLE("avx_kv_transcode", "kv_transcode", "attn",
        "KV rows re-encoded from one cache layout into another (the residency demote layout)",
        "u8 bytes", L(kv_transcode)),

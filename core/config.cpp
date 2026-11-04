@@ -106,6 +106,10 @@ static const Flag g_flags[] = {
     { "--qsa-bkey-dtype",     "T",      "bf16 (default) | i8 -- the QSA indexer's block keys: i8\n"
                                         "halves them (int8, an f16 scale a block; Flash-Next)\n"
                                         "and moves the indexer's selection slightly" },
+    { "--qsa-pool",           "N",      "0 (default, off) | blocks -- the hierarchical QSA indexer:\n"
+                                        "layers after the first QSA layer select only among its\n"
+                                        "top-N blocks (N >= the selection's 512, at most 4095;\n"
+                                        "Flash-Next); exact when N covers the history" },
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
@@ -1079,6 +1083,11 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->qsa_bkey_dtype = v;
         }
+        else if (S("--qsa-pool")) {
+            int64_t n = 0;
+            if (!(v = need(i)) || !parse_int(a.c_str(), v, 0, 4095, &n)) return RAD_E_INVAL;
+            c->qsa_pool = (int)n;
+        }
         else if (S("--attn-prefill-fp8")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off"))  c->attn_prefill_fp8 = 0;
@@ -1825,6 +1834,7 @@ const ShowRow kShow[] = {
     { "--kv-recipe",          [](const Config& c) { return or_none(c.kv_recipe_path, "none"); } },
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
     { "--qsa-bkey-dtype",     [](const Config& c) { return c.qsa_bkey_dtype; } },
+    { "--qsa-pool",           [](const Config& c) { return std::to_string(c.qsa_pool); } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--kv-resident",        [](const Config& c) {

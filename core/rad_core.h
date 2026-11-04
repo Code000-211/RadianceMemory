@@ -884,6 +884,9 @@ struct Config {
     /* --qsa-bkey-dtype bf16 | i8: the QSA indexer's block keys (RadBuildCtx::qsa_bkey_dtype).
      * bf16 is the plugin's own; i8 is refused at startup by a plugin that does not serve it. */
     std::string qsa_bkey_dtype = "bf16";
+    /* --qsa-pool N: the hierarchical QSA indexer's pool in blocks (RadBuildCtx::qsa_pool), 0 off.
+     * The plugin refuses an N it cannot serve; startup refuses a plugin without qsa_pool_ok. */
+    int qsa_pool = 0;
     /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
      * attn_prefill_fp8_name() spells it as the flag does. */

@@ -1775,6 +1775,18 @@ int ref_qsa_page_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("qsa_page", operand, out);
 }
 
+/* qsa_pool_mask: pool entries drawn over [0, blocks + 2), so some name columns past the row (which
+ * name nothing); a drawn row repeats entries, which must change nothing. */
+int ref_qsa_pool_mask_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t np = gi(p, n_p, "pool", 0);
+    if (M <= 0 || blocks <= 0 || np <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M, np + 1 }, blocks + 2, -1, 0);                    /* pool */
+    o.t((uint32_t)RAD_F32, { M, blocks });                        /* score */
+    return o.finish("qsa_pool_mask", operand, out);
+}
+
 /* kv_transcode: every byte of a row drawn, so E4M3 NaN codes and f16 scales that are inf or NaN
  * occur as well as ordinary ones; the codec's answers on those are defined (the stores' clamps), so
  * every implementation must give libref's bytes on them too. The layouts come from `from`/`to`. */

@@ -1003,6 +1003,8 @@ TEST(op_vocabulary) {
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "qsa_page", "dflash_conv",
+        /* The hierarchical indexer's pool restriction (--qsa-pool). */
+        "qsa_pool_mask",
         /* Window residency's demote layout (RAD_KVQ_DEMOTE): the requantise and the expand. */
         "kv_transcode",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
@@ -9645,6 +9647,83 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
 }
 
+/* qsa_pool_mask keeps exactly the columns a row's pool names and sets every other column of the
+ * row to -inf: repeated entries, -1 padding and entries past the row name nothing, a named column
+ * keeps its bytes (a NaN or a -0 included), and the plane's columns past the operand's width are
+ * not touched. */
+TEST(qsa_pool_mask_keeps_the_named_columns_and_kills_the_rest_of_the_row) {
+    const float nan = std::nanf(""), ninf = -INFINITY;
+    /* Two rows of a plane 6 wide, the operand narrowed to 5 columns (the live width). */
+    T sc(RAD_F32, {2, 6});
+    sc.f({ 1, 2, 3, 4, 5, 77,
+           nan, -0.0f, 7, 8, 9, 88 });
+    RadTensor& v = sc.t;
+    v.shape[1] = 5;
+    T po(RAD_I32, {2, 4});
+    po.n({ 3, 1, 3, -1,          /* row 0: blocks 1 and 3, block 3 twice */
+           0, 9, 1, -1 });       /* row 1: blocks 0 and 1; 9 is past the row */
+    A a; a.t(po).t(sc).i("M", 2).i("blocks", 6).i("pool", 3);
+    CHECK_OK(run("qsa_pool_mask", a));
+    const std::vector<float> want = { ninf, 2, ninf, 4, ninf, 77,
+                                      nan, -0.0f, ninf, ninf, ninf, 88 };
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float g = sc.at((int64_t)i);
+        if (std::isnan(want[i])) CHECK(std::isnan(g));
+        else {
+            CHECK_EQ(g, want[i]);
+            CHECK_EQ(std::signbit(g), std::signbit(want[i]));
+        }
+    }
+    /* A pool narrower than pool + 1 entries, and a pool of zero, are refused. */
+    T narrow(RAD_I32, {2, 3});
+    A an; an.t(narrow).t(sc).i("M", 2).i("blocks", 6).i("pool", 3);
+    CHECK_EQ(run("qsa_pool_mask", an), RAD_E_SHAPE);
+    A az; az.t(po).t(sc).i("M", 2).i("blocks", 6).i("pool", 0);
+    CHECK_EQ(run("qsa_pool_mask", az), RAD_E_SHAPE);
+}
+
+/* The hierarchical indexer as rad_qsa.h issues it, on libref: the first QSA layer's qsa_select at
+ * topk N over an identity table gives its top-N BLOCK INDICES (the pool); a later layer masks its
+ * own scores to the pool and selects its top-k. When N covers the history the result is the later
+ * layer's own selection exactly; when it does not, the later layer's best block outside the pool
+ * is never taken, and every taken block is one the first layer ranked in its top N. */
+TEST(the_hierarchical_indexer_selects_within_the_first_layers_pool_and_is_exact_when_it_covers) {
+    const int64_t nb = 8, ratio = 4, topk = 2;
+    const std::vector<int64_t> bt = { 20, 21, 22, 23, 24, 25, 26, 27 };
+    const std::vector<int64_t> ident = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    /* Position 29: seven complete blocks, a partial one (block 7). */
+    const std::vector<float> first = { 9, 1, 8, 2, 7, 3, 0, 0 };    /* layer 1 likes 0, 2, 4 */
+    const std::vector<float> later = { 1, 9, 5, 8, 4, 2, 0, 0 };    /* layer 2 likes 1, 3, 2 */
+    for (int64_t N : { (int64_t)3, (int64_t)7 }) {
+        const Sel pool = qsa_select_run(first, nb, ident, 7, { 29 }, N, ratio);
+        REQUIRE_EQ(pool.sel.size(), (size_t)(N + 1));
+        T po(RAD_I32, {1, N + 1});
+        po.n(pool.sel);
+        T sc(RAD_F32, {1, nb}); sc.f(later);
+        A a; a.t(po).t(sc).i("M", 1).i("blocks", nb).i("pool", N);
+        CHECK_OK(run("qsa_pool_mask", a));
+        std::vector<float> masked;
+        for (int64_t i = 0; i < nb; ++i) masked.push_back(sc.at(i));
+        const Sel got = qsa_select_run(masked, nb, bt, 7, { 29 }, topk, ratio);
+        const Sel own = qsa_select_run(later, nb, bt, 7, { 29 }, topk, ratio);
+        REQUIRE_EQ(got.sel.size(), (size_t)(topk + 1));
+        if (N == 7) {
+            /* The pool is the whole history: the later layer's own table, entry for entry. */
+            CHECK(got.sel == own.sel);
+            CHECK(got.nsel == own.nsel);
+            CHECK(got.su == own.su);
+        } else {
+            /* Pool {0, 2, 4} (+ the partial block 7): layer 2's best inside it are 2 (5) and 4 (4);
+             * its own best, 1 and 3, are outside. The partial page still comes last. */
+            CHECK_EQ(got.sel[0], 22LL); CHECK_EQ(got.sel[1], 24LL);
+            CHECK_EQ(got.sel[2], 27LL);
+            CHECK_EQ(own.sel[0], 21LL); CHECK_EQ(own.sel[1], 23LL);
+            CHECK(got.nsel == own.nsel);
+            CHECK(got.su == own.su);
+        }
+    }
+}
+
 /* ================================================================== kv_resolve
  * The residency map of a streamed group: selected block ids in, ring slots out, a block copied in
  * from the host mirror when it is not resident (docs/OPS.md "kv_resolve",
@@ -11192,6 +11271,7 @@ std::vector<Geo> geometries() {
         G("qsa_score", "M", 4, a.i("M", R).i("n", 32).i("heads", 2).i("blocks", 6).i("seqs", 2)
                                .s("dtype", "bf16")),
         G("qsa_select", "M", 4, a.i("M", R).i("blocks", 6).i("topk", 3).i("ratio", 4).i("seqs", 2)),
+        G("qsa_pool_mask", "M", 3, a.i("M", R).i("blocks", 6).i("pool", 3)),
         G("kv_resolve", "M", 3, a.i("M", R).i("blocks", 8).i("slots", 6).i("sel_pitch", 4)
                                  .i("block_bytes", 8)),
         G("qsa_tail_store", "M", 4, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)

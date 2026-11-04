@@ -519,6 +519,10 @@ static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("block
                                          P_STRO("pool_layout"), P_INTO("head_dim") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
                                            INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+/* The hierarchical indexer's restriction (docs/OPS.md, "`qsa_pool_mask`"): `pool` [M, pool + 1]
+ * block indices, `score` the plane, rewritten in place. */
+static const RadParamSpec pQsaPoolMask[] = { P_INT("M"), P_INT("blocks"), P_INT("pool") };
+static const RadOperandSpec oQsaPoolMask[] = { OPD("pool"), INOUT("score") };
 /* The residency store's demote layout (RAD_KVQ_DEMOTE): rows of one KV layout re-encoded in
  * another, `x` [M, row(from)] and `out` [M, row(to)] bytes, a row one token's head. */
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
@@ -1548,6 +1552,10 @@ static const RadOpSchema kSchemas[] = {
   "resident (>= 0) and empty (-1) entries pass through. `pool` is INOUT: only the scratch blocks "
   "of cold entries are written. With store_layout and pool_layout the fragment's rows are "
   "expanded from the store's layout into the pool's (kv_transcode's codec) instead of copied." },
+{ "qsa_pool_mask", ARR(pQsaPoolMask), ARR(oQsaPoolMask),
+  "The hierarchical indexer's pool: in each row of `score`, every column no entry of pool[m] names "
+  "(block indices, -1 padded, entries outside the row name nothing) becomes -inf, which qsa_select "
+  "reads as dead; named columns keep their bytes." },
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "Each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), decoded "
   "exactly and re-encoded in layout `to` as that layout's store encodes, into the row of out. "
@@ -2527,6 +2535,9 @@ SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
 SIMPLE("ref_qsa_page", "qsa_page", "attn",
        "QSA pager: cold selection entries copied from the residency store into scratch pages",
        "i32 tables, u8 bytes", ref_qsa_page),
+SIMPLE("ref_qsa_pool_mask", "qsa_pool_mask", "attn",
+       "QSA hierarchical pool: scores outside a row's candidate blocks set to -inf",
+       "f32 scores, i32 block indices", ref_qsa_pool_mask),
 SIMPLE("ref_kv_transcode", "kv_transcode", "attn",
        "KV rows re-encoded from one cache layout into another (the residency demote layout)",
        "u8 bytes", ref_kv_transcode),

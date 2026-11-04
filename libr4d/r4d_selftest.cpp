@@ -23646,6 +23646,63 @@ static void qsa_work_case(const Plugin& pl) {
                    " ring_rows=" + std::to_string(ring_differs));
 }
 
+/* qsa_pool_mask (the hierarchical indexer, --qsa-pool) against the host rule, libref's
+ * ref_qsa_pool_mask: in each row every column the row's pool does not name becomes -inf, a named
+ * column keeps its bits. Decode-sized and prefill-sized rows, a pool of 1025 entries (Flash-Next
+ * at --qsa-pool 1024, wider than the workgroup), the operand a column slice of a wider plane whose
+ * tail must keep its bytes, repeats, -1 and entries past the row, NaN / -0 / inf scores. Run
+ * twice: the bytes must repeat. */
+static void qsa_pool_mask_case(const Plugin& pl) {
+    const char* what = "qsa_pool_mask vs the host rule (libref's ref_qsa_pool_mask)";
+    const RadKernelInfo* r = find(pl, "qsa_pool_mask_f32");
+    if (!r) { ok(what, false, "row absent"); return; }
+    for (const int64_t M : { (int64_t)4, (int64_t)300 }) {
+        const int64_t cols = 5000, pitch = 5120, np = 1024;
+        std::vector<float> pre((size_t)(M * pitch));
+        const float special[] = { std::nanf(""), -0.0f, INFINITY, -INFINITY };
+        uint32_t s = 12345u + (uint32_t)M;
+        auto rnd = [&]() { s = s * 1664525u + 1013904223u; return s >> 8; };
+        for (size_t i = 0; i < pre.size(); ++i)
+            pre[i] = (i % 29 == 3) ? special[(i / 29) % 4] : (float)(rnd() % 4000) / 128.0f;
+        std::vector<int32_t> pool((size_t)(M * (np + 1)));
+        for (size_t i = 0; i < pool.size(); ++i)
+            pool[i] = (i % 17 == 16) ? -1 : (i % 23 == 22) ? (int32_t)(cols + rnd() % 9)
+                                                           : (int32_t)(rnd() % cols);
+        std::vector<float> want = pre;
+        for (int64_t m = 0; m < M; ++m) {
+            std::vector<char> keep((size_t)cols, 0);
+            for (int64_t j = 0; j <= np; ++j) {
+                const int32_t b = pool[(size_t)(m * (np + 1) + j)];
+                if (b >= 0 && b < cols) keep[(size_t)b] = 1;
+            }
+            for (int64_t b = 0; b < cols; ++b)
+                if (!keep[(size_t)b]) want[(size_t)(m * pitch + b)] = -INFINITY;
+        }
+        void* d_p = dalloc(pool.size() * 4);
+        void* d_s = dalloc(pre.size() * 4);
+        st_memcpy(d_p, pool.data(), pool.size() * 4, hipMemcpyHostToDevice);
+        RadTensor ts[2] = { T(d_p, RAD_I32, { M, np + 1 }), T(d_s, RAD_F32, { M, pitch }) };
+        ts[1].shape[1] = cols;   /* the live width, the declared pitch kept */
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", pitch), PI("pool", np) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 2; a.p = ps.data(); a.n_p = (int)ps.size();
+        bool same = true;
+        for (int pass = 0; pass < 2; ++pass) {
+            st_memcpy(d_s, pre.data(), pre.size() * 4, hipMemcpyHostToDevice);
+            const int rc = r->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc)); return; }
+            std::vector<float> got(pre.size());
+            st_memcpy(got.data(), d_s, got.size() * 4, hipMemcpyDeviceToHost);
+            same = same && std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+        }
+        ok(fmt("qsa_pool_mask, %lld rows, pool %lld over %lld of %lld columns: the host rule's "
+               "bytes, twice", (long long)M, (long long)np, (long long)cols, (long long)pitch)
+               .c_str(), same);
+    }
+}
+
 /* qsa_tail_store, against a token-by-token loop.
  *
  * Positions p and p + ring share a row, so a long prefill chunk has several tokens per row and
@@ -33103,6 +33160,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_tail_store_bf16")) {
         if (!g_case) std::printf("\nthe QSA raw-key tail, against a serial loop\n");
         qsa_tail_store_case(pl);
+    }
+
+    if (sel("qsa_pool_mask_f32")) {
+        if (!g_case) std::printf("\nthe hierarchical indexer's pool mask, against the host rule\n");
+        qsa_pool_mask_case(pl);
     }
 
     if (sel("qsa_page_u8")) {

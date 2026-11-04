@@ -586,6 +586,8 @@ std::vector<Case> build_cases() {
                         HI("seqs", 1), HI("signed", 1) });
     add("qsa_select", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
                         HI("seqs", 3), HI("signed", 1) });
+    add("qsa_pool_mask", { HI("M", 4), HI("blocks", 300), HI("pool", 64) });
+    add("qsa_pool_mask", { HI("M", 7), HI("blocks", 129), HI("pool", 200) });
     add("qsa_tail_store", { HI("M", 3), HI("n", 37), HI("ratio", 2), HI("ring", 2), HI("seqs", 3),
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),

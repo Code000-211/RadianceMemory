@@ -185,6 +185,34 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ qsa_pool_mask */
+/* The hierarchical indexer's restriction (docs/OPS.md, "`qsa_pool_mask`"): in each row m of
+ * `score`, every column b in [0, cols) that no entry pool[m][0 .. pool] names is set to -inf, which
+ * qsa_select reads as dead in both rankings; a named column keeps its bytes. `pool` holds block
+ * indices (the first QSA layer's qsa_select run over an identity table), -1 padded; an entry
+ * outside [0, cols) names nothing. Columns past `cols` (the plane's declared width) are not
+ * touched. */
+int ref_qsa_pool_mask(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *po = &a->t[0], *sc = &a->t[1];
+    const int64_t np = p_int(a, "pool", 0);
+    if (np <= 0) return RAD_E_SHAPE;
+    if (po->rank != 2 || sc->rank != 2) return RAD_E_SHAPE;
+    if (sc->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t M = sc->shape[0], cols = sc->shape[1];
+    if (M <= 0 || cols <= 0 || po->shape[0] < M || po->shape[1] < np + 1) return RAD_E_SHAPE;
+    for (int64_t m = 0; m < M; ++m) {
+        std::vector<char> keep((size_t)cols, 0);
+        for (int64_t j = 0; j <= np; ++j) {
+            const int64_t b = ldi(po, m * po->stride[0] + j * po->stride[1]);
+            if (b >= 0 && b < cols) keep[(size_t)b] = 1;
+        }
+        for (int64_t b = 0; b < cols; ++b)
+            if (!keep[(size_t)b]) stt(sc, m * sc->stride[0] + b * sc->stride[1], -INFINITY);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_tail_store */
 /* state[sidx[s][0]][0][pos[t] % ring] = k[t] for the last `ring` rows of each sequence, rows in
  * ascending order (a row whose slot is -1, or that no sequence holds, writes nothing). Every other

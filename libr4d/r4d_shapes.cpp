@@ -2004,6 +2004,21 @@ extern "C" int r4d_shape_qsa_page(const RadParam* p, int n_p, int operand, RadOp
     R4D_PICK(l);
 }
 
+/* The hierarchical pool's mask. Entries are drawn over [0, blocks + 2), so some fall past the row
+ * (naming nothing) and some repeat. */
+extern "C" int r4d_shape_qsa_pool_mask(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t nb = pi(p, n_p, "blocks");
+    const int64_t np = pi(p, n_p, "pool");
+    if (nb <= 0 || np <= 0 || np > 4095) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_idx(M, np + 1, nb + 2),
+        opd((uint32_t)RAD_F32, M, nb),
+    };
+    R4D_PICK(l);
+}
+
 /* The QSA block score. The block-key store's height is the KV pool's page count, which the
  * runtime decides, so `blocks` gives the widest a table entry can address: a bound, not the plan.
  * Table entries are page ids. */

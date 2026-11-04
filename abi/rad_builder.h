@@ -424,6 +424,16 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int32_t  qsa_bkey_dtype;
+
+    /* ---- appended in ABI 43 (the hierarchical indexer) */
+    /* --qsa-pool N: QSA layers after the first select their top-k only among the first QSA layer's
+     * top-N blocks (docs/QSA.md, "Hierarchical indexer"). 0, the default, is off: the program and
+     * every byte as before ABI 43. The engine sets it only for a plugin whose probe has
+     * RadArchProbe::qsa_pool_ok and refuses the flag otherwise; a plugin refuses an N it cannot
+     * serve (below its selection's topk, or wider than qsa_pool_mask holds).
+     *
+     * In the older struct's tail padding (zeroed by every caller), so its size is unchanged. */
+    int32_t  qsa_pool;
 } RadBuildCtx;
 
 /* ================================================================== a static V mean per layer */
@@ -1796,6 +1806,11 @@ typedef struct RadArchProbe {
      * RadBuildCtx::qsa_bkey_dtype RAD_I8. --qsa-bkey-dtype i8 is refused at startup with the
      * plugin named when this is 0. 64-bit so it starts past the older struct's tail padding. */
     int64_t qsa_bkey_i8_ok;
+
+    /* ---- appended in ABI 43 (the hierarchical indexer) */
+    /* Nonzero when the plugin serves RadBuildCtx::qsa_pool. --qsa-pool is refused at startup with
+     * the plugin named when this is 0. */
+    int64_t qsa_pool_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

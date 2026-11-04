@@ -11611,6 +11611,105 @@ TEST(flashnext_int8_block_keys_shrink_the_block_key_page_and_change_nothing_else
     CHECK(err.find("block keys") != std::string::npos);
 }
 
+/* --qsa-pool N (RadBuildCtx::qsa_pool), the hierarchical indexer, at one and two ranks: the first
+ * trunk QSA layer (3) adds an identity fill (`iota`) and a second `qsa_select` at topk N over it
+ * into the pool buffer; the later one (7) adds one `qsa_pool_mask` over its plane; the MTP head
+ * adds nothing. Every other op is today's, parameter for parameter, and the default declares no
+ * pool buffer. In each trunk pass (decode, prefill, verify) the first layer's pool select runs
+ * after its score, and the later layer's mask between its score and its select; every pass,
+ * the head's history included, lints clean. The probe says the plugin serves it; N below the selection's 512
+ * blocks, above 4095, or without a qsa_pool_mask kernel is refused. */
+TEST(flashnext_hierarchical_indexer_adds_the_pool_ops_and_changes_nothing_else) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.qsa_pool_ok, 1);
+    const std::set<std::string> added = { "iota", "qsa_pool_mask" };
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &ctx), RAD_OK);
+            ctx.qsa_pool = 1024;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK(find_b(a, "qsa_pool") == nullptr);
+            CHECK(find_b(a, "qsa_ident") == nullptr);
+            const RecBuf* pool = find_b(b, "qsa_pool");
+            REQUIRE(pool != nullptr);
+            CHECK_EQ(pool->d.shape[1], 1025);
+            /* b's ops are a's with the new ones inserted: walk both, skipping b's additions. */
+            int iotas = 0, masks = 0, pool_sels = 0;
+            size_t j = 0;
+            for (size_t i = 0; i < b.ops.size(); ++i) {
+                const RecOp& y = b.ops[i];
+                const bool extra_sel = y.op == "qsa_select" && pint(&y, "topk") == 1024;
+                if (added.count(y.op) || extra_sel) {
+                    iotas += y.op == "iota"; masks += y.op == "qsa_pool_mask"; pool_sels += extra_sel;
+                    continue;
+                }
+                REQUIRE(j < a.ops.size());
+                const RecOp& x = a.ops[j++];
+                REQUIRE_EQ(x.op, y.op);
+                REQUIRE_EQ(x.p.size(), y.p.size());
+                for (size_t k = 0; k < x.p.size(); ++k) {
+                    CHECK_EQ(y.p[k].key, x.p[k].key);
+                    CHECK_EQ(y.p[k].ival, x.p[k].ival);
+                    CHECK_EQ(y.p[k].sval, x.p[k].sval);
+                }
+            }
+            CHECK_EQ(j, a.ops.size());
+            CHECK_EQ(iotas, 1);
+            CHECK_EQ(pool_sels, 1);
+            CHECK_EQ(masks, 1);   /* layer 7 only: the MTP head keeps its own selection */
+
+            const auto dec = kit(b, { 1, 1, 1, 1 }, {});
+            const auto pre = kit(b, {}, { 64, 64 }, 9000);
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            for (const auto& v : { run_passes(b, qwen4exp_fp8::step, { dec.get() }, rank, world),
+                                   run_passes(b, qwen4exp_fp8::step, { pre.get() }, rank, world),
+                                   run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() },
+                                              rank, world) }) {
+                CHECK_PASSES(b, v);
+                /* The trunk pass: score, pool select, own select (layer 3; both read the same
+                 * plane, which neither writes); then score, mask, select (layer 7). */
+                std::vector<std::string> seq;
+                for (const RecIssue& is : v[0]->issues) {
+                    const RecOp* o = b.op_of(is.op);
+                    if (!o) continue;
+                    if (o->op == "qsa_score" || o->op == "qsa_pool_mask") seq.push_back(o->op);
+                    else if (o->op == "qsa_select")
+                        seq.push_back(pint(o, "topk") == 1024 ? "pool_select" : "qsa_select");
+                }
+                const std::vector<std::string> want = { "qsa_score", "pool_select", "qsa_select",
+                                                        "qsa_score", "qsa_pool_mask",
+                                                        "qsa_select" };
+                CHECK(seq == want);
+            }
+        }
+    for (int n : { 511, 4096 }) {
+        RadBuildCtx ctx = q4_ctx(0, 1);
+        ctx.qsa_pool = n;
+        RadBuilder c;
+        c.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&c, &meta, &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        CHECK(err.find("--qsa-pool") != std::string::npos);
+    }
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    ctx.qsa_pool = 1024;
+    RadBuilder c;
+    c.encs = { { "draft_head", u2_head() } };
+    c.undeclared = { "qsa_pool_mask" };
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&c, &meta, &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(err.find("qsa_pool_mask") != std::string::npos);
+}
+
 /* The rope table has a row for every position a step can name: a verify and the draft rounds run
  * up to max_spec past max_ctx, so a table ending at max_ctx would rotate them by unwritten rows.
  * Every draft pass fills its own rows before anything reads them, since a round's positions are

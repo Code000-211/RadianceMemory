@@ -80,6 +80,13 @@ struct QsaIndexer {
         const char* page_store_layout = nullptr;
         const char* page_pool_layout  = nullptr;
         int64_t     page_head_dim     = 0;
+        /* The hierarchical indexer (RadBuildCtx::qsa_pool, docs/QSA.md "Hierarchical indexer"):
+         * `pool` N > 0 blocks, at least `topk`. The first QSA layer of the trunk (`pool_role` 1)
+         * also selects its top N as block indices into Wire::pool; every later trunk layer
+         * (`pool_role` 2) sets the scores outside that pool to -inf before its own select. 0 (the
+         * default, and always the MTP head's) declares and issues nothing new: today's program. */
+        int64_t     pool      = 0;
+        int         pool_role = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -118,6 +125,15 @@ struct QsaIndexer {
          * step by `rope_table` for the attention block; the indexer rotates at the same `rot`,
          * `theta` and `scale`. Without it the unfused per-head norms run. */
         rad_buf cos_sin = 0;
+        /* The hierarchical indexer's pool (Config::pool; 0 when off). `pool`, `pool_n` and
+         * `pool_su` are the first QSA layer's qsa_select outputs at topk N: block indices, not page
+         * ids, because `ident` -- [max_seqs, max_blocks] i32, ident[s][b] = b, refilled by `iota`
+         * each step -- is passed as its table. Only device data: no host sync. The rows are
+         * queries like `sel`'s, so a later layer of the same step reads its own row's pool. */
+        rad_buf pool    = 0;   /* [max_tok, pool + 1] i32 */
+        rad_buf pool_n  = 0;   /* [max_tok]           i32 (select's nsel; unread) */
+        rad_buf pool_su = 0;   /* [max_tok]           i32 (select's seqused; unread) */
+        rad_buf ident   = 0;   /* [max_seqs, max_blocks] i32 */
     };
 
     Geom       g{};
@@ -132,6 +148,9 @@ struct QsaIndexer {
      * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0, op_page = 0;
+    /* The hierarchical indexer's (Config::pool): the producer's identity fill and top-N select, a
+     * consumer's mask. 0 when off. */
+    rad_op      op_iota = 0, op_pool_sel = 0, op_pool_mask = 0;
 
     bool on() const { return op_rope != 0; }
 
@@ -312,6 +331,41 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                       RAD_NOWEIGHTS),
                   {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
 
+    /* The hierarchical indexer (Config::pool). Declared only when on, so the program with it off is
+     * today's op for op. Needs `emit_sel` (a layer that does not select has no plane to restrict
+     * or to take a pool from) and N >= topk (a narrower pool would leave a later layer fewer live
+     * blocks than it selects). */
+    if (c.pool > 0 && c.pool_role != 0) {
+        if (!c.emit_sel || c.pool < c.topk || !w.pool || !w.pool_n || !w.pool_su)
+            return RAD_E_INVAL;
+        if (c.pool_role == 1) {
+            if (!w.ident) return RAD_E_INVAL;
+            op_iota = rw(b, RAD_OP(b, "iota",
+                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs * c.max_blocks),
+                                       RAD_INT("start", 0), RAD_INT("step", 1),
+                                       RAD_INT("period", c.max_blocks)),
+                            RAD_NOWEIGHTS),
+                        {}, {w.ident});
+            op_pool_sel = rw(b, RAD_OP(b, "qsa_select",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                           RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.pool),
+                                           RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
+                                RAD_NOWEIGHTS),
+                            {w.score, w.ident, w.nc}, {w.pool, w.pool_n, w.pool_su});
+            if (!op_iota || !op_pool_sel) return RAD_E_INVAL;
+        } else if (c.pool_role == 2) {
+            op_pool_mask = rw(b, RAD_OP(b, "qsa_pool_mask",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                            RAD_INT("blocks", c.max_blocks),
+                                            RAD_INT("pool", c.pool)),
+                                 RAD_NOWEIGHTS),
+                             {w.pool, w.score}, {w.score});
+            if (!op_pool_mask) return RAD_E_INVAL;
+        } else {
+            return RAD_E_INVAL;
+        }
+    }
+
     /* When the attention group streams, the attention block resolves `sel` to ring slots after its
      * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
     /* The pager rewrites `sel` in place, so it both reads and writes it; the attention, declared
@@ -463,12 +517,24 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                               "its window bounds (RadBuildCtx::max_mixed_tok)");
             return;
         }
+        if (op_iota) RAD_ISSUE_N(c_, op_iota, S * c.max_blocks, brows(w.ident, S));
         for (int64_t w0 = 0;;) {
             RAD_ISSUE_N(c_, op_score, PR,
                         brow_slice(w.q, w0, PR, qw), kv_cache(kv_bk, layer),
                         praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
                         praw(win_cu, RAD_I32, 2), brows(w.nc, S),
                         bcol_at(w.score, 0, c.max_blocks, 0, live, PR));
+            if (op_pool_mask)
+                RAD_ISSUE_N(c_, op_pool_mask, PR, brow_slice(w.pool, w0, PR, c.pool + 1),
+                            bcol_at(w.score, 0, c.max_blocks, 0, live, PR));
+            if (op_pool_sel)
+                RAD_ISSUE_N(c_, op_pool_sel, PR,
+                            bcol_at(w.score, 0, c.max_blocks, 0, live, PR),
+                            bcol_at(w.ident, 0, c.max_blocks, 0, live, S),
+                            brows(w.nc, S), praw(batch->positions + w0, RAD_I32, PR),
+                            praw(win_cu, RAD_I32, 2),
+                            brow_slice(w.pool, w0, PR, c.pool + 1),
+                            brow_slice(w.pool_n, w0, PR, 1), brow_slice(w.pool_su, w0, PR, 1));
             RAD_ISSUE_N(c_, op_select, PR,
                         bcol_at(w.score, 0, c.max_blocks, 0, live, PR),
                         praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
@@ -486,6 +552,20 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
                 praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
                 bcol_at(w.score, 0, c.max_blocks, 0, live, T));
+    /* The hierarchical indexer: a later layer restricts its plane to the first layer's pool before
+     * selecting; the first layer takes its top N from its own plane (unchanged by its select). */
+    if (op_pool_mask)
+        RAD_ISSUE_N(c_, op_pool_mask, T, brows(w.pool, T),
+                    bcol_at(w.score, 0, c.max_blocks, 0, live, T));
+    if (op_pool_sel) {
+        RAD_ISSUE_N(c_, op_iota, S * c.max_blocks, brows(w.ident, S));
+        RAD_ISSUE_N(c_, op_pool_sel, T,
+                    bcol_at(w.score, 0, c.max_blocks, 0, live, T),
+                    bcol_at(w.ident, 0, c.max_blocks, 0, live, S),
+                    brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    brows(w.pool, T), brows(w.pool_n, T), brows(w.pool_su, T));
+    }
     RAD_ISSUE_N(c_, op_select, T,
                 bcol_at(w.score, 0, c.max_blocks, 0, live, T),
                 praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),

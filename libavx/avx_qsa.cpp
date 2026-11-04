@@ -815,6 +815,34 @@ AVX_KERNEL(qsa_page) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ qsa_pool_mask */
+/* libref's ref_qsa_pool_mask (the contract is stated there): every column of a row that the row's
+ * pool does not name becomes -inf. A row at a time: a keep mask, then one pass over the row. Rows
+ * are independent and split across threads. */
+AVX_KERNEL(qsa_pool_mask) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *po = &a->t[0], *sc = &a->t[1];
+    const int64_t np = p_int(a, "pool", 0);
+    if (np <= 0) return RAD_E_SHAPE;
+    if (po->rank != 2 || sc->rank != 2) return RAD_E_SHAPE;
+    if (sc->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t M = sc->shape[0], cols = sc->shape[1];
+    if (M <= 0 || cols <= 0 || po->shape[0] < M || po->shape[1] < np + 1) return RAD_E_SHAPE;
+    float* s = (float*)sc->data;
+    const int64_t rs = sc->stride[0], cs = sc->stride[1];
+    AVX_PARALLEL_FOR_IF(M * cols >= AVX_PAR_MIN && M > 1)
+    for (int64_t m = 0; m < M; ++m) {
+        std::vector<char> keep((size_t)cols, 0);
+        for (int64_t j = 0; j <= np; ++j) {
+            const int64_t b = ldi(po, m * po->stride[0] + j * po->stride[1]);
+            if (b >= 0 && b < cols) keep[(size_t)b] = 1;
+        }
+        for (int64_t b = 0; b < cols; ++b)
+            if (!keep[(size_t)b]) s[m * rs + b * cs] = -INFINITY;
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_work */
 /* The blocks that complete in this batch, in sequence order and ascending within one (libref's
  * ref_qsa_work has the full statement): page bt[s][b] (-1 without a tail slot), the first token's

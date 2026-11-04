@@ -169,6 +169,7 @@ set(R4D_UNITS
   "r4d_qsa_block_key_bf16|"
   "r4d_qsa_score_bf16|"
   "r4d_qsa_page_u8|"
+  "r4d_qsa_pool_mask|"
   "r4d_qsa_select_bf16|"
   "r4d_kv_resolve|"
   "r4d_qsa_tail_store_bf16|"

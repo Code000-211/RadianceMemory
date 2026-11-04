@@ -521,7 +521,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
         { "--kv-recipe", { inventory_recipe(), "--kv-cache-dtype", "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
-        { "--qsa-bkey-dtype", { "i8" } },
+        { "--qsa-bkey-dtype", { "i8" } }, { "--qsa-pool", { "1024" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
@@ -844,6 +844,23 @@ TEST(the_qsa_block_key_dtype_is_bf16_by_default_or_i8) {
     CHECK_EQ(parse({ "--qsa-bkey-dtype", "fp8" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--qsa-bkey-dtype", "int8" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--qsa-bkey-dtype" }, &c), RAD_E_INVAL);
+}
+
+TEST(the_qsa_pool_is_off_by_default_and_takes_a_block_count_up_to_4095) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.qsa_pool, 0);
+    Config c;
+    CHECK_EQ(parse({ "--qsa-pool", "1024" }, &c), RAD_OK);
+    CHECK_EQ(c.qsa_pool, 1024);
+    CHECK_EQ(parse({ "--qsa-pool", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.qsa_pool, 0);
+    CHECK_EQ(parse({ "--qsa-pool", "4095" }, &c), RAD_OK);
+    CHECK_EQ(c.qsa_pool, 4095);
+    CHECK_EQ(parse({ "--qsa-pool", "4096" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-pool", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-pool", "2k" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-pool" }, &c), RAD_E_INVAL);
 }
 
 TEST(the_kv_cache_dtype_is_one_of_four_names) {

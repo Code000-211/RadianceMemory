@@ -930,6 +930,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             return RAD_E_UNSUPPORTED;
         }
         m.qsacfg.bkey_i8 = ctx->qsa_bkey_dtype == RAD_I8;
+        /* --qsa-pool N: the hierarchical indexer (arch/common/rad_qsa.h, docs/QSA.md). N blocks,
+         * at least the selection's topk and at most what qsa_pool_mask's kernel holds; a plugin
+         * set without the mask op refuses rather than run every layer on its own scores. */
+        if (ctx->qsa_pool != 0) {
+            if (ctx->qsa_pool < m.qsacfg.topk || ctx->qsa_pool > 4095) {
+                fprintf(stderr, "radiance: --qsa-pool %d: the pool must hold the selection's %lld "
+                                "blocks and at most 4095\n", (int)ctx->qsa_pool,
+                        (long long)m.qsacfg.topk);
+                return RAD_E_UNSUPPORTED;
+            }
+            if (!rad_op_declared(b, "qsa_pool_mask")) {
+                fprintf(stderr, "radiance: --qsa-pool: no kernel plugin serves qsa_pool_mask\n");
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+        m.qsacfg.pool = ctx->qsa_pool;
         m.qsacfg.page_block_bytes = m.kv_page_bytes[last_q];
         m.qsacfg.page_store_layout = m.kv_demote[last_q];
         m.qsacfg.page_pool_layout  = m.kv_pool_layout[last_q];
@@ -1101,6 +1117,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             !m.qsaw.bpos || !m.qsaw.nc || !m.qsaw.score || !m.qsaw.sel || !m.qsaw.nsel ||
             !m.qsaw.sequ)
             return RAD_E_INVAL;
+        /* The hierarchical indexer's pool and identity table (QsaIndexer::Wire), only when on. */
+        if (m.qsacfg.pool > 0) {
+            m.qsaw.pool    = decl_b(b, nm.f("qsa_pool"),    RAD_I32,
+                                    { g.max_tok, m.qsacfg.pool + 1 });
+            m.qsaw.pool_n  = decl_b(b, nm.f("qsa_pool_n"),  RAD_I32, { g.max_tok });
+            m.qsaw.pool_su = decl_b(b, nm.f("qsa_pool_su"), RAD_I32, { g.max_tok });
+            m.qsaw.ident   = decl_b(b, nm.f("qsa_ident"),   RAD_I32,
+                                    { g.max_seqs, m.qsacfg.max_blocks });
+            if (!m.qsaw.pool || !m.qsaw.pool_n || !m.qsaw.pool_su || !m.qsaw.ident)
+                return RAD_E_INVAL;
+        }
     }
 
     m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, conv_dim + v_dim});
@@ -1391,6 +1418,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 qc.page_store_layout = m.kv_demote[kq];
                 qc.page_pool_layout  = m.kv_pool_layout[kq];
                 qc.emit_sel = lay.attn.qsa_sel != 0;
+                /* --qsa-pool: the first QSA layer (the one that creates the block-key group) makes
+                 * the pool, every later trunk layer reads it. The MTP head keeps role 0. */
+                if (qc.pool > 0) qc.pool_role = m.kv_qsa_bkey == 0 ? 1 : 2;
                 RAD_ARCH_TRY(lay.qsa.declare(b, nm, g, (int)l, qc, m.qsaw, aw.h,
                                              &m.kv_qsa_bkey));
             }
@@ -1993,6 +2023,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     /* --qsa-bkey-dtype i8: libr4d's qsa_block_key and qsa_score take `key_dtype` i8 at the
      * indexer's geometry (n a multiple of 32 to 256). */
     out->qsa_bkey_i8_ok = 1;
+    /* --qsa-pool: the hierarchical indexer over the trunk's QSA layers (needs qsa_pool_mask). */
+    out->qsa_pool_ok = 1;
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;
     return RAD_OK;
