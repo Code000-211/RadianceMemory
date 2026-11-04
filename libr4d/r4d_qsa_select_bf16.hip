@@ -1079,6 +1079,247 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
         seqused[m] = su;
     }
 }
+
+/* ===================================================== block keys split across ranks
+ *
+ * --qsa-bkey-split (docs/QSA.md, "Block keys split across ranks"): rank r of R stores and scores
+ * only the blocks b with b % R == r, column b / R of its own score plane. qsa_select_part takes
+ * this rank's top-k as a list of (order key, global block) in block order; a row-interleaved
+ * all_gather puts the R lists side by side; qsa_select_join merges them into the page-id table
+ * the kernels above would build over the unsplit plane, byte for byte.
+ *
+ * It is the split path's argument across ranks instead of chunks: one total order on both sides
+ * (key descending, block ascending), so a rank's top-k holds every global top-k member of its
+ * share, and a flag a list (kParOver, as a chunk's count carries it) says whether the rank had
+ * more than topk live, which a full list cannot show. Chunks are contiguous, so their lists
+ * concatenate in block order; shares interleave, so the join places each entry at its merged
+ * block-order position (its index in its own list plus, by binary search, the entries of the
+ * other lists below its block) and then runs qsa_merge_kernel's threshold and emit unchanged.
+ *
+ * A list row (libref's ref_qsa_select_part states it): keys at [0, topk), blocks at
+ * [topk, 2 * topk), the count | kParOver at [2 * topk], zeros elsewhere, `pw` words in all. */
+
+/* The topk-th largest key and the tie count over `n` keys `key(i)`, by the four 8-bit digits of
+ * radix_thresh with every_at_want (topk or fewer live: T = 0, all taken), keys read through a
+ * functor so a list too long for LDS is read from the score plane each digit, as the
+ * single-workgroup kernel's uncached path does. */
+template <int NT, class K>
+__device__ __forceinline__ void part_thresh(const K& key, int n, uint32_t want, uint32_t* hist,
+                                            uint32_t* suf, uint32_t* wt, uint32_t* sh_T,
+                                            uint32_t* sh_need) {
+    const int t = (int)threadIdx.x;
+    uint32_t fixed = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = t; i < kBins; i += NT) hist[i] = 0;
+        __syncthreads();
+        const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
+        for (int b = t; b < n; b += NT) {
+            const uint32_t k = key(b);
+            if (k != 0u && (k & mask) == (fixed & mask))
+                atomicAdd(&hist[(k >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        bin_suffix<NT>(hist, suf, wt);
+        if (t == 0) { *sh_T = fixed; *sh_need = want - suf[0]; }
+        __syncthreads();
+        if (t < kBins) {
+            const uint32_t after = (t + 1 < kBins) ? suf[t + 1] : 0u;
+            if (suf[t] >= want && after < want) {
+                *sh_T    = fixed | ((uint32_t)t << shift);
+                *sh_need = want - after;
+            }
+        }
+        __syncthreads();
+        if (shift == 24 && suf[0] <= want) {
+            if (t == 0) { *sh_T = 0u; *sh_need = 0u; }
+            __syncthreads();
+            break;
+        }
+        fixed = *sh_T;
+        want  = *sh_need;
+    }
+}
+
+/* ---- one rank's list: one workgroup a query row, the share's keys cached in LDS when they fit. */
+template <bool Signed>
+__global__ __launch_bounds__(kThreads) void qsa_part_kernel(
+    const float* __restrict__ score, const int32_t* __restrict__ bt,
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, int32_t* __restrict__ part,
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int p_ld, int pw, int R, int rk,
+    int cap) {
+
+    __shared__ uint32_t hist[kBins], suf[kBins], wsum[kWaves];
+    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord;
+    __shared__ int      sh_seq;
+    R4D_DYN_LDS(uint32_t, sh_key);
+
+    const int m = (int)blockIdx.x;
+    const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
+
+    if (t == 0) sh_seq = 0;
+    __syncthreads();
+    for (int i = t; i < nseq; i += kThreads)
+        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+    __syncthreads();
+    const int seq = sh_seq;
+    const int p   = pos ? pos[m] : 0;
+    const int own = (p + 1) / ratio;
+    int n = nc[seq] < nb ? nc[seq] : nb;
+    if (own < n) n = own;
+    /* This rank's blocks below n: b = j * R + rk for j < nl. */
+    const int nl = n > rk ? (n - rk + R - 1) / R : 0;
+
+    const float*   sc = score + (size_t)m * s_ld;
+    const int32_t* tb = bt    + (size_t)seq * t_ld;
+    int32_t*       ou = part  + (size_t)m * p_ld;
+
+    const bool cached = nl <= cap;
+    if (cached) {
+        for (int j = t; j < nl; j += kThreads)
+            sh_key[j] = keyof<Signed>(sc[j], tb[(size_t)j * R + rk]);
+        __syncthreads();
+    }
+    auto key = [&](int j) -> uint32_t {
+        return cached ? sh_key[j] : keyof<Signed>(sc[j], tb[(size_t)j * R + rk]);
+    };
+
+    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, nl <= topk };
+    if (!e.all) {
+        part_thresh<kThreads>(key, nl, (uint32_t)topk, hist, suf, wsum, &sh_T, &sh_need);
+        e.T = sh_T; e.need = sh_need;
+    }
+    /* A threshold means more than topk live keys in this share. */
+    const bool over = !e.all && e.T != 0u;
+
+    for (int i = t; i < pw; i += kThreads) ou[i] = 0;
+    if (t == 0) { sh_hi = 0; sh_ord = 0; }
+    __syncthreads();
+
+    /* In block order, as the join's merge by block index reads it. */
+    for (int j0 = 0; j0 < nl; j0 += kThreads) {
+        const int j = j0 + t;
+        const uint32_t k = j < nl ? key(j) : 0u;
+        const ParTake r = par_take<false, true, kThreads>(e, k, lane, wave);
+        if (r.take && r.slot_ord < (uint32_t)topk) {
+            ou[r.slot_ord] = (int32_t)k;
+            ou[topk + r.slot_ord] = j * R + rk;
+        }
+    }
+    if (t == 0)
+        ou[2 * topk] = (int32_t)(sh_ord < (uint32_t)topk ? sh_ord : (uint32_t)topk) |
+                       (over ? kParOver : 0);
+}
+
+/* ---- the join: the R lists merged in block order, then qsa_merge_kernel's threshold and emit. */
+template <int NT>
+__global__ __launch_bounds__(NT) void qsa_join_kernel(
+    const int32_t* __restrict__ part, const int32_t* __restrict__ bt,
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu,
+    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int nb, int topk, int ratio, int nseq, int p_ld, int t_ld, int o_ld, int pw, int R) {
+
+    __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];
+    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord, sh_tot, sh_over;
+    __shared__ int      sh_seq, sh_off[kParWMax + 1];
+    R4D_DYN_LDS(uint32_t, lds);
+    uint32_t* const rawb = lds;                          /* each list's blocks, list after list */
+    uint32_t* const mkey = lds + (size_t)R * topk;       /* the union in block order: keys */
+    uint32_t* const mblk = mkey + (size_t)R * topk;      /* ... and blocks */
+
+    const int m = (int)blockIdx.x;
+    const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
+
+    if (t == 0) sh_seq = 0;
+    __syncthreads();
+    for (int i = t; i < nseq; i += NT)
+        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+    __syncthreads();
+    const int seq = sh_seq;
+    const int p   = pos ? pos[m] : 0;
+    const int own = (p + 1) / ratio;
+    int n = nc[seq] < nb ? nc[seq] : nb;
+    if (own < n) n = own;
+
+    const int32_t* pr = part + (size_t)m * p_ld;
+    /* List offsets, serially (R <= kParWMax). A count outside [0, topk] (no list
+     * qsa_select_part writes) is clamped, so nothing below reads or writes out of bounds. */
+    if (t == 0) {
+        int s = 0;
+        uint32_t over = 0;
+        for (int q = 0; q < R; ++q) {
+            const int32_t v = pr[(size_t)q * pw + 2 * topk];
+            over |= (v & kParOver) ? 1u : 0u;
+            int c = v & ~kParOver;
+            c = c < 0 ? 0 : (c > topk ? topk : c);
+            sh_off[q] = s;
+            s += c;
+        }
+        sh_off[R] = s;
+        sh_tot = (uint32_t)s;
+        sh_over = over;
+    }
+    __syncthreads();
+    const int tot = (int)sh_tot;
+    for (int q = 0; q < R; ++q) {
+        const int base = sh_off[q], cnt = sh_off[q + 1] - base;
+        for (int i = t; i < cnt; i += NT) rawb[base + i] = (uint32_t)pr[(size_t)q * pw + topk + i];
+    }
+    __syncthreads();
+    /* Each entry's place in the union's block order: its index in its own list plus the entries
+     * of every other list below its block (the shares are disjoint, so no tie). */
+    for (int g = t; g < tot; g += NT) {
+        int q = R - 1;
+        while (q > 0 && sh_off[q] > g) --q;
+        const uint32_t b = rawb[g];
+        uint32_t at = (uint32_t)(g - sh_off[q]);
+        for (int q2 = 0; q2 < R; ++q2)
+            if (q2 != q)
+                at += lower_bound_u32(rawb + sh_off[q2], (uint32_t)(sh_off[q2 + 1] - sh_off[q2]), b);
+        if (at < (uint32_t)tot) {
+            mkey[at] = (uint32_t)pr[(size_t)q * pw + (g - sh_off[q])];
+            mblk[at] = b;
+        }
+    }
+    __syncthreads();
+
+    /* As qsa_merge_kernel: everything in block order when the unsplit kernel takes everything. */
+    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, n <= topk || (!sh_over && tot <= topk) };
+    if (!e.all) {
+        radix_thresh<NT>(mkey, tot, (uint32_t)topk, false, hist, suf, wsum, &sh_T, &sh_need);
+        e.T = sh_T; e.need = sh_need;
+    }
+    if (t == 0) { sh_hi = 0; sh_ord = 0; }
+    __syncthreads();
+
+    const int32_t* tb = bt  + (size_t)seq * t_ld;
+    int32_t*       ou = sel + (size_t)m * o_ld;
+    for (int i0 = 0; i0 < tot; i0 += NT) {
+        const int i = i0 + t;
+        const uint32_t k = i < tot ? mkey[i] : 0u;
+        const ParTake r = par_take<true, false, NT>(e, k, lane, wave);
+        if (r.take) {
+            const uint32_t b = mblk[i];
+            const int32_t page = b < (uint32_t)nb ? tb[b] : -1;
+            if (r.hi) { if (r.slot_hi < (uint32_t)topk) ou[r.slot_hi] = page; }
+            else {
+                const uint32_t slot = (uint32_t)topk - e.need + r.rank_eq;
+                if (slot < (uint32_t)topk) ou[slot] = page;
+            }
+        }
+    }
+
+    if (t == 0) {
+        uint32_t out = e.all ? (sh_hi < (uint32_t)topk ? sh_hi : (uint32_t)topk) : (uint32_t)topk;
+        const int32_t part_pg = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
+        if (part_pg >= 0) ou[out++] = part_pg;
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        nsel[m] = (int32_t)out;
+        seqused[m] = (int32_t)((out == 0) ? 0
+                                : (out - 1) * (uint32_t)ratio + (uint32_t)(p % ratio) + 1u);
+    }
+}
 }  // namespace
 
 /* Split-path scratch, sized from topk alone so declare (parameters only) and issue agree: two
@@ -1206,3 +1447,90 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
                 stream);
 }
 
+/* ============================================================== block keys split across ranks */
+
+/* A list row's width: 2 * topk + 1 words rounded up to whole 16-byte words (docs/OPS.md). */
+static inline long long part_width(long long topk) { return (2 * topk + 1 + 3) / 4 * 4; }
+
+enum { QP_SCORE = 0, QP_BT = 1, QP_NC = 2, QP_POS = 3, QP_CU = 4, QP_PART = 5 };
+
+extern "C" int r4d_rad_qsa_select_part(const RadArgs* a, RadStream stream) {
+    const RadTensor* sc = r4d_opt(a, QP_SCORE);
+    const RadTensor* bt = r4d_opt(a, QP_BT);
+    const RadTensor* nc = r4d_opt(a, QP_NC);
+    const RadTensor* po = r4d_opt(a, QP_POS);
+    const RadTensor* cu = r4d_opt(a, QP_CU);
+    const RadTensor* pt = r4d_opt(a, QP_PART);
+    if (!sc || !bt || !nc || !po || !cu || !pt) return R4D_NO(RAD_E_INVAL);
+    if (sc->rank != 2 || bt->rank != 2 || pt->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long topk  = r4d_geti_or(a, "topk", 0);
+    const long long ratio = r4d_geti_or(a, "ratio", 0);
+    const long long R     = r4d_geti_or(a, "ranks", 0);
+    const long long rk    = r4d_geti_or(a, "rank", -1);
+    const long long sgn   = r4d_geti_or(a, "signed", 0);
+    if (topk <= 0 || ratio <= 0 || R < 1 || rk < 0 || rk >= R) return R4D_NO(RAD_E_INVAL);
+    if (sgn != 0 && sgn != 1) return R4D_NO(RAD_E_INVAL);
+    /* The width is the table's or the share's columns times R, whichever is less (the caller
+     * narrows the score columns to its share of the live reach). */
+    const long long M  = sc->shape[0];
+    const long long nb = bt->shape[1] < R * sc->shape[1] ? bt->shape[1] : R * sc->shape[1];
+    if (M < 1 || nb < 1 || nb > 0x7FFFFFFFll) return R4D_NO(RAD_E_SHAPE);
+    if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
+    const long long nseq = cu->shape[0] - 1;
+    if (bt->shape[0] < nseq || r4d_numel(nc) < nseq || r4d_numel(po) < M) return R4D_NO(RAD_E_SHAPE);
+    const long long pw = part_width(topk);
+    if (pt->shape[0] < M || pt->shape[1] < pw) return R4D_NO(RAD_E_SHAPE);
+    const long long sp = r4d_row_pitch(sc), tp = r4d_row_pitch(bt), pp = r4d_row_pitch(pt);
+    if (sp < 0 || tp < 0 || pp < 0) return R4D_NO(RAD_E_STRIDE);
+    int cap = (M <= kCacheMaxM) ? lds_cap_of() : 0;
+    const long long nl_max = (nb + R - 1) / R;
+    if (cap > nl_max) cap = (int)nl_max;
+#define QSA_PART_EMIT(S_)                                                                       \
+    R4D_EMIT(stream, qsa_part_kernel<S_>, dim3((unsigned)M), dim3(kThreads),                     \
+             (size_t)cap * sizeof(uint32_t), (const float*)r4d_addr(sc),                         \
+             (const int32_t*)r4d_addr(bt), (const int32_t*)r4d_addr(nc),                         \
+             (const int32_t*)r4d_addr(po), (const int32_t*)r4d_addr(cu), (int32_t*)r4d_addr(pt), \
+             (int)nb, (int)topk, (int)ratio, (int)nseq, (int)sp, (int)tp, (int)pp, (int)pw,      \
+             (int)R, (int)rk, cap)
+    const int rc = sgn ? QSA_PART_EMIT(true) : QSA_PART_EMIT(false);
+#undef QSA_PART_EMIT
+    return rc;
+}
+
+enum { QJ_PART = 0, QJ_BT = 1, QJ_NC = 2, QJ_POS = 3, QJ_CU = 4, QJ_SEL = 5, QJ_NSEL = 6,
+       QJ_SEQ = 7 };
+
+extern "C" int r4d_rad_qsa_select_join(const RadArgs* a, RadStream stream) {
+    const RadTensor* pt = r4d_opt(a, QJ_PART);
+    const RadTensor* bt = r4d_opt(a, QJ_BT);
+    const RadTensor* nc = r4d_opt(a, QJ_NC);
+    const RadTensor* po = r4d_opt(a, QJ_POS);
+    const RadTensor* cu = r4d_opt(a, QJ_CU);
+    const RadTensor* se = r4d_opt(a, QJ_SEL);
+    const RadTensor* ns = r4d_opt(a, QJ_NSEL);
+    const RadTensor* su = r4d_opt(a, QJ_SEQ);
+    if (!pt || !bt || !nc || !po || !cu || !se || !ns || !su) return R4D_NO(RAD_E_INVAL);
+    if (pt->rank != 2 || bt->rank != 2 || se->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long topk  = r4d_geti_or(a, "topk", 0);
+    const long long ratio = r4d_geti_or(a, "ratio", 0);
+    const long long R     = r4d_geti_or(a, "ranks", 0);
+    if (topk <= 0 || ratio <= 0 || R < 1) return R4D_NO(RAD_E_INVAL);
+    /* The serial offset walk and the union's three LDS arrays bound the rank count. */
+    if (R > kParWMax || 3 * R * topk > (long long)lds_cap_of()) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long M = pt->shape[0], nb = bt->shape[1], pw = part_width(topk);
+    if (M < 1 || nb < 1 || pt->shape[1] < R * pw) return R4D_NO(RAD_E_SHAPE);
+    if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
+    const long long nseq = cu->shape[0] - 1;
+    if (bt->shape[0] < nseq || r4d_numel(nc) < nseq) return R4D_NO(RAD_E_SHAPE);
+    if (se->shape[0] < M || se->shape[1] < topk + 1) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(ns) < M || r4d_numel(po) < M || r4d_numel(su) < M) return R4D_NO(RAD_E_SHAPE);
+    const long long pp = r4d_row_pitch(pt), tp = r4d_row_pitch(bt), op = r4d_row_pitch(se);
+    if (pp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    return R4D_EMIT(stream, qsa_join_kernel<kMergeThreads>, dim3((unsigned)M), dim3(kMergeThreads),
+                    (size_t)(3 * R * topk) * sizeof(uint32_t), (const int32_t*)r4d_addr(pt),
+                    (const int32_t*)r4d_addr(bt), (const int32_t*)r4d_addr(nc),
+                    (const int32_t*)r4d_addr(po), (const int32_t*)r4d_addr(cu),
+                    (int32_t*)r4d_addr(se), (int32_t*)r4d_addr(ns), (int32_t*)r4d_addr(su),
+                    (int)nb, (int)topk, (int)ratio, (int)nseq, (int)pp, (int)tp, (int)op, (int)pw,
+                    (int)R);
+}

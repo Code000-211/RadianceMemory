@@ -1758,6 +1758,45 @@ int ref_qsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("qsa_select", operand, out);
 }
 
+/* One rank's share at `ranks` 2, rank 1: the score plane is the share's columns, half the table. */
+int ref_qsa_select_part_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t topk = gi(p, n_p, "topk", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t R = gi(p, n_p, "ranks", 0);
+    if (M <= 0 || blocks <= 0 || topk <= 0 || ratio <= 0 || R <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = qsa_seqs(p, n_p, M);
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, (blocks + R - 1) / R });          /* score -- this rank's columns */
+    o.t_idx({ S, blocks }, S * blocks, -1, 0);                    /* bt -- page ids */
+    o.t_idx({ S }, blocks + 1, -1, 0);                            /* nc -- 0 .. blocks */
+    o.t_idx({ M }, (blocks + 1) * ratio, -1, 0);                  /* pos */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
+    o.t((uint32_t)RAD_I32, { M, (2 * topk + 1 + 3) / 4 * 4 });    /* part */
+    return o.finish("qsa_select_part", operand, out);
+}
+
+/* The join reads lists only qsa_select_part writes (sorted, disjoint, flagged), which no random
+ * draw makes, so the description draws every list empty (all zeros: count 0, no flag), a valid
+ * input whose answer is the partial page alone. The real lists are built by hand
+ * (tests/ref_test.cpp, libavx's hand cases, r4d_selftest). */
+int ref_qsa_select_join_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t topk = gi(p, n_p, "topk", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t R = gi(p, n_p, "ranks", 0);
+    if (M <= 0 || blocks <= 0 || topk <= 0 || ratio <= 0 || R <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = qsa_seqs(p, n_p, M);
+    Opd o;
+    o.t_idx({ M, R * ((2 * topk + 1 + 3) / 4 * 4) }, 1, -1, 0);  /* part -- gathered, empty */
+    o.t_idx({ S, blocks }, S * blocks, -1, 0);                    /* bt -- page ids */
+    o.t_idx({ S }, blocks + 1, -1, 0);                            /* nc -- 0 .. blocks */
+    o.t_idx({ M }, (blocks + 1) * ratio, -1, 0);                  /* pos */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
+    o.t((uint32_t)RAD_I32, { M, topk + 1 });                      /* sel */
+    o.t((uint32_t)RAD_I32, { M });                                /* nsel */
+    o.t((uint32_t)RAD_I32, { M });                                /* seqused */
+    return o.finish("qsa_select_join", operand, out);
+}
+
 /* sel's draw is [0, blocks): resident ids only. A cold entry needs a store slot and a scratch page
  * paired with it, which a random draw cannot promise, so the fixture exercises the pass-through
  * and tests/ref_test.cpp builds the cold cases by hand. */

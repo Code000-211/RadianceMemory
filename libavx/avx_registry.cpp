@@ -427,7 +427,19 @@ static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_ST
                                              P_STR("to") };
 static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
 static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
-                                         P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
+                                         P_INT("seqs"), P_CAP("work"), P_STR("dtype"),
+                                         P_INTO("ranks"), P_INTO("rank") };
+/* The selection with the block keys split across ranks (libref's ref_qsa_select_part/_join). */
+static const RadParamSpec pQsaSelectPart[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
+                                               P_INT("ratio"), P_INT("seqs"), P_INT("ranks"),
+                                               P_INT("rank"), P_INTO("signed") };
+static const RadOperandSpec oQsaSelectPart[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
+                                                 OPD("cu"), OUT("part") };
+static const RadParamSpec pQsaSelectJoin[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
+                                               P_INT("ratio"), P_INT("seqs"), P_INT("ranks") };
+static const RadOperandSpec oQsaSelectJoin[] = { OPD("part"), OPD("bt"), OPD("nc"), OPD("pos"),
+                                                 OPD("cu"), OUT("sel"), OUT("nsel"),
+                                                 OUT("seqused") };
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
@@ -1154,6 +1166,12 @@ static const RadOpSchema kSchemas[] = {
   "the topk highest-scoring complete blocks as page ids, libref's order exactly: the blocks above "
   "the threshold in block order, then its ties in block order, then the partial page, then -1 to "
   "topk + 1; a radix select, linear in the blocks." },
+{ "qsa_select_part", ARR(pQsaSelectPart), ARR(oQsaSelectPart),
+  "one rank's share of a split selection: its top-k by (order key desc, block asc) over blocks "
+  "b % ranks == rank, in block order as [keys | blocks | count, bit 30 over topk]; libref's bytes." },
+{ "qsa_select_join", ARR(pQsaSelectJoin), ARR(oQsaSelectJoin),
+  "the ranks' qsa_select_part lists merged into qsa_select's table, nsel and seqused, byte for "
+  "byte the unsplit selection; a list qsa_select_part would not write is refused." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
   "rows of the tail keep what they held." },
@@ -1168,7 +1186,8 @@ static const RadOpSchema kSchemas[] = {
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "the blocks completing in this batch: each block's `ratio` raw keys staged contiguously, its "
   "block-key page and first-token position; slots past the count get page -1. nc is each "
-  "sequence's complete-block count." },
+  "sequence's complete-block count. With `ranks` and `rank` only blocks b % ranks == rank are "
+  "stored, at page bt[b / ranks]." },
 { "rope", ARR(pRope), ARR(oRope), "rotary embedding in place." },
 { "embed_attn", ARR(pEmbedAttn), ARR(oEmbedAttn),
   "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },
@@ -1810,6 +1829,12 @@ SIMPLE("avx_qsa_score", "qsa_score", "attn",
 SIMPLE("avx_qsa_select", "qsa_select", "attn",
        "QSA selection: the top-k blocks as a page-id table, partial page last",
        "f32 scores, i32 tables", L(qsa_select)),
+SIMPLE("avx_qsa_select_part", "qsa_select_part", "attn",
+       "QSA split selection: one rank's top-k as (order key, block) in block order",
+       "f32 scores, i32 tables", L(qsa_select_part)),
+SIMPLE("avx_qsa_select_join", "qsa_select_join", "attn",
+       "QSA split selection: the ranks' lists merged into qsa_select's page-id table",
+       "i32 lists and tables", L(qsa_select_join)),
 SIMPLE("avx_qsa_tail_store", "qsa_tail_store", "attn",
        "QSA tail: the raw keys of open blocks into a per-sequence ring", DT_FLOAT,
        L(qsa_tail_store)),

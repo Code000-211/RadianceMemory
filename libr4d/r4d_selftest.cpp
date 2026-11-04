@@ -23633,6 +23633,45 @@ static void qsa_work_case(const Plugin& pl) {
     std::printf("        M-RoPE: [work, 3] positions %s (%ld from committed text); one column at "
                 "pitch 3 %s\n", mc_ok ? "ok" : "NO", mc_text, col_ok ? "ok" : "NO");
 
+    /* Block keys split across two ranks (`ranks` 2, `rank` r; docs/QSA.md): an item's page is
+     * bt[b / 2] when b % 2 == r and -1 otherwise, its staged rows are the unsplit launch's for
+     * this rank's blocks and untouched (a sentinel) for the other's, and position and nc are the
+     * unsplit ones. Both ranks together store every block exactly once. */
+    bool split_ok = true;
+    long split_mine = 0;
+    for (int64_t rk = 0; rk < 2; ++rk) {
+        std::vector<uint16_t> sent((size_t)(W_ * ratio * n), 0x7FC1);
+        st_memcpy(d_st, sent.data(), sent.size() * 2, hipMemcpyHostToDevice);
+        std::vector<RadParam> pr = ps;
+        pr.push_back(PI("ranks", 2));
+        pr.push_back(PI("rank", rk));
+        RadArgs as = a;
+        as.p = pr.data(); as.n_p = (int)pr.size();
+        if (r->launch(&as, nullptr) != RAD_OK) { split_ok = false; break; }
+        st_stream_sync(nullptr);
+        std::vector<uint16_t> ss((size_t)(W_ * ratio * n));
+        std::vector<int32_t> sp((size_t)W_), sb((size_t)W_), snc((size_t)seqs);
+        st_memcpy(ss.data(), d_st, ss.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(sp.data(), d_pg, sp.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(sb.data(), d_bp, sb.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(snc.data(), d_nc, snc.size() * 4, hipMemcpyDeviceToHost);
+        if (sb != gb || snc != gnc) split_ok = false;
+        for (int64_t w = 0; w < W_; ++w) {
+            const bool real = w < (int64_t)want.size();
+            const int64_t s = real ? want[(size_t)w].s : 0, b = real ? want[(size_t)w].b : 0;
+            const bool mine = real && b % 2 == rk;
+            if (sp[(size_t)w] != (mine ? bth[(size_t)(s * btw + b / 2)] : -1)) split_ok = false;
+            split_mine += mine;
+            for (int64_t i = 0; i < ratio * n; ++i)
+                if (ss[(size_t)(w * ratio * n + i)] !=
+                    (mine ? gs[(size_t)(w * ratio * n + i)] : (uint16_t)0x7FC1))
+                    split_ok = false;
+        }
+    }
+    ok("qsa_work split across two ranks: each block on rank b % 2 at page bt[b / 2], the rest -1",
+       split_ok && split_mine == (long)want.size(),
+       "blocks stored " + std::to_string(split_mine) + " of " + std::to_string(want.size()));
+
     /* `from_tail` requires a straddling block, `ring_differs` that ring and ratio rows differ. */
     const bool pass = page_ok && pos_ok && key_ok && pad_ok && nc_ok && from_tail > 0 &&
                       ring_differs > 0 && !want.empty() && mc_ok && mc_text > 0 && col_ok;
@@ -26324,6 +26363,135 @@ static void qsa_select_wide_case(const Plugin& pl) {
            fmt("%lld entries differ; %lld of %lld queries select a full table", (long long)diff,
                (long long)full, (long long)M));
     }
+}
+
+/* Block keys split across two ranks (--qsa-bkey-split, docs/QSA.md): each "rank" scores its
+ * share (column j is block 2j + r) and qsa_select_part takes its top-k, the two list rows are laid
+ * side by side as the row-interleaved all_gather lays them out, and qsa_select_join merges them.
+ * Held to qsa_select over the unsplit plane byte for byte: table, count and seqused.
+ *
+ * Two sequences, decode-shaped rows and prefill-shaped ones each bounded by its own position (a
+ * few under topk, so the every-block form runs), dead pages and -inf scattered, and score sets
+ * small enough that ties at the threshold decide most rows; `wide` takes histories past the LDS
+ * cache, so the part reads its share from the plane. One case for both rows: neither is checkable
+ * without the other. */
+static void qsa_select_ranks_case(const Plugin& pl, int sgn, bool wide) {
+    const RadKernelInfo* rs = find(pl, "qsa_select_i32");
+    const RadKernelInfo* rp = find(pl, "qsa_select_part_i32");
+    const RadKernelInfo* rj = find(pl, "qsa_select_join_i32");
+    const std::string what = std::string("qsa_select_part + qsa_select_join over two ranks vs "
+                                         "qsa_select unsplit, byte for byte") +
+                             (sgn ? ", signed" : "") + (wide ? ", past the LDS cache" : "");
+    if (!rs || !rp || !rj) { ok(what.c_str(), false, "row absent"); return; }
+    const int64_t S = 2, R = 2, topk = 512, ratio = 4, pages = 1 << 20;
+    const int64_t nb = wide ? 24000 : 3000, nbl = (nb + R - 1) / R;
+    const int64_t pw = (2 * topk + 1 + 3) / 4 * 4;
+    /* 60 rows: under the part's 64-row LDS gate, so `wide` alone decides the cache. */
+    const int64_t q0 = 33, q1 = 27, M = q0 + q1;
+    const int64_t base[2] = { 4 * (nb - 200), 4 * 300 };   /* the second sequence: under topk */
+    std::vector<int32_t> cuh = { 0, (int32_t)q0, (int32_t)M };
+    std::vector<int32_t> pos((size_t)M);
+    for (int64_t i = 0; i < q0; ++i) pos[(size_t)i] = (int32_t)(base[0] + 19 * i);
+    for (int64_t i = 0; i < q1; ++i) pos[(size_t)(q0 + i)] = (int32_t)(base[1] + 3 * i);
+    std::vector<int32_t> nc = { (int32_t)std::min<int64_t>((base[0] + 19 * q0) / ratio, nb - 1),
+                                (int32_t)((base[1] + 3 * q1) / ratio) };
+    uint64_t x = 0x9E3779B97F4A7C15ull ^ (uint64_t)(sgn * 7 + wide);
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    std::vector<int32_t> bt((size_t)(S * nb));
+    for (auto& v : bt) v = (rnd() % 89 == 0) ? -1 : (int32_t)(rnd() % pages);
+    std::vector<float> sc((size_t)(M * nb));
+    for (auto& v : sc) {
+        const uint64_t u = rnd();
+        v = u % 197 == 0 ? -INFINITY
+          : sgn ? (float)(u % 41) * 0.25f - 5.0f : (float)(u % 37) * 0.125f;
+    }
+    /* Rank r's share: column j holds block j * R + r. */
+    std::vector<float> share[2];
+    for (int64_t r = 0; r < R; ++r) {
+        share[r].assign((size_t)(M * nbl), -INFINITY);
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t j = 0; j * R + r < nb; ++j)
+                share[r][(size_t)(m * nbl + j)] = sc[(size_t)(m * nb + j * R + r)];
+    }
+    auto up = [](const void* h, size_t bytes) {
+        void* d = dalloc(bytes);
+        st_memcpy(d, h, bytes, hipMemcpyHostToDevice);
+        return d;
+    };
+    void* d_bt = up(bt.data(), bt.size() * 4);
+    void* d_nc = up(nc.data(), nc.size() * 4);
+    void* d_po = up(pos.data(), pos.size() * 4);
+    void* d_cu = up(cuh.data(), cuh.size() * 4);
+    auto params = [&](bool part, int64_t r) {
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk),
+                                     PI("ratio", ratio), PI("seqs", S) };
+        if (part) { ps.push_back(PI("ranks", R)); ps.push_back(PI("rank", r)); }
+        if (r == -1) ps.push_back(PI("ranks", R));
+        if (sgn && (part || r == -2)) ps.push_back(PI("signed", 1));
+        return ps;
+    };
+    auto launch = [&](const RadKernelInfo* k, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rc = k->launch(&a, nullptr);
+        return rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+    };
+    /* The unsplit selection. */
+    void* d_sc = up(sc.data(), sc.size() * 4);
+    std::vector<int32_t> fill((size_t)(M * (topk + 1)), 0x5A5A5A5A);
+    void* d_se0 = up(fill.data(), fill.size() * 4);
+    void* d_ns0 = up(fill.data(), (size_t)M * 4);
+    void* d_su0 = up(fill.data(), (size_t)M * 4);
+    bool run = launch(rs, { T(d_sc, RAD_F32, { M, nb }), T(d_bt, RAD_I32, { S, nb }),
+                            T(d_nc, RAD_I32, { S }), T(d_po, RAD_I32, { M }),
+                            T(d_cu, RAD_I32, { S + 1 }), T(d_se0, RAD_I32, { M, topk + 1 }),
+                            T(d_ns0, RAD_I32, { M }), T(d_su0, RAD_I32, { M }) },
+                      params(false, -2));
+    /* Each rank's list, gathered on the host as the all_gather would. */
+    std::vector<int32_t> gath((size_t)(M * R * pw), 0x5A5A5A5A);
+    for (int64_t r = 0; r < R && run; ++r) {
+        void* d_sh = up(share[r].data(), share[r].size() * 4);
+        std::vector<int32_t> pf((size_t)(M * pw), 0x5A5A5A5A);
+        void* d_pt = up(pf.data(), pf.size() * 4);
+        run = launch(rp, { T(d_sh, RAD_F32, { M, nbl }), T(d_bt, RAD_I32, { S, nb }),
+                           T(d_nc, RAD_I32, { S }), T(d_po, RAD_I32, { M }),
+                           T(d_cu, RAD_I32, { S + 1 }), T(d_pt, RAD_I32, { M, pw }) },
+                     params(true, r));
+        st_memcpy(pf.data(), d_pt, pf.size() * 4, hipMemcpyDeviceToHost);
+        for (int64_t m = 0; m < M; ++m)
+            std::memcpy(&gath[(size_t)((m * R + r) * pw)], &pf[(size_t)(m * pw)], (size_t)pw * 4);
+    }
+    void* d_g   = up(gath.data(), gath.size() * 4);
+    void* d_se1 = up(fill.data(), fill.size() * 4);
+    void* d_ns1 = up(fill.data(), (size_t)M * 4);
+    void* d_su1 = up(fill.data(), (size_t)M * 4);
+    run = run && launch(rj, { T(d_g, RAD_I32, { M, R * pw }), T(d_bt, RAD_I32, { S, nb }),
+                              T(d_nc, RAD_I32, { S }), T(d_po, RAD_I32, { M }),
+                              T(d_cu, RAD_I32, { S + 1 }), T(d_se1, RAD_I32, { M, topk + 1 }),
+                              T(d_ns1, RAD_I32, { M }), T(d_su1, RAD_I32, { M }) },
+                        params(false, -1));
+    if (!run) { ok(what.c_str(), false, "a launch failed"); return; }
+    std::vector<int32_t> a0(fill.size()), a1(fill.size()), n0((size_t)M), n1((size_t)M),
+        u0((size_t)M), u1((size_t)M);
+    st_memcpy(a0.data(), d_se0, a0.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(a1.data(), d_se1, a1.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(n0.data(), d_ns0, n0.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(n1.data(), d_ns1, n1.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(u0.data(), d_su0, u0.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(u1.data(), d_su1, u1.size() * 4, hipMemcpyDeviceToHost);
+    int64_t diff = 0, full = 0, over = 0;
+    for (size_t i = 0; i < a0.size(); ++i) diff += a0[i] != a1[i];
+    for (int64_t m = 0; m < M; ++m) {
+        diff += (n0[(size_t)m] != n1[(size_t)m]) + (u0[(size_t)m] != u1[(size_t)m]);
+        full += n0[(size_t)m] >= (int32_t)topk;
+        for (int64_t r = 0; r < R; ++r) over += (gath[(size_t)((m * R + r) * pw + 2 * topk)] >> 30) & 1;
+    }
+    /* Both forms must be reached: full tables (a rank over topk) and short ones (every block). */
+    ok(what.c_str(), diff == 0 && full > 0 && full < M && over > 0,
+       fmt("%lld entries differ; %lld of %lld rows full, %lld lists over topk", (long long)diff,
+           (long long)full, (long long)M, (long long)over));
 }
 
 /* qsa_select with the block list split across the device, against the same launch unsplit.
@@ -33141,6 +33309,15 @@ static void device_phase(const Plugin& pl) {
         qsa_select_split_one(pl, "qsa_select split, two sequences of four draft rows", 2, 4);
         qsa_select_few_live_case(pl);
     }
+
+    /* --qsa-bkey-split: the two rows are only checkable together, so each row's case is the pair. */
+    for (const char* row : { "qsa_select_part_i32", "qsa_select_join_i32" })
+        if (sel(row)) {
+            if (!g_case) std::printf("\nthe QSA selection split across two ranks (%s), against "
+                                     "qsa_select unsplit\n", row);
+            for (int sg = 0; sg <= 1; ++sg)
+                for (bool wide : { false, true }) qsa_select_ranks_case(pl, sg, wide);
+        }
 
     if (sel("kv_resolve_i32")) {
         if (!g_case) std::printf("\nthe streamed-KV residency map, against libref\n");

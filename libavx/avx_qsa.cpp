@@ -564,6 +564,169 @@ AVX_KERNEL(qsa_select) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ qsa_select_part / _join */
+/* The selection with the block keys split across ranks (libref's ref_qsa_select_part and
+ * ref_qsa_select_join state the contract; docs/OPS.md). Scalar and sort-based: one rank's share
+ * and the merge of a few hundred candidates are small next to the score. */
+namespace {
+
+constexpr int64_t kPartOver = int64_t(1) << 30;
+
+int64_t part_width(int64_t topk) { return (2 * topk + 1 + 3) / 4 * 4; }
+
+/* The selection's order key (order_keys above): bits(max(v, 0)) + 1, or the signed total order. */
+uint32_t part_key(float v, bool sgn) {
+    uint32_t u = 0;
+    if (sgn) {
+        if (v != 0.0f) std::memcpy(&u, &v, 4);
+        return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+    }
+    const float x = v > 0.0f ? v : 0.0f;
+    std::memcpy(&u, &x, 4);
+    return u + 1u;
+}
+
+struct Cand { uint32_t key; int64_t b; };
+
+/* qsa_select's rule over candidates: every one in block order when `all`, else the topk largest
+ * by (key desc, block asc), those above the topk-th key in block order, then its ties in block
+ * order. Rewrites `c` to the taken ones in that order. */
+void take_rule(std::vector<Cand>& c, int64_t topk, bool all) {
+    auto by_b = [](const Cand& x, const Cand& y) { return x.b < y.b; };
+    if (all) {
+        std::sort(c.begin(), c.end(), by_b);
+        if ((int64_t)c.size() > topk) c.resize((size_t)topk);
+        return;
+    }
+    std::sort(c.begin(), c.end(),
+              [](const Cand& x, const Cand& y) { return x.key != y.key ? x.key > y.key : x.b < y.b; });
+    if ((int64_t)c.size() > topk) c.resize((size_t)topk);
+    if (c.empty()) return;
+    const uint32_t thr = c.back().key;
+    const auto mid = std::stable_partition(c.begin(), c.end(),
+                                           [&](const Cand& x) { return x.key > thr; });
+    std::sort(c.begin(), mid, by_b);
+    std::sort(mid, c.end(), by_b);
+}
+
+}  /* namespace */
+
+AVX_KERNEL(qsa_select_part) {
+    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
+    const RadTensor *cu = &a->t[4], *pt = &a->t[5];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t R = p_int(a, "ranks", 0), rk = p_int(a, "rank", -1);
+    const int64_t sgn = p_int(a, "signed", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (R < 1 || rk < 0 || rk >= R || (sgn != 0 && sgn != 1)) return RAD_E_INVAL;
+    if (sc->rank != 2 || bt->rank != 2 || pt->rank != 2) return RAD_E_SHAPE;
+    const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], R * sc->shape[1]);
+    const int64_t n_seq = numel(cu) - 1, W = part_width(topk);
+    if (M <= 0 || nb <= 0 || n_seq <= 0) return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
+    if (pt->shape[0] < M || pt->shape[1] < W || numel(po) < M) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
+    for (int64_t m = 0; m < M; ++m)
+        if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    int64_t* seq = (int64_t*)scratch_raw((size_t)M * sizeof(int64_t) + 64);
+    seq_rows(cu, n_seq, M, 0, seq);
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq[m], p = ldi(po, offlin(po, m));
+        const int64_t n = std::min(std::min(ldi(nc, offlin(nc, s)), nb), (p + 1) / ratio);
+        std::vector<Cand> c;
+        for (int64_t b = rk; b < n; b += R) {
+            const float v = ldt(sc, m * sc->stride[0] + (b / R) * sc->stride[1]);
+            if (ldi(bt, s * bt->stride[0] + b * bt->stride[1]) < 0) continue;
+            if (sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+            c.push_back({ part_key(v, sgn != 0), b });
+        }
+        const bool over = (int64_t)c.size() > topk;
+        take_rule(c, topk, !over);
+        std::sort(c.begin(), c.end(), [](const Cand& x, const Cand& y) { return x.b < y.b; });
+        std::vector<int32_t> row((size_t)W, 0);
+        for (size_t i = 0; i < c.size(); ++i) {
+            row[i] = (int32_t)c[i].key;
+            row[(size_t)topk + i] = (int32_t)c[i].b;
+        }
+        row[(size_t)(2 * topk)] = (int32_t)((int64_t)c.size() | (over ? kPartOver : 0));
+        for (int64_t i = 0; i < W; ++i)
+            st_int_dt(pt->dtype, pt->data, m * pt->stride[0] + i * pt->stride[1], row[(size_t)i]);
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(qsa_select_join) {
+    if (!rad_args_have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *pt = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
+    const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t R = p_int(a, "ranks", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (R < 1) return RAD_E_INVAL;
+    if (pt->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
+    const int64_t M = pt->shape[0], nb = bt->shape[1], W = part_width(topk);
+    const int64_t n_seq = numel(cu) - 1;
+    if (M <= 0 || nb <= 0 || n_seq <= 0 || pt->shape[1] < R * W) return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
+    if (se->shape[0] < M || se->shape[1] < topk + 1) return RAD_E_SHAPE;
+    if (numel(ns) < M || numel(po) < M || numel(su) < M) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
+    for (int64_t m = 0; m < M; ++m)
+        if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    int64_t* seq = (int64_t*)scratch_raw((size_t)M * sizeof(int64_t) + 64);
+    seq_rows(cu, n_seq, M, 0, seq);
+    const int64_t p_rs = pt->stride[0], p_cs = pt->stride[1];
+    auto bound = [&](int64_t m) {
+        return std::min(std::min(ldi(nc, offlin(nc, seq[m])), nb),
+                        (ldi(po, offlin(po, m)) + 1) / ratio);
+    };
+    /* Every list, validated before any write (libref's refusals). */
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t n = bound(m);
+        for (int64_t q = 0; q < R; ++q) {
+            const int64_t base = m * p_rs + q * W * p_cs;
+            const int64_t cnt = ldi(pt, base + 2 * topk * p_cs) & ~kPartOver;
+            if (cnt < 0 || cnt > topk) return RAD_E_INVAL;
+            for (int64_t i = 0, last = -1; i < cnt; ++i) {
+                const int64_t b = ldi(pt, base + (topk + i) * p_cs);
+                if (b <= last || b >= n || b % R != q || ldi(pt, base + i * p_cs) == 0)
+                    return RAD_E_INVAL;
+                last = b;
+            }
+        }
+    }
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq[m], p = ldi(po, offlin(po, m)), n = bound(m);
+        std::vector<Cand> c;
+        bool over = false;
+        for (int64_t q = 0; q < R; ++q) {
+            const int64_t base = m * p_rs + q * W * p_cs;
+            const int64_t w = ldi(pt, base + 2 * topk * p_cs);
+            over = over || (w & kPartOver);
+            for (int64_t i = 0; i < (w & ~kPartOver); ++i)
+                c.push_back({ (uint32_t)ldi(pt, base + i * p_cs), ldi(pt, base + (topk + i) * p_cs) });
+        }
+        take_rule(c, topk, n <= topk || (!over && (int64_t)c.size() <= topk));
+        std::vector<int32_t> row((size_t)(topk + 1), -1);
+        int64_t out = 0;
+        for (const Cand& x : c)
+            row[(size_t)out++] = (int32_t)ldi(bt, s * bt->stride[0] + x.b * bt->stride[1]);
+        if (n < nb && (p + 1) % ratio != 0) {
+            const int64_t part = ldi(bt, s * bt->stride[0] + n * bt->stride[1]);
+            if (part >= 0) row[(size_t)out++] = (int32_t)part;
+        }
+        for (int64_t i = 0; i <= topk; ++i)
+            st_int_dt(se->dtype, se->data, m * se->stride[0] + i * se->stride[1], row[(size_t)i]);
+        st_int_dt(ns->dtype, ns->data, offlin(ns, m), out);
+        st_int_dt(su->dtype, su->data, offlin(su, m),
+                  out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_tail_store */
 /* state[sidx[s][0]][0][pos[t] % ring] = k[t] for the last `ring` rows of each sequence, rows in
  * ascending order, so a later row wins a shared target as in libref's serial loop (a row whose
@@ -831,6 +994,9 @@ AVX_KERNEL(qsa_work) {
     if (!k || !po || !cu || !tl || !sx || !bt || !stg || !pg || !bp || !nc) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
+    /* Split across ranks: only blocks b % R == rk are this rank's, at page bt[b / R]. */
+    const int64_t R = p_int(a, "ranks", 1), rk = p_int(a, "rank", 0);
+    if (R < 1 || rk < 0 || rk >= R) return RAD_E_INVAL;
     if (k->rank != 2 || bt->rank != 2 || stg->rank != 2) return RAD_E_SHAPE;
     if (tl->rank != 4 || tl->shape[1] != 1 || tl->shape[2] < ring || tl->shape[3] != n)
         return RAD_E_SHAPE;
@@ -864,7 +1030,7 @@ AVX_KERNEL(qsa_work) {
         const int64_t p0 = ldi(po, offlin(po, t0)), p1 = ldi(po, offlin(po, t1 - 1));
         for (int64_t b = p0 / ratio; b <= (p1 + 1) / ratio - 1; ++b) {
             if (ni >= mw) break;
-            if (b >= bt->shape[1]) return RAD_E_SHAPE;
+            if (b / R >= bt->shape[1]) return RAD_E_SHAPE;
             const int64_t si = ldi(sx, col0(sx, s));
             if (si >= slots) return RAD_E_INVAL;
             for (int64_t i = 0; si >= 0 && i < ratio; ++i) {
@@ -894,8 +1060,9 @@ AVX_KERNEL(qsa_work) {
         const int64_t s = items[2 * w], b = items[2 * w + 1];
         const int64_t t0 = cu_at(cu, s), p0 = ldi(po, offlin(po, t0));
         const int64_t si = ldi(sx, col0(sx, s));
+        const bool mine = b % R == rk;
         st_int_dt(pg->dtype, pg->data, offlin(pg, w),
-                  si < 0 ? -1 : ldi(bt, s * bt->stride[0] + b * bt->stride[1]));
+                  si < 0 || !mine ? -1 : ldi(bt, s * bt->stride[0] + (b / R) * bt->stride[1]));
         const int64_t f = b * ratio;
         if (!rp) {
             st_int_dt(bp->dtype, bp->data, bpos_at(0), f);
@@ -906,7 +1073,7 @@ AVX_KERNEL(qsa_work) {
                           f >= p0 ? ldi(rp, c * rs + (t0 + f - p0) * rc)
                                   : f + (ldi(rp, t0 * rc) - p0));
         }
-        if (si < 0) continue;
+        if (si < 0 || !mine) continue;
         float* buf = scratch_f32((size_t)n);
         for (int64_t i = 0; i < ratio; ++i) {
             const int64_t q = f + i;

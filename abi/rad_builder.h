@@ -424,6 +424,18 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int32_t  qsa_bkey_dtype;
+
+    /* ---- appended in ABI 43 (block keys split across ranks) */
+    /* --qsa-bkey-split on: a sparse indexer's block keys split across the tensor-parallel ranks,
+     * block b stored and scored on rank b % world_size only, the ranks' local top-k lists gathered
+     * and merged into the selection the unsplit scores give, byte for byte (docs/QSA.md, "Block
+     * keys split across ranks"). 0, the default, keeps every block key on every rank: the program
+     * and every byte as before ABI 43. The engine sets it only at more than one rank and for a
+     * plugin whose probe has RadArchProbe::qsa_bkey_split_ok, and refuses the flag otherwise.
+     *
+     * In the old tail padding (qsa_bkey_dtype ends at 236 of 240): the core writes the struct and
+     * a plugin built against the older one never reads past its last field. */
+    int32_t  qsa_bkey_split;
 } RadBuildCtx;
 
 /* ================================================================== a static V mean per layer */
@@ -1796,6 +1808,12 @@ typedef struct RadArchProbe {
      * RadBuildCtx::qsa_bkey_dtype RAD_I8. --qsa-bkey-dtype i8 is refused at startup with the
      * plugin named when this is 0. 64-bit so it starts past the older struct's tail padding. */
     int64_t qsa_bkey_i8_ok;
+
+    /* ---- appended in ABI 43 (block keys split across ranks) */
+    /* Nonzero when the plugin splits its indexer's block keys across the ranks under
+     * RadBuildCtx::qsa_bkey_split. --qsa-bkey-split on is refused at startup with the plugin named
+     * when this is 0. */
+    int64_t qsa_bkey_split_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

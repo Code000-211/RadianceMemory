@@ -1684,7 +1684,8 @@ AVX_KERNEL(qsa_block_key) {
     const int64_t rot = p_int(a, "rotary_dim", 0), pos0 = p_int(a, "pos0", -1);
     if (n <= 0 || ratio <= 0 || (pos0 < 0 && !pos)) return RAD_E_INVAL;
     if (rot < 0 || rot > n || (rot & 1) || rot / 2 > AVX_HD_MAX / 2) return RAD_E_SHAPE;
-    if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
+    /* `ratio`, or a multiple of it for a group split across ranks (one key a page either way). */
+    if (const int64_t bs = p_int(a, "block_size", ratio); bs < ratio || bs % ratio) return RAD_E_SHAPE;
     if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
     /* `key_dtype` i8: libref's int8 page, n codes, an f16 scale and zero padding (libref's
      * ref_qsa_block_key states the rule). */

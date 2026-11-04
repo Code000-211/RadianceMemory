@@ -58,8 +58,14 @@ extern "C" {
  * (RAD_KVQ_DEMOTE, rad_builder.h; --kv-recipe `demote LAYOUT`), and the optional `store_layout`,
  * `pool_layout` and `head_dim` of `qsa_page` with the new op `kv_transcode` (docs/OPS.md); no
  * struct moved. A plugin built at 41 would read a tiered layer's entry as a layout it does not
- * know and refuse it. */
-#define RAD_ABI_VERSION 42u
+ * know and refuse it.
+ *
+ * 43: the QSA indexer's block keys split across the tensor-parallel ranks (--qsa-bkey-split on):
+ * RadBuildCtx gained qsa_bkey_split and RadArchProbe qsa_bkey_split_ok (rad_builder.h), with the
+ * new ops `qsa_select_part` and `qsa_select_join` and the optional `ranks` and `rank` of
+ * `qsa_work` (docs/OPS.md). A plugin built at 42 would keep every block key on every rank under a
+ * flag that promised to halve them. */
+#define RAD_ABI_VERSION 43u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

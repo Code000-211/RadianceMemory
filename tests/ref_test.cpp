@@ -1003,6 +1003,8 @@ TEST(op_vocabulary) {
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "qsa_page", "dflash_conv",
+        /* The selection with the block keys split across ranks (--qsa-bkey-split). */
+        "qsa_select_part", "qsa_select_join",
         /* Window residency's demote layout (RAD_KVQ_DEMOTE): the requantise and the expand. */
         "kv_transcode",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
@@ -9645,6 +9647,292 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
 }
 
+/* ================================================================== block keys split across ranks
+ * --qsa-bkey-split (docs/QSA.md, "Block keys split across ranks"): rank r of R scores the blocks
+ * b % R == r into column b / R of its own plane, qsa_select_part takes its top-k as a list, the
+ * lists are laid side by side as a row-interleaved all_gather lays them out, and qsa_select_join
+ * merges them. The join must be qsa_select over the unsplit plane byte for byte. */
+namespace {
+/* A history of `S` sequences, each query row bounded by its own position, scores drawn from
+ * `levels` values (so the threshold is a tie on most rows), dead pages and -inf scores scattered;
+ * `sgn` draws negative scores too. */
+struct SplitFix {
+    int64_t S, M, nb, topk, ratio;
+    std::vector<float> sc;                  /* [M][nb] */
+    std::vector<int64_t> bt, nc, pos, cu;   /* [S][nb], [S], [M], [S + 1] */
+};
+
+SplitFix split_fixture(uint32_t seed, int64_t nb, int64_t topk, int levels, bool sgn) {
+    SplitFix f{ 3, 0, nb, topk, 4, {}, {}, {}, {}, {} };
+    uint32_t x = seed;
+    auto rnd = [&]() { x = x * 1664525u + 1013904223u; return x >> 8; };
+    /* Rows: sequence 0 deep (every row past topk), 1 shallow (under topk), 2 straddling it. */
+    const int64_t rows[3] = { 5, 4, 6 };
+    const int64_t first[3] = { nb - 12, topk / 2, topk - 3 };
+    f.cu = { 0 };
+    for (int64_t s = 0; s < f.S; ++s) {
+        for (int64_t i = 0; i < rows[s]; ++i)
+            f.pos.push_back((first[s] + 2 * i) * f.ratio + (int64_t)(rnd() % (uint32_t)f.ratio));
+        f.cu.push_back(f.cu.back() + rows[s]);
+        f.nc.push_back(std::min<int64_t>((f.pos.back() + 1) / f.ratio, nb - 1));
+    }
+    f.M = f.cu.back();
+    f.bt.resize((size_t)(f.S * nb));
+    for (auto& v : f.bt) v = rnd() % 29 == 0 ? -1 : (int64_t)(rnd() % 100000);
+    f.sc.resize((size_t)(f.M * nb));
+    for (auto& v : f.sc) {
+        const uint32_t u = rnd();
+        v = u % 31 == 0 ? -INFINITY
+          : u % 37 == 0 ? (sgn ? NAN : -0.0f)
+          : sgn ? 0.5f * (float)(int)(u % (uint32_t)levels) - 0.25f * (float)levels
+                : 0.5f * (float)(u % (uint32_t)levels);
+    }
+    /* The deep sequence's first row: every odd block dead, so at two ranks one list is over topk
+     * and the other empty -- exactly topk candidates with a flag, where only the flag tells the
+     * threshold layout from the every-block one. */
+    for (int64_t b = 1; b < nb; b += 2) f.sc[(size_t)b] = -INFINITY;
+    return f;
+}
+
+struct SelOut { std::vector<int64_t> sel, nsel, su; int rc = RAD_OK; };
+
+SelOut split_unsplit(const SplitFix& f, bool sgn) {
+    T sc(RAD_F32, {f.M, f.nb}); sc.f(f.sc);
+    T bt(RAD_I32, {f.S, f.nb}); bt.n(f.bt);
+    T nc(RAD_I32, {f.S}); nc.n(f.nc);
+    T po(RAD_I32, {f.M}); po.n(f.pos);
+    T cu(RAD_I32, {f.S + 1}); cu.n(f.cu);
+    T se(RAD_I32, {f.M, f.topk + 1}), ns(RAD_I32, {f.M}), su(RAD_I32, {f.M});
+    A a; a.t(sc).t(bt).t(nc).t(po).t(cu).t(se).t(ns).t(su).i("M", f.M).i("blocks", f.nb)
+          .i("topk", f.topk).i("ratio", f.ratio).i("seqs", f.S);
+    if (sgn) a.i("signed", 1);
+    SelOut r;
+    r.rc = run("qsa_select", a);
+    for (int64_t i = 0; i < f.M * (f.topk + 1); ++i) r.sel.push_back(se.iat(i));
+    for (int64_t i = 0; i < f.M; ++i) { r.nsel.push_back(ns.iat(i)); r.su.push_back(su.iat(i)); }
+    return r;
+}
+
+/* Every rank's list over its share, laid side by side: [M][R][W]. */
+std::vector<int64_t> split_lists(const SplitFix& f, int64_t R, bool sgn, int* rc) {
+    const int64_t W = (2 * f.topk + 1 + 3) / 4 * 4, nbl = (f.nb + R - 1) / R;
+    std::vector<int64_t> g((size_t)(f.M * R * W), 0);
+    *rc = RAD_OK;
+    for (int64_t r = 0; r < R; ++r) {
+        std::vector<float> share((size_t)(f.M * nbl), -INFINITY);
+        for (int64_t m = 0; m < f.M; ++m)
+            for (int64_t j = 0; j * R + r < f.nb; ++j)
+                share[(size_t)(m * nbl + j)] = f.sc[(size_t)(m * f.nb + j * R + r)];
+        T sc(RAD_F32, {f.M, nbl}); sc.f(share);
+        T bt(RAD_I32, {f.S, f.nb}); bt.n(f.bt);
+        T nc(RAD_I32, {f.S}); nc.n(f.nc);
+        T po(RAD_I32, {f.M}); po.n(f.pos);
+        T cu(RAD_I32, {f.S + 1}); cu.n(f.cu);
+        T pt(RAD_I32, {f.M, W});
+        std::vector<int64_t> junk((size_t)(f.M * W), 0x5A5A5A5A);
+        pt.n(junk);                                   /* every word must be written */
+        A a; a.t(sc).t(bt).t(nc).t(po).t(cu).t(pt).i("M", f.M).i("blocks", f.nb)
+              .i("topk", f.topk).i("ratio", f.ratio).i("seqs", f.S).i("ranks", R).i("rank", r);
+        if (sgn) a.i("signed", 1);
+        if ((*rc = run("qsa_select_part", a)) != RAD_OK) return g;
+        for (int64_t m = 0; m < f.M; ++m)
+            for (int64_t i = 0; i < W; ++i) g[(size_t)((m * R + r) * W + i)] = pt.iat(m * W + i);
+    }
+    return g;
+}
+
+SelOut split_join(const SplitFix& f, int64_t R, const std::vector<int64_t>& lists) {
+    const int64_t W = (2 * f.topk + 1 + 3) / 4 * 4;
+    T pt(RAD_I32, {f.M, R * W}); pt.n(lists);
+    T bt(RAD_I32, {f.S, f.nb}); bt.n(f.bt);
+    T nc(RAD_I32, {f.S}); nc.n(f.nc);
+    T po(RAD_I32, {f.M}); po.n(f.pos);
+    T cu(RAD_I32, {f.S + 1}); cu.n(f.cu);
+    T se(RAD_I32, {f.M, f.topk + 1}), ns(RAD_I32, {f.M}), su(RAD_I32, {f.M});
+    se.n(std::vector<int64_t>((size_t)(f.M * (f.topk + 1)), 77));
+    ns.n(std::vector<int64_t>((size_t)f.M, 77));
+    su.n(std::vector<int64_t>((size_t)f.M, 77));
+    A a; a.t(pt).t(bt).t(nc).t(po).t(cu).t(se).t(ns).t(su).i("M", f.M).i("blocks", f.nb)
+          .i("topk", f.topk).i("ratio", f.ratio).i("seqs", f.S).i("ranks", R);
+    SelOut r;
+    r.rc = run("qsa_select_join", a);
+    for (int64_t i = 0; i < f.M * (f.topk + 1); ++i) r.sel.push_back(se.iat(i));
+    for (int64_t i = 0; i < f.M; ++i) { r.nsel.push_back(ns.iat(i)); r.su.push_back(su.iat(i)); }
+    return r;
+}
+}  /* namespace */
+
+/* The tied histories at two and three ranks, both rankings: each rank's list over its share,
+ * gathered and merged, gives qsa_select's table, count and seqused over the unsplit plane byte for
+ * byte. The fixture reaches every form: rows with a rank over topk (the threshold layout), rows
+ * where every share is under topk and the union over it (no flag, threshold layout still), and
+ * rows under topk altogether (every block in block order). */
+TEST(qsa_select_split_across_ranks_gives_qsa_select_byte_for_byte) {
+    int64_t over_rows = 0, flagless_full = 0, short_rows = 0;
+    for (bool sgn : { false, true })
+        for (int64_t R : { 2, 3 })
+            for (int levels : { 3, 40 }) {
+                const SplitFix f = split_fixture(0x51u + (uint32_t)(R * 7 + levels + sgn), 220, 32,
+                                                 levels, sgn);
+                const SelOut want = split_unsplit(f, sgn);
+                REQUIRE_EQ(want.rc, RAD_OK);
+                int rc = RAD_OK;
+                const std::vector<int64_t> lists = split_lists(f, R, sgn, &rc);
+                REQUIRE_EQ(rc, RAD_OK);
+                const SelOut got = split_join(f, R, lists);
+                REQUIRE_EQ(got.rc, RAD_OK);
+                CHECK(got.sel == want.sel);
+                CHECK(got.nsel == want.nsel);
+                CHECK(got.su == want.su);
+                const int64_t W = (2 * f.topk + 1 + 3) / 4 * 4;
+                for (int64_t m = 0; m < f.M; ++m) {
+                    bool flag = false;
+                    for (int64_t q = 0; q < R; ++q)
+                        flag = flag || (lists[(size_t)((m * R + q) * W + 2 * f.topk)] >> 30);
+                    const bool full = want.nsel[(size_t)m] >= f.topk;
+                    over_rows += flag;
+                    flagless_full += !flag && full;
+                    short_rows += !full;
+                }
+            }
+    CHECK(over_rows > 0);
+    CHECK(flagless_full > 0);
+    CHECK(short_rows > 0);
+}
+
+/* A rank's list by hand: share {1, 3, 5, 7, 9} of R = 2, scores 4 2 4 9 1, topk 3 -- the top
+ * three by (score desc, block asc) are 7 (9), 1 (4) and 5 (4), written in block order with the
+ * order keys bits(score) + 1, count 3 and the over flag (five live), and zeros after. A dead page
+ * (block 3) drops out of the share; with it the share has four live, still over. */
+TEST(qsa_select_part_writes_its_top_k_in_block_order_with_the_over_flag) {
+    const int64_t topk = 3, W = 8, nb = 10;
+    T sc(RAD_F32, {1, 5}); sc.f({ 4, 2, 4, 9, 1 });
+    T bt(RAD_I32, {1, nb}); bt.n({ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 });
+    T nc(RAD_I32, {1}); nc.n({ 10 });
+    T po(RAD_I32, {1}); po.n({ 39 });
+    T cu(RAD_I32, {2}); cu.n({ 0, 1 });
+    T pt(RAD_I32, {1, W}); pt.n({ 5, 5, 5, 5, 5, 5, 5, 5 });
+    A a; a.t(sc).t(bt).t(nc).t(po).t(cu).t(pt).i("M", 1).i("blocks", nb).i("topk", topk)
+          .i("ratio", 4).i("seqs", 1).i("ranks", 2).i("rank", 1);
+    CHECK_OK(run("qsa_select_part", a));
+    auto key = [](float v) { uint32_t u; std::memcpy(&u, &v, 4); return (int64_t)(int32_t)(u + 1u); };
+    CHECK_EQ(pt.iat(0), key(4)); CHECK_EQ(pt.iat(1), key(4)); CHECK_EQ(pt.iat(2), key(9));
+    CHECK_EQ(pt.iat(3), 1LL); CHECK_EQ(pt.iat(4), 5LL); CHECK_EQ(pt.iat(5), 7LL);
+    CHECK_EQ(pt.iat(6), 3LL | (1LL << 30));
+    CHECK_EQ(pt.iat(7), 0LL);
+    /* Three live of the share: every one, in block order, no flag. */
+    T bt2(RAD_I32, {1, nb}); bt2.n({ 10, -1, 12, 13, 14, 15, 16, -1, 18, 19 });
+    A b; b.t(sc).t(bt2).t(nc).t(po).t(cu).t(pt).i("M", 1).i("blocks", nb).i("topk", topk)
+          .i("ratio", 4).i("seqs", 1).i("ranks", 2).i("rank", 1);
+    CHECK_OK(run("qsa_select_part", b));
+    CHECK_EQ(pt.iat(3), 3LL); CHECK_EQ(pt.iat(4), 5LL); CHECK_EQ(pt.iat(5), 9LL);
+    CHECK_EQ(pt.iat(6), 3LL);
+    /* The query's own bound: at position 21 only blocks below 5 are in its past (1 and 3). */
+    T po2(RAD_I32, {1}); po2.n({ 21 });
+    A c; c.t(sc).t(bt).t(nc).t(po2).t(cu).t(pt).i("M", 1).i("blocks", nb).i("topk", topk)
+          .i("ratio", 4).i("seqs", 1).i("ranks", 2).i("rank", 1);
+    CHECK_OK(run("qsa_select_part", c));
+    CHECK_EQ(pt.iat(3), 1LL); CHECK_EQ(pt.iat(4), 3LL); CHECK_EQ(pt.iat(5), 0LL);
+    CHECK_EQ(pt.iat(6), 2LL);
+}
+
+/* A join list qsa_select_part would not write is refused before any write: a count past topk,
+ * blocks out of order, a block of another rank's share, one past the query's bound, a dead key;
+ * and the parameters it cannot take. */
+TEST(qsa_select_join_refuses_a_list_the_part_would_not_write) {
+    const int64_t topk = 2, W = 8;
+    auto go = [&](std::vector<int64_t> l, int64_t ranks) {
+        T pt(RAD_I32, {1, 2 * W}); pt.n(l);
+        T bt(RAD_I32, {1, 8}); bt.n({ 0, 1, 2, 3, 4, 5, 6, 7 });
+        T nc(RAD_I32, {1}); nc.n({ 6 });
+        T po(RAD_I32, {1}); po.n({ 31 });
+        T cu(RAD_I32, {2}); cu.n({ 0, 1 });
+        T se(RAD_I32, {1, topk + 1}), ns(RAD_I32, {1}), su(RAD_I32, {1});
+        se.n({ 9, 9, 9 }); ns.n({ 9 }); su.n({ 9 });
+        A a; a.t(pt).t(bt).t(nc).t(po).t(cu).t(se).t(ns).t(su).i("M", 1).i("blocks", 8)
+              .i("topk", topk).i("ratio", 4).i("seqs", 1).i("ranks", ranks);
+        const int rc = run("qsa_select_join", a);
+        if (rc != RAD_OK) CHECK(se.iat(0) == 9 && se.iat(2) == 9 && ns.iat(0) == 9 && su.iat(0) == 9);
+        return rc;
+    };
+    /* Valid: rank 0 {0, 2}, rank 1 {1}; n = 6 <= ... all taken in block order. */
+    CHECK_OK(go({ 7, 7, 0, 2, 2, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 2));
+    CHECK_EQ(go({ 7, 7, 0, 2, 3, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 2), RAD_E_INVAL);  /* count */
+    CHECK_EQ(go({ 7, 7, 2, 0, 2, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 2), RAD_E_INVAL);  /* order */
+    CHECK_EQ(go({ 7, 7, 0, 2, 2, 0, 0, 0,   7, 0, 2, 0, 1, 0, 0, 0 }, 2), RAD_E_INVAL);  /* share */
+    CHECK_EQ(go({ 7, 7, 0, 6, 2, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 2), RAD_E_INVAL);  /* bound */
+    CHECK_EQ(go({ 7, 0, 0, 2, 2, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 2), RAD_E_INVAL);  /* key 0 */
+    CHECK_EQ(go({ 7, 7, 0, 2, 2, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 0), RAD_E_INVAL);  /* ranks */
+    CHECK_EQ(go({ 7, 7, 0, 2, 2, 0, 0, 0,   7, 0, 1, 0, 1, 0, 0, 0 }, 3), RAD_E_SHAPE);  /* width */
+}
+
+/* qsa_work split across two ranks over the fixture of the test above it: each rank gives page
+ * bt[b / 2] to its own blocks (b % 2 == rank) and -1 to the other's, stages only its own, and
+ * positions and nc are the unsplit ones. A rank out of range is refused. */
+TEST(qsa_work_split_stores_each_block_on_one_rank_at_its_half_page) {
+    const int64_t n = 2, ratio = 4, ring = 7, slots = 2, work = 4;
+    std::vector<float> kv;
+    for (int t = 0; t < 9; ++t) { kv.push_back((float)(100 + t)); kv.push_back((float)(200 + t)); }
+    T k(RAD_BF16, {9, n}); k.f(kv);
+    T pos(RAD_I32, {9}); pos.n({11, 12, 13, 14, 15, 16, 0, 1, 2});
+    T cu(RAD_I32, {3}); cu.n({0, 6, 9});
+    std::vector<float> tv;
+    for (int s = 0; s < slots; ++s)
+        for (int r = 0; r < ring; ++r) { tv.push_back((float)(-10 * s - r)); tv.push_back(0.5f); }
+    T tail(RAD_BF16, {slots, 1, ring, n}); tail.f(tv);
+    T sx(RAD_I32, {2, 1}); sx.n({1, 0});
+    /* The block-key table at two ranks: one page per two blocks. */
+    T bt(RAD_I32, {2, 4}); bt.n({50, 51, 52, 53, 60, 61, 62, 63});
+    for (int64_t rk = 0; rk < 2; ++rk) {
+        std::vector<float> nines((size_t)(work * ratio * n), 9.0f);
+        T stage(RAD_BF16, {work * ratio, n}); stage.f(nines);
+        T page(RAD_I32, {work}), bpos(RAD_I32, {work}), nc(RAD_I32, {2});
+        A a; a.t(k).t(pos).t(cu).t(tail).t(sx).t(bt).tnull().t(stage).t(page).t(bpos).t(nc)
+              .i("M", 9).i("n", n).i("ratio", ratio).i("ring", ring).i("seqs", 2).i("work", work)
+              .s("dtype", "bf16").i("ranks", 2).i("rank", rk);
+        CHECK_OK(run("qsa_work", a));
+        CHECK_EQ(nc.iat(0), 4LL); CHECK_EQ(nc.iat(1), 0LL);
+        /* Blocks 2 and 3 complete: block 2 is rank 0's (page bt[1] = 51), block 3 rank 1's. */
+        CHECK_EQ(page.iat(0), rk == 0 ? 51LL : -1LL);
+        CHECK_EQ(page.iat(1), rk == 1 ? 51LL : -1LL);
+        CHECK_EQ(page.iat(2), -1LL);
+        CHECK_EQ(bpos.iat(0), 8LL); CHECK_EQ(bpos.iat(1), 12LL);
+        /* Only this rank's block is staged; the other's rows keep the 9s. */
+        CHECK_EQ(stage.at(0 * n), rk == 0 ? -11.0f : 9.0f);
+        CHECK_EQ(stage.at(3 * n), rk == 0 ? 100.0f : 9.0f);
+        CHECK_EQ(stage.at(4 * n), rk == 1 ? 101.0f : 9.0f);
+    }
+    T stage(RAD_BF16, {work * ratio, n}), page(RAD_I32, {work}), bpos(RAD_I32, {work});
+    T nc(RAD_I32, {2});
+    A bad; bad.t(k).t(pos).t(cu).t(tail).t(sx).t(bt).tnull().t(stage).t(page).t(bpos).t(nc)
+            .i("M", 9).i("n", n).i("ratio", ratio).i("ring", ring).i("seqs", 2).i("work", work)
+            .s("dtype", "bf16").i("ranks", 2).i("rank", 2);
+    CHECK_EQ(run("qsa_work", bad), RAD_E_INVAL);
+}
+
+/* The block-key group split across ranks is paged at ranks * ratio tokens: qsa_block_key takes a
+ * block_size that is a multiple of ratio and stores the same key bytes into the page's
+ * [1, 8, 8] shape as into [1, 4, 16]; a block_size that is not a multiple is refused. */
+TEST(qsa_block_key_takes_a_block_size_that_is_a_multiple_of_ratio) {
+    const int64_t n = 128, ratio = 4, M = 2;
+    std::vector<float> kv((size_t)(M * ratio * n));
+    for (size_t i = 0; i < kv.size(); ++i) kv[i] = (float)((int)(i * 37 % 97) - 48) / 53.0f;
+    T k(RAD_BF16, {M * ratio, n}); k.f(kv);
+    std::vector<float> wv((size_t)n, 0.25f);
+    T w(RAD_F32, {n}); w.f(wv);
+    auto go = [&](int64_t bs, T& out) {
+        A a; a.t(k).t(w).tnull().tnull().t(out).i("M", M).i("n", n).i("ratio", ratio)
+              .i("rotary_dim", 64).i("pos0", 8).i("block_size", bs).d("eps", 1e-6)
+              .d("theta", 1e7).s("dtype", "bf16");
+        return run("qsa_block_key", a);
+    };
+    T a4(RAD_BF16, {M, 1, 4, 32}), a8(RAD_BF16, {M, 1, 8, 16}), a6(RAD_BF16, {M, 1, 4, 32});
+    CHECK_OK(go(4, a4));
+    CHECK_OK(go(8, a8));
+    CHECK(a4.mem == a8.mem);
+    CHECK_EQ(go(6, a6), RAD_E_SHAPE);
+}
+
 /* ================================================================== kv_resolve
  * The residency map of a streamed group: selected block ids in, ring slots out, a block copied in
  * from the host mirror when it is not resident (docs/OPS.md "kv_resolve",
@@ -11192,6 +11480,10 @@ std::vector<Geo> geometries() {
         G("qsa_score", "M", 4, a.i("M", R).i("n", 32).i("heads", 2).i("blocks", 6).i("seqs", 2)
                                .s("dtype", "bf16")),
         G("qsa_select", "M", 4, a.i("M", R).i("blocks", 6).i("topk", 3).i("ratio", 4).i("seqs", 2)),
+        G("qsa_select_part", "M", 4, a.i("M", R).i("blocks", 6).i("topk", 3).i("ratio", 4)
+                                     .i("seqs", 2).i("ranks", 2).i("rank", 1)),
+        G("qsa_select_join", "M", 4, a.i("M", R).i("blocks", 6).i("topk", 3).i("ratio", 4)
+                                     .i("seqs", 2).i("ranks", 2)),
         G("kv_resolve", "M", 3, a.i("M", R).i("blocks", 8).i("slots", 6).i("sel_pitch", 4)
                                  .i("block_bytes", 8)),
         G("qsa_tail_store", "M", 4, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)

@@ -522,6 +522,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kv-recipe", { inventory_recipe(), "--kv-cache-dtype", "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--qsa-bkey-dtype", { "i8" } },
+        { "--qsa-bkey-split", { "on" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
@@ -844,6 +845,23 @@ TEST(the_qsa_block_key_dtype_is_bf16_by_default_or_i8) {
     CHECK_EQ(parse({ "--qsa-bkey-dtype", "fp8" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--qsa-bkey-dtype", "int8" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--qsa-bkey-dtype" }, &c), RAD_E_INVAL);
+}
+
+/* --qsa-bkey-split: off by default (every block key on every rank, today's program), `on` or
+ * `off` and nothing else; whether the deployment can serve it (--tp 2 or more, a plugin that
+ * splits) is decided at startup, not here. */
+TEST(the_qsa_block_key_split_is_off_by_default_and_takes_on_or_off) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.qsa_bkey_split);
+    Config c;
+    CHECK_EQ(parse({ "--qsa-bkey-split", "on" }, &c), RAD_OK);
+    CHECK(c.qsa_bkey_split);
+    CHECK_EQ(parse({ "--qsa-bkey-split", "off" }, &c), RAD_OK);
+    CHECK(!c.qsa_bkey_split);
+    CHECK_EQ(parse({ "--qsa-bkey-split", "1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-bkey-split", "yes" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-bkey-split" }, &c), RAD_E_INVAL);
 }
 
 TEST(the_kv_cache_dtype_is_one_of_four_names) {
