@@ -11154,6 +11154,21 @@ extern "C" int rad_kernel_chain(int i) {
         "dflash_select_bf16", "dflash_tree_bf16",
         /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
         "prefetch",
+        /* Flash-Next at decode heights: the MoE block */
+        "router_gemm_topk_scatter_bf16", "moe_gemm_fp8a8", "moe_gemm_fp8a8_mod4", "gated_quant_fp8",
+        /* ...and the rest of a delta-net layer */
+        "hc_read_bf16", "hc_read_e4m3", "gdn_recurrent_update_k128_v128_bf16_fp32state",
+        "gdn_conv_recurrent_update_k128_v128_bf16", "ar_hc_write", "ar_gather_hc_write",
+        /* the four-bit routed experts and their rotated quantiser */
+        "moe_gemm_w4a8", "moe_gemm_w4a8_mod4", "gated_had_quant_fp8", "gated_had_quant_i8g",
+        /* ...and an attention layer: the indexer, the norm/rope/gate, the quantiser before o_proj
+         * and the gqa6 decode rows (their split-KV decode and merge already have chained forms) */
+        "qk_norm_rope_gate", "qsa_work_bf16", "qsa_block_key_bf16", "qsa_tail_store_bf16",
+        "qsa_score_bf16", "qsa_select_i32", "gate_quant_fp8",
+        "attn_decode_h256_gqa6_fp8kv", "attn_decode_h256_gqa6_fp8v4", "attn_decode_h256_gqa6_k6v4",
+        "attn_decode_h256_gqa6_bf16kv", "attn_decode_h256_gqa6_bs4_fp8kv",
+        "attn_decode_h256_gqa6_bs4_bf16kv", "attn_decode_gq_h256_gqa6_bs4_fp8kv",
+        "attn_decode_gq_h256_gqa6_bs4_bf16kv",
     };
     for (const char* p : kChained)
         if (std::strcmp(k->name, p) == 0) return 1;

@@ -83,3 +83,18 @@ __device__ __forceinline__ void r4d_chain_done() {
         __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 #endif  /* __HIP__ */
+
+/* The launchers given a chained form here take it only at steps of up to 32 token rows: above that
+ * the waiting blocks hold room a wide predecessor needs. Flash-Next on 2x R9700 at MTP depth 5 with
+ * the adaptive window, sampled: 32 against 64 rows 214/349/494/654/890 -> 218/355/494/662/893 tok/s
+ * at 1/2/4/8/16 streams. */
+constexpr long long kR4dChainMaxRows = 32;
+inline bool r4d_chain_rows_ok(long long rows) { return rows <= kR4dChainMaxRows; }
+
+/* A launcher that takes no RadArgs reads its row's `chain` here; the plugin
+ * ABI entry sets it around the launch only, so a direct C call never chains. */
+inline thread_local bool g_r4d_chain_arg = false;
+struct R4dChainArg {
+    explicit R4dChainArg(bool on) { g_r4d_chain_arg = on; }
+    ~R4dChainArg() { g_r4d_chain_arg = false; }
+};

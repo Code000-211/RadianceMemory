@@ -20276,15 +20276,21 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
                    : "the int8 run changed" + bad);
 }
 
-/* The gated residual's read at its decode kernels, byte for byte: the launcher's rule (kernels A and
- * B as one grid at one to seven rows, the tiled up-mix pipelined from eight) against the two-grid
- * form, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
- * one-grid form keys its counters on it). The two forms must dispatch different kernels, so a pin
- * that is ignored cannot pass by comparing a form with itself. */
+/* The gated residual's read at its decode kernels: the launcher's rule against the two-grid form,
+ * pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the one-grid
+ * form keys its counters on it). The two forms must dispatch different kernels, so a pin that is
+ * ignored cannot pass by comparing a form with itself.
+ *
+ * Up to sixteen rows at this shape the rule serves decode forms G (1..8) and S (9..16) with kernel
+ * B3: bf16 WMMA dots, S scaling after the dot. Byte for byte they match neither the per-row kernels
+ * nor the tiled ones, so there d is held to an fp64 host reference - no further from it than the
+ * two-grid form's d - the inject gains must match byte for byte, and x must stay within rounding of
+ * the two-grid form's. Above sixteen rows both forms are the tiled path's and match byte for byte. */
 static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
-    const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule "
-                               "byte-identical to the two-grid form", (long long)M,
-                               i8 ? "int8" : "E4M3");
+    const bool level = M <= 16;
+    const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule %s the "
+                               "two-grid form", (long long)M, i8 ? "int8" : "E4M3",
+                               level ? "as exact as" : "byte-identical to");
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
     if (!pl.pin_hc_dec || !pl.record) { skip(nm.c_str(), "no r4d_hc_read_pin_decode"); return; }
@@ -20359,6 +20365,7 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
     }
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; };
     Out out[2];
+    std::vector<uint8_t> dsv[2];   /* d: the scratch's first M x lr bf16 values */
     for (int form = 0; form < 2; ++form) {
         pl.pin_hc_dec(form);
         st_memset(d_x, 0, xb); st_memset(d_q, 0, qb); st_memset(d_qs, 0, sb);
@@ -20379,19 +20386,87 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
         };
         get(out[form].x, d_x, xb); get(out[form].inj, d_inj, ib); get(out[form].q, d_q, qb);
         get(out[form].qs, d_qs, sb); get(out[form].rq, d_rq, qb); get(out[form].rs, d_rs, sb);
+        if (a.scratch) {
+            dsv[form].resize((size_t)(M * lr * 2));
+            st_memcpy(dsv[form].data(), a.scratch, dsv[form].size(), hipMemcpyDeviceToHost);
+        }
     }
     pl.pin_hc_dec(0);
     (void)hipStreamDestroy(hs);
-    std::string bad;
-    if (out[0].x != out[1].x)     bad += " x";
-    if (out[0].inj != out[1].inj) bad += " inj";
-    if (out[0].q != out[1].q)     bad += " q";
-    if (out[0].qs != out[1].qs)   bad += " qs";
-    if (out[0].rq != out[1].rq)   bad += " rq";
-    if (out[0].rs != out[1].rs)   bad += " rs";
     int64_t nz = 0;
     for (uint8_t v : out[0].q) nz += v != 0;
     const bool distinct = out[0].fns != out[1].fns;
+    std::string bad;
+    if (!level) {
+        if (out[0].x != out[1].x)     bad += " x";
+        if (out[0].inj != out[1].inj) bad += " inj";
+        if (out[0].q != out[1].q)     bad += " q";
+        if (out[0].qs != out[1].qs)   bad += " qs";
+        if (out[0].rq != out[1].rq)   bad += " rq";
+        if (out[0].rs != out[1].rs)   bad += " rs";
+    } else {
+        if (out[0].inj != out[1].inj) bad += " inj";
+        if (dsv[0].empty()) bad += " (no scratch for d)";
+        /* d against fp64: N unrounded, the dot over the decoded codes and their group scales. The
+         * error of each form as a fraction of the row's RMS of d, max and mean over every row. */
+        const int64_t G = r4d_hc8::down_group(HN);
+        double emax[2] = { 0, 0 }, esum[2] = { 0, 0 };
+        for (int64_t r0 = 0; r0 < M && !dsv[0].empty(); ++r0) {
+            std::vector<double> N((size_t)HN);
+            for (int64_t c = 0; c < hc; ++c) {
+                double ss = 0;
+                for (int64_t j = 0; j < n; ++j) {
+                    const double v = h_bf16(hh[(size_t)(r0 * HN + c * n + j)]);
+                    ss += v * v;
+                }
+                const double sc = 1.0 / std::sqrt(ss / (double)n + 1e-6);
+                for (int64_t j = 0; j < n; ++j)
+                    N[(size_t)(c * n + j)] = h_bf16(hh[(size_t)(r0 * HN + c * n + j)]) * sc
+                                             * ((double)wg[(size_t)(c * n + j)] + 1.0);
+            }
+            std::vector<double> dref((size_t)lr);
+            double ssd = 0;
+            for (int64_t j = 0; j < lr; ++j) {
+                const uint8_t* row = down.data() + j * dld;
+                const float* gsc = (const float*)(row + HN);
+                double dot = 0;
+                for (int64_t kk = 0; kk < HN; ++kk)
+                    dot += (double)h_e4m3(row[kk]) * (double)gsc[kk / G] * N[(size_t)kk];
+                const double z = dot / (double)hc;
+                dref[(size_t)j] = z / (1.0 + std::exp(-z));
+                ssd += dref[(size_t)j] * dref[(size_t)j];
+            }
+            const double rms = std::sqrt(ssd / (double)lr) + 1e-30;
+            for (int f = 0; f < 2; ++f) {
+                const uint16_t* df = (const uint16_t*)dsv[f].data();
+                for (int64_t j = 0; j < lr; ++j) {
+                    const double e = std::fabs(h_bf16(df[r0 * lr + j]) - dref[(size_t)j]) / rms;
+                    emax[f] = std::max(emax[f], e);
+                    esum[f] += e;
+                }
+            }
+        }
+        const double cnt = (double)(M * lr);
+        if (esum[0] > esum[1] * 1.05 + 1e-6 * cnt || emax[0] > emax[1] * 1.10 + 1e-4)
+            bad += fmt(" d (rule %.5f / %.4f, two-grid %.5f / %.4f of RMS, mean / max)",
+                       esum[0] / cnt, emax[0], esum[1] / cnt, emax[1]);
+        /* x: within rounding of the two-grid form's, as a fraction of the row's RMS. */
+        const uint16_t* x0 = (const uint16_t*)out[0].x.data();
+        const uint16_t* x1 = (const uint16_t*)out[1].x.data();
+        double xmax = 0, xsum = 0;
+        for (int64_t r0 = 0; r0 < M; ++r0) {
+            double ss = 0;
+            for (int64_t j = 0; j < n; ++j) { const double v = h_bf16(x1[r0 * n + j]); ss += v * v; }
+            const double rms = std::sqrt(ss / (double)n) + 1e-30;
+            for (int64_t j = 0; j < n; ++j) {
+                const double e = std::fabs(h_bf16(x0[r0 * n + j]) - h_bf16(x1[r0 * n + j])) / rms;
+                xmax = std::max(xmax, e);
+                xsum += e;
+            }
+        }
+        if (xsum / (double)(M * n) > 0.005 || xmax > 0.15)
+            bad += fmt(" x (%.5f mean, %.4f max of RMS)", xsum / (double)(M * n), xmax);
+    }
     ok(nm.c_str(), bad.empty() && nz > (int64_t)qb / 2 && distinct,
        !bad.empty() ? "differs in" + bad
        : !distinct  ? std::string("both forms dispatched the same kernels")
@@ -33602,9 +33677,9 @@ static void device_phase(const Plugin& pl) {
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
             for (int64_t m : { 700, 2048 }) hc_read_i8(pl, m, true, 3);
         }
-        /* The served decode kernels against the two-grid form: each one-grid instantiation (1 to
-         * 7 rows) and the tiled up-mix at both of its row tiles. */
-        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64 })
+        /* The served decode kernels against the two-grid form: each row count of form G (1 to 8),
+         * form S at 12 and 16 rows, and the tiled up-mix at both of its row tiles. */
+        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
     }
     if (sel("hc_read_bf16")) {
