@@ -1679,6 +1679,16 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
     int64_t last = end - keep_tail;      /* one past the last entry the window covers */
     if (last > end - 1) last = end - 1;
     if (last < keep_head) last = keep_head;
+    /* Skips are counted here and charged once: a sweep re-walks the whole table every decode
+     * step, and a prefix-cached history is all skips, so a per-entry session lookup (a map
+     * search) cost O(context) of them a step. */
+    int64_t skipped = 0;
+    auto charge_skips = [&] {
+        if (skipped <= 0) return;
+        res_stats_.demote_skipped += skipped;
+        seq_res(id).skipped += skipped;
+        skipped = 0;
+    };
     for (int64_t i = keep_head; i < last && left > 0; ++i) {
         const int32_t b = tbl[(size_t)i];
         if (b < 0) continue;                               /* already cold (or empty) */
@@ -1686,8 +1696,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
          * that this one cannot promote for. It stays: dropping this table's reference would free
          * no VRAM, and a cache hit on a resident entry must find pool bytes. */
         if (cached_[(size_t)g][(size_t)b] || refcount_[(size_t)g][(size_t)b] > 1) {
-            ++res_stats_.demote_skipped;
-            ++seq_res(id).skipped;
+            ++skipped;
             continue;
         }
         /* The emulation (residency_emulate): the round trip in place, once, in the order and
@@ -1730,12 +1739,12 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         if (!res_arena_ || !res_arena_->enabled()) {
             RAD_ERR("KV group '%s': residency was asked for with no store open (--qsa-window-mib)",
                     p->name.c_str());
+            charge_skips();
             return RAD_E_STATE;
         }
         const int32_t slot = slot_new();
         if (slot < 0) {                                    /* store full: this one stays */
-            ++res_stats_.demote_skipped;
-            ++seq_res(id).skipped;
+            ++skipped;
             continue;
         }
         /* The entry is cold from here; the block keeps its one reference until the copy lands. */
@@ -1751,6 +1760,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         ++sr.demoted;
         sr.link_bytes += p->residency_bytes();
     }
+    charge_skips();
     return RAD_OK;
 }
 
