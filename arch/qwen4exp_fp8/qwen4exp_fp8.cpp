@@ -1766,6 +1766,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     }
     /* The gated residual applies a control vector after every block's write (HcProject). */
     out->control_vector_ok = 1;
+    /* Chained launches pay with the MTP drafter: the speculative step's small kernels wait on the
+     * previous one on the card instead of behind a queue barrier (libr4d/r4d_chain.h). On 2x R9700,
+     * sampled at temperature 1 with a 25k prompt, MTP depth 3, with the chained hc_read forms:
+     * 1/2/4/8/16 streams 174/291/458/657/851 -> 207/339/493/647/843 tok/s. */
+    out->chain_pays = 1;
     return RAD_OK;
 }
 
