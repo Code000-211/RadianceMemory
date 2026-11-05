@@ -461,6 +461,11 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(c.prefill_interleave, 4);
     CHECK_EQ(parse({ "--prefill-interleave", "65" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--prefill-interleave", "-1" }, &c), RAD_E_INVAL);
+    /* auto sizes the hold from measured step costs (Scheduler::interleave_steps) */
+    Config a;
+    CHECK_EQ(parse({ "--prefill-interleave", "auto" }, &a), RAD_OK);
+    CHECK_EQ(a.prefill_interleave, -1);
+    CHECK_EQ(parse({ "--prefill-interleave", "automatic" }, &c), RAD_E_INVAL);
 }
 
 /* ================================================================== the table, the parser and the help agree

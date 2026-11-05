@@ -1402,6 +1402,18 @@ decoders keep their cadence. A lone prefill is not held, nor is the step after a
 chunk. `0` (the default) schedules as before. `/stats` counts the decode-only steps the hold
 inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
 
+`--prefill-interleave auto` sizes the hold from measured step times instead: after each such chunk,
+as many decode-only steps as fit in a quarter of a chunk step's time at a decode step's (running
+means of both, at most 16 steps; one until a decode step has been timed). The prefill gives up at
+most a fifth of its rate however many sequences decode, and the decoders get several steps where a
+decode step is cheap beside a chunk, none where one costs more than that quarter (they still ride
+every chunk). In the scheduler's host simulation of 32 prompts of 128K tokens sent at once, each
+then decoding 512 tokens (2048-token chunks, MTP 3, step costs fitted to a lone prefill and to
+decode alone), auto raised the decode rate of the sequences decoding while prompts still waited
+from 6.5 to 31 tokens/s each and delayed the last first token by 6 %. Because the hold follows the
+device's timing, which steps carry a chunk differs from run to run; a number schedules the same
+steps every time.
+
 **A prefill alone in its step can carry several intervals** (`--prefill-span N`, default 1). A
 chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
 With
@@ -2364,7 +2376,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
-| `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
+| `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time |
 | `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |

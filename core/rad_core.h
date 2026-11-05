@@ -848,7 +848,8 @@ struct Config {
      * prefill stager arms for. 0 = off: the chunk takes every token the step has left. N > 0: cap
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
-    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
+                                        * -1 auto (Scheduler::interleave_steps) */
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */

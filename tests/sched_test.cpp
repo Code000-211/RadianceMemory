@@ -3076,12 +3076,17 @@ struct Interleaved {
     int64_t steps_held = 0;
 };
 
-static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
+/* `chunk_s` / `decode_s`: step costs fed to --prefill-interleave auto before the run (none when
+ * 0), standing in for step_finished's wall times. */
+static Interleaved interleave_run(int64_t n, bool decoder, int steps, double chunk_s = 0,
+                                  double decode_s = 0) {
     Fixture f;
     f.build();
     f.cfg.prefill_interleave = n;
     CHECK_OK(f.start());
     f.sch.set_stage_rows(64);
+    if (chunk_s > 0) f.sch.note_step_cost(true, chunk_s);
+    if (decode_s > 0) f.sch.note_step_cost(false, decode_s);
     if (decoder) {
         f.submit(100, 512);
         CHECK(f.sch.step() != nullptr);
@@ -3139,6 +3144,61 @@ TEST(interleave_leaves_a_lone_prefill_alone) {
     const Interleaved r = interleave_run(2, /*decoder=*/false, 8);
     CHECK_EQ(r.shape, std::string("CCCCCCCC"));
     CHECK_EQ(r.steps_held, 0);
+}
+
+/* auto: as many decode-only steps as fit in a quarter of a chunk step's measured time at a decode
+ * step's (rounded down, at most 16), one until both are measured, none where a decode step costs
+ * more than that quarter. */
+TEST(interleave_auto_fits_decode_steps_in_a_quarter_of_a_chunk_step) {
+    auto steps = [](double chunk_s, double decode_s) {
+        Fixture f;
+        f.build();
+        f.cfg.prefill_interleave = -1;
+        CHECK_OK(f.start());
+        if (chunk_s > 0) f.sch.note_step_cost(true, chunk_s);
+        if (decode_s > 0) f.sch.note_step_cost(false, decode_s);
+        return f.sch.interleave_steps();
+    };
+    CHECK_EQ(steps(0, 0), 1);
+    CHECK_EQ(steps(0.4, 0), 1);
+    CHECK_EQ(steps(0, 0.03), 1);
+    CHECK_EQ(steps(0.4, 0.03), 3);         /* 0.1 s of 0.03 s steps */
+    CHECK_EQ(steps(0.4, 0.05), 2);
+    CHECK_EQ(steps(0.4, 0.2), 0);          /* a decode step dearer than the quarter */
+    CHECK_EQ(steps(1.0, 0.001), 16);
+    /* A number is used as given, whatever was measured. */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_interleave = 5;
+    CHECK_OK(g.start());
+    g.sch.note_step_cost(true, 1.0);
+    g.sch.note_step_cost(false, 0.001);
+    CHECK_EQ(g.sch.interleave_steps(), 5);
+    /* The costs are running means: a chunk step of 0.4 s, then one of 0.8 s, reads 0.5 s. */
+    Fixture h;
+    h.build();
+    h.cfg.prefill_interleave = -1;
+    CHECK_OK(h.start());
+    h.sch.note_step_cost(true, 0.4);
+    h.sch.note_step_cost(true, 0.8);
+    h.sch.note_step_cost(false, 0.05);
+    CHECK_EQ(h.sch.interleave_steps(), 2);  /* 0.125 / 0.05 */
+}
+
+/* auto schedules the measured count after every chunk beside a decoder, holds nothing for a lone
+ * prefill, and with decode steps too dear for the quarter puts a chunk in every step. */
+TEST(interleave_auto_holds_each_chunk_for_the_steps_its_costs_allow) {
+    const Interleaved r = interleave_run(-1, /*decoder=*/true, 10, 0.4, 0.05);
+    CHECK_EQ(r.shape, std::string("CDDCDDCDDC"));
+    CHECK_EQ(r.steps_held, 6);
+    const Interleaved first = interleave_run(-1, /*decoder=*/true, 6);   /* nothing measured */
+    CHECK_EQ(first.shape, std::string("CDCDCD"));
+    const Interleaved dear = interleave_run(-1, /*decoder=*/true, 8, 0.4, 0.2);
+    CHECK_EQ(dear.shape, std::string("CCCCCCCC"));
+    CHECK_EQ(dear.steps_held, 0);
+    const Interleaved lone = interleave_run(-1, /*decoder=*/false, 8, 0.4, 0.01);
+    CHECK_EQ(lone.shape, std::string("CCCCCCCC"));
+    CHECK_EQ(lone.steps_held, 0);
 }
 
 /* After a prompt's last chunk there is nothing to interleave: the next request is admitted in the

@@ -140,7 +140,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "prompt unfinished while other sequences decode, the next %lld steps carry "
                  "decode rows only and admit nothing", (long long)cfg.prefill_interleave,
                  (long long)cfg.prefill_interleave);
+    else if (cfg.prefill_interleave < 0)
+        RAD_INFO("scheduler: --prefill-interleave auto: after a prefill chunk that leaves its "
+                 "prompt unfinished while other sequences decode, decode-only steps follow for up "
+                 "to a quarter of the chunk step's measured time (at most %lld steps)",
+                 (long long)kInterleaveAutoMax);
     interleave_left_ = 0;
+    ema_chunk_s_ = 0.0;
+    ema_decode_s_ = 0.0;
     held_prefill_ = 0;
     draft_refill_ = 0;
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
@@ -1217,6 +1224,33 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
     return std::min(std::max(cap, Q), budget);
 }
 
+/* ------------------------------------------------------------------ decode-only steps */
+/* How many decode-only steps follow a chunk that ran beside decoding sequences
+ * (--prefill-interleave). N as given; under auto, as many as fit in kInterleaveShare of a chunk
+ * step's measured time at a decode step's, so the prefill gives up at most a fifth of its rate
+ * (a quarter of a chunk step) however many sequences decode, and the decoders get the steps that
+ * share buys: several where decode steps are cheap beside the chunk, none where one costs more
+ * than a quarter of it (they still ride every chunk). One until both costs are measured, which
+ * takes the first decode-only step. Both are wall times read off step_finished, so under auto
+ * which steps carry a chunk follows the device's timing and differs from run to run; a number
+ * schedules the same steps every time. */
+void Scheduler::step_cost_locked(bool chunk, double seconds) {
+    double& ema = chunk ? ema_chunk_s_ : ema_decode_s_;
+    ema = ema > 0.0 ? ema + kInterleaveEma * (seconds - ema) : seconds;
+}
+
+void Scheduler::note_step_cost(bool chunk, double seconds) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (seconds > 0) step_cost_locked(chunk, seconds);
+}
+
+int64_t Scheduler::interleave_steps() const {
+    if (cfg_.prefill_interleave >= 0) return cfg_.prefill_interleave;
+    if (ema_chunk_s_ <= 0.0 || ema_decode_s_ <= 0.0) return 1;
+    const double n = kInterleaveShare * ema_chunk_s_ / ema_decode_s_;
+    return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
+}
+
 /* ------------------------------------------------------------------ preemption */
 void Scheduler::preempt_back() {
     int32_t slot = running_.back();
@@ -1817,7 +1851,7 @@ const RadBatch* Scheduler::step() {
     bool any_decoding = false;
     bool hold_prefill = false;
     held_prefill_ = 0;
-    if (cfg_.prefill_interleave > 0) {
+    if (cfg_.prefill_interleave != 0) {
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
             if (!s.req || !s.running) continue;
@@ -2248,13 +2282,13 @@ const RadBatch* Scheduler::step() {
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
         default:                ++m_.steps_decode;  break;
     }
-    if (cfg_.prefill_interleave > 0) {
+    if (cfg_.prefill_interleave != 0) {
         /* Armed only while a prompt continues past this step: after a last chunk nothing is left
          * to interleave, and holding would only keep the next request out. */
         bool continues = false;
         for (const StepEntry& e : plan_.e)
             if (e.is_prefill && !e.produces_token) continues = true;
-        if (any_pf) interleave_left_ = any_decoding && continues ? cfg_.prefill_interleave : 0;
+        if (any_pf) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
         else if (interleave_left_ > 0) --interleave_left_;
         if (held_prefill_ > 0) ++m_.steps_held;
     }
@@ -2909,6 +2943,9 @@ void Scheduler::step_finished() {
     /* The window ages by all elapsed time, idle included; only the busy part is added as time the
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
+    /* --prefill-interleave auto's two step costs (interleave_steps). */
+    if (wall > 0 && cfg_.prefill_interleave < 0)
+        step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
         const double f = std::exp(-aged / kWindowS);

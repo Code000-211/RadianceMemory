@@ -520,6 +520,12 @@ public:
      * multi-token chunk past the floor would overwrite keys its own earlier rows still read, while
      * one token a step attends as its decode step did. Otherwise `n_target`. */
     int64_t chunk_end(const Request& r, int64_t n_target) const;
+    /* --prefill-interleave: the decode-only steps that follow a chunk run beside decoding
+     * sequences. N as configured; under auto, from the measured step costs (see the definition).
+     * Visible for tests, as is note_step_cost, which feeds auto a step's wall time as
+     * step_finished does: `chunk` for a step that carried a prefill chunk, else a decode step. */
+    int64_t interleave_steps() const;
+    void    note_step_cost(bool chunk, double seconds);
 
 private:
     Program*      prog_ = nullptr;
@@ -793,6 +799,14 @@ private:
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
+    /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
+     * the running means of a step that carried a chunk and of a decode step, in seconds, fed by
+     * step_finished. */
+    static constexpr double  kInterleaveShare = 0.25;
+    static constexpr double  kInterleaveEma = 0.25;
+    static constexpr int64_t kInterleaveAutoMax = 16;
+    double  ema_chunk_s_ = 0.0, ema_decode_s_ = 0.0;
+    void    step_cost_locked(bool chunk, double seconds);
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

@@ -78,7 +78,8 @@ static const Flag g_flags[] = {
                                         "(default) leaves decode rows and new requests their room,\n"
                                         "off takes the whole step, N holds the chunk to N tokens" },
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
-                                        "sequences decode, at most 64; 0 (default) lets every step\n"
+                                        "sequences decode, at most 64; auto fits them in a quarter\n"
+                                        "of the chunk step's time; 0 (default) lets every step\n"
                                         "carry a chunk" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
@@ -1204,7 +1205,11 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "off"))  c->busy_prefill_chunk = 0;
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
-        else if (S("--prefill-interleave"))    { if (!num(0, 64, &c->prefill_interleave)) return RAD_E_INVAL; }
+        else if (S("--prefill-interleave"))    {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->prefill_interleave = -1;
+            else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -2076,7 +2081,8 @@ const ShowRow kShow[] = {
           return c.busy_prefill_chunk < 0 ? std::string("auto")
                : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
     { "--prefill-interleave", [](const Config& c) {
-          return c.prefill_interleave > 0 ? num(c.prefill_interleave) : std::string("off"); } },
+          return c.prefill_interleave > 0 ? num(c.prefill_interleave)
+               : c.prefill_interleave < 0 ? std::string("auto") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
