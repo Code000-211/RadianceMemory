@@ -14,7 +14,7 @@
  * scale_w[e][n][b] in f32 -- the exact order the libref reference runs, so it agrees bit for bit.
  *
  * Decode band: at most 16 sorted rows per block (M * top_k <= 16); prefill finds no row and falls
- * back. The activation stride a_ld is in BYTES (K/2 per row: K int4 nibbles).
+ * back. The activation stride a_ld is in BYTES (K/2 per row: stride[0] is K int4 nibbles).
  */
 #include <hip/hip_runtime.h>
 
@@ -197,7 +197,8 @@ int r3d_rad_moe_gemm_w4a4(const RadArgs* a, RadStream s)
     R3dMoeTabs tw;
     rc = r3d_moe_q_tabs(c, RAD_I4, 4, RAD_BF16, 16, c.N, c.K / kGroup, &tw);
     if (rc != RAD_OK) return rc;
-    const int a_ld = (int)c.a->stride[0], as_ld = (int)c.a_scale->stride[0];
+    /* Strides are in elements (abi/rad_types.h): an int4 row of K nibbles is K/2 bytes. */
+    const int a_ld = (int)c.a->stride[0] / 2, as_ld = (int)c.a_scale->stride[0];
     const int y_ld = (int)c.y->stride[0];
 
     const int mrows = r3d_geti_or(a, "mrows", 16);
