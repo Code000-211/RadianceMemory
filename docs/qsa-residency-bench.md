@@ -25,13 +25,14 @@ and the engine's seam on the host backend.
 
 ## What is not built
 
-Nothing on the engine side. The scheduler's sweep demotes after a decode step, a prefill promotes
+Nothing on the engine side. The scheduler's sweep demotes after every step, a prefill row promotes
 first, the engine's mover runs the batches on every rank's transfer stream, `landed` is one event
 poll, and `qsa_page` pages on the card and counts what it paged. What does not exist yet is a
 number from a card: the identity run and the BetterBench comparison below are the next step and have
-not been run. The sweep bound (`Engine::kResidencySweepBlocks` = 64 blocks a step) is a guess from
-arithmetic, not a measurement; read `kv_residency.demoted` against the steps taken if a long
-prefill's backlog drains too slowly.
+not been run. The sweep bound (`TierExec::sweep_blocks`: 32 MiB a rank a step, 1 024 blocks on
+Flash-Next; it was a fixed 64 blocks) is arithmetic, not a measurement; read `kv_residency.demoted`
+against the steps taken if a long prefill's backlog drains too slowly, and the step time if the
+sweep's host calls show.
 
 ## The smoke that works without a card
 

@@ -590,13 +590,6 @@ private:
      * slot a block, holding the blocks a sparse consumer's window does not cover. Empty unless a
      * KV group declared a residency window and --kv-residency-mib gave it a size. */
     HostArena res_store_;
-    /* Blocks the scheduler's sweep may demote after one decode step, between all sequences
-     * (Scheduler::set_residency_mover). Four transfer batches: a step pays at most 4 x
-     * kMoveBatch x (block bytes) on the link and 4 x n_layers gather launches on the transfer
-     * stream, off the compute stream's path (~29 KiB x 64 = 1.8 MiB for a 4-token block). Steady
-     * decode retires about one block per sequence per `block_tokens` tokens, so this clears the
-     * steady state with room to drain the backlog a long prefill leaves behind. */
-    static constexpr int kResidencySweepBlocks = 4 * 16;
     int  run_server();
     /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned

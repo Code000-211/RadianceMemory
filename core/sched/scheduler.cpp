@@ -1671,6 +1671,17 @@ void Scheduler::res_sweep() {
         if (left <= 0) break;
         const SchedReq& s = *reqs_[(size_t)slot];
         if (!s.req || !s.running || s.req->state != ReqState::Running) continue;
+        /* A sequence still prefilling is promoted whole by its next chunk (res_dense_rows: a
+         * prefill row cannot page), so demoting it now would only move its middle twice. One
+         * whose last chunk was this step waits one step too: the drafter's history pass over that
+         * chunk follows this commit, and it pages only the rows the scratch holds
+         * (serial_batch). The KL emulation sweeps everything after every step, as before. */
+        if (!res_mover_.every_step) {
+            if (s.req->n_computed + 1 < s.seq_len()) continue;
+            bool chunk = false;
+            for (const StepEntry& e : plan_.e) chunk |= e.is_prefill && e.seq == s.req->id;
+            if (chunk) continue;
+        }
         /* No skip for a step issued ahead or a drafter's rows: they read the device table staged
          * when they were built, whose pool ids stay valid. A demoted block is freed only once its
          * copy has landed, the copy waits on the compute stream as it stood at the sweep, and a new
@@ -2306,7 +2317,8 @@ const RadBatch* Scheduler::step() {
         if (res_issue(/*to_host=*/false) < 0) promote_failed = true;
         /* Still full: the sequence that could not be promoted gives its blocks up, by recompute.
          * Without this a pool that stays full replans the same dense step forever -- the sweep
-         * that would free room runs only after decode steps. It must be that sequence and not the
+         * that would free room runs only after a committed step, and an abandoned one commits
+         * nothing. It must be that sequence and not the
          * back of the running set: the back is usually the prompt that made the step mixed, which
          * would be readmitted at once into the same failing step while the cold sequence never
          * decodes. Recompute is dear for a long context, but such a sequence cannot run densely
@@ -2839,13 +2851,16 @@ int Scheduler::commit(StepResult& res) {
      * issued before this step's readback, and the engine waits for the drafter's passes behind it
      * before issuing anything that could reuse what is released here. */
     sweep_deferred();
-    /* After the release above, so a block it returned is not the sweep's to see; decode only,
-     * since a prefill chunk has not placed the sequence's history yet. */
+    /* After the release above, so a block it returned is not the sweep's to see. After every step,
+     * not only decode ones: while prompts are being prefilled almost every step is mixed, and a
+     * sweep after decode steps alone left the decoding conversations' middles in VRAM for as long
+     * as any prompt was arriving (res_sweep skips the sequences that are still prefilling). */
     /* Reap first: under step-ahead issue the engine calls step_next() and rarely step(), so a
      * reap at step() alone left the first batch held for the whole decode -- on the card, one
      * sweep went out, never landed in the scheduler's view, and VRAM never came back. The poll is
      * a query of one event a rank; it never waits. */
-    if (plan_.phase == RAD_PHASE_DECODE || res_mover_.every_step) { res_reap(); res_sweep(); }
+    res_reap();
+    res_sweep();
     res.n_prefill_done = (int)last_prefill_ids_.size();
     res.n_finished     = step_finished_;
     return RAD_OK;

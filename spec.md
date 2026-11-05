@@ -1247,11 +1247,12 @@ from the idle tiers' `tierx`, since either can run without the other), cut at `T
 (16) blocks a call; a follower rank carries out the list rank 0's manager planned, which is the only
 place the records live. `landed` polls one event a rank (`TierExec::moves_landed`), recorded after
 each batch on the transfer stream; held pool blocks and slots go back at the first step after it
-says yes, and the host never waits on a transfer. The sweep bound is `Engine::kResidencySweepBlocks`
-= 64 blocks a step between all sequences (four batches, about 1.8 MiB over the link for a 4-token
-block): steady decode retires about one block per sequence per 4 tokens, so the bound clears it and
-drains the backlog a long prefill leaves in a few thousand steps. It is a constant, not a flag,
-until a measurement asks for a knob.
+says yes, and the host never waits on a transfer. The sweep runs after every committed step, over
+the sequences that are done prefilling, and its bound is `TierExec::sweep_blocks`: 32 MiB a rank
+(`TierExec::kSweepBytes`, ~1.5 ms of a PCIe 4.0 x16 link) in blocks of the widest residency group's
+store block, between 64 and the 1 024 entries of the index ring (Flash-Next `--tp 2`: 1 024 blocks,
+26 MiB a rank). A 128K-token middle drains in ~31 sweeps. It is a constant, not a flag, until a
+measurement asks for a knob.
 
 **The pager's counter.** The card cannot say which blocks a step read, so `qsa_page` counts what it
 rewrote: one int64 a rank (`RadKVGroupBatch::residency_paged`, ABI 30), added to by the kernel and

@@ -180,13 +180,31 @@ Properties of the pager:
 
 ## 5. The sweep: how blocks leave the card
 
-After every committed decode step, the scheduler sweeps. It demotes at most a bounded number of
-blocks per step, across all sequences, and only one sweep is in flight at a time.
+After every committed step, decode, mixed or prefill, the scheduler sweeps. It demotes at most a
+bounded number of blocks per step, across all sequences, and only one sweep is in flight at a time.
+
+**Which sequences.** Every running one that is done prefilling. A sequence still mid-prompt is
+skipped (its next chunk would promote it whole again, [§6](#6-dense-steps-promotion)), and so is one
+whose last chunk was this step: the drafter's history pass over that chunk follows the commit and
+pages only the rows the scratch holds. It is swept from the next step on. Sweeping after decode
+steps only, as before, left every decoding conversation's middle in VRAM for as long as prompts
+kept arriving, since nearly every such step is mixed.
+
+**How much.** `TierExec::sweep_blocks`: a byte budget of 32 MiB a rank (`TierExec::kSweepBytes`),
+in blocks of the widest residency group's store block, at least 64 and at most the 1 024 entries of
+the transfer's index ring. 32 MiB is about 1.5 ms of a PCIe 4.0 x16 link, each rank on its own; the
+copy runs after the step already queued and only the step after it waits for it, so a copy well
+under one decode step is hidden. On Flash-Next at `--tp 2` (26 KiB a rank's fp8 block) that is the
+ring's 1 024 blocks, 4 096 tokens a sweep: a 128K-token middle (~31K blocks) drains in ~31 sweeps,
+about 60 steps, instead of ~490 sweeps at the old fixed 64. The host pays ~30 async calls a batch of
+16 (index upload, a gather a layer, a copy a block), ~2 K a sweep and rank. The index ring starts
+over once every earlier move has landed, so a sweep never waits on the host for its wrap
+(`MoveStats::idx_syncs`); a promotion of a whole middle still can.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant SCH as scheduler<br/>(end of decode step)
+    participant SCH as scheduler<br/>(end of a step)
     participant KV as KV manager
     participant TX as transfer stream
     participant CS as compute stream
@@ -195,7 +213,7 @@ sequenceDiagram
     opt landed
         SCH->>KV: residency_demote_landed()<br/>→ pool blocks back to the free list
     end
-    SCH->>KV: residency_demote(seq, sink, tail, ≤ 64 blocks)
+    SCH->>KV: residency_demote(seq, sink, tail, ≤ sweep_blocks)
     KV-->>SCH: moves (block → slot), entries now read cold
     SCH->>TX: issue_moves(to_host)
     TX->>CS: wait for everything compute was given
@@ -452,8 +470,10 @@ radiance --model flashnext.rad --tp 2 \
 * The flag is exclusive with `--kv-resident` (KV streaming, [§12](#12-how-it-relates-to---kv-resident-kv-streaming)).
   The server refuses both together.
 * Startup prints the store, its slot count, the scratch reservation and the window, for example
-  `kv residency: window enforced -- after a decode step, blocks outside the sink and the 2048-token
-  tail leave the pool for the store, 16 per batch and at most 64 per step`.
+  `kv residency: window enforced -- after a step, blocks outside the sink and the 2048-token tail
+  leave the pool for the store, 16 per batch and at most 32.0 MiB a rank per step`, then
+  `kv residency: a sweep moves at most 1024 blocks of 26.0 KiB a rank (26.0 MiB), after any step, of
+  sequences not prefilling`.
 
 **Counters**, in `/stats` under `kv_residency` and per session in `/sessions`:
 

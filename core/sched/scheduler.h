@@ -486,8 +486,9 @@ public:
      *   landed  whether every move issued so far has landed. Polled, never waited on: held pool
      *           blocks and store slots are given back at the first step after it says yes.
      *
-     * After a committed decode step the sequences outside sink + tail window lose at most
-     * `sweep_blocks` blocks between them (the copy a step pays is bounded); before a prefill or
+     * After every committed step the sequences that are not prefilling lose what lies outside
+     * sink + tail window, at most `sweep_blocks` blocks between them (the copy a step pays is
+     * bounded, TierExec::sweep_blocks); before a prefill or
      * mixed step its prefill rows are promoted whole, and its decode rows too when the step may
      * be dense (res_dense_rows), so no dense read meets a cold entry; a sparse step's decode
      * rows page as a decode step's do. */
@@ -499,8 +500,8 @@ public:
          * reads a block demoted does not depend on the transfer's timing -- what a tiered
          * residency run and its emulation must share to be compared byte for byte. */
         bool sync = false;
-        /* The KL mode's emulation: a sweep after every step, prefill too and unbounded, since the
-         * KL mode scores prefill chunks and runs no decode step a sweep could follow. */
+        /* The KL mode's emulation: unbounded, and every sequence after every step, mid-prefill
+         * too, since the KL mode scores prefill chunks and runs no decode step. */
         bool every_step = false;
     };
     void    set_residency_mover(ResidencyMover m, int64_t sweep_blocks);
@@ -540,7 +541,7 @@ private:
     int res_issue(bool to_host);
     /* Gives back the blocks and slots of moves that have landed. */
     void res_reap();
-    /* After a committed decode step: demote what falls outside sink + tail, within the bound. */
+    /* After a committed step: demote what falls outside sink + tail, within the bound. */
     void res_sweep();
     /* Whether step `p` may read its decode rows' tables densely, so they too must be promoted;
      * false when every residency group's consumer reads them sparsely, through the pager. */

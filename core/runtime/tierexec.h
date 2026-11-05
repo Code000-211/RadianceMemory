@@ -145,8 +145,30 @@ public:
      * pager reading a slot the copy has not finished filling would serve stale bytes. Steps
      * issued before it already ran past the block, which it waited for. */
     static constexpr int kMoveBatch = 16;
+    /* Block indices the staging ring holds (move_idx_host_): 64 batches. A run of batches issued
+     * once everything before it has landed starts the ring over, so a run of at most this many
+     * blocks never waits on the host for a wrap (MoveStats::idx_syncs). */
+    static constexpr int64_t kMoveIdxCap = 64 * kMoveBatch;
+    /* What one residency sweep may move, per rank: the blocks of `block_bytes` (a rank's share of
+     * one block in the store, KVManager::residency_block_bytes) in kSweepBytes, at least four
+     * batches and at most the index ring, so a sweep never waits on the host.
+     *
+     * 32 MiB is about 1.5 ms of a PCIe 4.0 x16 link (~22 GB/s), each rank on its own: a demotion
+     * runs on the transfer stream after the step already queued and only the step after it waits
+     * for it (issue_moves), so a copy well under one decode step is hidden behind it. On
+     * Flash-Next at --tp 2 a rank's fp8 block is 13 x 2 KiB = 26 KiB, which the ring caps at 1 024
+     * blocks (26 MiB, 4 096 tokens) a sweep: a 128K-token middle (~31K blocks) drains in ~31
+     * sweeps instead of ~490 at the old fixed 64. The host pays ~30 async calls a batch (the index
+     * upload, n_layers gathers, one copy a block), ~2 K a sweep and rank. */
+    static constexpr int64_t kSweepBytes = (int64_t)32 << 20;
+    static constexpr int64_t sweep_blocks(int64_t block_bytes) {
+        const int64_t n = block_bytes > 0 ? kSweepBytes / block_bytes : kMoveIdxCap;
+        return n < 4 * kMoveBatch ? 4 * kMoveBatch : n > kMoveIdxCap ? kMoveIdxCap : n;
+    }
     int  issue_moves(const std::vector<BlockMove>& moves, RadStream compute, bool to_host);
-    struct MoveStats { int64_t out_blocks = 0, in_blocks = 0, out_bytes = 0, in_bytes = 0; };
+    /* idx_syncs: host waits for the index ring's wrap (a run longer than the ring, or one issued
+     * while an earlier one is still in flight). */
+    struct MoveStats { int64_t out_blocks = 0, in_blocks = 0, out_bytes = 0, in_bytes = 0, idx_syncs = 0; };
     const MoveStats& move_stats() const { return mv_; }
     /* Whether every move issued so far has landed: a poll of one event, no host sync. True when
      * nothing was issued. A failed query counts as landed, so a broken card cannot hold pool
@@ -315,7 +337,6 @@ private:
     /* Pinned, kMoveIdxCap entries used as a ring: the upload is a kernel reading host memory when
      * the transfer stream reaches it, which is after the compute it waits for, so a batch issued
      * later in the same sweep must not overwrite the indices of one not yet uploaded. */
-    static constexpr int64_t kMoveIdxCap = 64 * kMoveBatch;
     int32_t*  move_idx_host_ = nullptr;
     int64_t   move_idx_off_ = 0;      /* the next free entry of move_idx_host_ */
     int32_t*  move_idx_dev_ = nullptr;

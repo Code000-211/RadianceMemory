@@ -3720,7 +3720,7 @@ int Engine::configure_kv() {
              * the pager's counter on each rank's card. A rank that cannot move the bytes would
              * leave the store open and the window unenforced, which is worse than refusing the
              * flag, so it stops the start. The scheduler's sweep and the engine's mover are
-             * installed in Engine::init once the scheduler exists (kResidencySweepBlocks). */
+             * installed in Engine::init once the scheduler exists (TierExec::sweep_blocks). */
             std::vector<int32_t> rg;
             for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g)
                 if (const KVGroupPlan* p = ranks_[0]->kv.plan(g); p && p->residency()) rg.push_back(g);
@@ -3741,10 +3741,11 @@ int Engine::configure_kv() {
                 r->kv.set_residency_paged(paged);
             }
             RAD_TRY(rad_dev_set(ranks_[0]->device));
-            RAD_INFO("kv residency: window enforced -- after a decode step, blocks outside the sink "
-                     "and the %lld-token tail leave the pool for the store, %d per batch and at most "
-                     "%d per step; a prefill promotes its sequence whole first",
-                     (long long)window_tokens, TierExec::kMoveBatch, kResidencySweepBlocks);
+            RAD_INFO("kv residency: window enforced -- after a step, blocks outside the sink and "
+                     "the %lld-token tail leave the pool for the store, %d per batch and at most "
+                     "%s a rank per step; a prefill row promotes its sequence whole first",
+                     (long long)window_tokens, TierExec::kMoveBatch,
+                     humanb(TierExec::kSweepBytes).c_str());
         }
     }
     for (auto& r : ranks_) {

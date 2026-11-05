@@ -2070,7 +2070,6 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * when the store is open and every rank can move bytes (bring-up refuses otherwise), so a
      * server without --kv-residency-mib never gets a mover and the scheduler demotes and promotes
      * nothing -- the same code path as before the pager existed. */
-    static_assert(kResidencySweepBlocks == 4 * TierExec::kMoveBatch, "the sweep bound is four batches");
     if (!gen_ && ranks_[0]->resx.enabled()) {
         Scheduler::ResidencyMover m;
         /* Every rank moves its own shard of the same block ids; the manager's records are rank
@@ -2103,7 +2102,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * (KVManager::residency_emulate), the reference a tiered recipe's residency-on output is
          * compared with byte for byte under `sync`. In the KL mode, which scores prefill chunks
          * and runs no decode step, the emulation sweeps after every step and unbounded. */
-        int64_t sweep = kResidencySweepBlocks;
+        /* A sweep's bound in blocks, from a byte budget a rank (TierExec::sweep_blocks), for the
+         * widest residency group's block: the copy a step pays is bounded in link time. */
+        int64_t widest = 0;
+        for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g)
+            if (const KVGroupPlan* p = ranks_[0]->kv.plan(g); p && p->residency())
+                widest = std::max(widest, ranks_[0]->kv.residency_block_bytes(g));
+        int64_t sweep = TierExec::sweep_blocks(widest);
+        RAD_INFO("kv residency: a sweep moves at most %lld blocks of %s a rank (%s), after any "
+                 "step, of sequences not prefilling",
+                 (long long)sweep, humanb(widest).c_str(), humanb(sweep * widest).c_str());
         if (const char* t = std::getenv("RADIANCE_DEBUG_KV_TIER"); t && *t) {
             const bool emul = !std::strcmp(t, "emulate");
             if (!emul && std::strcmp(t, "sync")) {

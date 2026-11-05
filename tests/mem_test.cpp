@@ -8668,6 +8668,81 @@ TEST(a_demoted_block_comes_back_byte_for_byte_after_the_pool_is_overwritten) {
     rad_stream_destroy(compute);
 }
 
+/* A sweep's bound is a byte budget a rank, in whole blocks, between four batches and the index
+ * ring: Flash-Next's 26 KiB fp8 block (13 layers x 2 KiB at --tp 2) takes the whole ring, a
+ * bf16-sized one less, and a huge block still gets four batches. */
+TEST(a_sweep_s_block_bound_follows_its_byte_budget_within_the_index_ring) {
+    CHECK_EQ(TierExec::sweep_blocks(26 * 1024), TierExec::kMoveIdxCap);
+    CHECK_EQ(TierExec::sweep_blocks(0), TierExec::kMoveIdxCap);
+    CHECK_EQ(TierExec::sweep_blocks(64 * 1024), TierExec::kSweepBytes / (64 * 1024));
+    CHECK(TierExec::sweep_blocks(64 * 1024) < TierExec::kMoveIdxCap);
+    CHECK_EQ(TierExec::sweep_blocks((int64_t)4 << 20), (int64_t)4 * TierExec::kMoveBatch);
+    CHECK(TierExec::kMoveIdxCap >= 4 * TierExec::kMoveBatch);
+}
+
+/* The index ring starts over once every earlier move has landed, so a run of up to kMoveIdxCap
+ * blocks -- the most one sweep moves -- issued after the last one landed never waits on the host
+ * for a wrap. Without that a 1 024-block sweep starting part way round waits, on the scheduler's
+ * thread, for the step its copies are queued behind. Many demote/promote rounds, each issued
+ * after the last landed, cross the ring's size several times with no host wait, and the bytes
+ * still come back. */
+TEST(a_residency_run_issued_after_the_last_landed_never_waits_for_the_index_ring) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    ResidencyFixture f;
+    CHECK_OK(f.build(/*window_tokens=*/512, /*slots=*/64));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    const std::vector<int32_t> groups{ G_RES };
+    CHECK_OK(x.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    resid_fill(f.kv, G_RES);
+    std::vector<int32_t> orig = f.kv.block_table(1, G_RES);
+    auto run = [&](const std::vector<BlockMove>& mv, bool to_host) {
+        for (size_t i = 0; i < mv.size(); i += TierExec::kMoveBatch) {
+            const std::vector<BlockMove> part(
+                mv.begin() + (long)i, mv.begin() + (long)std::min(mv.size(), i + TierExec::kMoveBatch));
+            CHECK_OK(x.issue_moves(part, compute, to_host));
+        }
+        x.quiesce();
+    };
+    int64_t entries = 0;
+    for (int round = 0; round < 40; ++round) {
+        std::vector<BlockMove> down;
+        CHECK_OK(f.kv.residency_demote(1, G_RES, /*keep_head=*/2, /*keep_tail=*/8, &down));
+        REQUIRE_EQ(down.size(), 30u);
+        run(down, /*to_host=*/true);
+        f.kv.residency_demote_landed();
+        resid_scribble(f.kv, G_RES);
+        std::vector<BlockMove> up;
+        CHECK_OK(f.kv.residency_promote_all(1, &up));
+        REQUIRE_EQ(up.size(), 30u);
+        run(up, /*to_host=*/false);
+        f.kv.residency_complete();
+        entries += 60;
+        for (int64_t e = 2; e < 32; ++e)
+            CHECK_EQ(resid_mismatches(f.kv, G_RES, f.kv.block_table(1, G_RES)[(size_t)e],
+                                      orig[(size_t)e]), 0ll);
+        resid_fill(f.kv, G_RES);     /* the pool's ids moved: the next round's pattern */
+        orig = f.kv.block_table(1, G_RES);
+    }
+    CHECK(entries > 2 * TierExec::kMoveIdxCap);
+    CHECK_EQ(x.move_stats().idx_syncs, 0ll);
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
 /* ------------------------------------------------------------------ window residency: cold entries */
 
 /* Demotes entries [2, 32) of a 40-block sequence and lands them, as a sweep does. */

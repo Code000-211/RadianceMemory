@@ -5136,6 +5136,46 @@ TEST(the_sweep_after_a_decode_step_respects_its_bound_and_never_demotes_the_sink
     CHECK(f.kv.free_blocks(0) + 2 >= free_before + cold);
 }
 
+/* While prompts arrive nearly every step is mixed, and a sweep after decode steps alone left the
+ * decoding conversations' middles in VRAM for as long as any prompt was being prefilled. A mixed
+ * step's commit sweeps too, but only sequences that are done prefilling: one mid-prompt would be
+ * promoted whole by its next chunk, and one whose last chunk was this step waits a step for the
+ * drafter's history pass over that chunk. */
+TEST(a_mixed_step_sweeps_the_decoding_sequences_and_not_the_ones_still_prefilling) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);       /* two chunks of at most 256 */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();                            /* a's first chunk: a is mid-prompt */
+    CHECK_EQ(rig.moved(true), (int64_t)0);
+    const uint64_t b = f.submit(1200, 8);        /* several chunks */
+    bool mixed = false;
+    for (int i = 0; i < 16 && !mixed; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        REQUIRE((int)p.phase != (int)RAD_PHASE_DECODE);   /* b keeps every step a prefill one */
+        mixed = p.phase == RAD_PHASE_MIXED;
+        bool a_chunk = false, b_left = false;
+        for (const StepEntry& e : p.e) {
+            a_chunk |= e.is_prefill && e.seq == a;
+            b_left  |= e.is_prefill && e.seq == b && !e.produces_token;
+        }
+        if (mixed) REQUIRE(b_left);              /* b is still mid-prompt after this step */
+        f.commit_plain();
+        if (!mixed) CHECK_EQ(rig.moved(true), (int64_t)0);  /* a prefilled in it, or still is */
+        (void)a_chunk;
+    }
+    REQUIRE(mixed);
+    CHECK(rig.moved(true) > 0);                  /* the mixed step's commit swept `a` */
+    for (int32_t e : f.kv.block_table(b, 0)) CHECK(e >= 0 || e == -1);   /* b is untouched */
+    int64_t cold = 0;
+    for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
+    CHECK_EQ(cold, rig.moved(true));
+}
+
 /* RADIANCE_DEBUG_KV_TIER: under `sync` a step that finds the last sweep in flight waits for it to
  * land (polling until it does) instead of skipping the reap, so every commit sweeps and which step
  * first reads a demoted block does not depend on the transfer's timing; under the KL mode's
@@ -5281,7 +5321,7 @@ TEST(a_prompt_that_hits_a_cached_chain_with_cold_entries_prefills_on_pool_ids_af
 }
 
 /* A dense step whose sequence cannot be promoted because the pool is full must not be planned and
- * abandoned forever: the sweep that would free room runs only after decode steps. The scheduler
+ * abandoned forever: the sweep that would free room runs only after a committed step. The scheduler
  * preempts the back of the running set by recompute, as it does when a sequence cannot grow, so
  * every failed attempt costs one request and the server keeps stepping. The step is dense (every
  * row within window + block - 1 = 79 tokens, no sink), so its decode row is promoted too. */

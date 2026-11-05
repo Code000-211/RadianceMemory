@@ -634,11 +634,16 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
 
     /* Each batch its own entries (see move_idx_host_): the engine issues a sweep's batches back to
      * back, and with one shared buffer every batch queued behind a busy compute stream gathered the
-     * last batch's blocks. A wrap waits for the uploads still queued, rarely: the ring holds sixteen
-     * full decode sweeps, and a sweep goes out only once the last one landed. */
+     * last batch's blocks. Once every earlier move has landed (one event query) no upload is
+     * queued, so the ring starts over: a sweep goes out only once the last one landed, so one of
+     * up to kMoveIdxCap blocks never wraps. Without this a sweep of that size starting part way
+     * round would wait here, on the host, for the step its copies are queued behind. A wrap that
+     * is still needed (a longer run: a promotion of a whole middle) waits for the uploads queued. */
+    if (move_idx_off_ > 0 && moves_landed()) move_idx_off_ = 0;
     if (move_idx_off_ + n > kMoveIdxCap) {
         TIER_TRY(rad_stream_sync(stream_), "reusing the residency block indices");
         move_idx_off_ = 0;
+        ++mv_.idx_syncs;
     }
     int32_t* idx_host = move_idx_host_ + move_idx_off_;
     move_idx_off_ += n;
