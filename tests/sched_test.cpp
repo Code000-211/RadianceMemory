@@ -1996,6 +1996,49 @@ TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
     f.commit_plain();
 }
 
+/* An overdue preempted prefill the pool still refuses keeps its place: nothing queued behind it is
+ * admitted in that step, since the room the overdue path makes is for it. Asking the next request
+ * instead let a request just forced off for it come straight back (its prompt published, so its
+ * recompute needed almost nothing) and take that room again: under KV pressure the same victim was
+ * forced off and re-admitted 26 times in 16 s while the overdue request waited. */
+TEST(an_overdue_preempted_prefill_keeps_its_place_ahead_of_the_queue) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;               /* overdue from the next step */
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+
+    /* B is overdue and does not fit beside A. C, queued behind it, would fit; it must wait. */
+    uint64_t c = f.submit(16, 4, /*priority=*/0);
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+        CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+        f.commit_plain();
+    }
+    /* Once A finishes, B goes in first. */
+    for (int i = 0; i < 80 && f.sch.find(a) && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    bool b_first = false;
+    for (int i = 0; i < 4; ++i) {
+        if (!f.sch.step()) continue;
+        const ReqState bs = f.sch.find(b)->state, cs = f.sch.find(c)->state;
+        if (bs == ReqState::Running) { b_first = true; f.commit_plain(); break; }
+        CHECK(cs != ReqState::Running);
+        f.commit_plain();
+    }
+    CHECK(b_first);
+}
+
 /* A lower-priority overdue prefill may stay queued while a higher-priority runner keeps its
  * blocks. Forcing that runner off just swaps who is at zero. The priority-5 request must not be
  * the one left in Preempted while someone else still runs. */

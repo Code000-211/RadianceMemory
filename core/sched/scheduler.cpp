@@ -2076,7 +2076,17 @@ const RadBatch* Scheduler::step() {
             admit_full_ = 0;
             admit_next_step_ = false;
             const int as = admit_one(s, budget, areserve);
-            if (as == kAdmitWait) { ++at; continue; }
+            /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
+             * an overdue one does not. The room the overdue path made this step is for it, and a
+             * request queued behind it would take that room back: a victim just forced off for it,
+             * its prompt published, needs almost nothing to come back, and under KV pressure the
+             * same victim was forced off and re-admitted 26 times in 16 s while the overdue request
+             * waited. */
+            if (as == kAdmitWait) {
+                if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
+                ++at;
+                continue;
+            }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
              * Fail it (spec §17) and ask the next request, instead of parking the step loop. Not
