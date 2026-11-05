@@ -189,7 +189,7 @@ __global__ __launch_bounds__(THR) void sample_logprobs_kernel(
     float* __restrict__ st, uint32_t n, uint32_t k, uint32_t lg_ld, uint32_t st_ld,
     int32_t voff) {
     const uint32_t row = blockIdx.x;
-    if (!(pr[row].flags & RAD_SP_LOGPROBS)) return;
+    if (pr && !(pr[row].flags & RAD_SP_LOGPROBS)) return;   /* no params: every row */
 
     Acc a;
     a.mx = -INFINITY;
@@ -570,7 +570,7 @@ static inline int logits_rows(const RadArgs* a, const RadTensor* lg, long long* 
 extern "C" int r3d_sample_logprobs(long lg, long params, long stats, int M, int n_vocab, int k,
                                   long long lg_ld, long long stats_ld, int vocab_off,
                                   long stream) {
-    if (!lg || !params || !stats) return -1;
+    if (!lg || !stats) return -1;
     if (M <= 0 || n_vocab <= 0 || k <= 0) return -2;
     if (k > kKMax) return -2;
     if (!lg_ld) lg_ld = n_vocab;

@@ -525,7 +525,7 @@ static const RadOperandSpec oArgmax[]    = { { "logits", RAD_OPD_IN, 0 },
                                              { "params", RAD_OPD_IN, 0 },
                                              { "token", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oLogprobs[]  = { { "logits", RAD_OPD_IN, 0 },
-                                             { "params", RAD_OPD_IN, 0 },
+                                             { "params", RAD_OPD_IN, 1 },
                                              { "stats", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oNarrow[]    = { { "cand_idx", RAD_OPD_INOUT, 0 },
                                              { "cand_val", RAD_OPD_INOUT, 0 },
@@ -2572,7 +2572,7 @@ static const RadKernelInfo kKernels[] = {
   "one read of the logits plane where the reference reads it three (max, sum, k-list); the sum is "
   "SUM exp(v - max) in DOUBLE, the reference's law, and a row's k-list is one insertion list in "
   "registers, not an upper_bound per element; stats is [M][2 + 2k], and rows the flag leaves alone "
-  "are not written",
+  "are not written (no params at all: every row runs)",
   "f32 logits, f32 params, f32 stats; k <= 64 is the pool's depth and above it the shim refuses "
   "(RAD_E_UNSUPPORTED); on a row that contains a NaN the reference's list freezes at the first k it "
   "saw: once a NaN sits in the k-list's tail, every later real value fails the tail's compare "
