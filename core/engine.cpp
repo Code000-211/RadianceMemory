@@ -2133,6 +2133,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         /* The pager's count, read back when a statistics poll asks (rank 0's counter). */
         static_cast<KVBinding<KVManager>*>(kv_iface_.get())->paged_read =
             [this] { return ranks_[0]->resx.paged_in(); };
+        static_cast<KVBinding<KVManager>*>(kv_iface_.get())->hits_read =
+            [this] { return ranks_[0]->resx.hits_in(); };
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());

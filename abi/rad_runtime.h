@@ -94,7 +94,8 @@ typedef struct RadKVGroupBatch {
     const int64_t* residency_layer_off;
     /* Scratch pages, device: [n_rows, residency_scratch_pitch] pool block ids, one row per decode
      * row of the step (n_seq_decode x (1 + n_spec)), each (topk + 1) pages. They are ordinary pool
-     * blocks the engine owns; a row's pages are valid for the step that wrote them only. */
+     * blocks the engine owns, and nothing but the pager writes them: a page keeps the block it last
+     * received until the pager gives it another, which the page cache (residency_tags) relies on. */
     const int32_t* residency_scratch;
     int64_t        residency_scratch_pitch;
     /* One int64 on the card (null: not counted). `qsa_page` adds the cold entries it rewrote, one
@@ -104,6 +105,23 @@ typedef struct RadKVGroupBatch {
     /* Slots in the residency store, so the pager can bound a cold entry's slot and see the store
      * as the plane it is ([slots, residency_slot_bytes]); 0 when the store is closed. */
     int64_t        residency_slots;
+    /* ---- the pager's page cache (ABI 46): a scratch page keeps the block it last received, so a
+     * later step whose selection names that block again rewrites its entry to the page and copies
+     * nothing (docs/OPS.md `qsa_page`, `tags`). Null/0: the pager copies every cold entry, as at 45.
+     *
+     * Device, i32, persistent across steps: one plane of [residency_tags_rows,
+     * residency_scratch_pitch] per layer this group holds, in model-layer order -- the plane of a
+     * model layer is the count of layers below it with residency_layer_off[l] >= 0. Entry (m, p)
+     * is 1 + the store slot whose fragment page residency_scratch[m][p] holds for that layer, 0 for
+     * none (negative: a copy the pager has planned but not finished, also none). The pager is the
+     * only writer; the engine zeroes every plane, on the compute stream before the step, whenever a
+     * store slot was freed since the last zeroing, so a tag never names a slot reused for another
+     * block. */
+    int32_t*       residency_tags;
+    int64_t        residency_tags_rows;
+    /* One int64 on the card (null: not counted): the entries of residency_paged that were served
+     * by the page cache without a copy. */
+    int64_t*       residency_hits;
 } RadKVGroupBatch;
 
 /* The cold block-table entry: the block's bytes are in residency-store slot `slot` (>= 0). Its own

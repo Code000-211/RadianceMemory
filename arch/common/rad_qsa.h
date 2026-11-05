@@ -589,7 +589,18 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * its history was promoted before the step. */
     if (op_page && atb->residency_store && atb->residency_slots > 0 && atb->residency_layer_off &&
         atb->residency_scratch &&
-        batch->n_tok_decode > 0)
+        batch->n_tok_decode > 0) {
+        /* The page cache (RadKVGroupBatch::residency_tags): this layer's plane is the count of the
+         * group's layers below it. Absent, or narrower than the step's decode rows, every cold
+         * entry is copied, as before the cache. */
+        RadOperand tags = RAD_NONE;
+        if (atb->residency_tags && atb->residency_tags_rows >= batch->n_tok_decode) {
+            int64_t plane = 0;
+            for (int l = 0; l < layer; ++l) plane += atb->residency_layer_off[l] >= 0;
+            tags = praw2(atb->residency_tags +
+                             plane * atb->residency_tags_rows * atb->residency_scratch_pitch,
+                         RAD_I32, atb->residency_tags_rows, atb->residency_scratch_pitch);
+        }
         RAD_ISSUE_N(c_, op_page, batch->n_tok_decode,
                     brows(w.sel, batch->n_tok_decode),
                     /* The store as this layer's fragments see it: the offset is folded in here, on the
@@ -601,7 +612,9 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                     praw2(atb->residency_scratch, RAD_I32, batch->n_tok_decode,
                           atb->residency_scratch_pitch),
                     /* The optional counter (null: not counted; a null operand is an absent one). */
-                    praw(atb->residency_paged, RAD_I64, 1));
+                    praw(atb->residency_paged, RAD_I64, 1),
+                    tags, praw(atb->residency_hits, RAD_I64, 1));
+    }
 
     /* RADIANCE_DEBUG_QSA: prints the first few selections (nc, nsel, sequ, leading sel and score
      * entries) to tell a divergence from intended dropping (`nc` above `topk`). Synchronises the

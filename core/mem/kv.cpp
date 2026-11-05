@@ -665,6 +665,7 @@ int KVManager::carve_into(Pool& kv_pool) {
      * tensor parallelism every rank takes the same slot id for the same block, and only the
      * offsets differ. */
     size_residency();
+    ++res_epoch_;                                      /* the scratch pages' bytes are gone */
     /* Row r of the scratch table is pages [r * pitch, (r + 1) * pitch): fixed for the engine's life. */
     scratch_.assign(plans_.size(), {});
     for (size_t i = 0; i < plans_.size(); ++i) {
@@ -1501,6 +1502,28 @@ const std::vector<int32_t>& KVManager::scratch_table(int32_t g) const {
     static const std::vector<int32_t> none;
     return g >= 0 && g < (int32_t)scratch_.size() ? scratch_[(size_t)g] : none;
 }
+int64_t KVManager::residency_tags_bytes(int32_t g) const {
+    const KVGroupPlan* p = plan(g);
+    if (!p || p->scratch_blocks <= 0) return 0;
+    int64_t planes = 0;
+    for (int64_t o : residency_layer_off(g)) planes += o >= 0;
+    return planes * scratch_rows() * p->scratch_pitch * (int64_t)sizeof(int32_t);
+}
+
+int64_t KVManager::residency_tags_bytes() const {
+    int64_t n = 0;
+    for (int32_t g = 0; g < (int32_t)plans_.size(); ++g) n += residency_tags_bytes(g);
+    return n;
+}
+
+int32_t* KVManager::residency_tags(int32_t g) const {
+    if (!res_tags_ || res_tags_cap_ < residency_tags_bytes() || residency_tags_bytes(g) <= 0)
+        return nullptr;
+    int64_t off = 0;
+    for (int32_t i = 0; i < g; ++i) off += residency_tags_bytes(i);
+    return (int32_t*)((char*)res_tags_ + off);
+}
+
 const std::vector<int64_t>& KVManager::residency_layer_off(int32_t g) const {
     static const std::vector<int64_t> none;
     return g >= 0 && g < (int32_t)res_layer_off_.size() ? res_layer_off_[(size_t)g] : none;
@@ -1537,6 +1560,7 @@ int KVManager::set_residency_store(int32_t g, HostArena* store, int64_t rank_off
     size_residency();                                  /* the per-group vectors, sized */
     res_arena_[(size_t)g] = store;
     res_rank_off_[(size_t)g] = rank_off > 0 ? rank_off : 0;
+    ++res_epoch_;
     /* The slot size is derived from the plans at carve, so a store set before configure() needs no
      * number here; one set after keeps the size the carve computed. */
     size_residency();
@@ -1561,6 +1585,7 @@ void KVManager::release_residency() {
                 if (res_refs_[g][i] > 0) a->free((int32_t)i);
     res_refs_.clear();
     res_slots_.clear();
+    ++res_epoch_;
     res_origin_.assign(plans_.size(), {});
     res_emul_.assign(plans_.size(), {});
     res_pending_.clear();
@@ -1635,6 +1660,7 @@ void KVManager::slot_drop(int32_t g, int32_t slot) {
     }
     if (--res_refs_[(size_t)g][(size_t)slot] > 0) return;
     --res_slots_[(size_t)g];
+    ++res_epoch_;                                      /* the slot may next hold another block */
     if (HostArena* a = res_store(g)) a->free(slot);
 }
 

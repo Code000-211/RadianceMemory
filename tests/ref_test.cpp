@@ -10953,6 +10953,155 @@ TEST(qsa_page_adds_the_cold_entries_it_rewrote_to_its_counter) {
     CHECK_EQ(paged.iat(0), 44LL);
 }
 
+/* The page cache (`tags`, docs/OPS.md): a row's scratch pages keep the slot they last received.
+ * Launch 1 has empty tags, so every cold entry is a miss: copied into the row's free pages in
+ * order and tagged. Launch 2 selects two of those slots again (in other positions) and one new
+ * one: the two are hits, rewritten to the pages that already hold them with no copy, and the new
+ * one takes the first page no hit took. Both counters, and the pool bytes a hit leaves alone. */
+TEST(qsa_page_with_tags_rewrites_a_repeated_slot_to_the_page_holding_it_without_a_copy) {
+    Page p({ rad_kv_cold_entry(4), 3, rad_kv_cold_entry(0),
+             rad_kv_cold_entry(2), -1, rad_kv_cold_entry(1) },
+           { 6, 7, 8,  9, 10, 11 }, 2, 1);
+    T tags(RAD_I32, {2, 3}), paged(RAD_I64, {1}), hits(RAD_I64, {1});
+    tags.n({ 0, 0, 0,  0, 0, 0 }); paged.n({ 0 }); hits.n({ 0 });
+    auto go = [&]() {
+        A a; a.t(p.sel).t(p.store).t(p.pool).t(p.scratch).t(paged).t(tags).t(hits);
+        a.i("M", p.M).i("topk", p.topk).i("blocks", 6).i("seqs", 1).i("block_bytes", Page::bb);
+        return run("qsa_page", a);
+    };
+    CHECK_OK(go());
+    const std::vector<int64_t> s1 = { 6, 3, 7,  9, -1, 10 }, t1 = { 5, 1, 0,  3, 2, 0 };
+    for (size_t i = 0; i < s1.size(); ++i) { CHECK_EQ(p.sel.iat((int64_t)i), s1[i]); CHECK_EQ(tags.iat((int64_t)i), t1[i]); }
+    CHECK(p.holds(6, 4, 1)); CHECK(p.holds(7, 0, 1)); CHECK(p.holds(9, 2, 1)); CHECK(p.holds(10, 1, 1));
+    CHECK(p.untouched(8)); CHECK(p.untouched(11));
+    CHECK_EQ(paged.iat(0), 4LL); CHECK_EQ(hits.iat(0), 0LL);
+
+    /* Poison the hit pages: a hit must not copy, so the poison stays (the engine never writes a
+     * scratch page behind the pager; the poison only proves no copy ran). */
+    p.pool.mem[(size_t)(7 * Page::bb)] = 0x11;
+    p.sel.n({ rad_kv_cold_entry(0), rad_kv_cold_entry(3), rad_kv_cold_entry(4),
+              -1, rad_kv_cold_entry(2), 5 });
+    CHECK_OK(go());
+    const std::vector<int64_t> s2 = { 7, 8, 6,  -1, 9, 5 }, t2 = { 5, 1, 4,  3, 2, 0 };
+    for (size_t i = 0; i < s2.size(); ++i) { CHECK_EQ(p.sel.iat((int64_t)i), s2[i]); CHECK_EQ(tags.iat((int64_t)i), t2[i]); }
+    CHECK_EQ(p.pool.mem[(size_t)(7 * Page::bb)], 0x11);
+    CHECK(p.holds(8, 3, 1)); CHECK(p.holds(6, 4, 1)); CHECK(p.holds(9, 2, 1));
+    CHECK_EQ(paged.iat(0), 8LL); CHECK_EQ(hits.iat(0), 3LL);
+}
+
+/* What the attention reads does not depend on the cache: over a run of launches whose selections
+ * drift (most slots kept, some swapped, positions shuffled), every position of every launch names
+ * a page holding exactly the bytes the uncached pager's page for it holds (both the store slot's
+ * fragment); resident and empty entries are the same ids. The hits are at least the slots a row
+ * shares with its previous selection, and the counters add up. A tag naming a slot whose bytes
+ * changed is stale, which is why the engine clears the tags whenever a slot is freed: cleared,
+ * the next launch copies the new bytes. */
+TEST(qsa_page_with_tags_gives_the_attention_the_bytes_the_uncached_pager_gives) {
+    const int64_t M = 2, topk = 15, w = topk + 1, slots = 48, bb = 24, res = 8;
+    const int64_t blocks = res + M * w;
+    std::mt19937 rng(29);
+    T store(RAD_U8, {slots, bb});
+    for (auto& b : store.mem) b = (uint8_t)rng();
+    T pool_c(RAD_U8, {blocks, bb}), pool_u(RAD_U8, {blocks, bb});
+    for (int64_t i = 0; i < blocks * bb; ++i) pool_c.mem[(size_t)i] = pool_u.mem[(size_t)i] = (uint8_t)(i * 7);
+    /* Scratch pages after the resident blocks, shuffled. */
+    std::vector<int64_t> ids;
+    for (int64_t i = 0; i < M * w; ++i) ids.push_back(res + i);
+    std::shuffle(ids.begin(), ids.end(), rng);
+    T scratch(RAD_I32, {M, w}); scratch.n(ids);
+    T tags(RAD_I32, {M, w}), paged(RAD_I64, {1}), hits(RAD_I64, {1}), paged_u(RAD_I64, {1});
+    std::fill(tags.mem.begin(), tags.mem.end(), (uint8_t)0);
+    paged.n({ 0 }); hits.n({ 0 }); paged_u.n({ 0 });
+    std::vector<std::vector<int64_t>> prev((size_t)M);
+    int64_t want_paged = 0, min_hits = 0;
+    for (int step = 0; step < 12; ++step) {
+        if (step == 8) {
+            /* A slot reused for another block: the engine clears the tags first. */
+            for (int64_t i = 0; i < bb; ++i) store.mem[(size_t)(5 * bb + i)] ^= 0x5a;
+            std::fill(tags.mem.begin(), tags.mem.end(), (uint8_t)0);
+            for (auto& v : prev) v.clear();
+        }
+        std::vector<int64_t> sv;
+        for (int64_t m = 0; m < M; ++m) {
+            /* Keep most of the previous cold slots, swap a few, refill. */
+            std::vector<int64_t> keep;
+            for (int64_t sl : prev[(size_t)m]) if (rng() % 5) keep.push_back(sl);
+            std::vector<int64_t> cold = keep;
+            const int64_t n_cold = 9 + (int64_t)(rng() % 5);
+            while ((int64_t)cold.size() < n_cold) {
+                const int64_t sl = (int64_t)(rng() % slots);
+                if (std::find(cold.begin(), cold.end(), sl) == cold.end()) cold.push_back(sl);
+            }
+            if ((int64_t)cold.size() > n_cold) cold.resize((size_t)n_cold);
+            for (int64_t sl : cold)
+                min_hits += std::find(prev[(size_t)m].begin(), prev[(size_t)m].end(), sl) != prev[(size_t)m].end();
+            std::vector<int64_t> row;
+            for (int64_t sl : cold) row.push_back(rad_kv_cold_entry((int32_t)sl));
+            while ((int64_t)row.size() < w) row.push_back(rng() % 3 ? (int64_t)(rng() % res) : -1);
+            std::shuffle(row.begin(), row.end(), rng);
+            sv.insert(sv.end(), row.begin(), row.end());
+            prev[(size_t)m] = cold;
+            want_paged += (int64_t)cold.size();
+        }
+        T sel_c(RAD_I32, {M, w}), sel_u(RAD_I32, {M, w});
+        sel_c.n(sv); sel_u.n(sv);
+        /* The uncached pager's scratch: a page a position, the same pool ids. */
+        A a; a.t(sel_c).t(store).t(pool_c).t(scratch).t(paged).t(tags).t(hits);
+        a.i("M", M).i("topk", topk).i("blocks", blocks).i("seqs", M).i("block_bytes", bb);
+        CHECK_OK(run("qsa_page", a));
+        A u; u.t(sel_u).t(store).t(pool_u).t(scratch).t(paged_u);
+        u.i("M", M).i("topk", topk).i("blocks", blocks).i("seqs", M).i("block_bytes", bb);
+        CHECK_OK(run("qsa_page", u));
+        int64_t bad = 0;
+        for (int64_t i = 0; i < M * w; ++i) {
+            const int64_t c = sel_c.iat(i), x = sel_u.iat(i);
+            if ((c < 0) != (x < 0) || (c < 0 && c != x)) { ++bad; continue; }
+            if (c >= 0 && std::memcmp(pool_c.mem.data() + c * bb, pool_u.mem.data() + x * bb, (size_t)bb)) ++bad;
+            if (sv[(size_t)i] <= -2 &&
+                std::memcmp(pool_c.mem.data() + c * bb, store.mem.data() + (-2 - sv[(size_t)i]) * bb, (size_t)bb))
+                ++bad;
+        }
+        CHECK_EQ(bad, 0LL);
+    }
+    CHECK_EQ(paged.iat(0), want_paged);
+    CHECK_EQ(paged_u.iat(0), want_paged);
+    CHECK(hits.iat(0) >= min_hits);
+    CHECK(min_hits > want_paged / 2);
+    std::printf("    page cache: %lld of %lld cold entries served without a copy (at least %lld shared "
+                "with the row's previous selection)\n", (long long)hits.iat(0), (long long)want_paged,
+                (long long)min_hits);
+}
+
+/* With tags, refused before any write as without: a slot outside the store, a taken page outside
+ * the pool, two taken pages with one id; and tags of the wrong dtype or narrower than the rows. */
+TEST(qsa_page_with_tags_refuses_what_it_cannot_serve_before_writing) {
+    auto go = [](Page& p, T& tags) {
+        A a; a.t(p.sel).t(p.store).t(p.pool).t(p.scratch).tnull().t(tags);
+        a.i("M", p.M).i("topk", p.topk).i("blocks", 6).i("seqs", 1).i("block_bytes", Page::bb);
+        return run("qsa_page", a);
+    };
+    T tags(RAD_I32, {1, 2}); tags.n({ 0, 0 });
+    Page a({ rad_kv_cold_entry(0), rad_kv_cold_entry(Page::slots) }, { 1, 2 }, 1, 0);
+    CHECK_EQ(go(a, tags), (int)RAD_E_INVAL);
+    CHECK(a.untouched(1)); CHECK_EQ(tags.iat(0), 0LL);
+    Page b({ rad_kv_cold_entry(0), rad_kv_cold_entry(1) }, { 1, Page::blocks }, 1, 0);
+    CHECK_EQ(go(b, tags), (int)RAD_E_INVAL);
+    CHECK(b.untouched(1)); CHECK_EQ(tags.iat(0), 0LL);
+    Page c({ rad_kv_cold_entry(0), rad_kv_cold_entry(1) }, { 4, 4 }, 1, 0);
+    CHECK_EQ(go(c, tags), (int)RAD_E_INVAL);
+    CHECK(c.untouched(4));
+    /* An id outside the pool on a page no cold position takes is not read. */
+    Page d({ rad_kv_cold_entry(0), 3 }, { 4, Page::blocks }, 1, 0);
+    CHECK_OK(go(d, tags));
+    CHECK_EQ(d.sel.iat(0), 4LL); CHECK_EQ(tags.iat(0), 1LL);
+    Page e({ rad_kv_cold_entry(0), 3 }, { 4, 5 }, 1, 0);
+    T narrow(RAD_I32, {1, 1}); narrow.n({ 0 });
+    CHECK_EQ(go(e, narrow), (int)RAD_E_SHAPE);
+    T wrong(RAD_I64, {1, 2}); wrong.n({ 0, 0 });
+    CHECK_EQ(go(e, wrong), (int)RAD_E_DTYPE);
+    CHECK(e.untouched(4)); CHECK_EQ(e.sel.iat(0), (int64_t)rad_kv_cold_entry(0));
+}
+
 /* qsa_page over a packed per-layer layout (--kv-recipe): the core binds such a layer's cache as
  * E4M3 columns at its row's bytes over two -- [blocks, kv_heads, block_size, 2 * head_dim * row16 /
  * 32], 25 a 16-byte unit for fp8_v4, 22 for k6_v4 -- and its store fragment is one block of that,

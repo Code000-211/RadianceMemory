@@ -3655,6 +3655,37 @@ void kvx_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== the pager's page cache
+ *
+ * `qsa_page` with `tags` (docs/OPS.md): libref's plan, by hand. Row 0 holds a slot tagged twice
+ * (the lowest page wins), a tag left pending (negative: a page whose fill never ran, not a hit)
+ * and two misses that take the free pages in order; row 1 starts empty. Every output -- the
+ * selection, the pool, the tags and both counters -- is compared with libref's. */
+void page_cache_cases(std::vector<Hand>& hs) {
+    const int64_t bb = 16, slots = 6, blocks = 16;
+    Hand h("the page cache: hits, a duplicate and a pending tag, misses in order", "qsa_page", 0.0);
+    h.dense(RAD_I32, { 2, 5 }, [](int64_t i) {
+         const int64_t v[10] = { -2 - 2, -2 - 1, 4, -2 - 5, -2 - 0,  -2 - 3, -1, -2 - 4, 2, -1 };
+         return (float)v[i];
+     }, true)
+     .view(RAD_U8, { slots, bb }, { 2 * bb, 1 }, slots * 2 * bb,
+           [](int64_t i) { return (float)((i * 2654435761u >> 11) & 0xff); })
+     .dense(RAD_U8, { blocks, bb }, [](int64_t) { return (float)0xEE; }, true)
+     .dense(RAD_I32, { 2, 5 }, [](int64_t i) {
+         const int64_t v[10] = { 10, 11, 12, 13, 14,  5, 6, 7, 8, 9 };
+         return (float)v[i];
+     })
+     .dense(RAD_I64, { 1 }, [](int64_t) { return 7.0f; }, true)
+     .dense(RAD_I32, { 2, 5 }, [](int64_t i) {
+         const int64_t v[10] = { 3, 0, 6, -2, 3,  0, 0, 0, 0, 0 };
+         return (float)v[i];
+     }, true)
+     .dense(RAD_I64, { 1 }, [](int64_t) { return 1.0f; }, true)
+     .pi("M", 2).pi("topk", 4).pi("blocks", blocks).pi("seqs", 2).pi("block_bytes", bb);
+    h.expect(0, { 10, 11, 4, 12, 13,  5, -1, 6, 2, -1 });
+    hs.push_back(std::move(h));
+}
+
 /* ================================================================== the k5_v4 cache
  *
  * kv_dtype k5_v4 (RAD_KVQ_K5V4: int5 K, int4 V, f16 scales a group of 32, 20 * head_dim / 16 bytes
@@ -5356,6 +5387,7 @@ bool hand_cases(const Check& ck) {
     qsa_cases(hs);
     kv_cases(hs);
     kvx_cases(hs);
+    page_cache_cases(hs);
     k5_cases(hs);
     kvstream_cases(hs);
     encoder_cases(hs);

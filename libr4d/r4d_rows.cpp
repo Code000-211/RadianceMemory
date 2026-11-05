@@ -1491,6 +1491,10 @@ static const RadOperandSpec oQsaPage[] = {
     { "scratch", RAD_OPD_IN,    0 },
     /* One i64 on the card the pager adds its rewritten entries to; absent, nothing is counted. */
     { "paged",   RAD_OPD_INOUT, 1 },
+    /* The page cache (docs/OPS.md): [rows >= M, >= topk + 1] i32 slot tags of the scratch pages,
+     * this layer's plane, and one i64 the hits are added to. Absent, every cold entry is copied. */
+    { "tags",    RAD_OPD_INOUT, 1 },
+    { "hits",    RAD_OPD_INOUT, 1 },
 };
 
 /* `kv_transcode` (docs/OPS.md): rows of one KV layout re-encoded in another, a row one token's
@@ -3775,7 +3779,10 @@ static const RadOpSchema kSchemas[] = {
            "(its offset already folded in, row pitch = slot bytes), because a device kernel may "
            "not read the host offset table. `pool` is INOUT and only scratch blocks of cold "
            "entries are written. A device kernel cannot refuse: an entry whose slot or scratch id "
-           "is out of range is left as it was."),
+           "is out of range is left as it was. With `tags` (the page cache) a row's scratch pages "
+           "are tagged with the slot each holds: a cold entry whose slot a page of its row holds "
+           "is rewritten to it uncopied (counted in `hits`), the rest take the pages no hit took "
+           "in order (libref's plan, byte for byte), are copied and tagged."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "

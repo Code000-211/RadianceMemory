@@ -42,6 +42,24 @@ namespace {
 
 constexpr int kThreads = 128;
 
+// One fragment from a store slot into a pool block, by the whole workgroup (see the kernel below).
+__device__ inline void page_copy(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                                 int64_t block_bytes, int wide, int xf, int xt, uint32_t hd) {
+    if (xf >= 0) {
+        /* Expanding: a wave a row, every lane of it through the row's reductions. */
+        const int64_t rf = r4d_kvx::row_bytes(xf, hd), rt = r4d_kvx::row_bytes(xt, hd);
+        const uint32_t wv = threadIdx.x / 32u, lane = threadIdx.x % 32u;
+        for (int64_t r = wv; r < block_bytes / rt; r += kThreads / 32)
+            r4d_kvx::row(xf, xt, src + r * rf, dst + r * rt, hd, lane);
+    } else if (wide) {
+        /* Both planes, both pitches and the length are 16-byte multiples: one 16-byte move a lane. */
+        for (int64_t i = (int64_t)threadIdx.x; i < block_bytes / 16; i += kThreads)
+            ((uint4*)dst)[i] = ((const uint4*)src)[i];
+    } else {
+        for (int64_t i = (int64_t)threadIdx.x; i < block_bytes; i += kThreads) dst[i] = src[i];
+    }
+}
+
 __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
     int32_t* __restrict__ sel, const int32_t* __restrict__ scratch,
     const uint8_t* __restrict__ store, uint8_t* __restrict__ pool,
@@ -57,21 +75,8 @@ __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
     const int64_t pg = scratch[(size_t)m * sc_ld + j];
     if (slot >= slots || pg < 0 || pg >= blocks) return;
 
-    const uint8_t* src = store + (size_t)slot * slot_pitch;
-    uint8_t*       dst = pool  + (size_t)pg * pool_pitch;
-    if (xf >= 0) {
-        /* Expanding: a wave a row, every lane of it through the row's reductions. */
-        const int64_t rf = r4d_kvx::row_bytes(xf, hd), rt = r4d_kvx::row_bytes(xt, hd);
-        const uint32_t wv = threadIdx.x / 32u, lane = threadIdx.x % 32u;
-        for (int64_t r = wv; r < block_bytes / rt; r += kThreads / 32)
-            r4d_kvx::row(xf, xt, src + r * rf, dst + r * rt, hd, lane);
-    } else if (wide) {
-        /* Both planes, both pitches and the length are 16-byte multiples: one 16-byte move a lane. */
-        for (int64_t i = (int64_t)threadIdx.x; i < block_bytes / 16; i += kThreads)
-            ((uint4*)dst)[i] = ((const uint4*)src)[i];
-    } else {
-        for (int64_t i = (int64_t)threadIdx.x; i < block_bytes; i += kThreads) dst[i] = src[i];
-    }
+    page_copy(store + (size_t)slot * slot_pitch, pool + (size_t)pg * pool_pitch, block_bytes, wide,
+              xf, xt, hd);
     /* The entry is rewritten by one thread, and only after every thread of the workgroup has read
      * it: a wave that started after the rewrite would read a resident id and skip its share of
      * the copy (the waves of a workgroup are not scheduled together; the emulator runs them one
@@ -86,6 +91,143 @@ __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
     }
 }
 
+// ------------------------------------------------------------------ the page cache (`tags`)
+//
+// Two launches. The plan, a workgroup a row, decides every cold position's page as libref's plan
+// does and rewrites every cold entry of the row at once: a hit (some page of the row is tagged with
+// the entry's slot, the lowest such page) to that page, a miss (the k-th in position order) to the
+// k-th page no hit took (page order), whose tag becomes -(1 + slot): planned, not yet filled. The
+// fill, a workgroup a page, copies the fragment into each planned page and only then tags it
+// 1 + slot, so a page whose fill never ran is never a hit. A page's tag has one writer per launch
+// and every byte of a page one writer; the plan's only atomics are on its own LDS and the counters.
+//
+// The lookup is an LDS hash of the row's tags (open addressing, linear probing, 2 * kMaxW slots):
+// a key's slot is claimed by compare-and-swap and the page kept is the lowest (atomicMin), so the
+// answer does not depend on which thread inserted first. A row is at most kMaxW pages wide.
+//
+// Unlike libref the plan cannot refuse; a page whose scratch id is outside the pool is never
+// taken and a position whose slot is outside the store is left cold, so a bad table writes nothing
+// out of bounds, and a miss for which no page remains (only possible with such pages) stays cold.
+
+constexpr int kPlanThreads = 256;
+constexpr int kMaxW        = 1025;            // topk up to 1024
+constexpr int kHash        = 2048;            // a power of two >= 2 * kMaxW - 2
+constexpr int kChunk       = (kMaxW + kPlanThreads - 1) / kPlanThreads;
+
+__device__ inline uint32_t tag_hash(int32_t t) { return ((uint32_t)t * 2654435761u) >> 21; }
+
+// Exclusive prefix sum over the workgroup of one value a thread; `tot` gets the total.
+__device__ inline int scan_excl(int v, int* buf, int* tot) {
+    const int t = (int)threadIdx.x;
+    buf[t] = v;
+    __syncthreads();
+    for (int o = 1; o < kPlanThreads; o <<= 1) {
+        const int x = t >= o ? buf[t - o] : 0;
+        __syncthreads();
+        buf[t] += x;
+        __syncthreads();
+    }
+    const int incl = buf[t];
+    *tot = buf[kPlanThreads - 1];
+    __syncthreads();
+    return incl - v;
+}
+
+__global__ __launch_bounds__(kPlanThreads) void qsa_page_plan_kernel(
+    int32_t* __restrict__ sel, const int32_t* __restrict__ scratch, int32_t* __restrict__ tags,
+    int w, int64_t slots, int64_t blocks, int64_t sel_ld, int64_t sc_ld, int64_t tg_ld,
+    int64_t* __restrict__ paged, int64_t* __restrict__ hits) {
+    __shared__ int32_t hkey[kHash];
+    __shared__ int32_t hval[kHash];
+    __shared__ int32_t busy[kMaxW];   // page: taken by a hit, or unusable
+    __shared__ int32_t pick[kMaxW];   // position: its hit page, -2 a miss, -1 nothing to do
+    __shared__ int32_t freep[kMaxW];  // the free pages in order
+    __shared__ int32_t buf[kPlanThreads];
+    const int m = (int)blockIdx.x, t = (int)threadIdx.x;
+    int32_t* const so = sel + (size_t)m * sel_ld;
+    const int32_t* const sc = scratch + (size_t)m * sc_ld;
+    int32_t* const tg = tags + (size_t)m * tg_ld;
+
+    for (int h = t; h < kHash; h += kPlanThreads) { hkey[h] = 0; hval[h] = 0x7fffffff; }
+    __syncthreads();
+    for (int p = t; p < w; p += kPlanThreads) {
+        const int32_t pg = sc[p], k = tg[p];
+        const bool ok = pg >= 0 && pg < blocks;
+        busy[p] = ok ? 0 : 1;
+        if (!ok || k <= 0) continue;
+        for (uint32_t h = tag_hash(k);; h = (h + 1) & (kHash - 1)) {
+            const int32_t o = atomicCAS(&hkey[h], 0, k);
+            if (o == 0 || o == k) { atomicMin(&hval[h], p); break; }
+        }
+    }
+    __syncthreads();
+    for (int j = t; j < w; j += kPlanThreads) {
+        const int32_t e = so[j];
+        int32_t r = -1;
+        if (e <= -2 && -2 - (int64_t)e < slots) {
+            r = -2;
+            const int32_t k = -1 - e;
+            for (uint32_t h = tag_hash(k);; h = (h + 1) & (kHash - 1)) {
+                const int32_t x = hkey[h];
+                if (x == 0) break;
+                if (x == k) { r = hval[h]; busy[r] = 1; break; }
+            }
+        }
+        pick[j] = r;
+    }
+    __syncthreads();
+    // The k-th free page in page order, then the k-th miss in position order takes it: a thread
+    // owns a contiguous chunk of each, so one scan of its counts orders both.
+    const int c0 = t * kChunk, c1 = c0 + kChunk < w ? c0 + kChunk : w;
+    int nf = 0;
+    for (int p = c0; p < c1; ++p) nf += busy[p] == 0;
+    int n_free = 0;
+    int base = scan_excl(nf, buf, &n_free);
+    for (int p = c0; p < c1; ++p) if (busy[p] == 0) freep[base++] = p;
+    int nm = 0;
+    for (int j = c0; j < c1; ++j) nm += pick[j] == -2;
+    int n_miss = 0;
+    base = scan_excl(nm, buf, &n_miss);   // its barriers also publish freep
+    int rw = 0, hit = 0;
+    for (int j = c0; j < c1; ++j) {
+        const int32_t r = pick[j];
+        if (r >= 0) { so[j] = sc[r]; ++rw; ++hit; continue; }
+        if (r != -2) continue;
+        const int k = base++;
+        if (k >= n_free) continue;        // no page left: only with unusable pages; stays cold
+        const int p = freep[k];
+        tg[p] = so[j] + 1;                // -(1 + slot): planned, filled by the next launch
+        so[j] = sc[p];
+        ++rw;
+    }
+    int n_rw = 0, n_hit = 0;
+    (void)scan_excl(rw, buf, &n_rw);
+    (void)scan_excl(hit, buf, &n_hit);
+    if (t == 0) {
+        if (paged && n_rw) atomicAdd((unsigned long long*)paged, (unsigned long long)n_rw);
+        if (hits && n_hit) atomicAdd((unsigned long long*)hits, (unsigned long long)n_hit);
+    }
+}
+
+// A workgroup a page (p, m): a planned page (tag < 0) receives its slot's fragment, then its tag.
+__global__ __launch_bounds__(kThreads) void qsa_page_fill_kernel(
+    const int32_t* __restrict__ scratch, int32_t* __restrict__ tags,
+    const uint8_t* __restrict__ store, uint8_t* __restrict__ pool, int64_t block_bytes,
+    int64_t slots, int64_t blocks, int64_t sc_ld, int64_t tg_ld, int64_t slot_pitch,
+    int64_t pool_pitch, int wide, int xf, int xt, uint32_t hd) {
+    const int p = (int)blockIdx.x, m = (int)blockIdx.y;
+    int32_t* const to = tags + (size_t)m * tg_ld + p;
+    const int32_t k = *to;
+    if (k >= 0) return;
+    const int64_t slot = -1 - (int64_t)k;
+    const int64_t pg = scratch[(size_t)m * sc_ld + p];
+    if (slot >= slots || pg < 0 || pg >= blocks) return;
+    page_copy(store + (size_t)slot * slot_pitch, pool + (size_t)pg * pool_pitch, block_bytes, wide,
+              xf, xt, hd);
+    __syncthreads();                      // every thread read the tag before it changes
+    if (threadIdx.x == 0) *to = (int32_t)(slot + 1);
+}
+
 }  // namespace
 
 //   sel      [M][w]               i32 in place, `sel_ld` elements a row; w = topk + 1
@@ -95,11 +237,26 @@ __global__ __launch_bounds__(kThreads) void qsa_page_kernel(
 static int r4d_qsa_page_u8_emit(long sel, long scratch, long store, long pool, int M, int w,
                                long long bb, long long slots, long long blocks, long long sel_ld,
                                long long sc_ld, long long slot_pitch, long long pool_pitch,
-                               long paged, int xf, int xt, int hd, RadStream stream) {
+                               long paged, int xf, int xt, int hd, long tags, long long tg_ld,
+                               long hits, RadStream stream) {
     if (!sel || !scratch || !store || !pool) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || w <= 0 || bb <= 0 || slots <= 0 || blocks <= 0) return R4D_NO(RAD_E_SHAPE);
     const int wide = xf < 0 && ((((uintptr_t)store | (uintptr_t)pool) |
                        (uint64_t)(slot_pitch | pool_pitch | bb)) & 15u) == 0u;
+    if (tags) {
+        if (w > kMaxW) return R4D_NO(RAD_E_UNSUPPORTED);
+        const int st = R4D_EMIT(stream, qsa_page_plan_kernel, dim3((unsigned)M),
+                                dim3(kPlanThreads), 0, (int32_t*)sel, (const int32_t*)scratch,
+                                (int32_t*)tags, w, (int64_t)slots, (int64_t)blocks,
+                                (int64_t)sel_ld, (int64_t)sc_ld, (int64_t)tg_ld, (int64_t*)paged,
+                                (int64_t*)hits);
+        if (st != RAD_OK) return st;
+        return R4D_EMIT(stream, qsa_page_fill_kernel, dim3((unsigned)w, (unsigned)M),
+                        dim3(kThreads), 0, (const int32_t*)scratch, (int32_t*)tags,
+                        (const uint8_t*)store, (uint8_t*)pool, (int64_t)bb, (int64_t)slots,
+                        (int64_t)blocks, (int64_t)sc_ld, (int64_t)tg_ld, (int64_t)slot_pitch,
+                        (int64_t)pool_pitch, wide, xf, xt, (uint32_t)hd);
+    }
     return R4D_EMIT(stream, qsa_page_kernel, dim3((unsigned)w, (unsigned)M), dim3(kThreads), 0,
                     (int32_t*)sel, (const int32_t*)scratch, (const uint8_t*)store,
                     (uint8_t*)pool, w, (int64_t)bb, (int64_t)slots, (int64_t)blocks,
@@ -147,7 +304,8 @@ extern "C" int r4d_rad_kv_transcode(const RadArgs* a, RadStream stream) {
 
 // ============================================================== the plugin ABI entry point
 
-enum { QP_SEL = 0, QP_STORE = 1, QP_POOL = 2, QP_SCRATCH = 3, QP_PAGED = 4 };
+enum { QP_SEL = 0, QP_STORE = 1, QP_POOL = 2, QP_SCRATCH = 3, QP_PAGED = 4, QP_TAGS = 5,
+       QP_HITS = 6 };
 
 extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream) {
     const RadTensor* se = r4d_opt(a, QP_SEL);
@@ -201,7 +359,19 @@ extern "C" int r4d_rad_qsa_page(const RadArgs* a, RadStream stream) {
     /* The optional counter: one i64 the kernel adds to. */
     const RadTensor* pg = r4d_opt(a, QP_PAGED);
     if (pg && pg->dtype != RAD_I64) return R4D_NO(RAD_E_DTYPE);
+    /* The page cache: this layer's plane of slot tags, [rows >= M, >= w], and its hit counter. */
+    const RadTensor* tg = r4d_opt(a, QP_TAGS);
+    const RadTensor* ht = r4d_opt(a, QP_HITS);
+    long long tp = 0;
+    if (tg) {
+        if (tg->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+        if (tg->rank != 2 || tg->shape[0] < M || tg->shape[1] < w) return R4D_NO(RAD_E_SHAPE);
+        tp = r4d_row_pitch(tg);
+        if (tp < 0) return R4D_NO(RAD_E_STRIDE);
+    }
+    if (ht && ht->dtype != RAD_I64) return R4D_NO(RAD_E_DTYPE);
     return r4d_qsa_page_u8_emit(r4d_addr(se), r4d_addr(sc), r4d_addr(st), r4d_addr(pl), (int)M,
                                 (int)w, bb, st->shape[0], pl->shape[0], sp, cp, st->stride[0],
-                                pitch, r4d_addr(pg), xf, xt, (int)hd, stream);
+                                pitch, r4d_addr(pg), xf, xt, (int)hd, tg ? r4d_addr(tg) : 0, tp,
+                                tg ? r4d_addr(ht) : 0, stream);
 }

@@ -218,6 +218,7 @@ void TierExec::close() {
     release_device();
     if (paged_dev_)  { (void)rad_dev_set(device_); rad_dev_free(paged_dev_, RAD_MEM_DEVICE); paged_dev_ = nullptr; }
     if (paged_host_) { rad_dev_free(paged_host_, RAD_MEM_HOST_PINNED); paged_host_ = nullptr; }
+    if (tags_dev_)   { (void)rad_dev_set(device_); rad_dev_free(tags_dev_, RAD_MEM_DEVICE); tags_dev_ = nullptr; }
     copy_out_ = false;
     gi_.clear();
     order_.clear();
@@ -725,13 +726,14 @@ bool TierExec::moves_landed() const {
 int64_t* TierExec::paged_counter() {
     if (paged_dev_) return paged_dev_;
     if (rad_dev_set(device_) != RAD_OK) return nullptr;
-    paged_dev_  = (int64_t*)rad_dev_alloc(sizeof(int64_t), RAD_MEM_DEVICE);
-    paged_host_ = (int64_t*)rad_dev_alloc(sizeof(int64_t), RAD_MEM_HOST_PINNED);
+    /* [0] the entries the pager rewrote, [1] those of them the page cache served. */
+    paged_dev_  = (int64_t*)rad_dev_alloc(2 * sizeof(int64_t), RAD_MEM_DEVICE);
+    paged_host_ = (int64_t*)rad_dev_alloc(2 * sizeof(int64_t), RAD_MEM_HOST_PINNED);
     /* Zeroed on a stream of its own, once: no stream exists yet (device_init is lazy), and the
      * default stream is not valid on every backend. */
     RadStream zs = nullptr;
     const bool zeroed = paged_dev_ && paged_host_ && rad_stream_create(&zs, 0) == RAD_OK &&
-                        rad_memset_async(paged_dev_, 0, sizeof(int64_t), zs) == RAD_OK &&
+                        rad_memset_async(paged_dev_, 0, 2 * sizeof(int64_t), zs) == RAD_OK &&
                         rad_stream_sync(zs) == RAD_OK;
     if (zs) rad_stream_destroy(zs);
     if (!zeroed) {
@@ -752,6 +754,29 @@ int64_t TierExec::paged_in() {
         rad_stream_sync(stream_) != RAD_OK)
         return 0;
     return *paged_host_;
+}
+
+int64_t TierExec::hits_in() {
+    if (!paged_dev_ || !paged_host_ || rad_dev_set(device_) != RAD_OK || !stream_) return 0;
+    paged_host_[1] = 0;
+    if (rad_memcpy_async(paged_host_ + 1, paged_dev_ + 1, sizeof(int64_t), stream_) != RAD_OK ||
+        rad_stream_sync(stream_) != RAD_OK)
+        return 0;
+    return paged_host_[1];
+}
+
+int32_t* TierExec::page_tags(int64_t bytes) {
+    if (tags_dev_ || bytes <= 0) return tags_dev_;
+    if (rad_dev_set(device_) != RAD_OK) return nullptr;
+    tags_dev_ = (int32_t*)rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+    /* Zeroed as the counter is: tag 0 is "no slot". */
+    RadStream zs = nullptr;
+    const bool zeroed = tags_dev_ && rad_stream_create(&zs, 0) == RAD_OK &&
+                        rad_memset_async(tags_dev_, 0, bytes, zs) == RAD_OK &&
+                        rad_stream_sync(zs) == RAD_OK;
+    if (zs) rad_stream_destroy(zs);
+    if (!zeroed && tags_dev_) { rad_dev_free(tags_dev_, RAD_MEM_DEVICE); tags_dev_ = nullptr; }
+    return tags_dev_;
 }
 
 

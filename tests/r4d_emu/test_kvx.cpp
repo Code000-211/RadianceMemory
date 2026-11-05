@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <dlfcn.h>
 #include <random>
 #include <string>
@@ -219,6 +220,125 @@ void check_page(RadLaunchFn ref, RadLaunchFn ref_page, std::mt19937& rng, const 
     }
 }
 
+/* The page cache (`tags`): a run of launches over Flash-Next's selection width (topk 512, 513
+ * pages a row), two decode rows, whose cold slots drift from launch to launch, the emulated plan
+ * and fill against libref's plan after every launch -- selection, pool, tags, both counters -- and
+ * every cold position's page holding its slot's bytes, as the uncached pager's would. Then the
+ * widest row the plan serves (topk 1024), and one past it refused. With `xs` an expanding layer:
+ * one launch fills, the same selection again is all hits. */
+void check_page_cache(RadLaunchFn ref_page, std::mt19937& rng, int64_t topk, int launches,
+                      const char* xs = nullptr, const char* xp = nullptr, int64_t rows = 4) {
+    const int64_t M = 2, w = topk + 1, res = 16, hd = 256;
+    const int64_t slots = xs ? 6 : 3 * w;
+    const int64_t bb = xs ? rows * row_of(xp, hd) : 64, sbb = xs ? rows * row_of(xs, hd) : bb;
+    const int64_t blocks = res + M * w;
+    /* Every byte drawn: the codec's answers on any bytes are defined (see above). */
+    std::vector<uint8_t> store((size_t)(slots * sbb));
+    for (auto& b : store) b = (uint8_t)rng();
+    std::vector<int32_t> scr((size_t)(M * w));
+    for (int64_t i = 0; i < M * w; ++i) scr[(size_t)i] = (int32_t)(res + i);
+    std::shuffle(scr.begin(), scr.end(), rng);
+    std::vector<uint8_t> pw((size_t)(blocks * bb), 0xEE), pe = pw;
+    std::vector<int32_t> tw((size_t)(M * w), 0), te = tw;
+    int64_t cw[2] = { 3, 9 }, ce[2] = { 3, 9 };
+    std::vector<std::vector<int32_t>> prev((size_t)M);
+    std::vector<int32_t> sv;
+    auto go = [&](RadLaunchFn fn, std::vector<int32_t>& sel, std::vector<uint8_t>& pool,
+                  std::vector<int32_t>& tags, int64_t* ctr, int64_t mw) {
+        RadTensor t[7] = {
+            plane(sel.data(), RAD_I32, M, mw, mw),
+            plane(store.data(), RAD_U8, slots, sbb, sbb),
+            plane(pool.data(), RAD_U8, blocks, bb, bb),
+            plane(scr.data(), RAD_I32, M, mw, mw),
+            {}, plane(tags.data(), RAD_I32, M, mw, mw), {} };
+        for (int k : { 4, 6 }) {
+            t[k].data = ctr + (k == 6); t[k].dtype = RAD_I64; t[k].rank = 1; t[k].shape[0] = 1; t[k].stride[0] = 1;
+        }
+        RadParam p[8]{};
+        p[0] = { "M", RAD_P_INT, M, 0, nullptr, 0.0 };
+        p[1] = { "topk", RAD_P_INT, mw - 1, 0, nullptr, 0.0 };
+        p[2] = { "blocks", RAD_P_INT, blocks, 0, nullptr, 0.0 };
+        p[3] = { "seqs", RAD_P_INT, M, 0, nullptr, 0.0 };
+        p[4] = { "block_bytes", RAD_P_INT, bb, 0, nullptr, 0.0 };
+        p[5] = { "store_layout", RAD_P_STR, 0, 0, xs, 0.0 };
+        p[6] = { "pool_layout", RAD_P_STR, 0, 0, xp, 0.0 };
+        p[7] = { "head_dim", RAD_P_INT, hd, 0, nullptr, 0.0 };
+        RadArgs a{};
+        a.t = t; a.n_t = 7; a.p = p; a.n_p = xs ? 8 : 5;
+        return fn(&a, nullptr);
+    };
+    int64_t hits_floor = 0;
+    for (int l = 0; l < launches; ++l) {
+        if (!xs || l == 0) {
+            sv.clear();
+            for (int64_t m = 0; m < M; ++m) {
+                std::vector<int32_t> cold;
+                for (int32_t s : prev[(size_t)m]) if (rng() % 8) cold.push_back(s);
+                const int64_t n_cold = xs ? 4 : w * 3 / 4;
+                while ((int64_t)cold.size() < n_cold) {
+                    const int32_t s = (int32_t)(rng() % (uint32_t)slots);
+                    if (std::find(cold.begin(), cold.end(), s) == cold.end()) cold.push_back(s);
+                }
+                cold.resize((size_t)n_cold);
+                for (int32_t s : cold)
+                    hits_floor += std::find(prev[(size_t)m].begin(), prev[(size_t)m].end(), s) !=
+                                  prev[(size_t)m].end();
+                std::vector<int32_t> row;
+                for (int32_t s : cold) row.push_back(rad_kv_cold_entry(s));
+                while ((int64_t)row.size() < w) row.push_back(rng() % 3 ? (int32_t)(rng() % res) : -1);
+                std::shuffle(row.begin(), row.end(), rng);
+                sv.insert(sv.end(), row.begin(), row.end());
+                prev[(size_t)m] = cold;
+            }
+        } else {
+            for (int64_t m = 0; m < M; ++m) hits_floor += (int64_t)prev[(size_t)m].size();
+        }
+        std::vector<int32_t> sw = sv, se = sv;
+        const int rr = go(ref_page, sw, pw, tw, cw, w), re = go(r4d_rad_qsa_page, se, pe, te, ce, w);
+        const std::string name = std::string("qsa_page with tags, topk ") + std::to_string(topk) +
+                                 (xs ? std::string(", ") + xs + " -> " + xp : std::string()) +
+                                 ", launch " + std::to_string(l);
+        if (rr != RAD_OK || re != RAD_OK) {
+            fail(name + ": libref " + std::to_string(rr) + ", emulated " + std::to_string(re));
+            return;
+        }
+        int64_t diff = 0, wrong = 0;
+        for (size_t i = 0; i < pw.size(); ++i) diff += pw[i] != pe[i];
+        for (size_t i = 0; i < sv.size(); ++i) {
+            if (sv[i] > -2) continue;
+            const int64_t slot = -2 - sv[i];
+            /* An expanding page is libref's expansion (the pool compare above); a plain one is
+             * the slot's bytes, which is what the uncached pager would have put in front of the
+             * attention. */
+            if (!xs && (se[i] < 0 || std::memcmp(pe.data() + (int64_t)se[i] * bb,
+                                                 store.data() + slot * sbb, (size_t)bb)))
+                ++wrong;
+        }
+        const bool same = sw == se && tw == te && cw[0] == ce[0] && cw[1] == ce[1];
+        if (diff) fail(name + ": " + std::to_string(diff) + " pool bytes differ from libref");
+        if (!same) fail(name + ": the selection, tags or counters differ from libref's");
+        if (wrong) fail(name + ": " + std::to_string(wrong) + " cold positions name a page without their slot's bytes");
+        if (l + 1 == launches) {
+            if (ce[1] - 9 < hits_floor)
+                fail(name + ": " + std::to_string(ce[1] - 9) + " hits, fewer than the " +
+                     std::to_string(hits_floor) + " slots shared with the previous launch");
+            std::printf("  %-58s %s (%lld of %lld cold entries hit)\n", name.c_str(),
+                        diff || !same || wrong ? "DIFFERS" : "libref's bytes",
+                        (long long)(ce[1] - 9), (long long)(ce[0] - 3));
+        }
+    }
+    if (xs || topk != 1024) return;
+    /* One page past the plan's LDS: refused, nothing written. */
+    std::vector<int32_t> big((size_t)(M * (w + 1)), -1), bt = big, bs((size_t)(M * (w + 1)), 0);
+    big[0] = rad_kv_cold_entry(0);
+    std::vector<int32_t> keep = scr;
+    scr.assign((size_t)(M * (w + 1)), (int32_t)res);
+    std::vector<uint8_t> pk = pe;
+    if (go(r4d_rad_qsa_page, big, pe, bs, ce, w + 1) == RAD_OK) fail("a row of 1026 pages was not refused");
+    if (pe != pk || big[0] != rad_kv_cold_entry(0)) fail("the refused row wrote");
+    scr = keep;
+}
+
 }  // namespace
 
 int main() {
@@ -256,6 +376,10 @@ int main() {
     for (const char* res : kResident)
         for (const char* dem : kDemote)
             for (int64_t rows : { 4, 8 }) check_page(ref, ref_page, rng, res, dem, rows);
+    check_page_cache(ref_page, rng, 512, 6);
+    check_page_cache(ref_page, rng, 1024, 2);
+    for (const char* res : kResident)
+        for (const char* dem : kDemote) check_page_cache(ref_page, rng, 7, 2, dem, res, 8);
     /* Refused, as libref refuses: the same layout twice, a head_dim off the lane map. */
     {
         std::vector<uint8_t> x(4096), o(4096);

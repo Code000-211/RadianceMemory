@@ -3768,6 +3768,21 @@ int Engine::configure_kv() {
                     return rc != RAD_OK ? rc : RAD_E_NOMEM;
                 }
                 r->kv.set_residency_paged(paged);
+                /* The page cache (docs/OPS.md `qsa_page`, `tags`): a scratch page keeps the block it
+                 * last received, so a step selecting it again copies nothing. Without its memory
+                 * the pager copies every cold entry, as before; RADIANCE_QSA_PAGE_CACHE=0 asks for
+                 * that (the A/B the cache's speed is measured against). */
+                static const char* pc = std::getenv("RADIANCE_QSA_PAGE_CACHE");
+                const int64_t tb = r->kv.residency_tags_bytes();
+                int32_t* tags = (pc && !std::strcmp(pc, "0")) ? nullptr : r->resx.page_tags(tb);
+                r->kv.set_residency_hits(r->resx.hits_counter());
+                r->kv.set_residency_tags(tags, tags ? tb : 0);
+                if (&r == &ranks_[0])
+                    RAD_INFO("kv residency: page cache %s (%s of VRAM for the slot tags of %lld "
+                             "scratch rows)",
+                             tags ? "on" : (pc && !std::strcmp(pc, "0") ? "off (RADIANCE_QSA_PAGE_CACHE=0)"
+                                                                      : "off (no memory)"),
+                             humanb(tags ? tb : 0).c_str(), (long long)r->kv.scratch_rows());
             }
             RAD_TRY(rad_dev_set(ranks_[0]->device));
             RAD_INFO("kv residency: window enforced -- after a step, blocks outside the sink and "

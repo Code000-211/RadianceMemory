@@ -422,7 +422,8 @@ static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("block
                                          P_INT("block_bytes"), P_STRO("store_layout"),
                                          P_STRO("pool_layout"), P_INTO("head_dim") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
-                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged"),
+                                           INOUT_O("tags"), INOUT_O("hits") };
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
                                              P_STR("to") };
 static const RadOperandSpec oKvTranscode[] = { OPD("x"), OUT("out") };
@@ -1183,7 +1184,8 @@ static const RadOpSchema kSchemas[] = {
   "rewrites each cold entry (<= -2) of the selection to its scratch page after copying the block's "
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; resident and "
   "empty entries pass through. A byte copy, libref's contract exactly; with store_layout and "
-  "pool_layout the fragment's rows are expanded through kv_transcode's codec." },
+  "pool_layout the fragment's rows are expanded through kv_transcode's codec; with `tags` the "
+  "scratch pages are a slot-tagged cache, hits rewritten uncopied (libref's plan)." },
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "each row of x, one token's K and V head in layout `from`, decoded exactly and re-encoded in "
   "layout `to` as that layout's store encodes; libref's bytes." },

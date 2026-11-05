@@ -120,6 +120,7 @@ struct SchedMetrics {
     /* Cold entries the pager rewrote, summed over QSA layers and decode rows (rank 0's counter on
      * the card, read back per poll). Not per session: the card cannot attribute a row. */
     int64_t res_paged_in = 0;
+    int64_t res_paged_hits = 0;
     /* Per session (= request id), empty until something moved; see SessionStat. */
     std::vector<SeqResidency> res_seqs;
     /* Admissions whose attention hit was cut to nothing: no snapshot at or below it (recurrent

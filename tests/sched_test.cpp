@@ -5038,6 +5038,77 @@ TEST(a_residency_group_s_batch_carries_the_store_its_layer_offsets_and_scratch_p
     bb.fini();
 }
 
+/* The page cache's operands ride in the batch with the pager's (RadKVGroupBatch::residency_tags,
+ * _tags_rows, _hits), and the build clears the tags, on the rank's stream before the step, whenever
+ * the manager's residency epoch moved since the last clear (a store slot freed may hold another
+ * block by this step): once at the first build, not again while the epoch holds, again after it
+ * moves. A tag the build did not clear is the pager's to keep. */
+TEST(a_residency_group_s_batch_carries_the_page_cache_and_clears_it_when_a_slot_was_freed) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    const int64_t pitch = 5, rows = f.cfg.max_seqs;
+    static const int64_t off[] = { -1, 4096, 6144 };
+    std::vector<int32_t> scratch((size_t)(rows * pitch), 0);
+    std::vector<int32_t> tags((size_t)(2 * rows * pitch), 7);
+    int64_t counters[2] = { 0, 0 };
+    f.kv.pager_group = 0;
+    f.kv.pager_pitch = pitch;
+    f.kv.pager_view.store = reinterpret_cast<void*>(uintptr_t(0x7f0000000000));
+    f.kv.pager_view.slot_bytes = 8192;
+    f.kv.pager_view.layer_off = off;
+    f.kv.pager_view.scratch = scratch.data();
+    f.kv.pager_view.paged = &counters[0];
+    f.kv.pager_view.tags = tags.data();
+    f.kv.pager_view.tags_rows = rows;
+    f.kv.pager_view.tags_bytes = (int64_t)(tags.size() * sizeof(int32_t));
+    f.kv.pager_view.hits = &counters[1];
+    f.kv.pager_view.epoch = 3;
+
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+        kvg.g[i].scratch_pitch = f.kv.scratch_pitch((int32_t)i);
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 32));
+    auto zeros = [&]() { int64_t n = 0; for (int32_t t : tags) n += t == 0; return n; };
+    /* epoch per round: 3 (first build: cleared), 3 (kept), 4 (cleared), 4 (kept) */
+    const int64_t epoch[] = { 3, 3, 4, 4 };
+    const bool cleared[] = { true, false, true, false };
+    for (int round = 0; round < 4; ++round) {
+        std::fill(tags.begin(), tags.end(), 7);
+        f.kv.pager_view.epoch = epoch[round];
+        StepPlan p;
+        StepEntry e;
+        e.seq = 1;
+        e.card = 0;
+        e.n_tokens = 1;
+        e.ctx_len = 31;
+        p.e.push_back(e);
+        p.n_tok = 1;
+        const RadBatch* b = bb.build(p, f.kv, round);
+        CHECK(b != nullptr);
+        if (!b) break;
+        const RadKVGroupBatch& g = b->kv[0];
+        CHECK(g.residency_tags == tags.data());
+        CHECK_EQ(g.residency_tags_rows, rows);
+        CHECK(g.residency_hits == &counters[1]);
+        CHECK_EQ(zeros(), cleared[round] ? (int64_t)tags.size() : 0);
+        const RadKVGroupBatch& none = b->kv[1];
+        CHECK(none.residency_tags == nullptr);
+        CHECK_EQ(none.residency_tags_rows, (int64_t)0);
+        CHECK(none.residency_hits == nullptr);
+    }
+    bb.fini();
+}
+
 /* ------------------------------------------------------------------ window residency */
 namespace {
 /* The engine's half of the sweep, recorded: what the scheduler asked to move in which direction,

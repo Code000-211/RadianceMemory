@@ -850,6 +850,8 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
 
         /* Each rank's own view of the group's ring and mirror (kvstream_step_view). */
         const RadKVStream* sv = kv.stream_view((int32_t)gi);
+        if (tags_epoch_.size() < s.groups.size()) tags_epoch_.resize(s.groups.size());
+        if (tags_epoch_[gi].size() != ranks_.size()) tags_epoch_[gi].assign(ranks_.size(), -1);
         for (size_t r = 0; r < ranks_.size(); ++r) {
             void* base = s.dev[r];
             RadKVGroupBatch& b = o.kv[r][gi];
@@ -878,6 +880,21 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 b.residency_scratch_pitch = g.scratch_pitch;
                 b.residency_paged         = pg.paged;
                 b.residency_slots         = pg.slots;
+                b.residency_tags          = pg.tags;
+                b.residency_tags_rows     = pg.tags_rows;
+                b.residency_hits          = pg.hits;
+                /* A slot freed since the last build may hold another block by this step: every
+                 * tag goes, on the compute stream before this step's pagers and after every
+                 * earlier step's (RadKVGroupBatch::residency_tags). */
+                if (pg.tags && pg.epoch != tags_epoch_[gi][r]) {
+                    if (rad_memset_async(pg.tags, 0, pg.tags_bytes, ranks_[r].stream) < 0) {
+                        RAD_ERR("step batch: rank %zu could not clear the page cache", r);
+                        b.residency_tags = nullptr;
+                        b.residency_tags_rows = 0;
+                    } else {
+                        tags_epoch_[gi][r] = pg.epoch;
+                    }
+                }
             } else {
                 b.residency_store = nullptr;
                 b.residency_slot_bytes = 0;
@@ -886,6 +903,9 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 b.residency_scratch_pitch = 0;
                 b.residency_paged = nullptr;
                 b.residency_slots = 0;
+                b.residency_tags = nullptr;
+                b.residency_tags_rows = 0;
+                b.residency_hits = nullptr;
             }
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }

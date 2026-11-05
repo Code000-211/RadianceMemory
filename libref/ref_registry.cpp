@@ -531,7 +531,8 @@ static const RadParamSpec pQsaPage[] = { P_INT("M"), P_INT("topk"), P_INT("block
                                          P_INT("block_bytes"), P_STRO("store_layout"),
                                          P_STRO("pool_layout"), P_INTO("head_dim") };
 static const RadOperandSpec oQsaPage[] = { INOUT("sel"), OPD("store"),
-                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged") };
+                                           INOUT("pool"), OPD("scratch"), INOUT_O("paged"),
+                                           INOUT_O("tags"), INOUT_O("hits") };
 /* The residency store's demote layout (RAD_KVQ_DEMOTE): rows of one KV layout re-encoded in
  * another, `x` [M, row(from)] and `out` [M, row(to)] bytes, a row one token's head. */
 static const RadParamSpec pKvTranscode[] = { P_INT("M"), P_INT("head_dim"), P_STR("from"),
@@ -1574,7 +1575,10 @@ static const RadOpSchema kSchemas[] = {
   "fragment (block_bytes at the start of this layer's view of slot -2 - entry) into that pool block; "
   "resident (>= 0) and empty (-1) entries pass through. `pool` is INOUT: only the scratch blocks "
   "of cold entries are written. With store_layout and pool_layout the fragment's rows are "
-  "expanded from the store's layout into the pool's (kv_transcode's codec) instead of copied." },
+  "expanded from the store's layout into the pool's (kv_transcode's codec) instead of copied. "
+  "With `tags` the row's scratch pages are a cache tagged by slot: a cold entry whose slot a page "
+  "of its row already holds takes that page uncopied (a hit, counted in `hits`), the others take "
+  "the pages no hit took in order and are copied and tagged." },
 { "kv_transcode", ARR(pKvTranscode), ARR(oKvTranscode),
   "Each row of x, one token's K and V head in layout `from` (fp8, k4h_v4, k4h_v2h, i8h), decoded "
   "exactly and re-encoded in layout `to` as that layout's store encodes, into the row of out. "

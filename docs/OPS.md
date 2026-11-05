@@ -3121,7 +3121,7 @@ order, not a slow one.
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` `ranks`/opt `rank`/opt | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
-| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` `store_layout`/opt `pool_layout`/opt `head_dim`/opt | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout? |
+| `qsa_page` | `M`(range) `topk` `blocks` `seqs` `block_bytes` `store_layout`/opt `pool_layout`/opt `head_dim`/opt | `sel`:inout, `store`, `pool`:inout, `scratch`, `paged`:inout?, `tags`:inout?, `hits`:inout? |
 
 `qsa_page` is the sixth op of the family and runs only when the attention group declares a
 residency window and the store is open (see "`qsa_page`" below).
@@ -3268,6 +3268,27 @@ the store, a scratch id outside the pool, or two cold positions sharing a scratc
   (`RAD_E_INVAL`, `RAD_E_SHAPE`) for one without the other, an unknown or repeated word, or a
   `block_bytes` that is not whole rows of the pool's layout. libr4d's four waves split a
   fragment's rows; `r4d_emu_kvx` and r4d_selftest hold it to libref.
+- **The page cache** (`tags`, `hits`; ABI 46, `RadKVGroupBatch::residency_tags`): with `tags`
+  `[R >= M, >= topk + 1]` i32, in place, a row's scratch pages are a cache that outlives the step.
+  `scratch[m, p]` is page `p` of row `m`, whichever position it serves, and `tags[m, p]` is
+  `1 + slot` for the slot whose fragment that page holds, `0` (or negative) for none. Per row, in
+  order: a cold position whose slot some page of the row is tagged with is a *hit* and takes the
+  lowest such page, with **no copy**; the remaining cold positions, in position order, are *misses*
+  and take the row's pages no hit took, in page order (the k-th miss the k-th free page), are
+  copied as above and tagged. Every cold entry still ends as a page holding its slot's fragment
+  (expanded, on a tiered layer), so the attention reads the bytes it would without the cache; only
+  which page, and whether this launch copied it, differ. `paged` still counts every rewritten
+  entry; `hits` (one i64, optional) adds the hits. The reference refuses, before any write, a slot
+  outside the store, or a taken page whose id is outside the pool or equal to another taken
+  page's. **The caller owns invalidation**: a tag names a slot, so once a slot may hold another
+  block (it was freed) every tag must be cleared before the next launch (the engine zeroes the
+  planes on the compute stream, `BatchBuilder`, whenever `KVManager::residency_epoch` moved).
+  libr4d runs it as two launches: the plan (a workgroup a row: an LDS hash of the row's tags, two
+  prefix scans; it rewrites every cold entry and marks a miss's page `-(1 + slot)`) and the fill (a
+  workgroup a page: a marked page receives its fragment, then its tag `1 + slot`, so a page whose
+  fill never ran is never a hit). A row is at most 1025 pages wide there (`topk <= 1024`; wider is
+  refused, `RAD_E_UNSUPPORTED`); an id outside the pool is never taken and a slot outside the
+  store is left cold, as the kernel cannot refuse.
 
 ### `qsa_select`
 

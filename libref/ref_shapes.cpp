@@ -1813,6 +1813,8 @@ int ref_qsa_page_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx_dt((uint32_t)RAD_U8, { pool + blocks, bb }, 256, -1, 0);  /* pool */
     o.t_idx({ M, topk + 1 }, pool, -1, 0);                        /* scratch */
     o.t_idx_dt((uint32_t)RAD_I64, { 1 }, 1, -1, 0);               /* paged: the counter, starts at 0 */
+    o.t_idx({ M, topk + 1 }, 1, -1, 0);                           /* tags: the page cache, empty */
+    o.t_idx_dt((uint32_t)RAD_I64, { 1 }, 1, -1, 0);               /* hits: its counter */
     return o.finish("qsa_page", operand, out);
 }
 

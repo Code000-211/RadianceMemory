@@ -78,6 +78,7 @@ struct IKVManager {
         int64_t link_bytes = 0;      /* bytes over the link, both directions */
         int64_t scratch_bytes = 0;   /* VRAM the pager's scratch pages hold (reserved, not traffic) */
         int64_t paged_in = 0;        /* cold entries the pager rewrote, from the card's counter */
+        int64_t paged_hits = 0;      /* of them, served by the page cache without a copy */
     };
     virtual Residency residency() const { return Residency{}; }
     /* The same per request id, which is the session id; an overlapping view (see SessionStat). */
@@ -126,6 +127,13 @@ struct IKVManager {
         const int64_t* layer_off = nullptr;
         const int32_t* scratch = nullptr;
         int64_t*       paged = nullptr;   /* the pager's counter on this rank's card, or null */
+        /* The page cache (RadKVGroupBatch::residency_tags): this rank's planes of the group, their
+         * rows and bytes, its hit counter, and the leader's residency_epoch(). */
+        int32_t*       tags = nullptr;
+        int64_t        tags_rows = 0;
+        int64_t        tags_bytes = 0;
+        int64_t*       hits = nullptr;
+        int64_t        epoch = 0;
     };
     virtual Pager   pager(int32_t group, int rank) const { (void)group; (void)rank; return {}; }
     virtual int64_t scratch_pitch(int32_t group) const { (void)group; return 0; }
@@ -439,6 +447,7 @@ struct KVBinding final : IKVManager {
         r.link_bytes = st.demoted_bytes + st.promoted_bytes;
         r.scratch_bytes = m->residency_scratch_bytes();
         if (paged_read) r.paged_in = paged_read();
+        if (hits_read) r.paged_hits = hits_read();
         return r;
     }
     std::vector<SeqResidency> residency_seqs() const override {
@@ -452,6 +461,7 @@ struct KVBinding final : IKVManager {
     /* Reads the pager's counter back from the card (TierExec::paged_in); set by the engine when
      * the pager is live. Called per statistics poll, never per step. */
     std::function<int64_t()> paged_read;
+    std::function<int64_t()> hits_read;   /* the page cache's hits (TierExec::hits_in), the same way */
     Pager pager(int32_t g, int rank) const override {
         const KV* k = rank > 0 && (size_t)rank <= peers.size() ? peers[(size_t)rank - 1] : m;
         Pager p;
@@ -463,6 +473,11 @@ struct KVBinding final : IKVManager {
         p.layer_off  = k->residency_layer_off(g).data();
         p.scratch    = k->scratch_table(g).data();
         p.paged      = k->residency_paged();
+        p.tags       = k->residency_tags(g);
+        p.tags_rows  = p.tags ? k->scratch_rows() : 0;
+        p.tags_bytes = p.tags ? k->residency_tags_bytes(g) : 0;
+        p.hits       = k->residency_hits();
+        p.epoch      = m->residency_epoch();
         return p;
     }
     int64_t scratch_pitch(int32_t g) const override {

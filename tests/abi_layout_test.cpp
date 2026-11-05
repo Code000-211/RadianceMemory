@@ -8,7 +8,7 @@
  *
  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
  * struct's listed fields account for its size, so the list in rad_abi_layout_rows.h is complete; and
- * the layout agrees with the table below, taken at RAD_ABI_VERSION 45 and RAD_FORMAT_VER 2. Under
+ * the layout agrees with the table below, taken at RAD_ABI_VERSION 46 and RAD_FORMAT_VER 2. Under
  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
  * headers: nothing else states the layout. When it disagrees the test prints the live table.
@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 45 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 45, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 46 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 46, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };

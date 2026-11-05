@@ -74,6 +74,7 @@ read `--prefill` depths of 4000 and 16000 rather than the decode categories.
 |---|---|---|
 | `kv_residency.demoted` / `host_bytes` | `/stats` | VRAM the window gave back |
 | `kv_residency.promoted` / `misses` | `/stats` | blocks a dense step promoted whole: the link traffic that pays for it |
+| `kv_residency.paged_hits` | `/stats` | of `paged_in`, the entries the page cache served without a copy; `paged_hits / paged_in` is its hit rate (0 with `RADIANCE_QSA_PAGE_CACHE=0`) |
 | `kv_residency.paged_in` | `/stats` | cold entries the pager rewrote for decode selections (divide by QSA layers for blocks); must be non-zero in the identity run |
 | TTFT and decode tok/s, residency on vs off | BetterBench | whether the traffic is cheaper than the VRAM it bought |
 | `kv_util` | `/stats` | with the window on, an admitted session should fit at a higher `--max-num-seqs` |

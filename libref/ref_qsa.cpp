@@ -436,7 +436,20 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
  *
  * With `store_layout` and `pool_layout` (RAD_KVQ_DEMOTE, a tiered layer) the copy expands: the
  * slot holds the fragment's rows in the demote layout and each is decoded and re-encoded into the
- * pool's layout (kv_transcode's codec), so the attention reads the one layout it was declared at. */
+ * pool's layout (kv_transcode's codec), so the attention reads the one layout it was declared at.
+ *
+ * With the sixth operand `tags` ([R >= M, >= w] i32, in place) the scratch pages are a cache:
+ * scratch[m][p] is page p of row m, whatever position it served, and tags[m][p] is 1 + the slot
+ * whose fragment that page holds (0 or negative: none). Per row, in order:
+ *   - a hit: a cold position whose slot some page of the row is tagged with takes the lowest such
+ *     page, and nothing is copied;
+ *   - a miss: the remaining cold positions, in position order, take the row's pages no hit took, in
+ *     page order (the k-th miss the k-th free page); the fragment is copied in and the page tagged.
+ * Every cold entry ends as a page holding its slot's bytes, as without tags, so what the attention
+ * reads is the same: only which page, and whether it was copied this call, differ. The counter
+ * still counts every rewritten entry; the optional seventh operand `hits` (one i64) adds the hits.
+ * Refused before any write, as without tags: a slot outside the store, or a page a cold position
+ * takes whose scratch id is outside the pool or equal to another taken page's. */
 int ref_qsa_page(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *sel = &a->t[0], *st = &a->t[1], *pl = &a->t[2], *sc = &a->t[3];
@@ -481,6 +494,70 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
     const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
     int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
     if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
+    const RadTensor* tg = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
+    int64_t* hits = a->n_t > 6 && a->t[6].data ? (int64_t*)a->t[6].data : nullptr;
+    if (hits && a->t[6].dtype != RAD_I64) return RAD_E_DTYPE;
+    const uint8_t* sb = (const uint8_t*)st->data;
+    uint8_t* pb = (uint8_t*)pl->data;
+    auto copy = [&](int64_t slot, int64_t pg) {
+        if (xf >= 0)
+            kvx_rows(xf, xt, hd, sb + slot * slot_b, kvx_row_bytes(xf, hd), pb + pg * pitch,
+                     kvx_row_bytes(xt, hd), rows);
+        else
+            std::memcpy(pb + pg * pitch, sb + slot * slot_b, (size_t)bb);
+    };
+    if (tg) {
+        if (tg->dtype != RAD_I32) return RAD_E_DTYPE;
+        if (tg->rank != 2 || tg->shape[0] < M || tg->shape[1] < w) return RAD_E_SHAPE;
+        /* The plan of every row first, (sel offset, slot, tag offset, page id, hit) a cold
+         * position, so the refusals come before any write. */
+        struct Pos { int64_t so, slot, to, pg; bool hit; };
+        std::vector<Pos> plan;
+        std::vector<bool> taken((size_t)blocks);
+        std::vector<int64_t> page((size_t)w);
+        std::vector<bool> busy((size_t)w);
+        for (int64_t m = 0; m < M; ++m) {
+            auto tag = [&](int64_t p) { return ldi(tg, m * tg->stride[0] + p * tg->stride[1]); };
+            std::fill(busy.begin(), busy.end(), false);
+            std::fill(page.begin(), page.end(), (int64_t)-1);
+            for (int64_t j = 0; j < w; ++j) {               /* the hits */
+                const int64_t e = ldi(sel, m * sel->stride[0] + j * sel->stride[1]);
+                if (e > -2) continue;
+                for (int64_t p = 0; p < w; ++p)
+                    if (tag(p) == -1 - e) { page[(size_t)j] = p; busy[(size_t)p] = true; break; }
+            }
+            int64_t q = 0;
+            for (int64_t j = 0; j < w; ++j) {               /* the misses: the free pages in order */
+                const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
+                if (e > -2) continue;
+                int64_t p = page[(size_t)j];
+                const bool hit = p >= 0;
+                if (!hit) {
+                    while (busy[(size_t)q]) ++q;            /* q < w: a row has at most w cold */
+                    p = q;
+                    busy[(size_t)p] = true;
+                }
+                const int64_t pg = ldi(sc, m * sc->stride[0] + p * sc->stride[1]);
+                if (-2 - e >= slots || pg < 0 || pg >= blocks || taken[(size_t)pg])
+                    return RAD_E_INVAL;
+                taken[(size_t)pg] = true;
+                plan.push_back({ so, -2 - e, m * tg->stride[0] + p * tg->stride[1], pg, hit });
+            }
+        }
+        int64_t n_hit = 0;
+        for (const Pos& x : plan) {
+            if (x.hit) {
+                ++n_hit;
+            } else {
+                copy(x.slot, x.pg);
+                st_int(tg->dtype, tg->data, x.to, x.slot + 1);
+            }
+            st_int(sel->dtype, sel->data, x.so, x.pg);
+        }
+        if (paged) *paged += (int64_t)plan.size();
+        if (hits) *hits += n_hit;
+        return RAD_OK;
+    }
     int64_t n_cold = 0;
     std::vector<bool> used((size_t)blocks);
     for (int64_t m = 0; m < M; ++m)
@@ -492,19 +569,13 @@ int ref_qsa_page(const RadArgs* a, RadStream) {
             used[(size_t)pg] = true;
             ++n_cold;
         }
-    const uint8_t* sb = (const uint8_t*)st->data;
-    uint8_t* pb = (uint8_t*)pl->data;
     for (int64_t m = 0; m < M; ++m)
         for (int64_t j = 0; j < w; ++j) {
             const int64_t so = m * sel->stride[0] + j * sel->stride[1];
             const int64_t e = ldi(sel, so);
             if (e > -2) continue;
             const int64_t pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
-            if (xf >= 0)
-                kvx_rows(xf, xt, hd, sb + (-2 - e) * slot_b, kvx_row_bytes(xf, hd), pb + pg * pitch,
-                         kvx_row_bytes(xt, hd), rows);
-            else
-                std::memcpy(pb + pg * pitch, sb + (-2 - e) * slot_b, (size_t)bb);
+            copy(-2 - e, pg);
             st_int(sel->dtype, sel->data, so, pg);
         }
     if (paged) *paged += n_cold;

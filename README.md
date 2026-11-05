@@ -81,7 +81,7 @@ stateDiagram-v2
     Demoting --> Cold : copy to the store has landed\n→ pool block freed
     Cold --> Resident : promotion (dense step)\nnew pool block, copy back
     Cold --> Paged : a decode step selects it
-    Paged --> Cold : step ends\n(scratch page is per step)
+    Paged --> Cold : step ends\n(the entry; the page keeps a copy)
     Resident --> Cold : re-point (unchanged block\nwhose origin slot is still held)\n→ no copy at all
     Resident --> [*] : sequence freed
     Cold --> [*] : last reference gone\n→ slot freed
@@ -90,9 +90,10 @@ stateDiagram-v2
 * **Demoting.** The copy to the host store is in flight. The entry already reads cold, but the pool
   block keeps its reference until the copy has landed, so nothing can reuse it while it is being
   read.
-* **Paged.** A decode step selected the cold block. The pager copied it into one of that step's
-  scratch pages, and the step's selection points there. On the next step that copy is gone and the
-  entry is cold again. Nothing in the table changed.
+* **Paged.** A decode step selected the cold block. The pager copied it into one of the row's
+  scratch pages, and the step's selection points there. The entry in the table stays cold; the
+  page keeps the copy until the row's pager needs it for another block, so a later step selecting
+  the block again reads it there without a copy (the page cache, [§4](#4-a-decode-step-the-pager)).
 
 ---
 
@@ -171,7 +172,54 @@ Properties of the pager:
 * **Counted.** The kernel adds the number of entries it rewrote to one int64 on the card (`paged_in`).
   `/stats` reads that counter back on a poll, never per step.
 * **Scratch.** Each decode row has `topk + 1` scratch pages of its own. They are reserved when the
-  pool is carved and are valid for one step.
+  pool is carved.
+* **Cached across steps.** A scratch page keeps the block it last received (per layer, a tag of
+  `1 + slot` on the card), so a step whose selection names that block again rewrites the entry to
+  that page and copies nothing; only the blocks new to the row's selection cross the link. See
+  [the page cache](#the-page-cache-hiding-the-page-in) below.
+
+### The page cache: hiding the page-in
+
+The pager copies a layer's selected cold blocks over PCIe while the card waits, 3-15 % of a
+single-sequence decode (fp8 at 128K: 85 -> 72 tokens/s). A prefetch of the previous step's
+selection on the copy engine during the preceding gated-delta-net layers cannot be built in this
+engine without a larger restructuring: the selection exists only on the card (`w.sel`, written by
+`qsa_select` in `arch/common/rad_qsa.h` `QsaIndexer::step` and paged right after it), the host never
+learns it, and a DMA copy needs its addresses on the host -- the expert prefetch
+(`core/runtime/xprefetch.h`) gets them through a pinned mailbox, a host thread and device-side
+polling, a machinery a page per block per layer would multiply by 12 x 512.
+
+It is also not needed. The bytes such a prefetch would bring are already on the card: the previous
+step's pager wrote every block that layer selected into the row's scratch pages, and nothing else
+writes them. So the pager became a cache over its own pages. Per row and layer (one launch, two
+kernels):
+
+1. **Plan** (a workgroup a row): every cold entry whose slot a page of the row is tagged with is a
+   hit and is rewritten to that page; the others, in position order, take the pages no hit took, in
+   page order, are rewritten to them, and those pages are marked to fill.
+2. **Fill** (a workgroup a page): each marked page receives its block from the store, then its tag.
+
+A hit costs nothing but the plan's lookup; a miss costs exactly the copy it cost before. A row's
+`topk + 1` pages always suffice (hits plus misses are at most the cold entries of one selection),
+so no page is added. Consecutive decode steps of one layer overlap far more than neighbouring
+layers (0.69-0.82 for those, measured on rebuilt block keys): the query moves by one token, most top-512
+blocks stay, and the blocks new to the selection are mostly the tail's, which is resident. A low
+overlap costs the plan only. `/stats` `kv_residency.paged_hits / paged_in` is the measured rate.
+
+**Correct by construction.** A hit page holds the bytes a demand copy of the same slot writes (it is
+one), and the attention reads the page its entry names, so output is byte-identical whatever hits.
+A tag names a store slot, so the one hazard is a slot that comes to hold another block. A slot's
+bytes change only after it is freed (a demotion takes a fresh or freed slot; a promoted block keeps
+its origin slot; a re-point reuses a slot still held, with unchanged bytes). The manager counts
+frees, store changes and pool carves (`KVManager::residency_epoch`), and the batch builder zeroes
+every tag plane on the compute stream before a step whenever that count moved, after every earlier
+step's pagers. A page whose fill never ran stays marked, not tagged, and is never a hit. Draft and
+verify rows page as decode rows; each row's pages are its own, a row moving to another sequence
+only lowers the hit rate (tags name slots, not sequences).
+
+`RADIANCE_QSA_PAGE_CACHE=0` turns it off (the pager copies every cold entry, as before), for the
+A/B. Tag memory: one i32 a scratch page a residency layer, `layers x rows x (topk + 1) x 4` bytes a
+rank -- 13 x 32 x 513 x 4 = 0.8 MiB on Flash-Next at 8 sequences and 3 drafts; no scratch page added.
 
 `qsa_select` changed in one place: a block is absent exactly when its entry is `-1`. It used to be
 "any negative". This is what lets a cold block be selected at all. Its *score* is unaffected, because
@@ -355,6 +403,7 @@ flowchart TB
 | item | size | where it is charged |
 |---|---|---|
 | scratch pages | `(window/block + 1) × max_seqs × (1 + n_spec)` blocks per residency group, about 208 MiB on Flash-Next at 8 decode rows | fixed costs, before the VRAM split, so the budget resolver sees them |
+| page-cache tags | one i32 a scratch page and residency layer, under 1 MiB a rank on Flash-Next | allocated beside the pager's counter, not charged to the KV budget |
 | residency store | `--kv-residency-mib`, one store per residency group, its slot one block of that group (every rank's shard) at that group's own layout's size; the budget is split so every store holds the same tokens (in proportion to a group's bytes a token), so it holds (store bytes) / (the groups' real block bytes) blocks a group, not / the widest | pinned host memory, opened host-mapped |
 | per-block bookkeeping | 4 bytes a block (the table entry already holds the slot) | none worth counting |
 
@@ -498,6 +547,7 @@ radiance --model flashnext.rad --tp 2 \
 | `demoted`, `promoted` | blocks moved to the store / back to the pool |
 | `freed_bytes` | VRAM the landed demotions gave back to the pool |
 | `paged_in` | cold entries the pager rewrote on the card (summed over QSA layers and decode rows; rank 0) |
+| `paged_hits` | of those, the ones the page cache served without a copy (`paged_hits / paged_in` is its hit rate) |
 | `skipped` | blocks a sweep left (held by another live sequence, partial, store full) |
 | `link_bytes` | bytes moved over PCIe, both directions |
 | `host_bytes`, `cap_bytes` | store in use / store size |
@@ -624,7 +674,7 @@ decode rows, and the sweep drains a middle in ~60 steps), how often a follow-up'
 
 | part | files |
 |---|---|
-| ABI: cold entries, batch fields, window declaration | `abi/rad_runtime.h`, `abi/rad_builder.h`, `abi/rad_abi.h` (ABI 33) |
+| ABI: cold entries, batch fields, window declaration | `abi/rad_runtime.h`, `abi/rad_builder.h`, `abi/rad_abi.h` (ABI 33; the page cache 46) |
 | block states, slots, demote / promote / re-point | `core/mem/kv.{h,cpp}` |
 | host-mapped store | `core/mem/hostarena.{h,cpp}` (`open_mapped`) |
 | prefix cache with cold entries | `core/mem/prefix.{h,cpp}` |
@@ -632,7 +682,7 @@ decode rows, and the sweep drains a middle in ~60 steps), how often a follow-up'
 | sweep, reap, dense-step promotion | `core/sched/scheduler.cpp` (`res_sweep`, `res_reap`) |
 | engine wiring, store, mover, counter | `core/engine.cpp`, `core/engine_bringup.cpp` |
 | the window declaration and the pager issue | `arch/common/rad_qsa.h` |
-| the pager | `libref/ref_qsa.cpp` (reference), `libr4d/r4d_qsa_page_u8.hip` (card), `libavx/avx_qsa.cpp` |
+| the pager and its page cache | `libref/ref_qsa.cpp` (reference), `libr4d/r4d_qsa_page_u8.hip` (card), `libavx/avx_qsa.cpp`; tags in `core/runtime/tierexec.cpp` (`page_tags`), cleared in `core/sched/batch.cpp` |
 | the demote layout's codec (`kv_transcode`, the expanding pager) | `libref/ref_attn.cpp` (`kvx_rows`), `libr4d/r4d_kvx.h`, `libavx/avx_qsa.cpp` |
 | the selection change | `libr4d/r4d_qsa_select_bf16.hip` |
 | spec and operator docs | `spec.md` §7.3 "Window residency", `docs/GUIDE.md` §4.8, `docs/OPS.md` `qsa_page`, `docs/qsa-residency-bench.md` |

@@ -99,6 +99,7 @@ struct SchedMetrics {
     int64_t res_link_bytes = 0;      /* bytes over the link, both directions */
     int64_t res_scratch_bytes = 0;   /* VRAM the pager's scratch pages hold */
     int64_t res_paged_in = 0;        /* cold entries the pager rewrote (card counter, rank 0) */
+    int64_t res_paged_hits = 0;      /* of them, served by the page cache without a copy */
     /* Decoupled prefix caching (spec §7.3). `prefix_hit_rate` is the attention hit rate, as in
      * vLLM. The linear side hits at a different granularity (whole checkpoints, not blocks), so
      * it is reported separately, with token counts and checkpoints written. */

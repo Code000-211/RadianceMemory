@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 45 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 46 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -495,7 +495,7 @@
 { "RadGeneratorDecl", "chunk_bos", 364, 4 },
 { "RadGeneratorDecl", "chunk_eos", 368, 4 },
 { "RadGeneratorDecl", "cond_opts", 372, 4 },
-{ "RadKVGroupBatch", "", 0, 136 },
+{ "RadKVGroupBatch", "", 0, 160 },
 { "RadKVGroupBatch", "group", 0, 4 },
 { "RadKVGroupBatch", "slot_mapping", 8, 8 },
 { "RadKVGroupBatch", "block_table", 16, 8 },
@@ -513,6 +513,9 @@
 { "RadKVGroupBatch", "residency_scratch_pitch", 112, 8 },
 { "RadKVGroupBatch", "residency_paged", 120, 8 },
 { "RadKVGroupBatch", "residency_slots", 128, 8 },
+{ "RadKVGroupBatch", "residency_tags", 136, 8 },
+{ "RadKVGroupBatch", "residency_tags_rows", 144, 8 },
+{ "RadKVGroupBatch", "residency_hits", 152, 8 },
 { "RadKVGroupDecl", "", 0, 64 },
 { "RadKVGroupDecl", "kind", 0, 4 },
 { "RadKVGroupDecl", "dtype", 4, 4 },

@@ -334,6 +334,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         /* Cold entries the pager rewrote to scratch pages (summed over layers and decode rows),
          * counted on the card and read back per poll; nonzero is the proof a step read paged bytes. */
         o["kv_residency"]["paged_in"] = m.res_paged_in;
+        /* Of those, the ones the page cache served from a scratch page that still held the block
+         * (no copy): paged_hits / paged_in is the cache's hit rate. */
+        o["kv_residency"]["paged_hits"] = m.res_paged_hits;
         /* Linear-state caching, separate from the attention hit rate: a hybrid prompt can be
          * fully attention-cached and still re-run every recurrent layer over its prefix, since
          * the two hit at different granularities. Zero on a model with no recurrent state. */

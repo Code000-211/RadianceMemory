@@ -2058,6 +2058,8 @@ extern "C" int r4d_shape_qsa_page(const RadParam* p, int n_p, int operand, RadOp
         store, pool,
         opd_idx(M, k + 1, M * (k + 1)),       /* scratch: ids inside the pool */
         opd((uint32_t)RAD_I64, 1),            /* paged: the counter */
+        opd_idx(M, k + 1, 1),                 /* tags: the page cache, empty */
+        opd((uint32_t)RAD_I64, 1),            /* hits: its counter */
     };
     R4D_PICK(l);
 }

@@ -24679,6 +24679,154 @@ static void qsa_page_one(const Plugin& pl, const char* what, int64_t bb, int64_t
     dlclose(ref);
 }
 
+/* qsa_page with the page cache (`tags`), against libref's plan byte for byte, over a run of
+ * launches on the card: two decode rows at Flash-Next's width (topk 512) whose cold slots drift
+ * (most kept, some swapped, positions shuffled), the selection, the pool, the tags and both
+ * counters compared after every launch. Each cold position must also name a page holding its
+ * slot's bytes -- what the uncached pager puts in front of the attention -- whether it was a hit
+ * (no copy) or a miss; and the hits must be at least the slots a row shares with its previous
+ * launch. `xs` / `xp`: an expanding layer (eight rows a fragment), where the second launch repeats
+ * the first selection and is all hits. */
+static void qsa_page_cache_one(const Plugin& pl, const char* what, int64_t topk, int launches,
+                               const char* xs = nullptr, const char* xp = nullptr,
+                               int64_t xs_rowb = 0, int64_t xp_rowb = 0) {
+    const RadKernelInfo* r = find(pl, "qsa_page_u8");
+    if (!r || !g_plugin) { ok(what, false, "row or plugin path absent"); return; }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what, false, "reference plugin unavailable"); return; }
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "qsa_page")) { oracle = at(i); break; }
+    if (!oracle) { ok(what, false, "reference operation unavailable"); dlclose(ref); return; }
+
+    const int64_t M = 2, w = topk + 1, res = 16, rows = 8;
+    const int64_t slots = xs ? 6 : 3 * w;
+    const int64_t bb = xs ? rows * xp_rowb : 1024, sbb = xs ? rows * xs_rowb : bb;
+    const int64_t blocks = res + M * w;
+    std::mt19937 rng(4129);
+    std::vector<uint8_t> store((size_t)(slots * sbb));
+    for (auto& b : store) b = (uint8_t)rng();
+    std::vector<int32_t> scr((size_t)(M * w));
+    for (int64_t i = 0; i < M * w; ++i) scr[(size_t)i] = (int32_t)(res + i);
+    std::shuffle(scr.begin(), scr.end(), rng);
+    std::vector<uint8_t> wpool((size_t)(blocks * bb), 0xA5);
+    std::vector<int32_t> wtag((size_t)(M * w), 0);
+    int64_t wct[2] = { 1000, 2000 };
+
+    void* d_se = dalloc((size_t)(M * w) * 4);
+    void* d_sc = dalloc(scr.size() * 4);
+    void* d_st = dalloc(store.size());
+    void* d_pl = dalloc(wpool.size());
+    void* d_tg = dalloc(wtag.size() * 4);
+    int64_t* d_ct = (int64_t*)dalloc(2 * sizeof(int64_t));
+    st_memcpy(d_sc, scr.data(), scr.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_st, store.data(), store.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_pl, wpool.data(), wpool.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_tg, wtag.data(), wtag.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_ct, wct, sizeof wct, hipMemcpyHostToDevice);
+
+    std::vector<RadParam> ps = { PI("M", M), PI("topk", topk), PI("blocks", blocks), PI("seqs", M),
+                                 PI("block_bytes", bb) };
+    if (xs) {
+        ps.push_back(PS("store_layout", xs));
+        ps.push_back(PS("pool_layout", xp));
+        ps.push_back(PI("head_dim", 256));
+    }
+    auto mk = [&](void* se, void* st, void* pool, void* sc, void* tg, int64_t* ct) {
+        return std::vector<RadTensor>{ T(se, RAD_I32, { M, w }), T(st, RAD_U8, { slots, sbb }),
+                                       T(pool, RAD_U8, { blocks, bb }), T(sc, RAD_I32, { M, w }),
+                                       T(ct, RAD_I64, { 1 }), T(tg, RAD_I32, { M, w }),
+                                       T(ct + 1, RAD_I64, { 1 }) };
+    };
+    std::vector<std::vector<int32_t>> prev((size_t)M);
+    std::vector<int32_t> sv;
+    int64_t floor_hits = 0, cold_total = 0;
+    bool all_ok = true;
+    std::string detail;
+    for (int l = 0; l < launches && all_ok; ++l) {
+        if (!xs || l == 0) {
+            sv.clear();
+            for (int64_t m = 0; m < M; ++m) {
+                std::vector<int32_t> cold;
+                for (int32_t sl : prev[(size_t)m]) if (rng() % 8) cold.push_back(sl);
+                const int64_t n_cold = xs ? 4 : w * 3 / 4;
+                while ((int64_t)cold.size() < n_cold) {
+                    const int32_t sl = (int32_t)(rng() % (uint32_t)slots);
+                    if (std::find(cold.begin(), cold.end(), sl) == cold.end()) cold.push_back(sl);
+                }
+                cold.resize((size_t)n_cold);
+                for (int32_t sl : cold)
+                    floor_hits += std::find(prev[(size_t)m].begin(), prev[(size_t)m].end(), sl) !=
+                                  prev[(size_t)m].end();
+                std::vector<int32_t> row;
+                for (int32_t sl : cold) row.push_back(-2 - sl);
+                while ((int64_t)row.size() < w) row.push_back(rng() % 3 ? (int32_t)(rng() % res) : -1);
+                std::shuffle(row.begin(), row.end(), rng);
+                sv.insert(sv.end(), row.begin(), row.end());
+                prev[(size_t)m] = cold;
+            }
+        } else {
+            for (int64_t m = 0; m < M; ++m) floor_hits += (int64_t)prev[(size_t)m].size();
+        }
+        for (int32_t e : sv) cold_total += e <= -2;
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        std::vector<int32_t> wsel = sv;
+        std::vector<RadTensor> hts = mk(wsel.data(), store.data(), wpool.data(), scr.data(),
+                                        wtag.data(), wct);
+        a.t = hts.data(); a.n_t = (int)hts.size();
+        const int rr = oracle->launch(&a, nullptr);
+        st_memcpy(d_se, sv.data(), sv.size() * 4, hipMemcpyHostToDevice);
+        std::vector<RadTensor> dts = mk(d_se, d_st, d_pl, d_sc, d_tg, d_ct);
+        a.t = dts.data(); a.n_t = (int)dts.size();
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rr != RAD_OK || rc != RAD_OK) {
+            all_ok = false;
+            detail = "reference rc=" + std::to_string(rr) + " launch rc=" + std::to_string(rc);
+            break;
+        }
+        std::vector<int32_t> gsel(sv.size()), gtag(wtag.size());
+        std::vector<uint8_t> gpool(wpool.size());
+        int64_t gct[2] = { 0, 0 };
+        st_memcpy(gsel.data(), d_se, gsel.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(gtag.data(), d_tg, gtag.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(gpool.data(), d_pl, gpool.size(), hipMemcpyDeviceToHost);
+        st_memcpy(gct, d_ct, sizeof gct, hipMemcpyDeviceToHost);
+        int64_t wrong = 0;
+        if (!xs)
+            for (size_t i = 0; i < sv.size(); ++i)
+                if (sv[i] <= -2 && (gsel[i] < 0 || std::memcmp(gpool.data() + (int64_t)gsel[i] * bb,
+                                                             store.data() + (int64_t)(-2 - sv[i]) * sbb,
+                                                             (size_t)bb)))
+                    ++wrong;
+        const bool same = gsel == wsel && gtag == wtag && gpool == wpool && gct[0] == wct[0] &&
+                          gct[1] == wct[1];
+        if (!same || wrong) {
+            all_ok = false;
+            detail = "launch " + std::to_string(l) + ": sel=" + (gsel == wsel ? "1" : "0") +
+                     " tags=" + (gtag == wtag ? "1" : "0") + " pool=" + (gpool == wpool ? "1" : "0") +
+                     " counters=" + std::to_string(gct[0]) + "/" + std::to_string(wct[0]) + "," +
+                     std::to_string(gct[1]) + "/" + std::to_string(wct[1]) +
+                     " wrong_pages=" + std::to_string(wrong);
+        }
+    }
+    if (all_ok) {
+        const int64_t hits = wct[1] - 2000;
+        all_ok = wct[0] - 1000 == cold_total && hits >= floor_hits;
+        detail = "hits=" + std::to_string(hits) + "/" + std::to_string(cold_total) +
+                 " floor=" + std::to_string(floor_hits);
+    }
+    ok(what, all_ok, detail);
+    dlclose(ref);
+}
+
 static void qsa_page_case(const Plugin& pl) {
     qsa_page_one(pl, "qsa_page vs libref byte for byte, a 16-byte-aligned fragment (wide copy)",
                  96, 128, 112, 0);
@@ -24715,6 +24863,14 @@ static void qsa_page_case(const Plugin& pl) {
                                  "head(s)", t.s, t.p, (long long)heads).c_str(),
                          bb, 2 * sb + 64, bb + 16, sb + 64, false, t.pr, t.s, t.p, t.sr);
         }
+    /* The page cache (`tags`): hits and misses over drifting selections, at Flash-Next's width and
+     * at the widest the plan serves, and an expanding layer's repeat. */
+    qsa_page_cache_one(pl, "qsa_page with tags vs libref byte for byte, topk 512, six launches", 512, 6);
+    qsa_page_cache_one(pl, "qsa_page with tags vs libref byte for byte, topk 1024, two launches", 1024, 2);
+    for (const auto& t : tier)
+        qsa_page_cache_one(pl, fmt("qsa_page with tags vs libref byte for byte, %s slots expanded "
+                                   "into %s, the repeat all hits", t.s, t.p).c_str(),
+                           7, 2, t.s, t.p, t.sr, t.pr);
 }
 
 /* kv_transcode (window residency's demote layout), against libref's byte for byte: every direction

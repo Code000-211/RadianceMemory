@@ -8351,6 +8351,61 @@ TEST(a_demoted_block_gives_its_slot_back_when_its_last_reference_goes) {
     CHECK_EQ(f.kv.free_blocks(G_RES), total);
 }
 
+/* The page cache's invalidation (KVManager::residency_epoch, RadKVGroupBatch::residency_tags): a
+ * scratch page's tag names a store slot, so the epoch must move whenever a slot could next hold
+ * another block -- a slot freed -- and need not move for what leaves every slot's bytes as they
+ * were: a demotion into a slot, its landing. */
+TEST(the_residency_epoch_moves_when_a_slot_is_freed_and_not_while_slots_only_fill) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 256));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    const int64_t e0 = f.kv.residency_epoch();
+    std::vector<BlockMove> moves;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &moves));
+    CHECK(!moves.empty());
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.residency_epoch(), e0);
+    REQUIRE(!f.kv.residency_cold_entries(1, G_RES).empty());
+    CHECK_OK(f.kv.add_sequence(2));
+    f.kv.free_sequence(1);
+    CHECK(f.kv.residency_epoch() > e0);
+    CHECK_EQ(f.store.used_slots(), 0ll);
+    const int64_t e1 = f.kv.residency_epoch();
+    CHECK_OK(f.kv.ensure(2, 16 * 40));
+    std::vector<BlockMove> m2;
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &m2));
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.residency_epoch(), e1);           /* reused slots, but filled after the move */
+    /* A store set again: slot ids may name other bytes. */
+    CHECK_OK(f.kv.set_residency_store(&f.store, 0));
+    CHECK(f.kv.residency_epoch() > e1);
+}
+
+/* The page cache's planes: one [scratch_rows, scratch_pitch] i32 plane a layer the group holds,
+ * every residency group's in group order in the one region the engine allocates; a region smaller
+ * than every group's need gives none (the pager then copies as before), as does no region. */
+TEST(the_page_cache_carves_one_plane_a_held_layer_of_every_residency_group) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, 64));
+    const KVGroupPlan* p = f.kv.plan(G_RES);
+    REQUIRE(p != nullptr);
+    int64_t held = 0;
+    for (int64_t o : f.kv.residency_layer_off(G_RES)) held += o >= 0;
+    CHECK(held > 0);
+    const int64_t want = held * f.kv.scratch_rows() * p->scratch_pitch * 4;
+    CHECK_EQ(f.kv.residency_tags_bytes(G_RES), want);
+    CHECK_EQ(f.kv.residency_tags_bytes(), want);     /* the only residency group */
+    CHECK(f.kv.residency_tags(G_RES) == nullptr);
+    std::vector<int32_t> region((size_t)(want / 4));
+    f.kv.set_residency_tags(region.data(), want);
+    CHECK(f.kv.residency_tags(G_RES) == region.data());
+    for (int32_t g = 0; g < f.kv.n_groups(); ++g)
+        if (g != G_RES) CHECK(f.kv.residency_tags(g) == nullptr);
+    f.kv.set_residency_tags(region.data(), want - 4);
+    CHECK(f.kv.residency_tags(G_RES) == nullptr);
+}
+
 TEST(a_full_store_leaves_the_rest_resident_and_reports_the_skips) {
     ResidencyFixture f;
     CHECK_OK(f.build(512, /*slots=*/4));
@@ -10307,6 +10362,19 @@ TEST(the_pagers_counter_starts_at_zero_keeps_its_address_and_reads_back_what_the
     CHECK_EQ(x.paged_in(), 5ll);
     *c += 7;
     CHECK_EQ(x.paged_in(), 12ll);
+    /* The page cache's hit counter is the int64 after it, read back the same way, and its tag
+     * planes one zeroed region at a fixed address. */
+    CHECK(x.hits_counter() == c + 1);
+    CHECK_EQ(x.hits_in(), 0ll);
+    c[1] += 9;
+    CHECK_EQ(x.hits_in(), 9ll);
+    CHECK_EQ(x.paged_in(), 12ll);
+    int32_t* tg = x.page_tags(4096);
+    REQUIRE(tg != nullptr);
+    CHECK(x.page_tags(4096) == tg);
+    int64_t nz = 0;
+    for (int i = 0; i < 1024; ++i) nz += tg[i] != 0;
+    CHECK_EQ(nz, 0ll);
     CHECK_OK(rad_stream_sync(compute));
     rad_stream_destroy(compute);
 }
@@ -10323,6 +10391,10 @@ TEST(the_manager_binding_reports_the_pagers_count_only_when_a_reader_is_installe
     CHECK_EQ(bind.residency().paged_in, 41ll);
     counted = 42;
     CHECK_EQ(bind.residency().paged_in, 42ll);
+    /* The page cache's hits, the same way. */
+    CHECK_EQ(bind.residency().paged_hits, 0ll);
+    bind.hits_read = [&] { return counted - 2; };
+    CHECK_EQ(bind.residency().paged_hits, 40ll);
 }
 
 RAD_TEST_MAIN()

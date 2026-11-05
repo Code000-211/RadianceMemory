@@ -1304,7 +1304,12 @@ valid for one step. The op `qsa_page` (`docs/OPS.md`) sits between `qsa_select` 
 and rewrites each cold entry of the selection to a scratch page it has filled from the store, one
 writer per position and no atomics; the attention is unchanged. Dense steps (prefill, mixed) promote
 a sequence's cold blocks from the host before they run, because only the host knows the cold set.
-ABI 30 adds `residency_paged`, the card-side counter above.
+ABI 30 adds `residency_paged`, the card-side counter above. ABI 46 adds the page cache:
+`residency_tags` (per layer the group holds, one i32 tag a scratch page: `1 + slot` of the block the
+page holds) and `residency_hits`. With them `qsa_page` rewrites a cold entry whose slot a page of
+its row already holds to that page without a copy, and copies only the rest; the engine zeroes the
+tags before a step whenever a store slot was freed since the last zeroing, so a tag never names a
+reused slot. The bytes the attention reads are the same either way.
 
 ---
 

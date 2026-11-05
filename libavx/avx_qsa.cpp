@@ -996,18 +996,68 @@ AVX_KERNEL(qsa_page) {
     /* The cold positions as (sel offset, slot, page), validated before any write. */
     int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
     if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
+    /* The page cache (libref's plan): `tags` and `hits` optional; the hits are rewritten here, the
+     * misses join `cold` with the page the plan gave them. */
+    const RadTensor* tg = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
+    int64_t* hits = a->n_t > 6 && a->t[6].data ? (int64_t*)a->t[6].data : nullptr;
+    if (hits && a->t[6].dtype != RAD_I64) return RAD_E_DTYPE;
     std::vector<int64_t> cold;
     std::vector<bool> used((size_t)blocks);
-    for (int64_t m = 0; m < M; ++m)
-        for (int64_t j = 0; j < w; ++j) {
-            const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
-            if (e > -2) continue;
-            const int64_t slot = -2 - e, pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
-            if (slot >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
-            used[(size_t)pg] = true;
-            cold.push_back(so); cold.push_back(slot); cold.push_back(pg);
+    int64_t n_rw = 0;
+    if (tg) {
+        if (tg->dtype != RAD_I32) return RAD_E_DTYPE;
+        if (tg->rank != 2 || tg->shape[0] < M || tg->shape[1] < w) return RAD_E_SHAPE;
+        /* The plan first (libref's), refusals before any write: hits as (sel offset, page id),
+         * misses into `cold` with their tag offsets beside. */
+        std::vector<int64_t> hit, mtag;
+        std::vector<int64_t> page((size_t)w);
+        std::vector<bool> busy((size_t)w);
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t t0 = m * tg->stride[0], ts = tg->stride[1];
+            std::fill(busy.begin(), busy.end(), false);
+            std::fill(page.begin(), page.end(), (int64_t)-1);
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t e = ldi(sel, m * sel->stride[0] + j * sel->stride[1]);
+                if (e > -2) continue;
+                for (int64_t p = 0; p < w; ++p)
+                    if (ldi(tg, t0 + p * ts) == -1 - e) { page[(size_t)j] = p; busy[(size_t)p] = true; break; }
+            }
+            int64_t q = 0;
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
+                if (e > -2) continue;
+                int64_t p = page[(size_t)j];
+                const bool h = p >= 0;
+                if (!h) {
+                    while (busy[(size_t)q]) ++q;
+                    p = q;
+                    busy[(size_t)p] = true;
+                }
+                const int64_t pg = ldi(sc, m * sc->stride[0] + p * sc->stride[1]);
+                if (-2 - e >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
+                used[(size_t)pg] = true;
+                if (h) { hit.push_back(so); hit.push_back(pg); continue; }
+                cold.push_back(so); cold.push_back(-2 - e); cold.push_back(pg);
+                mtag.push_back(t0 + p * ts);
+            }
         }
+        for (size_t i = 0; i < hit.size(); i += 2) st_int_dt(sel->dtype, sel->data, hit[i], hit[i + 1]);
+        for (size_t i = 0; i < mtag.size(); ++i) st_int_dt(tg->dtype, tg->data, mtag[i], cold[3 * i + 1] + 1);
+        n_rw = (int64_t)(hit.size() / 2 + mtag.size());
+        if (hits) *hits += (int64_t)hit.size() / 2;
+    } else {
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
+                if (e > -2) continue;
+                const int64_t slot = -2 - e, pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
+                if (slot >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
+                used[(size_t)pg] = true;
+                cold.push_back(so); cold.push_back(slot); cold.push_back(pg);
+            }
+    }
     const int64_t n = (int64_t)cold.size() / 3;
+    if (!tg) n_rw = n;
     const uint8_t* sb = (const uint8_t*)st->data;
     uint8_t* pb = (uint8_t*)pl->data;
     AVX_PARALLEL_FOR_IF(n * bb >= AVX_PAR_MIN && n > 1)
@@ -1021,7 +1071,7 @@ AVX_KERNEL(qsa_page) {
                         (size_t)bb);
         st_int_dt(sel->dtype, sel->data, cold[3 * i], cold[3 * i + 2]);
     }
-    if (paged) *paged += n;   /* the optional counter operand (libref's ref_qsa_page) */
+    if (paged) *paged += n_rw;   /* the optional counter operand (libref's ref_qsa_page) */
     return RAD_OK;
 }
 

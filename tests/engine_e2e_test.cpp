@@ -1761,7 +1761,7 @@ TEST(a_residency_flag_on_a_model_without_a_window_changes_no_token_and_moves_not
     CHECK_EQ(c.read(&out), 200);
     const json st = json::parse(out, nullptr, false);
     REQUIRE(st.is_object() && st.contains("kv_residency"));
-    for (const char* k : { "demoted", "promoted", "skipped", "misses", "host_bytes", "paged_in" })
+    for (const char* k : { "demoted", "promoted", "skipped", "misses", "host_bytes", "paged_in", "paged_hits" })
         CHECK_EQ(st["kv_residency"].value(k, (int64_t)-1), (int64_t)0);
     CHECK_EQ(plain.stop(), 0);
     CHECK_EQ(flagged.stop(), 0);

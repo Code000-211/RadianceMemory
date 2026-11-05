@@ -74,8 +74,12 @@ extern "C" {
  * RadBuildCtx gained qsa_bkey_split (in the padding between qsa_bkey_dtype and kv_vpred) and
  * RadArchProbe qsa_bkey_split_ok (rad_builder.h), with the new ops `qsa_select_part` and
  * `qsa_select_join` and the optional `ranks` and `rank` of `qsa_work` (docs/OPS.md). A plugin built
- * at 44 would keep every block key on every rank under a flag that promised to halve them. */
-#define RAD_ABI_VERSION 45u
+ * at 44 would keep every block key on every rank under a flag that promised to halve them.
+ *
+ * 46: the pager's page cache (docs/OPS.md `qsa_page`, `tags` and `hits`): RadKVGroupBatch gained
+ * residency_tags, residency_tags_rows and residency_hits, appended. A plugin built at 45 would
+ * read past the struct it knows. */
+#define RAD_ABI_VERSION 46u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

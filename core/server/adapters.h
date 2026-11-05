@@ -104,6 +104,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.res_freed_bytes = m.res_freed_bytes;
     o.res_link_bytes = m.res_link_bytes; o.res_scratch_bytes = m.res_scratch_bytes;
     o.res_paged_in = m.res_paged_in;
+    o.res_paged_hits = m.res_paged_hits;
     /* What only the cache holds (SchedMetrics::prefix_held_tokens), clamped to the pool's
      * used figure: the two are counted at different moments in a step, and cached > used
      * would show a negative live share. */

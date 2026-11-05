@@ -316,6 +316,20 @@ public:
      * engine (TierExec::paged_counter); the manager only carries the address to the batch. */
     void     set_residency_paged(int64_t* dev) { res_paged_ = dev; }
     int64_t* residency_paged() const { return res_paged_; }
+    /* The page cache (RadKVGroupBatch::residency_tags), owned by the engine like the counter:
+     * `hits` its counter, `tags` one zeroed device region of `bytes` that residency_tags(g) carves
+     * per group in group order (residency_tags_bytes() is what every group needs; a region
+     * smaller than that gives every group none, and the pager copies as before). */
+    void     set_residency_hits(int64_t* dev) { res_hits_ = dev; }
+    int64_t* residency_hits() const { return res_hits_; }
+    void     set_residency_tags(int32_t* dev, int64_t bytes) { res_tags_ = dev; res_tags_cap_ = bytes; }
+    int64_t  residency_tags_bytes(int32_t group) const;   /* one group's planes */
+    int64_t  residency_tags_bytes() const;                /* every group's */
+    int32_t* residency_tags(int32_t group) const;
+    /* Counts the events after which a page-cache tag may name the wrong bytes: a store slot freed
+     * (it may next hold another block), a store set or released, the pool carved anew. The batch
+     * zeroes the tags on the card whenever it moved since the last build (BatchBuilder). */
+    int64_t  residency_epoch() const { return res_epoch_; }
     /* RADIANCE_DEBUG_KV_TIER=emulate (Engine): the emulation the residency-on output is held to.
      * residency_demote() then names every block the sweep would demote -- outside sink and tail,
      * not shared, not already done -- with host_slot -1 and leaves its table entry and pool block
@@ -349,8 +363,8 @@ public:
         return a ? a->capacity() : 0;
     }
     /* What the pager (`qsa_page`) reads for a group, host side. scratch_table() is
-     * [scratch_rows(), scratch_pitch] pool ids, row-major: the same every step, since a row's
-     * pages are valid for the step that wrote them only and the next step overwrites them.
+     * [scratch_rows(), scratch_pitch] pool ids, row-major: the same every step; a page keeps the
+     * block the pager last wrote into it, which the page cache (residency_tags) reuses.
      * residency_layer_off() is indexed by model layer: the byte offset of that layer's fragment
      * inside a slot of the group's store (this rank's shard included), -1 for a layer the group
      * does not own.
@@ -984,6 +998,10 @@ private:
     /* RAD_OK when `store` may become group g's at `rank_off` (see set_residency_store). */
     int     res_store_check(int32_t g, const HostArena* store, int64_t rank_off) const;
     int64_t*   res_paged_ = nullptr;
+    int64_t*   res_hits_ = nullptr;
+    int32_t*   res_tags_ = nullptr;
+    int64_t    res_tags_cap_ = 0;
+    int64_t    res_epoch_ = 0;
     int64_t    res_cold_ = 0;                         /* cold entries held across all tables */
     /* Blocks a demotion encoded cold whose copy has not been reported landed: still referenced
      * (refcount 1, in no table) so the pool cannot reuse them under the gather. */

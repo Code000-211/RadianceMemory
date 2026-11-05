@@ -1971,7 +1971,9 @@ promotes its sequence whole first, and `qsa_page` pages a cold block the selecti
 scratch page between the selection and the attention. Startup says `kv residency: window enforced`.
 `/stats` `kv_residency.freed_bytes` is the VRAM given back; `paged_in` is how many cold entries the
 pager rewrote (summed over QSA layers and decode rows, from a counter on the card, rank 0), and is
-the number that tells you the window is doing something. A model that declares no window warns that
+the number that tells you the window is doing something; `paged_hits` is how many of those the
+pager's page cache served from a scratch page still holding the block, with no copy over the link
+(`RADIANCE_QSA_PAGE_CACHE=0` turns the cache off for an A/B). A model that declares no window warns that
 the flag does nothing and moves nothing. Not yet measured on a card: see `docs/qsa-residency-bench.md`.
 Under tensor parallelism every rank moves its own shard, but that path has only been tested through
 the host-side seam.

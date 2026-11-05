@@ -3574,6 +3574,7 @@ SchedMetrics Scheduler::metrics_locked() const {
         m.res_freed_bytes = r.freed_bytes;
         m.res_link_bytes = r.link_bytes; m.res_scratch_bytes = r.scratch_bytes;
         m.res_paged_in = r.paged_in;
+        m.res_paged_hits = r.paged_hits;
         m.res_seqs = kv_->residency_seqs();
     }
     m.attn_hit_rate = m.prompt_tokens

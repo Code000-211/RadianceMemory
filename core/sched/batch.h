@@ -293,6 +293,9 @@ private:
     ChunkGeometry geo_{};
     KVGeom        kvgeom_{};
     std::vector<RankIO> ranks_;
+    /* Per group and rank, the residency epoch (IKVManager::Pager::epoch) the page cache's tags
+     * were last cleared at; -1 never. */
+    std::vector<std::vector<int64_t>> tags_epoch_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the

@@ -186,6 +186,13 @@ public:
      * only -- never for the step -- so it belongs on a statistics poll, not on the step path. */
     int64_t* paged_counter();
     int64_t  paged_in();
+    /* The page cache's: its hit counter, the int64 after paged_counter() (allocated, zeroed and read
+     * back with it; RadKVGroupBatch::residency_hits), and its tag planes, `bytes` of zeroed device
+     * memory allocated by the first call and never moved (null when the card has none, or bytes
+     * <= 0). */
+    int64_t* hits_counter() { int64_t* p = paged_counter(); return p ? p + 1 : nullptr; }
+    int64_t  hits_in();
+    int32_t* page_tags(int64_t bytes);
 
 
     /* ---------------- RADIANCE_DEBUG_TIER_VERIFY, the replicated window ----------------
@@ -308,6 +315,7 @@ private:
     bool      moved_ = false;         /* a move was recorded on ev_move_ */
     int64_t*  paged_dev_ = nullptr;   /* paged_counter(), device */
     int64_t*  paged_host_ = nullptr;  /* its readback target, pinned */
+    int32_t*  tags_dev_ = nullptr;    /* page_tags(), device */
     bool      copy_out_ = false;
     /* Transfer stream. Each stream costs a hardware queue, and a fourth queue costs this card 65% of
      * its decode step, so the tier borrows the expert mover's maintenance stream

@@ -11921,6 +11921,85 @@ TEST(flashnext_steps_with_qsa_page_issue_it_between_select_and_attention_and_lin
         }
 }
 
+/* The page cache (RadKVGroupBatch::residency_tags, ABI 46): each pager gets its own layer's plane
+ * of slot tags -- the plane is the count of the group's layers below it (residency_layer_off >= 0),
+ * so planes are dense over the layers the group holds and no two layers share one -- as rows x
+ * pitch i32, and the hit counter as its seventh operand. A batch without tags, or with fewer tag
+ * rows than the step's decode rows, passes neither and the pager copies as before. */
+TEST(flashnext_issues_each_pager_its_layers_page_cache_plane_and_the_hit_counter) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    static char store[4096];
+    static int64_t layer_off[64];
+    static const int32_t scratch[64 * 513] = {};
+    static int32_t tags[8 * 4 * 513];
+    static int64_t counters[2];
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            ctx.kv_residency = 1;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            if (b.kv_groups[0].zero) continue;
+            /* First the layers the pagers run at (their pool operand names the layer); then a table
+             * holding only those, with every other layer -1. */
+            for (int64_t& o : layer_off) o = 0;
+            std::vector<int64_t> layers;
+            for (int mode = 0; mode < 4; ++mode) {
+                const auto k = kit(b, { 1, 1, 1, 1 }, {});
+                for (auto& gb : k->kv) {
+                    gb.residency_store = store;
+                    gb.residency_slot_bytes = (int64_t)sizeof store;
+                    gb.residency_slots = 1;
+                    gb.residency_layer_off = layer_off;
+                    gb.residency_scratch = scratch;
+                    gb.residency_scratch_pitch = 513;
+                    gb.residency_paged = &counters[0];
+                    if (mode >= 1) {
+                        gb.residency_tags = tags;
+                        gb.residency_tags_rows = mode == 3 ? 3 : 4;   /* 3: fewer than the rows */
+                        gb.residency_hits = &counters[1];
+                    }
+                }
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                const auto pg = issues_of(b, *v[0], "qsa_page");
+                REQUIRE(!pg.empty());
+                if (mode == 0) {
+                    for (const RecIssue* i : pg) layers.push_back(i->opd[2].offset);
+                    for (int64_t l = 0; l < 64; ++l)
+                        layer_off[l] = std::find(layers.begin(), layers.end(), l) != layers.end() ? l * 8 : -1;
+                    continue;
+                }
+                std::vector<int64_t> held;
+                for (int64_t l = 0; l < 64; ++l) if (layer_off[l] >= 0) held.push_back(l);
+                for (const RecIssue* i : pg) {
+                    REQUIRE(i->opd.size() >= 7);
+                    if (mode == 3) {
+                        CHECK(i->opd[5].kind == RAD_OPK_NONE);
+                        continue;
+                    }
+                    const int64_t l = i->opd[2].offset;
+                    const int64_t plane = std::find(held.begin(), held.end(), l) - held.begin();
+                    CHECK(plane < (int64_t)held.size());
+                    CHECK(i->opd[5].raw == (void*)(tags + plane * 4 * 513));
+                    CHECK_EQ(i->opd[5].rows, 4LL);
+                    CHECK_EQ(i->opd[5].cols, 513LL);
+                    CHECK(i->opd[6].raw == (void*)&counters[1]);
+                    CHECK(i->opd[4].raw == (void*)&counters[0]);
+                }
+                /* Distinct planes, one a layer. */
+                if (mode != 3) {
+                    std::vector<void*> ps;
+                    for (const RecIssue* i : pg) ps.push_back(i->opd[5].raw);
+                    std::sort(ps.begin(), ps.end());
+                    CHECK(std::adjacent_find(ps.begin(), ps.end()) == ps.end());
+                }
+            }
+        }
+}
+
 /* Sparse attention issues one row per query, chunked by the split-KV scratch it declared, never
  * by `max_seqs`: with four sequences allowed, a 1024-token chunk after a long history is one
  * launch of the gated form, or four of 256 rows where only the plain form resolves. Rows of four
