@@ -1404,8 +1404,9 @@ inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
 
 `--prefill-interleave auto` sizes the hold from measured step times instead: after each such chunk,
 as many decode-only steps as fit in a quarter of a chunk step's time at a decode step's (running
-means of both, at most 16 steps; one until a decode step has been timed). The prefill gives up at
-most a fifth of its rate however many sequences decode, and the decoders get several steps where a
+means of both, at most 64 steps; one until a decode step has been timed). `auto:SHARE` uses SHARE
+of the chunk step's time instead of a quarter (0 < SHARE <= 4; `auto:1` gives decode as much time
+as prefill). With the quarter the prefill gives up at most a fifth of its rate however many sequences decode, and the decoders get several steps where a
 decode step is cheap beside a chunk, none where one costs more than that quarter (they still ride
 every chunk). In the scheduler's host simulation of 32 prompts of 128K tokens sent at once, each
 then decoding 512 tokens (2048-token chunks, MTP 3, step costs fitted to a lone prefill and to

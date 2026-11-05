@@ -802,9 +802,8 @@ private:
     /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
      * the running means of a step that carried a chunk and of a decode step, in seconds, fed by
      * step_finished. */
-    static constexpr double  kInterleaveShare = 0.25;
     static constexpr double  kInterleaveEma = 0.25;
-    static constexpr int64_t kInterleaveAutoMax = 16;
+    static constexpr int64_t kInterleaveAutoMax = 64;
     double  ema_chunk_s_ = 0.0, ema_decode_s_ = 0.0;
     void    step_cost_locked(bool chunk, double seconds);
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps

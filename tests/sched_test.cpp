@@ -3165,7 +3165,16 @@ TEST(interleave_auto_fits_decode_steps_in_a_quarter_of_a_chunk_step) {
     CHECK_EQ(steps(0.4, 0.03), 3);         /* 0.1 s of 0.03 s steps */
     CHECK_EQ(steps(0.4, 0.05), 2);
     CHECK_EQ(steps(0.4, 0.2), 0);          /* a decode step dearer than the quarter */
-    CHECK_EQ(steps(1.0, 0.001), 16);
+    CHECK_EQ(steps(1.0, 0.001), 64);       /* capped at kInterleaveAutoMax */
+    /* auto:SHARE: SHARE of the chunk step's time instead of a quarter. */
+    Fixture k;
+    k.build();
+    k.cfg.prefill_interleave = -1;
+    k.cfg.prefill_interleave_share = 1.0;
+    CHECK_OK(k.start());
+    k.sch.note_step_cost(true, 0.4);
+    k.sch.note_step_cost(false, 0.04);
+    CHECK_EQ(k.sch.interleave_steps(), 10);  /* 0.4 s of 0.04 s steps */
     /* A number is used as given, whatever was measured. */
     Fixture g;
     g.build();

@@ -143,8 +143,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     else if (cfg.prefill_interleave < 0)
         RAD_INFO("scheduler: --prefill-interleave auto: after a prefill chunk that leaves its "
                  "prompt unfinished while other sequences decode, decode-only steps follow for up "
-                 "to a quarter of the chunk step's measured time (at most %lld steps)",
-                 (long long)kInterleaveAutoMax);
+                 "to %.2f of the chunk step's measured time (at most %lld steps)",
+                 cfg.prefill_interleave_share, (long long)kInterleaveAutoMax);
     interleave_left_ = 0;
     ema_chunk_s_ = 0.0;
     ema_decode_s_ = 0.0;
@@ -1226,7 +1226,7 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
 
 /* ------------------------------------------------------------------ decode-only steps */
 /* How many decode-only steps follow a chunk that ran beside decoding sequences
- * (--prefill-interleave). N as given; under auto, as many as fit in kInterleaveShare of a chunk
+ * (--prefill-interleave). N as given; under auto, as many as fit in Config::prefill_interleave_share of a chunk
  * step's measured time at a decode step's, so the prefill gives up at most a fifth of its rate
  * (a quarter of a chunk step) however many sequences decode, and the decoders get the steps that
  * share buys: several where decode steps are cheap beside the chunk, none where one costs more
@@ -1247,7 +1247,7 @@ void Scheduler::note_step_cost(bool chunk, double seconds) {
 int64_t Scheduler::interleave_steps() const {
     if (cfg_.prefill_interleave >= 0) return cfg_.prefill_interleave;
     if (ema_chunk_s_ <= 0.0 || ema_decode_s_ <= 0.0) return 1;
-    const double n = kInterleaveShare * ema_chunk_s_ / ema_decode_s_;
+    const double n = cfg_.prefill_interleave_share * ema_chunk_s_ / ema_decode_s_;
     return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
 }
 

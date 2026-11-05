@@ -79,7 +79,8 @@ static const Flag g_flags[] = {
                                         "off takes the whole step, N holds the chunk to N tokens" },
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
                                         "sequences decode, at most 64; auto fits them in a quarter\n"
-                                        "of the chunk step's time; 0 (default) lets every step\n"
+                                        "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
+                                        "0 (default) lets every step\n"
                                         "carry a chunk" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
@@ -1207,7 +1208,17 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--prefill-interleave"))    {
             if (!(v = need(i))) return RAD_E_INVAL;
-            if (!std::strcmp(v, "auto")) c->prefill_interleave = -1;
+            if (!std::strcmp(v, "auto")) { c->prefill_interleave = -1; c->prefill_interleave_share = 0.25; }
+            else if (!std::strncmp(v, "auto:", 5)) {
+                /* auto:SHARE -- decode-only steps for up to SHARE x a chunk step's time, 0 < SHARE <= 4 */
+                char* e = nullptr;
+                const double sh = std::strtod(v + 5, &e);
+                if (e == v + 5 || *e || !(sh > 0.0 && sh <= 4.0)) {
+                    RAD_ERR("--prefill-interleave %s: auto:SHARE takes a share in (0, 4]", v);
+                    return RAD_E_INVAL;
+                }
+                c->prefill_interleave = -1; c->prefill_interleave_share = sh;
+            }
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
@@ -2082,7 +2093,8 @@ const ShowRow kShow[] = {
                : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
     { "--prefill-interleave", [](const Config& c) {
           return c.prefill_interleave > 0 ? num(c.prefill_interleave)
-               : c.prefill_interleave < 0 ? std::string("auto") : std::string("off"); } },
+               : c.prefill_interleave < 0 ? "auto:" + std::to_string(c.prefill_interleave_share)
+                                          : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {

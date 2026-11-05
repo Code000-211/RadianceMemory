@@ -466,6 +466,15 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "auto" }, &a), RAD_OK);
     CHECK_EQ(a.prefill_interleave, -1);
     CHECK_EQ(parse({ "--prefill-interleave", "automatic" }, &c), RAD_E_INVAL);
+    /* auto:SHARE gives decode-only steps SHARE of a chunk step's time, in (0, 4] */
+    Config h;
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:1" }, &h), RAD_OK);
+    CHECK_EQ(h.prefill_interleave, -1);
+    CHECK(h.prefill_interleave_share == 1.0);
+    CHECK(a.prefill_interleave_share == 0.25);
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:x" }, &c), RAD_E_INVAL);
 }
 
 /* ================================================================== the table, the parser and the help agree
