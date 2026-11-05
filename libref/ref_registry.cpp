@@ -650,7 +650,7 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
-/* The same op over four classes by expert number mod 4: `w`/`w_scale` class 0 at [N, K],
+ /* The same op over four classes by expert number mod 4: `w`/`w_scale` class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4; how four ranks
  * share the extra block of a five-block expert (as in libr4d's schema). */
 static const RadParamSpec pMoeGemmQMod4[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
@@ -681,6 +681,9 @@ static const RadOperandSpec oRowTopk[] = { OPD("x"), OUT("idx"), OUT("val"), OUT
 static const RadParamSpec pRowTopkMerge[] = { P_INT("M"), P_INT("R"), P_INT("world_size"),
                                               P_STR("dtype") };
 static const RadOperandSpec oRowTopkMerge[] = { OPD("gathered"), OUT("idx"), OUT("val") };
+static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype"),
+                                           P_INT("twos") };
+static const RadOperandSpec oDequantW4[] = { WGT("wq"), WGT("ws"), OUT("y") };
 static const RadParamSpec pPairArgmax[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oPairArgmax[] = { OPD("pairs"), OUT("idx"), OUT_O("val") };
 
@@ -1733,6 +1736,9 @@ static const RadOpSchema kSchemas[] = {
   "(idx, val) form the single-rank top-R produces. `gathered` is [M, world_size * R, 2] pairs, "
   "rank r's at [r*R, (r+1)*R); id -1 is a pad and is dropped. Ties break on the LOWER id, which is "
   "what makes the merged answer agree with a top-R over the unsharded plane." },
+{ "dequant_w4", ARR(pDequantW4), ARR(oDequantW4),
+  "Packed int4 weight to row-major bf16. Each 32-bit word holds 8 codes; the scale is "
+  "f16 in the low 16 bits, the zero point -(1024+zero) as f16 in the high 16 bits." },
 { "pair_argmax", ARR(pPairArgmax), ARR(oPairArgmax),
   "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in the first "
   "f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties to the lower "
@@ -2539,6 +2545,7 @@ SIMPLE("ref_gated_had_quant_i8", "gated_had_quant_i8", "quant",
        "gated product, rotation and int8 in one pass", "float in, i8 out, f32 scale",
        ref_gated_had_quant_i8),
 SIMPLE("ref_dequant", "dequant", "quant", "group-scaled dequantisation", DT_ANY, ref_dequant),
+SIMPLE("ref_dequant_w4", "dequant_w4", "quant", "packed int4 weight to row-major bf16", DT_ANY, ref_dequant_w4),
 
 SIMPLE("ref_gemm_nt", "gemm_nt", "gemm", "C = A B^T, f32 accumulate", DT_FLOAT, ref_gemm_nt),
 SIMPLE("ref_gemm_nt_bias", "gemm_nt_bias", "gemm", "C = A B^T + bias", DT_FLOAT,

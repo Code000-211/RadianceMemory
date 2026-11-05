@@ -17,6 +17,8 @@
 #include "ref_gemm.h"
 #include "ref_ops.h"
 #include "ref_planes.h"
+#include <cstdio>
+#include <cstring>
 
 #include <algorithm>
 #include <cstdlib>
@@ -707,8 +709,228 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
 }
 
 int ref_moe_gemm(const RadArgs* a, RadStream)   { return moe_gemm_impl(a, false); }
-int ref_moe_gemm_q(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true); }
+int ref_moe_gemm_q(const RadArgs* a, RadStream s) {
+    const char* dt = p_str(a, "dtype", "");
+    if (dt && std::strcmp(dt, "w4a8") == 0) return ref_moe_gemm_w4a8(a, s);
+    if (dt && std::strcmp(dt, "w4a4") == 0) return ref_moe_gemm_w4a4(a, s);
+    return moe_gemm_impl(a, true);
+}
 int ref_moe_gemm_q_mod4(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true, 4); }
+
+/* ------------------------------------------------------------------ moe_gemm_w4a8 */
+/* moe_gemm_q dtype w4a8: y[i, :] = a[sorted_tok[i] / top_k, :] @ w[e(i)]^T. The two's-complement
+ * int4 experts (nibbles, -8..7) carry one bf16 scale per (row, 128 of K); the output is bf16 in
+ * sorted order. The experts are two tables by parity (the even in `w` / `w_scale`, the odd in
+ * `w_odd` / `w_odd_scale`, expert e at entry e/2 of class e%2). Two activation arms:
+ *   * int8 a: each 128-block accumulates its raw product sum in i32 (exact), then folds
+ *     (sub * a_scale) * w_scale in f32 in ascending block order -- the exact arithmetic and order
+ *     the libr3d kernel runs, so the two agree bit for bit.
+ *   * E4M3 a: the a and w codes decode exactly to f32 and the 128-block dot is summed in f32, the
+ *     scales folded the same way; the kernel's f16 wave-matrix arm matches this to the f16 store
+ *     ulp.
+ * A row no expert owns (a dropped slot) is left as the caller set it. */
+int ref_moe_gemm_w4a8(const RadArgs* a, RadStream) {
+    if (!have(a, 9)) return RAD_E_INVAL;
+    const RadTensor* A   = &a->t[0];
+    const RadTensor* AS  = &a->t[1];
+    const RadTensor* W   = &a->t[2];
+    const RadTensor* WS  = &a->t[3];
+    const RadTensor* ST  = &a->t[4];
+    const RadTensor* OF  = &a->t[5];
+    const RadTensor* WO  = &a->t[6];
+    const RadTensor* WOS = &a->t[7];
+    const RadTensor* Y   = &a->t[8];
+    const bool e4m3 = (A->dtype == RAD_F8E4M3);
+    if (A->dtype != RAD_I8 && !e4m3) return RAD_E_DTYPE;
+    if (AS->dtype != RAD_F32 || W->dtype != RAD_I4 || WS->dtype != RAD_BF16 || Y->dtype != RAD_BF16)
+        return RAD_E_DTYPE;
+    if (e4m3 && (WO->dtype != RAD_I4 || WOS->dtype != RAD_BF16)) return RAD_E_DTYPE;
+
+    const char* ord = p_str(a, "a_order", "token");
+    const bool sorted_a = ord && std::strcmp(ord, "sorted") == 0;
+    if (ord && !sorted_a && std::strcmp(ord, "token") != 0) return RAD_E_UNSUPPORTED;
+
+    const int64_t n_expert = p_int(a, "n_expert", W->rank >= 3 ? W->shape[0] * 2 : 0);
+    const int64_t top_k    = p_int(a, "top_k", 1);
+    if (n_expert <= 0 || top_k <= 0) return RAD_E_SHAPE;
+    const int64_t N = W->rank >= 3 ? W->shape[1] : 0;
+    const int64_t K = W->rank >= 3 ? W->shape[2] : 0;
+    const int64_t T = Y->rank >= 2 ? Y->shape[0] : 0;
+    if (N <= 0 || K <= 0 || T <= 0 || K % 128) return RAD_E_SHAPE;
+    if (p_int(a, "N", N) != N || p_int(a, "K", K) != K) return RAD_E_SHAPE;
+
+    const int64_t n_even = (n_expert + 1) / 2, n_odd = n_expert / 2;
+    if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K) return RAD_E_SHAPE;
+    if (WS->rank < 3 || WS->shape[0] < n_even || WS->shape[1] < N || WS->shape[2] < K / 128)
+        return RAD_E_SHAPE;
+    if (n_odd > 0) {
+        if (WO->rank < 3 || WO->shape[0] < n_odd || WO->shape[1] < N || WO->shape[2] < K)
+            return RAD_E_SHAPE;
+        if (WOS->rank < 3 || WOS->shape[0] < n_odd || WOS->shape[1] < N || WOS->shape[2] < K / 128)
+            return RAD_E_SHAPE;
+    }
+    const int64_t M = A->rank >= 2 ? A->shape[0] : 0;
+    const int64_t ar = sorted_a ? T : M;
+    if (M <= 0 || numel(AS) < ar * (K / 128) || numel(ST) < T || numel(OF) < n_expert + 1)
+        return RAD_E_SHAPE;
+
+    const int64_t a_ld  = A->rank >= 2 ? A->stride[0] : K;
+    const int64_t y_ld  = Y->rank >= 2 ? Y->stride[0] : N;
+    const int64_t w_ld  = W->stride[1];                 // nibbles per weight row
+    const int64_t ws_ld = WS->stride[1];                // scales per weight row
+    const int8_t*  ap   = (const int8_t*)A->data;
+    const uint8_t* ap8  = (const uint8_t*)A->data;
+    const float*   asp  = (const float*)AS->data;
+    const int32_t* st   = (const int32_t*)ST->data;
+    const int32_t* of   = (const int32_t*)OF->data;
+    const uint8_t* wp   = (const uint8_t*)W->data;
+    const uint16_t* wsp = (const uint16_t*)WS->data;
+    const uint8_t* wop  = (const uint8_t*)WO->data;
+    const uint16_t* wosp = (const uint16_t*)WOS->data;
+    uint16_t* yp = (uint16_t*)Y->data;
+
+    for (int64_t i = 0; i < T; ++i) {
+        const int32_t f = st[i];
+        const int64_t src = sorted_a ? i : (f >= 0 ? (int64_t)f / top_k : -1);
+        if (src < 0 || (!sorted_a && (int64_t)f / top_k >= M)) continue;  // a dropped slot
+        int64_t e = 0;
+        while (e + 1 < n_expert && of[e + 1] <= i) ++e;
+        if (i < of[e] || i >= of[e + 1]) continue;        // no expert owns this row
+        const int64_t cls = e & 1, e2 = e >> 1;
+        const uint8_t*  wt  = cls ? wop  : wp;
+        const uint16_t* wst = cls ? wosp : wsp;
+        const int64_t wrow0 = (size_t)e2 * (size_t)N * w_ld / 2;
+        const int64_t wsrow0 = (size_t)e2 * (size_t)N * ws_ld;
+        for (int64_t n = 0; n < N; ++n) {
+            const uint8_t*  wrow = wt  + wrow0 + (size_t)n * w_ld / 2;
+            const uint16_t* wsrow = wst + wsrow0 + (size_t)n * ws_ld;
+            const float* asr = asp + src * (K / 128);
+            float acc = 0.f;
+            for (int64_t b = 0; b < K / 128; ++b) {
+                const int64_t k0 = b * 128;
+                float term;
+                float wscale;
+                const uint32_t ws_bits = (uint32_t)wsrow[b] << 16;   /* bf16 -> f32: align to high 16 bits */
+                std::memcpy(&wscale, &ws_bits, 4);
+                if (e4m3) {
+                    float dot = 0.f;
+                    for (int64_t k = 0; k < 128; ++k)
+                        dot += fp8e4m3_to_f32(ap8[(size_t)src * a_ld + k0 + k]) * w4_code(wrow, k0 + k);
+                    term = dot * asr[b] * wscale;
+                } else {
+                    int32_t sub = 0;
+                    for (int64_t k = 0; k < 128; ++k)
+                        sub += (int32_t)ap[(size_t)src * a_ld + k0 + k] * (int32_t)w4_code(wrow, k0 + k);
+                    term = (float)sub * asr[b] * wscale;
+                }
+                acc += term;
+            }
+            yp[i * y_ld + n] = f32_to_bf16(acc);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ moe_gemm_w4a4 */
+/* moe_gemm_q dtype w4a4: y[i, :] = a[sorted_tok[i] / top_k, :] @ w[e(i)]^T. Both the activation and
+ * the experts are two's-complement int4 (nibbles, -8..7) packed two per byte; the activation carries
+ * one f32 scale per (row, 128 of K), each expert one bf16 scale per (row, 128 of K); the output is
+ * bf16 in sorted order. The experts are two tables by parity (the even in `w` / `w_scale`, the odd in
+ * `w_odd` / `w_odd_scale`, expert e at entry e/2 of class e%2). Each 128-block accumulates its raw
+ * product sum in i32 (exact: both codes widen to int8), then folds (sub * a_scale) * w_scale in f32
+ * in ascending block order -- the exact arithmetic and order the libr3d kernel runs, so the two agree
+ * bit for bit. A row no expert owns (a dropped slot) is left as the caller set it. */
+int ref_moe_gemm_w4a4(const RadArgs* a, RadStream) {
+    if (!have(a, 9)) return RAD_E_INVAL;
+    const RadTensor* A   = &a->t[0];
+    const RadTensor* AS  = &a->t[1];
+    const RadTensor* W   = &a->t[2];
+    const RadTensor* WS  = &a->t[3];
+    const RadTensor* ST  = &a->t[4];
+    const RadTensor* OF  = &a->t[5];
+    const RadTensor* WO  = &a->t[6];
+    const RadTensor* WOS = &a->t[7];
+    const RadTensor* Y   = &a->t[8];
+    if (A->dtype != RAD_I4) return RAD_E_DTYPE;
+    if (AS->dtype != RAD_F32 || W->dtype != RAD_I4 || WS->dtype != RAD_BF16 || Y->dtype != RAD_BF16)
+        return RAD_E_DTYPE;
+    if (WO->dtype != RAD_I4 || WOS->dtype != RAD_BF16) return RAD_E_DTYPE;
+
+    const char* ord = p_str(a, "a_order", "token");
+    const bool sorted_a = ord && std::strcmp(ord, "sorted") == 0;
+    if (ord && !sorted_a && std::strcmp(ord, "token") != 0) return RAD_E_UNSUPPORTED;
+
+    const int64_t n_expert = p_int(a, "n_expert", W->rank >= 3 ? W->shape[0] * 2 : 0);
+    const int64_t top_k    = p_int(a, "top_k", 1);
+    if (n_expert <= 0 || top_k <= 0) return RAD_E_SHAPE;
+    const int64_t N = W->rank >= 3 ? W->shape[1] : 0;
+    const int64_t K = W->rank >= 3 ? W->shape[2] : 0;
+    const int64_t T = Y->rank >= 2 ? Y->shape[0] : 0;
+    if (N <= 0 || K <= 0 || T <= 0 || K % 128) return RAD_E_SHAPE;
+    if (p_int(a, "N", N) != N || p_int(a, "K", K) != K) return RAD_E_SHAPE;
+
+    const int64_t n_even = (n_expert + 1) / 2, n_odd = n_expert / 2;
+    if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K) return RAD_E_SHAPE;
+    if (WS->rank < 3 || WS->shape[0] < n_even || WS->shape[1] < N || WS->shape[2] < K / 128)
+        return RAD_E_SHAPE;
+    if (n_odd > 0) {
+        if (WO->rank < 3 || WO->shape[0] < n_odd || WO->shape[1] < N || WO->shape[2] < K)
+            return RAD_E_SHAPE;
+        if (WOS->rank < 3 || WOS->shape[0] < n_odd || WOS->shape[1] < N || WOS->shape[2] < K / 128)
+            return RAD_E_SHAPE;
+    }
+    const int64_t M = A->rank >= 2 ? A->shape[0] : 0;
+    const int64_t ar = sorted_a ? T : M;
+    if (M <= 0 || numel(AS) < ar * (K / 128) || numel(ST) < T || numel(OF) < n_expert + 1)
+        return RAD_E_SHAPE;
+
+    const int64_t a_ld  = A->rank >= 2 ? A->stride[0] : K / 2;   // BYTES per activation row (K int4)
+    const int64_t y_ld  = Y->rank >= 2 ? Y->stride[0] : N;
+    const int64_t w_ld  = W->stride[1];                 // nibbles per weight row
+    const int64_t ws_ld = WS->stride[1];                // scales per weight row
+    const uint8_t* ap   = (const uint8_t*)A->data;
+    const float*   asp  = (const float*)AS->data;
+    const int32_t* st   = (const int32_t*)ST->data;
+    const int32_t* of   = (const int32_t*)OF->data;
+    const uint8_t* wp   = (const uint8_t*)W->data;
+    const uint16_t* wsp = (const uint16_t*)WS->data;
+    const uint8_t* wop  = (const uint8_t*)WO->data;
+    const uint16_t* wosp = (const uint16_t*)WOS->data;
+    uint16_t* yp = (uint16_t*)Y->data;
+
+    for (int64_t i = 0; i < T; ++i) {
+        const int32_t f = st[i];
+        const int64_t src = sorted_a ? i : (f >= 0 ? (int64_t)f / top_k : -1);
+        if (src < 0 || (!sorted_a && (int64_t)f / top_k >= M)) continue;  // a dropped slot
+        int64_t e = 0;
+        while (e + 1 < n_expert && of[e + 1] <= i) ++e;
+        if (i < of[e] || i >= of[e + 1]) continue;        // no expert owns this row
+        const int64_t cls = e & 1, e2 = e >> 1;
+        const uint8_t*  wt  = cls ? wop  : wp;
+        const uint16_t* wst = cls ? wosp : wsp;
+        const int64_t wrow0 = (size_t)e2 * (size_t)N * w_ld / 2;
+        const int64_t wsrow0 = (size_t)e2 * (size_t)N * ws_ld;
+        for (int64_t n = 0; n < N; ++n) {
+            const uint8_t*  wrow = wt  + wrow0 + (size_t)n * w_ld / 2;
+            const uint16_t* wsrow = wst + wsrow0 + (size_t)n * ws_ld;
+            const float* asr = asp + src * (K / 128);
+            float acc = 0.f;
+            for (int64_t b = 0; b < K / 128; ++b) {
+                const int64_t k0 = b * 128;
+                float wscale;
+                const uint32_t ws_bits = (uint32_t)wsrow[b] << 16;   /* bf16 -> f32: high 16 bits */
+                std::memcpy(&wscale, &ws_bits, 4);
+                int32_t sub = 0;
+                for (int64_t k = 0; k < 128; ++k)
+                    sub += (int32_t)w4_code(ap + (size_t)src * a_ld, k0 + k)
+                         * (int32_t)w4_code(wrow, k0 + k);
+                acc += (float)sub * asr[b] * wscale;
+            }
+            yp[i * y_ld + n] = f32_to_bf16(acc);
+        }
+    }
+    return RAD_OK;
+}
 
 /* ------------------------------------------------------------------ moe_gather */
 /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)].

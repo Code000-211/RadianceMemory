@@ -146,6 +146,7 @@ int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
 int ref_gated_had_quant_i8 (const RadArgs*, RadStream);
 int ref_dequant            (const RadArgs*, RadStream);
+int ref_dequant_w4         (const RadArgs*, RadStream);
 
 /* ---- gemm and the vocabulary edges */
 int ref_gemm_nt            (const RadArgs*, RadStream);
@@ -286,6 +287,8 @@ int ref_router_gemm_topk_scatter(const RadArgs*, RadStream);
 int ref_moe_gemm           (const RadArgs*, RadStream);
 int ref_moe_gemm_q         (const RadArgs*, RadStream);
 int ref_moe_gemm_q_mod4    (const RadArgs*, RadStream);
+int ref_moe_gemm_w4a8      (const RadArgs*, RadStream);
+int ref_moe_gemm_w4a4      (const RadArgs*, RadStream);
 /* The layout hooks of moe_gemm_q and moe_gemm_q_mod4: a codebook expert's views of several planes
  * in the joined form of abi/rad_planes.h, checked against `dtype` (ref_moe.cpp). */
 int ref_moe_cb_layout      (const RadParam*, int, int, const RadEncoding*, const int*,
@@ -437,6 +440,7 @@ REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
 REF_SHAPE_FN(ref_gated_had_quant_i8);
 REF_SHAPE_FN(ref_dequant);
+REF_SHAPE_FN(ref_dequant_w4);
 
 REF_SHAPE_FN(ref_gemm_nt);
 REF_SHAPE_FN(ref_gemm_nt_bias);
@@ -562,6 +566,8 @@ REF_SHAPE_FN(ref_router_gemm_topk_scatter);
 REF_SHAPE_FN(ref_moe_gemm);
 REF_SHAPE_FN(ref_moe_gemm_q);
 REF_SHAPE_FN(ref_moe_gemm_q_mod4);
+REF_SHAPE_FN(ref_moe_gemm_w4a8);
+REF_SHAPE_FN(ref_moe_gemm_w4a4);
 REF_SHAPE_FN(ref_scale_rows);
 REF_SHAPE_FN(ref_moe_gather);
 REF_SHAPE_FN(ref_row_topk);

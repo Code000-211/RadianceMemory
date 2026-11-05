@@ -1336,6 +1336,17 @@ int ref_dequant_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     return o.finish("dequant", operand, out);
 }
 
+int ref_dequant_w4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const int64_t group = gi(p, n_p, "group", 128);
+    if (N < 1 || K < 1 || N % 16 || K % 64 || group < 1 || K % group) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(RAD_I4,  { N * K / 8 });            /* wq -- packed int4 */
+    o.t(RAD_F32, { N * K / group });        /* ws -- scale (f16 in a dword, but declared f32) */
+    o.t(RAD_BF16, { N, K });                /* y */
+    return o.finish("dequant_w4", operand, out);
+}
+
 /* ================================================================== gemm */
 
 int ref_gemm_nt_f32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2115,6 +2126,10 @@ static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
  * `w` is described stacked [ne, N, K], since a fixture cannot hold a pointer table; expert_entry()
  * reads both forms. */
 int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (const char* dk = gs(p, n_p, "dtype")) {
+        if (!std::strcmp(dk, "w4a8")) return ref_moe_gemm_w4a8_shape(p, n_p, operand, out);
+        if (!std::strcmp(dk, "w4a4")) return ref_moe_gemm_w4a4_shape(p, n_p, operand, out);
+    }
     const int64_t M  = gi(p, n_p, "M", 0);
     const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
     const int64_t N1 = gi(p, n_p, "N_odd", N0), K1 = gi(p, n_p, "K_odd", K0);
@@ -2193,6 +2208,61 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     cls(3);
     o.t(D, { M * k, N });                             /* y -- in sorted order */
     return o.finish("moe_gemm_q_mod4", operand, out);
+}
+
+/* The grouped int4 GEMM: an int8 activation with an f32 scale per (row, 128 of K), two's-
+ * complement int4 experts (nibbles, -8..7) with an f32 scale per (row, 128 of K); one weight
+ * table, token-order a only. */
+int ref_moe_gemm_w4a8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
+    const int64_t N1 = gi(p, n_p, "N_odd", N0), K1 = gi(p, n_p, "K_odd", K0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    if (M <= 0 || N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || K0 % 128 || K1 % 128 ||
+        ne <= 0 || k <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
+    const int64_t ne0 = (ne + 1) / 2, ne1 = ne / 2;
+    const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+    Opd o;
+    o.t((uint32_t)RAD_I8, { AR, K });                    /* a -- int8 (the E4M3 arm is 8-bit too) */
+    o.t((uint32_t)RAD_F32, { AR, K / 128 });             /* a_scale */
+    o.t((uint32_t)RAD_I4, { ne0, N0, K0 });              /* w -- even experts, nibbles */
+    o.t((uint32_t)RAD_BF16, { ne0, N0, K0 / 128 });      /* w_scale */
+    o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
+    o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
+    o.t((uint32_t)RAD_I4, { ne1, N1, K1 });              /* w_odd -- odd experts */
+    o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
+    o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
+    return o.finish("moe_gemm_q", operand, out);
+}
+
+/* The same over a two's-complement int4 activation (two nibbles per byte): the w4a8 grid with an
+ * I4 a, so the activation row is K/2 bytes. */
+int ref_moe_gemm_w4a4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
+    const int64_t N1 = gi(p, n_p, "N_odd", N0), K1 = gi(p, n_p, "K_odd", K0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    if (M <= 0 || N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || K0 % 128 || K1 % 128 ||
+        ne <= 0 || k <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
+    const int64_t ne0 = (ne + 1) / 2, ne1 = ne / 2;
+    const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+    Opd o;
+    o.t((uint32_t)RAD_I4, { AR, K });                    /* a -- int4, two nibbles per byte */
+    o.t((uint32_t)RAD_F32, { AR, K / 128 });             /* a_scale */
+    o.t((uint32_t)RAD_I4, { ne0, N0, K0 });              /* w -- even experts, nibbles */
+    o.t((uint32_t)RAD_BF16, { ne0, N0, K0 / 128 });      /* w_scale */
+    o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
+    o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
+    o.t((uint32_t)RAD_I4, { ne1, N1, K1 });              /* w_odd -- odd experts */
+    o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
+    o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
+    return o.finish("moe_gemm_q", operand, out);
 }
 
 int ref_moe_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

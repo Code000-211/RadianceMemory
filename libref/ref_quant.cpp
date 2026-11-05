@@ -273,6 +273,66 @@ int ref_dequant(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ dequant_w4
+ * The packed 4-bit weight back to a plain row-major bf16 [N, K]. The fragment order is
+ * [t][kb][lh][r][s] with eight nibbles along i, where t = n/16, r = n%16, kb = k/64,
+ * s = (k%64)/16, and the k inside the step is 4*lh + _KOFF[i] with _KOFF = {0,8,1,9,2,10,3,11}.
+ * The scale dword at [t][g][r] holds the f16 scale low and -(1024+zero) high. */
+static const int kKOFF[8] = {0, 8, 1, 9, 2, 10, 3, 11};
+static float f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1fu;
+    uint32_t mant = (uint32_t)(h & 0x3ffu);
+    uint32_t f32;
+    if (exp == 0) {
+        if (mant == 0) f32 = sign;
+        else { while (!(mant & 0x400u)) { mant <<= 1; --exp; } f32 = sign | ((exp + 126u) << 23) | ((mant & 0x3ffu) << 13); }
+    } else if (exp == 31) {
+        f32 = sign | 0x7f800000u | (mant << 13);
+    } else {
+        f32 = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f; std::memcpy(&f, &f32, 4); return f;
+}
+
+int ref_dequant_w4(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *wq = &a->t[0], *ws = &a->t[1], *y = &a->t[2];
+    const int64_t N = y->shape[0], K = y->shape[1];
+    const int64_t group = p_int(a, "group", 128);
+    const int64_t twos  = p_int(a, "twos", 1);
+    if (N <= 0 || K <= 0 || N % 16 || K % 64 || group < 1 || K % group) return RAD_E_SHAPE;
+
+    const uint32_t* Wq = (const uint32_t*)wq->data;
+    const uint32_t* Ws = (const uint32_t*)ws->data;
+    const int64_t nkb = K / 64, ng = K / group;
+    const int64_t ys = y->stride[1];
+
+    for (int64_t idx = 0; idx < N * K / 8; ++idx) {
+        const int s  = (int)(idx & 3);
+        const int r  = (int)((idx >> 2) & 15);
+        const int lh = (int)((idx >> 6) & 1);
+        const int kb = (int)((idx >> 7) % nkb);
+        const int t  = (int)((idx >> 7) / nkb);
+        const int row_n = t * 16 + r;
+        const uint32_t w = Wq[idx];
+
+        const int kbase = kb * 64 + s * 16 + 4 * lh;
+        const uint32_t sz = Ws[(size_t)(t * ng + kbase / group) * 16 + r];
+        const float sc   = f16_bits_to_f32((uint16_t)(sz & 0xFFFFu));
+        const float nz   = f16_bits_to_f32((uint16_t)(sz >> 16));
+        const float zero = -nz - 1024.f;
+
+        for (int i = 0; i < 8; i++) {
+            const int n = (int)((w >> (4 * i)) & 0xF);
+            const float q = twos ? (float)((n ^ 8) - 8) : (float)n;
+            const int k = kbase + kKOFF[i];
+            stt(y, (size_t)row_n * K + k, (q - (twos ? 0.f : zero)) * sc);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ quant_act_fp8
  *
  * The oracle for the block-scaled FP8 family, the activation format the production checkpoints
