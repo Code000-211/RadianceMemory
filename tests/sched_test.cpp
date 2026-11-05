@@ -8008,3 +8008,124 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
         CHECK_EQ(h, c.want);
     }
 }
+
+/* ================================================================== a burst of long prompts, timed
+ *
+ * Not a check: a measurement harness for scheduling policy, run on request only:
+ *
+ *   RAD_SCHED_SIM=1 [SIM_N=32 SIM_LEN=131072 SIM_OUT=512 SIM_MAXTOK=2048 SIM_INTERVAL=2048
+ *                    SIM_BUSY=-1 SIM_IL=0 SIM_SEQS=32 SIM_TRACE=1] sched_test sim_burst
+ *
+ * SIM_N prompts of SIM_LEN tokens arrive at once, each then decodes SIM_OUT tokens with three
+ * drafts a step (a uniform 0..3 accepted), the stager arming at 1025 rows, under
+ * --prefix-resume exact. SIM_BUSY and SIM_IL are --busy-prefill-chunk and --prefill-interleave
+ * (-1 for auto). Each step's time is a cost model in seconds: SIM_DEC0 + SIM_DECR per decode row
+ * when it has one, plus SIM_PF0 + SIM_PFB per row when it carries a chunk. The defaults are fitted
+ * to Qwen3.8-Flash-Next at TP2 (a lone prefill at ~5.4K tokens/s on 2048-token chunks; one
+ * sequence decoding ~145 tokens/s, sixteen ~650 with MTP), not measured per step shape: the
+ * schedule is the scheduler's own, the times are an estimate. Prints the aggregate prefill rate,
+ * the time-to-first-token spread and the decode rate of sequences decoding while some prompt still
+ * waits for its first token. */
+static double sim_env(const char* k, double d) {
+    const char* v = std::getenv(k);
+    return v ? std::atof(v) : d;
+}
+
+TEST(sim_burst_of_long_prompts) {
+    if (!std::getenv("RAD_SCHED_SIM")) return;
+    const int     N   = (int)sim_env("SIM_N", 32);
+    const int64_t L   = (int64_t)sim_env("SIM_LEN", 131072);
+    const int     OUT = (int)sim_env("SIM_OUT", 512);
+    const int64_t MT  = (int64_t)sim_env("SIM_MAXTOK", 2048);
+    const double  dec0 = sim_env("SIM_DEC0", 0.014), decr = sim_env("SIM_DECR", 0.003);
+    const double  pf0 = sim_env("SIM_PF0", 0.075), pfb = sim_env("SIM_PFB", 0.147e-3);
+    Fixture f;
+    const int64_t ctx = L + OUT + 4096;
+    f.build(/*blocks=*/(int64_t)N * (ctx / 16 + 8) + 1024, /*states=*/2 * N + 8, MT, ctx);
+    f.cfg.checkpoint_interval = (int64_t)sim_env("SIM_INTERVAL", 2048);
+    f.cfg.busy_prefill_chunk = (int64_t)sim_env("SIM_BUSY", -1);
+    f.cfg.prefill_interleave = (int64_t)sim_env("SIM_IL", 0);
+    f.cfg.max_seqs = (int64_t)sim_env("SIM_SEQS", 32);
+    f.cfg.prefix_exact = true;
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < N; ++i) {
+        auto r = f.request((int)L, OUT);
+        for (size_t k = 0; k < r->prompt.size(); ++k)
+            r->prompt[k] = 1000 + (int32_t)(((int64_t)k * 7 + i * 13) % 60000);
+        r->ignore_eos = true;
+        ids.push_back(f.add(std::move(r)));
+    }
+    std::vector<double> ttft(ids.size(), -1), done(ids.size(), -1);
+    double t = 0, t_pf = 0, dec_s = 0;
+    int64_t pf_tok = 0, steps = 0, mixed = 0, small = 0, dec_tok = 0;
+    uint32_t rng = 12345;
+    int32_t draft[3] = { 7, 7, 7 };
+    auto idx = [&](uint64_t id) { return (size_t)(id - ids[0]); };
+    while (steps < 200000) {
+        for (uint64_t id : ids) {
+            const Request* r = f.sch.find(id);
+            if (r && r->state == ReqState::Running && r->n_computed >= (int64_t)r->prompt.size())
+                (void)f.sch.set_draft(id, draft, 3);
+        }
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        int64_t P = 0, D = 0, nd = 0;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) P += e.n_tokens;
+            else { D += e.n_tokens; ++nd; }
+        }
+        const double dt = (nd ? dec0 + decr * (double)nd : 0.0) +
+                          (P ? pf0 + pfb * (double)(P + D) : 0.0);
+        if (std::getenv("SIM_TRACE") && (steps < 12 || steps % 97 == 0)) {
+            std::printf("step %lld t=%.1f:", (long long)steps, t);
+            for (const StepEntry& e : p.e)
+                std::printf(" %llu:%s%d@%d", (unsigned long long)e.seq, e.is_prefill ? "P" : "d",
+                            e.n_tokens, e.ctx_len);
+            std::printf("\n");
+        }
+        ++steps;
+        mixed += P && nd;
+        small += P && P < 1025;
+        pf_tok += P;
+        if (P) t_pf += dt;
+        bool waiting = false;
+        int64_t decoders = 0;
+        for (size_t k = 0; k < ids.size(); ++k) {
+            if (done[k] >= 0) continue;
+            if (ttft[k] >= 0) ++decoders; else waiting = true;
+        }
+        std::vector<std::pair<uint64_t, size_t>> before;
+        for (const StepEntry& e : p.e) before.push_back({ e.seq, e.req->output.size() });
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+        f.sch.note_step_cost(P > 0, dt);
+        t += dt;
+        if (waiting) dec_s += dt * (double)decoders;
+        for (const auto& b : before) {
+            const Request* r = f.sch.find(b.first);
+            if (!r) continue;
+            const size_t k = idx(b.first);
+            if (b.second == 0 && !r->output.empty() && ttft[k] < 0) ttft[k] = t;
+            else if (waiting && b.second > 0) dec_tok += (int64_t)(r->output.size() - b.second);
+        }
+        std::vector<uint64_t> c;
+        f.sch.take_completed(&c);
+        for (uint64_t id : c) { done[idx(id)] = t; (void)f.sch.reap(id); }
+    }
+    std::vector<double> tt;
+    for (double x : ttft) if (x >= 0) tt.push_back(x);
+    std::sort(tt.begin(), tt.end());
+    if (tt.empty()) return;
+    auto pct = [&](double q) { return tt[std::min(tt.size() - 1, (size_t)(q * (double)tt.size()))]; };
+    std::printf("sim: %d x %lld tokens, max_tok %lld, busy %lld, interleave %lld: %lld steps (%lld "
+                "mixed, %lld with a chunk under 1025); prefill %.0f tokens/s over the steps with a "
+                "chunk, %.0f to the last first token; TTFT p50 %.0f p95 %.0f max %.0f s; decode "
+                "while prompts wait %.1f tokens/s a sequence; all done at %.0f s\n",
+                N, (long long)L, (long long)MT, (long long)f.cfg.busy_prefill_chunk,
+                (long long)f.cfg.prefill_interleave, (long long)steps, (long long)mixed,
+                (long long)small, (double)pf_tok / std::max(t_pf, 1e-9),
+                (double)N * (double)L / tt.back(), pct(0.5), pct(0.95), tt.back(),
+                dec_s > 0 ? (double)dec_tok / dec_s : 0.0, t);
+}
