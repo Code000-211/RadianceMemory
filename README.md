@@ -225,12 +225,24 @@ moves are the ones a walk of the whole table would move (`mem_test`).
 
 ## 6. Dense steps: promotion
 
-Prefill and mixed steps read the table densely, every entry. A cold entry there would be a store slot
-read as a pool block id. Before such a step, the scheduler therefore promotes every sequence in it:
+A step that reads a table densely would read a cold entry's store slot as a pool block id. Which rows
+do that is decided per step by the attention (`rad_block_attn_gated_fp8.h`): the whole step is dense
+only while `max_ctx_len + max_q_len <= qsa_exact_to = budget + ratio - 1` (2 051 tokens on
+Flash-Next); past it every row, decode and prefill, reads its own selection (`sel`). So before a
+prefill or mixed step the scheduler promotes (`Scheduler::res_dense_rows`):
+
+* every **prefill row** with cold entries. A sparse prefill row reads only its selection, but the
+  pager cannot serve it: the scratch is `topk + 1` pages a decode row for `max_seqs × (1 + n_spec)`
+  rows, and a chunk is up to thousands of query rows each selecting 512 blocks (see
+  [§12](#12-how-it-relates-to---kv-resident-kv-streaming) for what serving it from the store would take);
+* the **decode rows** only when the step may be dense, i.e. no entry's `ctx_len + n_tokens` passes
+  `window + block - 1` (the plugin's `qsa_exact_to`, pinned by `arch_test`). In a sparse mixed step
+  they keep their cold entries and page what they select, exactly as in a decode step: a long
+  conversation that merely shares a step with a prompt no longer comes back to VRAM whole.
 
 ```mermaid
 flowchart LR
-    A[plan a prefill / mixed step] --> B{sequence has<br/>cold entries?}
+    A[plan a prefill / mixed step] --> B{prefill row, or<br/>a step that may be dense,<br/>with cold entries?}
     B -- no --> E[build the batch]
     B -- yes --> C[residency_promote_all<br/>fresh pool block per cold entry]
     C -->|pool full| P[ask the prefix cache for room]
@@ -404,8 +416,8 @@ flowchart LR
     subgraph decode
         S[qsa_select] --> P[qsa_page] --> A[attn_paged]
     end
-    subgraph dense [prefill / mixed]
-        PR[promote all cold entries] --> D[dense attention]
+    subgraph dense [prefill rows / dense steps]
+        PR[promote all cold entries] --> D[dense attention or<br/>a prefill row's selection]
     end
     X[cold entry] -. never reaches .-> A
     X -. never reaches .-> D
@@ -420,7 +432,8 @@ The checks:
 | selection with cold entries | a cold entry is chosen exactly where a resident one with the same score would be, in both ranking modes | `r4d_selftest --case qsa_select_i32` |
 | a block comes back intact | demoted, the pool overwritten, promoted: byte for byte, and only the named blocks moved | `mem_test` (host backend) |
 | no leaks | slots and blocks across demote, promote, preempt, rollback, fork, eviction, trim, expiry, re-plan | `mem_test` |
-| scheduler | sweep bound, sink and tail never demoted, dense steps see pool ids only, no livelock on a full pool | `sched_test` |
+| scheduler | sweep bound, sink and tail never demoted, dense steps and prefill rows see pool ids only, a sparse mixed step's decode rows stay cold for the pager, no livelock on a full pool | `sched_test` |
+| where a mixed step is sparse | one token past `window + block - 1` every attention launch reads `sel`; at it the step is dense | `arch_test` |
 | drafts page too | the MTP head's draft passes stage their rows as decode rows, so its `qsa_page` runs and it never reads a cold block as absent | `sched_test` |
 | why drafts must match too | under `--state-cache-dtype f16` the anchor state is rounded once a step, so the text depends on how many drafts each step accepts (f32 does not): residency that changes a draft changes the text there | `ref_test` |
 

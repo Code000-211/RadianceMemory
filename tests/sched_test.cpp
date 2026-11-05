@@ -5165,10 +5165,12 @@ TEST(the_debug_sync_waits_for_each_sweep_and_the_kl_emulation_sweeps_after_prefi
     }
 }
 
-/* A prefill or mixed step reads tables densely, so a cold entry in one would be a store slot
- * dereferenced as a pool block. Every sequence in such a step is promoted before the batch is
- * built, and the batch's own table holds pool ids only. */
-TEST(a_dense_step_after_demotion_sees_only_pool_blocks_in_its_tables) {
+/* A mixed step past the consumer's dense reach (window + block - 1 = 79 tokens here) is sparse for
+ * every row: decode rows read their selection through the pager, as in a decode step, so they keep
+ * their cold entries; only the prefill rows, which the per-decode-row scratch cannot page, are
+ * promoted. Promoting the decode rows too, as every mixed step used to, brought each decoding
+ * conversation's whole middle back whenever a prompt shared its step. */
+TEST(a_sparse_mixed_step_promotes_its_prefill_rows_and_leaves_decode_rows_to_the_pager) {
     Fixture f;
     f.build();
     Rig rig;
@@ -5182,16 +5184,63 @@ TEST(a_dense_step_after_demotion_sees_only_pool_blocks_in_its_tables) {
     rig.landed = true;
     CHECK(f.sch.step() != nullptr);
     f.commit_plain();                            /* reaps; a is cold in the middle */
-    int64_t cold = 0;
-    for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
-    CHECK(cold > 0);
+    int64_t cold_a = 0;
+    for (int32_t e : f.kv.block_table(a, 0)) cold_a += e <= -2;
+    CHECK(cold_a > 0);
 
-    f.submit(48, 8);                             /* a new prompt beside a decoding row: mixed */
+    /* A returning conversation beside the decoding row: its chain has 10 cold entries. */
+    f.pc.seed_cold(256, /*first=*/2, /*n=*/10);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t c = f.submit(300, 8);
     const RadBatch* b = f.sch.step();
     CHECK(b != nullptr);
     if (!b) return;
     CHECK_EQ((int)f.sch.plan().phase, (int)RAD_PHASE_MIXED);
-    CHECK_EQ(rig.moved(false), cold);            /* each cold entry was promoted by the host */
+    CHECK_EQ(rig.moved(false), (int64_t)10);     /* the prefill row's cold entries, no more */
+    CHECK_EQ(f.kv.res_cold, cold_a);             /* the decode row kept every cold entry */
+    REQUIRE_EQ(b->n_seq, 2);
+    CHECK_EQ(f.sch.plan().e[0].seq, a);          /* decode rows first: the pager's rows */
+    CHECK_EQ(b->n_seq_decode, 1);
+    CHECK(b->n_tok_decode >= 1);
+    const RadKVGroupBatch& g = b->kv[0];
+    int64_t cold_row = 0;
+    const std::vector<int32_t>& ta = f.kv.block_table(a, 0);
+    for (size_t k = 0; k < ta.size(); ++k) cold_row += g.block_table[(int64_t)k] <= -2;
+    CHECK_EQ(cold_row, cold_a);                  /* staged cold: the pager rewrites them */
+    CHECK_EQ(f.sch.plan().e[1].seq, c);
+    const std::vector<int32_t>& tc = f.kv.block_table(c, 0);
+    for (size_t k = 0; k < tc.size(); ++k)
+        CHECK(g.block_table[g.block_table_pitch + (int64_t)k] >= 0);
+}
+
+/* A step every row of which is within the consumer's dense reach takes the dense attention, which
+ * reads every table entry: there a decode row's cold entry would be a store slot read as a pool
+ * block, so a dense mixed step promotes its decode rows too. With no sink, a 70-token row whose
+ * 64-token window leaves its first block outside is such a row (reach 71 <= 79). */
+TEST(a_dense_mixed_step_promotes_its_decode_rows_too) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/64, /*window=*/64, /*sink=*/0);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(70, 64);
+    run_to_decode(f);
+    f.commit_plain();
+    rig.landed = true;
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                            /* reaps */
+    int64_t cold = 0;
+    for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
+    REQUIRE(cold > 0);
+
+    f.submit(8, 4);                              /* a short prompt beside it: mixed and dense */
+    const RadBatch* b = f.sch.step();
+    CHECK(b != nullptr);
+    if (!b) return;
+    CHECK_EQ((int)f.sch.plan().phase, (int)RAD_PHASE_MIXED);
+    for (const StepEntry& e : f.sch.plan().e) CHECK(e.ctx_len + e.n_tokens <= 79);
+    CHECK_EQ(rig.moved(false), cold);
     CHECK_EQ(f.kv.res_cold, (int64_t)0);
     const RadKVGroupBatch& g = b->kv[0];
     for (int32_t i = 0; i < b->n_seq; ++i) {
@@ -5234,31 +5283,31 @@ TEST(a_prompt_that_hits_a_cached_chain_with_cold_entries_prefills_on_pool_ids_af
 /* A dense step whose sequence cannot be promoted because the pool is full must not be planned and
  * abandoned forever: the sweep that would free room runs only after decode steps. The scheduler
  * preempts the back of the running set by recompute, as it does when a sequence cannot grow, so
- * every failed attempt costs one request and the server keeps stepping. */
+ * every failed attempt costs one request and the server keeps stepping. The step is dense (every
+ * row within window + block - 1 = 79 tokens, no sink), so its decode row is promoted too. */
 TEST(a_dense_step_the_pool_cannot_promote_preempts_instead_of_retrying_forever) {
     Fixture f;
     f.build();
     Rig rig;
-    rig.arm(f, /*sweep=*/64);
+    rig.arm(f, /*sweep=*/64, /*window=*/64, /*sink=*/0);
     CHECK_OK(f.start());
-    const uint64_t a = f.submit(320, 64);
+    const uint64_t a = f.submit(70, 64);
     run_to_decode(f);
-    f.commit_plain();                            /* sweeps the middle of `a` */
+    f.commit_plain();                            /* sweeps the block of `a` the window left */
     rig.landed = true;
     CHECK(f.sch.step() != nullptr);
-    f.commit_plain();                            /* reaps: the freed blocks are back */
+    f.commit_plain();                            /* reaps: the freed block is back */
     int64_t cold = 0;
     for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
     REQUIRE(cold > 0);
-    /* Room for the newcomer's 48 tokens (3 blocks) and its first decode token, not for `a`'s
-     * promotion: admission succeeds, the mixed step's promotion cannot. */
-    REQUIRE(cold > 4);
+    /* Room for the newcomer's 8 tokens (1 block), not for `a`'s promotion: admission succeeds,
+     * the mixed step's promotion cannot. */
     std::vector<int32_t> taken;
     auto& fl = f.kv.freelist[0];
-    while (fl.size() > 4) { taken.push_back(fl.back()); fl.pop_back(); }
+    while (fl.size() > 1) { taken.push_back(fl.back()); fl.pop_back(); }
 
     const int64_t pre0 = f.sch.metrics().preemptions;
-    f.submit(48, 8);                             /* beside a decoding row: a mixed step */
+    f.submit(8, 4);                              /* beside a decoding row: a dense mixed step */
     int stepped = 0;
     for (int i = 0; i < 20; ++i)
         if (f.sch.step() != nullptr) { ++stepped; f.commit_plain(); }

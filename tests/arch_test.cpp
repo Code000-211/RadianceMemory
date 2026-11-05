@@ -11976,6 +11976,49 @@ TEST(flashnext_qsa_declares_a_window_on_its_attention_group_and_none_on_its_bloc
     CHECK_EQ(b.kv_groups[attn - 1].d.n_head_kv, 2);
 }
 
+/* The scheduler promotes a mixed step's decode rows only when the step may be dense, and it takes a
+ * step whose reach passes `window + block - 1` for sparse in every row (Scheduler::res_dense_rows):
+ * its decode rows keep their cold entries for the pager. That holds only while the attention's own
+ * dense bound (qsa_exact_to) is no larger. Pinned at the edge: one token past it every attention
+ * launch reads the selection, and at it the step is dense (the bound is exactly the plugin's). */
+TEST(flashnext_a_mixed_step_past_the_window_plus_a_block_reads_every_row_through_its_selection) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadBuilder b;
+    /* The attention block is `ratio` tokens on the card (rad_qsa.h, page_block_bytes); the fake's
+     * default of 16 would put the bound past the plugin's and hide the edge. */
+    b.kv_block = 4;
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    ctx.kv_residency = 1;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    int64_t win = 0;
+    for (const auto& g : b.kv_groups) if (g.name == "kv_attn") win = g.d.residency_window;
+    REQUIRE(win > 0);
+    REQUIRE(b.kv_block > 0);
+    const int64_t bound = win + b.kv_block - 1;
+    for (int past = 0; past < 2; ++past) {
+        auto k = kit(b, { 1, 1 }, { 32 }, 100);
+        /* The batch's reach is max_ctx_len + max_q_len (rad_block_attn_gated_fp8.h). */
+        k->b.max_ctx_len = (int32_t)(bound + past - k->b.max_q_len);
+        RadCtx c;
+        c.b = &b;
+        c.batch = &k->b;
+        qwen4exp_fp8::step(&c, &k->b);
+        int sparse = 0, dense = 0;
+        rad_buf sel = 0;
+        for (const RecIssue& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            if (o->op == "qsa_select") sel = i.opd[5].handle;
+            else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant")
+                ++(sel && i.opd[2].handle == sel ? sparse : dense);
+        }
+        CHECK(sparse + dense > 0);
+        if (past) CHECK_EQ(dense, 0);
+        else      CHECK(dense > 0);
+    }
+}
+
 TEST(flashnext_qsa_tail_is_per_layer_state) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();

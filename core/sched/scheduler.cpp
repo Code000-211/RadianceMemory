@@ -1629,6 +1629,24 @@ int Scheduler::res_issue(bool to_host) {
     return rc;
 }
 
+/* Whether a step may read its decode rows' tables densely. A QSA consumer (arch/common/rad_qsa.h,
+ * rad_block_attn_gated_fp8.h) takes the dense attention for the whole step only while
+ * `max_ctx_len + max_q_len <= qsa_exact_to = budget + ratio - 1`, with the budget its declared
+ * window and the ratio its block: past that every row, decode and prefill, reads its selection
+ * (`sel`), never the table. The batch's reach is at least any entry's ctx_len + n_tokens
+ * (max_ctx_len is a rounded-up maximum), so an entry past `window + block - 1` makes the step
+ * sparse for every group with a window. The same bound already holds the decode step's verify
+ * rows (T != n_seq) on the pager: a window below the consumer's dense reach would break both. */
+bool Scheduler::res_dense_rows(const StepPlan& p) const {
+    int64_t reach = 0;
+    for (const StepEntry& e : p.e) reach = std::max<int64_t>(reach, (int64_t)e.ctx_len + e.n_tokens);
+    for (int32_t g = 0; g < kv_->n_groups(); ++g) {
+        const int64_t win = kv_->residency_window(g), bt = kv_->block_tokens(g);
+        if (win > 0 && bt > 0 && reach <= win + bt - 1) return true;
+    }
+    return false;
+}
+
 void Scheduler::res_reap() {
     if (!res_inflight_ || !res_mover_.landed) return;
     if (res_mover_.sync)
@@ -2259,15 +2277,20 @@ const RadBatch* Scheduler::step() {
         lost_restore = true;
     }
 
-    /* A prefill or mixed step reads its sequences' tables densely, and a cold entry is a store slot,
-     * not a block: every sequence in it is promoted first, and the compute stream waits on the
-     * copy (the mover). A pool too full to take them all abandons the step like a failed staging,
-     * and the next one asks again once the sweep or a finish has freed room. */
+    /* A cold entry is a store slot, not a block: whatever reads a table densely must find it
+     * promoted first, and the compute stream waits on the copy (the mover). Which rows that is
+     * (res_dense_rows): a dense step's every sequence; in a sparse step only the prefill rows,
+     * which the pager cannot serve -- its scratch is per decode row (KVManager::scratch_rows), so
+     * a sparse step's decode rows keep their cold entries and page what they select, as in a
+     * decode step. A pool too full to take them all abandons the step like a failed staging, and
+     * the next one asks again once the sweep or a finish has freed room. */
     bool promote_failed = false;
     if (res_mover_.move && plan_.phase != RAD_PHASE_DECODE) {
         uint64_t full_seq = 0;
         bool full = false;
+        const bool all = res_dense_rows(plan_);
         for (const StepEntry& e : plan_.e) {
+            if (!all && !e.is_prefill) continue;
             int st = kv_->residency_promote_all(e.seq, &res_moves_);
             /* Room first from the prefix cache, as growth takes it (bounded the same way). */
             for (int round = 0; st == RAD_E_FULL && round < kEvictRounds && pc_ &&

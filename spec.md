@@ -1234,9 +1234,10 @@ that found the store full.
 selection as the attention's block table, on the card; nothing on the host knows which blocks a
 decode step will read before it runs. A cold entry the selection names is therefore paged in by the
 `qsa_page` op between the selection and the attention ("The pager contract" below). The host
-promotes only for dense steps, which read the whole table and whose cold set it knows
-(`KVManager::residency_promote_all`, run through `TierExec::issue_moves` with the compute stream
-made to wait). With the store open the engine installs the scheduler's mover (below), so the sweep
+promotes only rows the pager cannot serve, whose cold set it knows (`KVManager::residency_promote_all`,
+run through `TierExec::issue_moves` with the compute stream made to wait): a prefill row, and a
+decode row of a step that may be dense (`Scheduler::res_dense_rows`: no entry past `window + block -
+1`, the consumer's `qsa_exact_to`). A sparse mixed step's decode rows page as a decode step's do. With the store open the engine installs the scheduler's mover (below), so the sweep
 demotes and the pager pages: startup says "window enforced". A model that declares no window warns
 that the flag does nothing and installs nothing.
 
