@@ -529,6 +529,56 @@ Choose window residency for contexts below the streaming floor, for workloads th
 prefixes turn after turn, and for a card that has the VRAM for the tails. Choose streaming for very
 long contexts on a card that cannot hold them at all.
 
+### Prefill rows from the store instead of a promotion (design note, not built)
+
+A returning conversation's prefill is sparse past 2 051 tokens, so each of its rows reads only its
+selection, yet its whole cold middle is promoted first (§6), because the pager serves decode rows
+only. Could a streaming-like resolve copy just what the chunk selects?
+
+**What streaming does for prefill today.** Nothing selection-aware. `kv_pass_view`
+(`core/kvstream/bind.cpp:32`) gives every non-decode pass, and every decode-classified pass wider
+than `n_seq × (1 + n_spec)`, the **stage**: per layer, every block the step's tables name is copied
+from the host mirror into a one-layer buffer at block-id identity (`kvstream_step_runs`,
+`core/kvstream/stage.cpp:154`; ordering in `core/kvstream/stage.h`), decode rows of a mixed step
+included, and `resolve_sel` returns early on a staged pass (`rad_block_attn_gated_fp8.h:993`). It
+was built that way because one prefill launch's selection union is 70-100 % of the history
+(KV-STREAMING.md §3.5: 23 429 of ~33 000 blocks at 133K tokens), which no ring holds.
+
+**Can the residency store be the host source?** As bytes, yes: it is host-mapped and the card reads
+it directly (`qsa_page` does, per layer, at `residency_layer_off`, expanding a tiered demote layout).
+As a drop-in for the mirror, no: the mirror is one row a layer addressed by block id in the pool's
+layout, the store is one slot a block (every layer and rank inside, possibly in the demote layout)
+addressed by slot, and a cold entry has no block id to stage at. `kv_resolve` and the stage copy
+cannot read it unchanged; `qsa_page`'s fragment copy and codec can.
+
+**Copy volume, Flash-Next `--tp 2` fp8, a 128K-token conversation (~31.4K middle blocks, 26 KiB a
+rank's block = 13 layers × 2 KiB).**
+
+| | link a rank | VRAM held a rank during the prefill |
+|---|--:|--:|
+| promotion (today) | ~800 MiB once a turn; re-demoted by re-pointing at its origin slots, no copy | the middle, ~800 MiB |
+| selection union per chunk | ~0.7 × 800 ≈ 560 MiB **a chunk** (each layer its own union) | the union, a pool page a block and layer: no saving |
+| residency stage (streaming's shape) | ~800 MiB **a chunk** (cold H2D + resident D2D) | one layer of the history, ~64 MiB |
+
+The union is no cheaper than the promotion for a one-chunk follow-up, and k chunks cost k times
+as much. Its pages would have to be pool ids, which hold every layer, so it saves no VRAM either: the
+only design that does is the one-layer stage. The gain of that design is **VRAM headroom, not link
+bytes or TTFT**: a follow-up turn proceeds with ~64 MiB a rank free instead of ~800 MiB (a promotion
+that does not fit preempts the sequence and recomputes 128K tokens, §6). The promotion's own cost
+is ~37 ms of link a rank at ~22 GB/s.
+
+**The work.** Not a contained change: (1) a per-rank stage buffer one layer deep, `max_ctx / block ×
+fragment`, charged to the VRAM budget, and a per-step staged table for the prefill rows (stage index
+per table entry); (2) a per-layer copy into it, cold fragments from store slots (with the tiered
+expand) and resident ones from the pool, ordered like streaming's (copy L before L's store, L+1 after
+every attention launch of L); (3) in `rad_qsa.h` the prefill rows' `qsa_select` on the staged table,
+and in `rad_block_attn_gated_fp8.h` the sparse launches split at `n_tok_decode` (decode rows on the
+pool and the pager, prefill rows on the stage) plus the identity store of the chunk's own K/V into the
+stage; (4) the same for the MTP head's history pass; (5) libref / avx / r4d rows, selftests, and the
+emulation. **Plan:** first measure, with the two changes above (sparse mixed steps no longer promote
+decode rows, and the sweep drains a middle in ~60 steps), how often a follow-up's promotion fails
+(`preemptions`, follow-up TTFT); build the stage only if it does.
+
 ---
 
 ## 13. Limits and open points
