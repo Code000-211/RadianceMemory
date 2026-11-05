@@ -819,7 +819,10 @@ void KVManager::drop_block(int32_t g, int32_t b) {
         if (rc == 2) ++cache_only_[(size_t)g];
         else if (rc == 1) { --cache_only_[(size_t)g]; cached_[(size_t)g][(size_t)b] = 0; }
     }
-    if (--rc != 0) return;
+    if (--rc != 0) {
+        if (rc == 1 && !cached_[(size_t)g][(size_t)b]) ++res_skip_epoch_;   /* no longer shared */
+        return;
+    }
     forget_origin(g, b);                  /* a freed block is no longer a copy of anything */
     auto& fl = free_blocks_[(size_t)g];
     fl.push_back(b);
@@ -1162,6 +1165,7 @@ int KVManager::add_sequence(uint64_t id) {
     s.win.resize(plans_.size());
     s.state.assign(plans_.size(), -1);
     s.dirty_from.assign(plans_.size(), 0);
+    s.res.resize(plans_.size());
     seqs_.emplace(id, std::move(s));
     return RAD_OK;
 }
@@ -1180,7 +1184,7 @@ int KVManager::preempt(uint64_t id) {
         /* The runtime window goes with the blocks: re-admission re-arms it at the prompt end
          * (the scheduler's admission path calls set_window again before the KV grows). */
         s->win[g] = SeqWindow{};
-        s->dirty_from[g] = 0;
+        table_changed(s, g, 0);
         /* The recurrent state goes too (see preempt in kv.h, spec §7.1). */
         if (s->state[g] >= 0) { drop_state((int32_t)g, s->state[g]); s->state[g] = -1; }
     }
@@ -1227,13 +1231,13 @@ int KVManager::rollback(uint64_t id, int64_t n_tokens) {
              * already recycled, so drop everything and rebase. */
             want = 0;
             s->first_block_pos[g] = (n_tokens / p.block_size) * p.block_size;
-            s->dirty_from[g] = 0;
+            table_changed(s, g, 0);
         }
         while ((int64_t)s->blocks[g].size() > want) {
             drop_entry((int32_t)g, s->blocks[g].back());
             s->blocks[g].pop_back();
         }
-        s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], (int64_t)s->blocks[g].size());
+        table_changed(s, g, (int64_t)s->blocks[g].size());
         /* The new partial tail takes the next append: it stops being a copy of its origin. */
         if (n_tokens % p.block_size != 0 && !s->blocks[g].empty() && s->blocks[g].back() >= 0)
             forget_origin((int32_t)g, s->blocks[g].back());
@@ -1679,9 +1683,8 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
     int64_t last = end - keep_tail;      /* one past the last entry the window covers */
     if (last > end - 1) last = end - 1;
     if (last < keep_head) last = keep_head;
-    /* Skips are counted here and charged once: a sweep re-walks the whole table every decode
-     * step, and a prefix-cached history is all skips, so a per-entry session lookup (a map
-     * search) cost O(context) of them a step. */
+    /* Skips are counted here and charged once a call, not with a session lookup (a map search)
+     * per entry. */
     int64_t skipped = 0;
     auto charge_skips = [&] {
         if (skipped <= 0) return;
@@ -1689,7 +1692,17 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         seq_res(id).skipped += skipped;
         skipped = 0;
     };
-    for (int64_t i = keep_head; i < last && left > 0; ++i) {
+    /* Resume where the last call left off: the entries before `from` were all decided and
+     * nothing since has changed them (table_changed lowers it) or unshared one (the epoch). Each
+     * would only `continue` below without using `left`, so the moves are the full walk's. The
+     * re-walk's repeated skip counts are not repeated: `skipped` counts each decision once. */
+    Seq::ResCursor& cur = s->res[(size_t)g];
+    if (cur.epoch != res_skip_epoch_ || cur.head != keep_head) cur = { keep_head, keep_head, res_skip_epoch_ };
+    int64_t& from = cur.from;
+    int64_t i = std::max<int64_t>(keep_head, from);
+    bool decided = true;                 /* every entry from `from` to `i` is decided */
+    for (; i < last && left > 0; ++i) {
+        if (decided) from = i;
         const int32_t b = tbl[(size_t)i];
         if (b < 0) continue;                               /* already cold (or empty) */
         /* A block the prefix cache indexes, or a child holds, is read by another sequence's step
@@ -1745,6 +1758,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         const int32_t slot = slot_new();
         if (slot < 0) {                                    /* store full: this one stays */
             ++skipped;
+            decided = false;                               /* retried when a slot frees */
             continue;
         }
         /* The entry is cold from here; the block keeps its one reference until the copy lands. */
@@ -1760,6 +1774,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         ++sr.demoted;
         sr.link_bytes += p->residency_bytes();
     }
+    if (decided) from = i;
     charge_skips();
     return RAD_OK;
 }
@@ -1791,7 +1806,7 @@ int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64
         const int32_t slot = rad_kv_entry_slot(e);
         const bool shared = res_refs_[(size_t)slot] > 1;
         tbl[(size_t)i] = fresh;
-        s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
+        table_changed(s, (size_t)g, i);
         --res_cold_;
         res_pending_.push_back({ g, slot });
         /* A tiered block keeps its slot too: its pool bytes are the slot's expanded, and a
@@ -1872,7 +1887,7 @@ void KVManager::recycle_window(Seq* s, int64_t keep_from) {
         while (first < target && !s->blocks[g].empty()) {
             drop_entry((int32_t)g, s->blocks[g].front());
             s->blocks[g].erase(s->blocks[g].begin());
-            s->dirty_from[g] = 0;
+            table_changed(s, g, 0);
             ++first;
         }
         if (s->blocks[g].empty()) first = target;   /* nothing held: rebase to the window */
@@ -1941,7 +1956,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                         int32_t fresh = -1;
                         grab_block((int32_t)g, &fresh);
                         s->blocks[g][(size_t)bi] = fresh;
-                        s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], bi);
+                        table_changed(s, g, bi);
                         drop_block((int32_t)g, old);
                         pending_.push_back({(int32_t)g, old, fresh});
                     }
@@ -1951,8 +1966,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                 ? window_table_len(p, s->win[g], n_tokens) - first
                 : ceil_div(n_tokens, p.block_size) - first;
             if ((int64_t)s->blocks[g].size() < want)
-                s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g],
-                                                     (int64_t)s->blocks[g].size());
+                table_changed(s, g, (int64_t)s->blocks[g].size());
             while ((int64_t)s->blocks[g].size() < want) {
                 int32_t b = -1;
                 grab_block((int32_t)g, &b);
@@ -1999,7 +2013,7 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
         else { slot_ref(rad_kv_entry_slot(b)); ++res_cold_; }
     }
     s->blocks[(size_t)g] = blocks;
-    s->dirty_from[(size_t)g] = 0;
+    table_changed(s, (size_t)g, 0);
     s->n_tokens = n_tokens;
     return RAD_OK;
 }
@@ -2298,7 +2312,7 @@ int KVManager::seed_window(uint64_t id, int64_t pos) {
             grab_block((int32_t)g, &b);
             s->blocks[g].push_back(b);
         }
-        s->dirty_from[g] = 0;
+        table_changed(s, g, 0);
     }
     if (s->n_tokens == 0) s->n_tokens = pos;
     return RAD_OK;

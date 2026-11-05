@@ -408,7 +408,7 @@ public:
     struct ResidencyStats {
         int64_t demoted = 0, promoted = 0;         /* blocks, over the manager's life */
         int64_t demoted_bytes = 0, promoted_bytes = 0;
-        int64_t demote_skipped = 0;                /* shared or partial, or the store was full */
+        int64_t demote_skipped = 0;                /* shared (once per decision) or the store was full (each try) */
         int64_t freed_blocks = 0, freed_bytes = 0; /* pool blocks given back by landed demotions: VRAM freed */
         int64_t promoted_misses = 0;               /* a promotion a step needed: the link traffic */
         int64_t repointed = 0;                     /* demotions that moved no bytes: the entry went back to its origin slot */
@@ -866,7 +866,20 @@ private:
          * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
          * zero; kNoDirty is unchanged. Mutable because take_table_changes() clears it. */
         mutable std::vector<int64_t> dirty_from;
+        /* Per group, where the residency sweep resumes: every entry in [head, from) was decided
+         * by an earlier residency_demote() with that keep_head -- cold, emulated, or kept because
+         * shared -- under the skip epoch `epoch` (res_skip_epoch_). `from` is lowered with
+         * dirty_from by every table change (table_changed), so a sweep is O(new entries) a step,
+         * not O(context). */
+        struct ResCursor { int64_t from = 0, head = -1; uint64_t epoch = 0; };
+        std::vector<ResCursor> res;
     };
+    /* A table entry of `s` in group `g` from `from` on changed: for the batch builder's upload
+     * (dirty_from) and the residency sweep's resume point (res_from). */
+    void table_changed(Seq* s, size_t g, int64_t from) {
+        s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], from);
+        s->res[g].from   = std::min<int64_t>(s->res[g].from, from);
+    }
 
     int  grab_block(int32_t g, int32_t* out);
     void drop_block(int32_t g, int32_t b);
@@ -948,6 +961,10 @@ private:
      * (group, slot). residency_complete() frees them. */
     std::vector<std::pair<int32_t, int32_t>> res_pending_;
     ResidencyStats res_stats_;
+    /* Bumped when a block stops being shared (drop_block leaves it one holder and no cache
+     * mark): an entry the sweep kept because it was shared may now move, so every resume point
+     * decided under an older epoch is void. */
+    uint64_t res_skip_epoch_ = 0;
     /* Per-session counters, oldest request id first, at most kResidencySessions (seq_res()). */
     std::map<uint64_t, SeqResidency> res_seq_;
     SeqResidency& seq_res(uint64_t id);

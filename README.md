@@ -214,6 +214,13 @@ The rules that keep this safe without any host wait:
 4. **One sweep in flight.** Landing is a poll of the newest transfer, so a sweep issued every step
    would keep the newest transfer always pending and never free anything.
 
+**The sweep resumes where it left off.** Each sequence remembers, per group, the first table entry
+not yet decided (cold, or kept because the prefix cache or a fork shares it). A step's sweep
+starts there, so it costs the entries that are new since the last one, not the whole context. The
+mark goes back when the table changes (append, promotion, rollback, adoption, preemption), when a
+shared block loses its last other holder, and it stops at an entry a full store kept. The blocks it
+moves are the ones a walk of the whole table would move (`mem_test`).
+
 ---
 
 ## 6. Dense steps: promotion

@@ -8363,6 +8363,158 @@ TEST(a_full_store_leaves_the_rest_resident_and_reports_the_skips) {
     CHECK_EQ((int64_t)f.kv.residency_cold_entries(1, G_RES).size(), 4ll);
 }
 
+/* The sweep resumes where it left off: an entry it decided (cold, or kept because shared) is not
+ * walked again every step, so a prefix-cached history costs its walk once, not once a decode step.
+ * The skip count shows it: a second sweep over an unchanged table skips nothing new. What is
+ * decided is undone exactly when it could change: a block that stops being shared, a promotion,
+ * a rollback, and a slot freed after the store was full. */
+TEST(a_sweep_resumes_where_it_left_off_and_revisits_what_changed) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, /*slots=*/32));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 40));
+    const std::vector<int32_t> t0 = f.kv.block_table(1, G_RES);
+    for (int i = 2; i < 12; ++i) CHECK_OK(f.kv.retain_block(G_RES, t0[(size_t)i]));   /* cached */
+
+    std::vector<BlockMove> m;
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    CHECK_EQ((int64_t)m.size(), 20);                   /* entries 12..31 */
+    CHECK_EQ(f.kv.residency_stats().demote_skipped, 10ll);
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    CHECK(m.empty());
+    CHECK_EQ(f.kv.residency_stats().demote_skipped, 10ll);   /* nothing re-walked */
+
+    /* The cache lets entry 5 go: it is this sequence's alone now, and the next sweep moves it. */
+    f.kv.release_block(G_RES, t0[5]);
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    REQUIRE_EQ(m.size(), (size_t)1);
+    CHECK_EQ(m[0].block, t0[5]);
+    f.kv.residency_demote_landed();
+
+    /* A promoted entry is resident again, and the next sweep demotes it again. */
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote(1, G_RES, { 20 }, &up));
+    f.kv.residency_complete();
+    const int32_t fresh = f.kv.block_table(1, G_RES)[20];
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    REQUIRE_EQ(m.size(), (size_t)1);
+    CHECK_EQ(m[0].block, fresh);
+    f.kv.residency_demote_landed();
+
+    /* A full store keeps what it cannot take, and the next sweep retries it once a slot is back:
+     * 21 slots are this sequence's, a second sequence takes 10, and growing by 16 entries finds
+     * one slot. Freeing the second sequence gives 10 back, without touching this table. */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 16 * 20));
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &m));
+    CHECK_EQ((int64_t)m.size(), 10);
+    f.kv.residency_demote_landed();
+    CHECK_OK(f.kv.ensure(1, 16 * 56));
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    CHECK_EQ((int64_t)m.size(), 1);
+    f.kv.residency_demote_landed();
+    f.kv.free_sequence(2);
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    CHECK_EQ((int64_t)m.size(), 10);
+    f.kv.residency_demote_landed();
+
+    /* A rollback drops entries; the ones regrown in their place are new and are swept. */
+    CHECK_OK(f.kv.rollback(1, 16 * 40));
+    CHECK_OK(f.kv.ensure(1, 16 * 56));
+    const std::vector<int32_t> t1 = f.kv.block_table(1, G_RES);
+    m.clear();
+    CHECK_OK(f.kv.residency_demote(1, G_RES, 2, 8, &m));
+    REQUIRE_EQ(m.size(), (size_t)3);                   /* the 3 slots entries 40..42 gave back */
+    for (int i = 0; i < 3; ++i) CHECK_EQ(m[(size_t)i].block, t1[(size_t)(40 + i)]);
+    for (int i = 2; i < 12; ++i)
+        if (i != 5) f.kv.release_block(G_RES, t0[(size_t)i]);
+}
+
+/* The resumed sweep makes the decisions a walk of the whole table would: over random growth,
+ * sharing and unsharing, promotion, rollback and bounded sweeps of two sequences, each call's
+ * moves are the first `max` entries, in table order, that are resident and not shared. */
+TEST(a_resumed_sweep_moves_what_a_whole_table_walk_would) {
+    ResidencyFixture f;
+    CHECK_OK(f.build(512, /*slots=*/4096));
+    uint32_t rs = 12345;
+    auto rnd = [&rs](uint32_t n) { rs = rs * 1664525u + 1013904223u; return (rs >> 8) % n; };
+    const uint64_t ids[2] = { 1, 2 };
+    std::vector<int32_t> held[2];                       /* blocks the "cache" retained */
+    for (uint64_t id : ids) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_OK(f.kv.ensure(id, 16 * 20));
+    }
+    for (int it = 0; it < 400; ++it) {
+        const int k = (int)rnd(2);
+        const uint64_t id = ids[k];
+        const std::vector<int32_t> t = f.kv.block_table(id, G_RES);
+        const int64_t n = (int64_t)t.size();
+        switch (rnd(6)) {
+            case 0:                                      /* grow */
+                if (n < 60) CHECK_OK(f.kv.ensure(id, 16 * (n + 1 + (int64_t)rnd(4))));
+                break;
+            case 1: {                                    /* the cache takes a resident block */
+                const int32_t b = t[(size_t)rnd((uint32_t)n)];
+                if (b >= 0 && f.kv.block_refcount(G_RES, b) == 1) {
+                    CHECK_OK(f.kv.retain_block(G_RES, b));
+                    held[k].push_back(b);
+                }
+                break;
+            }
+            case 2:                                      /* and lets one go */
+                if (!held[k].empty()) {
+                    const size_t j = rnd((uint32_t)held[k].size());
+                    f.kv.release_block(G_RES, held[k][j]);
+                    held[k].erase(held[k].begin() + (std::ptrdiff_t)j);
+                }
+                break;
+            case 3: {                                    /* a dense step promotes a few */
+                std::vector<int64_t> want;
+                for (int j = 0; j < 3; ++j) want.push_back((int64_t)rnd((uint32_t)n));
+                std::vector<BlockMove> up;
+                CHECK_OK(f.kv.residency_promote(id, G_RES, want, &up));
+                f.kv.residency_complete();
+                break;
+            }
+            case 4: {                                    /* a rejected draft, block-aligned */
+                const int64_t to = n - 1 - (int64_t)rnd(3);
+                if (to > 12 && !rad_kv_entry_cold(t[(size_t)to - 1])) {
+                    /* A retained block the rollback drops would leave the cache's reference. */
+                    bool mine = true;
+                    for (int64_t i = to; i < n; ++i)
+                        for (int32_t b : held[k]) mine = mine && b != t[(size_t)i];
+                    if (mine) CHECK_OK(f.kv.rollback(id, 16 * to));
+                }
+                break;
+            }
+            default: {                                   /* the sweep, against the full walk */
+                const int64_t head = 2, tail = 4, max = 1 + (int64_t)rnd(6);
+                int64_t last = std::min<int64_t>(n - tail, n - 1);
+                if (last < head) last = head;
+                std::vector<int32_t> want;
+                for (int64_t i = head; i < last && (int64_t)want.size() < max; ++i)
+                    if (t[(size_t)i] >= 0 && f.kv.block_refcount(G_RES, t[(size_t)i]) == 1)
+                        want.push_back(t[(size_t)i]);
+                std::vector<BlockMove> m;
+                CHECK_OK(f.kv.residency_demote(id, G_RES, head, tail, &m, max));
+                std::vector<int32_t> got;
+                for (const BlockMove& mv : m) got.push_back(mv.block);
+                CHECK(got == want);
+                f.kv.residency_demote_landed();
+                break;
+            }
+        }
+    }
+    for (int k = 0; k < 2; ++k)
+        for (int32_t b : held[k]) f.kv.release_block(G_RES, b);
+}
+
 TEST(a_residency_window_without_a_store_refuses_rather_than_moving_nothing) {
     ResidencyFixture f;
     CHECK_OK(f.build(512, 256));
