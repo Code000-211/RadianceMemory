@@ -2293,6 +2293,120 @@ static int build_gdn_recurrent(Case& c, const RadOpSchema* s) {
     return 0;
 }
 
+/* gdn_conv_recurrent_update: the conv's inputs (as build_gdn_conv_update) then the recurrence's
+ * minus q, k and v (as build_gdn_recurrent), one geometry across both halves. */
+static int build_gdn_conv_recurrent(Case& c, const RadOpSchema* s) {
+    const long long T = 4, Hg = 2, H = 4, K = 128, V = 128, W = 4, SL = 4, SLOTS = 2;
+    const long long units = 2 * Hg + H, XD = units * K;
+    if (s->n_operands != 18) { fail("gdn_conv_recurrent_update: the schema has %d operands, not 18",
+                                     s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "q_len", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "head_k", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "head_v", RAD_P_INT, V, 0, nullptr, 0.0 },
+                            { "conv_width", RAD_P_INT, W, 0, nullptr, 0.0 },
+                            { "eps", RAD_P_F64, 0, 0, nullptr, 1e-6 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x5C1D8E3Fu;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+
+    std::vector<uint16_t> hx(T * XD), hw(XD * W), hb(XD);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hw) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hb) x = f32_to_bf16((rndf() - 0.5f) * 0.2f);
+    std::vector<uint16_t> hcs(XD * SL, 0);
+    for (auto& x : hcs) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    std::vector<uint16_t> ha(T * H), hbb(T * H), hz(T * H * V);
+    for (auto& x : ha) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    for (auto& x : hbb) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    for (auto& x : hz) x = f32_to_bf16((rndf() - 0.5f) * 4.0f);
+    std::vector<float> halog(H), hdtb(H), hstate(SLOTS * H * V * K), hnw(V);
+    for (auto& x : halog) x = logf(0.1f + rndf());
+    for (auto& x : hdtb)  x = (rndf() - 0.5f) * 4.0f;
+    for (auto& x : hstate) x = (rndf() - 0.5f) * 0.1f;
+    for (auto& x : hnw)    x = (rndf() - 0.5f) * 2.0f;
+    std::vector<uint16_t> ho(T * H * V, 0x7fc0u);
+    const int cidxv[1] = { 0 }, sidxv[T] = { 0, 0, 1, 1 };
+    /* num_accepted counts from 1 (docs/OPS.md): the window's history is read at column
+     * num_accepted - 1, so 1 is the handover out of a prefill. */
+    const int nav[1] = { 1 };
+    const int cuv[2] = { 0, (int)T };
+
+    struct { uint32_t dt; long long nel; } qd[18] = {
+        { RAD_BF16, T * XD },        // x
+        { RAD_BF16, XD * W },        // conv_w
+        { RAD_BF16, XD },            // conv_b
+        { RAD_BF16, XD * SL },       // conv_state [XD, 1, SL]
+        { RAD_I32,  1 },             // conv_idx
+        { RAD_BF16, T * H },         // a
+        { RAD_BF16, T * H },         // b
+        { RAD_F32,  H },             // A_log
+        { RAD_F32,  H },             // dt_bias
+        { RAD_F32,  SLOTS * H * V * K },  // state
+        { RAD_I32,  T },             // state_idx [1, T]
+        { RAD_I32,  1 },             // num_accepted
+        { RAD_I32,  2 },             // cu
+        { RAD_BF16, T * H * V },     // z
+        { RAD_F32,  V },             // norm_w
+        { RAD_BF16, T * H * V },     // o
+        { RAD_I8,   0 },             // o_q: absent
+        { RAD_F32,  0 }              // o_scale: absent
+    };
+    for (int o = 0; o < 16; ++o) {
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("gdn_conv_recurrent: hipMalloc(%zu) failed",
+                                                       bytes); return 1; }
+        c.dev.push_back(d);
+        switch (o) {
+            case 0: std::memcpy(d, hx.data(), bytes); break;
+            case 1: std::memcpy(d, hw.data(), bytes); break;
+            case 2: std::memcpy(d, hb.data(), bytes); break;
+            case 3: std::memcpy(d, hcs.data(), bytes); break;
+            case 4: std::memcpy(d, cidxv, sizeof cidxv); break;
+            case 5: std::memcpy(d, ha.data(), bytes); break;
+            case 6: std::memcpy(d, hbb.data(), bytes); break;
+            case 7: std::memcpy(d, halog.data(), bytes); break;
+            case 8: std::memcpy(d, hdtb.data(), bytes); break;
+            case 9: std::memcpy(d, hstate.data(), bytes); break;
+            case 10: std::memcpy(d, sidxv, sizeof sidxv); break;
+            case 11: std::memcpy(d, nav, sizeof nav); break;
+            case 12: std::memcpy(d, cuv, sizeof cuv); break;
+            case 13: std::memcpy(d, hz.data(), bytes); break;
+            case 14: std::memcpy(d, hnw.data(), bytes); break;
+            default: std::memcpy(d, ho.data(), bytes); break;
+        }
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt;
+        switch (o) {
+            case 0: t.rank = 2; t.shape[0] = T; t.shape[1] = XD; t.stride[1] = 1; t.stride[0] = XD; break;
+            case 1: t.rank = 2; t.shape[0] = XD; t.shape[1] = W; t.stride[1] = 1; t.stride[0] = W; break;
+            case 2: t.rank = 1; t.shape[0] = XD; t.stride[0] = 1; break;
+            case 3: t.rank = 3; t.shape[0] = XD; t.shape[1] = 1; t.shape[2] = SL;
+                    t.stride[2] = 1; t.stride[1] = SL; t.stride[0] = SL; break;
+            case 4: t.rank = 1; t.shape[0] = 1; t.stride[0] = 1; break;
+            case 5: case 6: t.rank = 2; t.shape[0] = T; t.shape[1] = H; t.stride[1] = 1; t.stride[0] = H; break;
+            case 7: case 8: t.rank = 1; t.shape[0] = H; t.stride[0] = 1; break;
+            case 9: t.rank = 4; t.shape[0] = SLOTS; t.shape[1] = H; t.shape[2] = V; t.shape[3] = K;
+                    t.stride[3] = 1; t.stride[2] = K; t.stride[1] = V * K; t.stride[0] = H * V * K; break;
+            case 10: t.rank = 2; t.shape[0] = 1; t.shape[1] = T; t.stride[1] = 1; t.stride[0] = T; break;
+            case 11: t.rank = 1; t.shape[0] = 1; t.stride[0] = 1; break;
+            case 12: t.rank = 1; t.shape[0] = 2; t.stride[0] = 1; break;
+            case 13: t.rank = 3; t.shape[0] = T; t.shape[1] = H; t.shape[2] = V;
+                     t.stride[2] = 1; t.stride[1] = V; t.stride[0] = H * V; break;
+            case 14: t.rank = 1; t.shape[0] = V; t.stride[0] = 1; break;
+            default: t.rank = 3; t.shape[0] = T; t.shape[1] = H; t.shape[2] = V;
+                     t.stride[2] = 1; t.stride[1] = V; t.stride[0] = H * V; break;
+        }
+    }
+    c.t[16] = RadTensor{};   // o_q absent
+    c.t[17] = RadTensor{};   // o_scale absent
+    return 0;
+}
+
 static int run_row(int i) {
     const RadKernelInfo* k = row_at(i);
     if (!k) return 1;
@@ -2319,6 +2433,7 @@ static int run_row(int i) {
         : (0 == std::strcmp(k->name, "gdn_conv_prep_w4_h128")) ? 9
         : (0 == std::strcmp(k->name, "gdn_conv_update_w4_h128")) ? 10
         : (0 == std::strcmp(k->name, "gdn_recurrent_update_k128_v128")) ? 11
+        : (0 == std::strcmp(k->name, "gdn_conv_recurrent_update_k128_v128")) ? 23
         : (0 == std::strcmp(k->name, "expert_scale_bf16")) ? 12
         : (0 == std::strcmp(k->name, "moe_router_topk_bf16")) ? 13
         : (0 == std::strcmp(k->name, "moe_scatter_small")) ? 14
@@ -2349,6 +2464,7 @@ static int run_row(int i) {
                         : hand == 9 ? build_gdn_conv_prep(c, s)
                         : hand == 10 ? build_gdn_conv_update(c, s)
                         : hand == 11 ? build_gdn_recurrent(c, s)
+                        : hand == 23 ? build_gdn_conv_recurrent(c, s)
                         : hand == 12 ? build_expert_scale(c, s)
                         : hand == 13 ? build_moe_router_topk(c, s)
                         : hand == 14 ? build_moe_scatter(c, s)

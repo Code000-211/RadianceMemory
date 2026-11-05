@@ -187,6 +187,7 @@ int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s);
 /* --- r3dh_gdn_recurrent_update.hip (libhalo's): the gated-delta-net recurrent state update at
  * decode against the paged state cache, in either state form (per_candidate or anchor). */
 extern "C" int r3dh_rad_gdn_recurrent_update(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s);
 
 /* --- r3d_expert_scale_bf16.hip: each routing weight times its expert's own scale, in place. */
 int r3d_rad_expert_scale_bf16(const RadArgs* a, RadStream s);

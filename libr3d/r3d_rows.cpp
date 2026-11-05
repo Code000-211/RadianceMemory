@@ -393,6 +393,32 @@ static const RadOperandSpec oGdnRecurrent[] = { { "q", RAD_OPD_IN, 0 },
                                                { "o_q", RAD_OPD_OUT, 1 },
                                                { "o_scale", RAD_OPD_OUT, 1 } };
 
+/* gdn_conv_recurrent_update: the decode conv and the recurrent update as one kernel, the
+ * convolution's operands then the recurrence's minus q, k and v (never materialised). */
+static const RadParamSpec pGdnConvRecurrent[] = { P_INT("q_len"), P_INT("head_k"), P_INT("head_v"),
+                                                 P_INT("conv_width"), P_INTO("n_head_v"),
+                                                 P_F64O("scale"), P_F64O("eps"), P_F64O("l2_eps"),
+                                                 P_F64O("softplus_thr"), P_STRO("act"),
+                                                 P_INTO("state_fp16"), P_STRO("state_form") };
+static const RadOperandSpec oGdnConvRecurrent[] = { { "x", RAD_OPD_IN, 0 },
+                                                   { "conv_w", RAD_OPD_WEIGHT, 0 },
+                                                   { "conv_b", RAD_OPD_WEIGHT, 1 },
+                                                   { "conv_state", RAD_OPD_INOUT, 0 },
+                                                   { "conv_idx", RAD_OPD_IN, 0 },
+                                                   { "a", RAD_OPD_IN, 0 },
+                                                   { "b", RAD_OPD_IN, 0 },
+                                                   { "A_log", RAD_OPD_WEIGHT, 0 },
+                                                   { "dt_bias", RAD_OPD_WEIGHT, 0 },
+                                                   { "state", RAD_OPD_INOUT, 0 },
+                                                   { "state_idx", RAD_OPD_IN, 0 },
+                                                   { "num_accepted", RAD_OPD_IN, 0 },
+                                                   { "cu", RAD_OPD_IN, 0 },
+                                                   { "z", RAD_OPD_IN, 0 },
+                                                   { "norm_w", RAD_OPD_WEIGHT, 0 },
+                                                   { "o", RAD_OPD_OUT, 0 },
+                                                   { "o_q", RAD_OPD_OUT, 1 },
+                                                   { "o_scale", RAD_OPD_OUT, 1 } };
+
 
 /* ================================================================== the vocab and the sampler
  *
@@ -704,6 +730,11 @@ static const RadOpSchema kSchemas[] = {
             "dt_bias), beta = sigmoid(b), q/k l2-normalised, S *= e^g, u = beta (v - S k), S += u "
             "k^T, o = S q, per token against a paged fp32 state cache; the gated RMS norm is "
             "folded in when `z` and `norm_w` are present."),
+
+    SCHEMA("gdn_conv_recurrent_update", pGdnConvRecurrent, oGdnConvRecurrent,
+            "gdn_conv_update followed by gdn_recurrent_update, with q, k and v never written: the "
+            "operands are the convolution's (`conv_idx` is its state_idx) and then the recurrence's "
+            "without those three."),
     SCHEMA("expert_scale", pExpertScale, oExpertScale,
            "Each routing weight times its expert's own per-expert scale, in place: the router's "
            "renormalised top-k weight scaled by the [n_expert] table, an out-of-table id reading "
@@ -1268,6 +1299,8 @@ static const RadConstraint cGdnConvUpdW4[] = { C_GE("q_len", 1), C_EQ("head_k", 
                                               C_EQ("head_v", 128), C_EQ("conv_width", 4) };
 static const RadConstraint cGdnRecurrent[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
                                               C_EQ("head_v", 128) };
+static const RadConstraint cGdnConvRecurrent[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
+                                                   C_EQ("head_v", 128), C_EQ("conv_width", 4) };
 static const RadConstraint cExpertScaleBf16[] = { C_IN("dtype", "bf16"), C_GE("top_k", 1),
                                                   C_LE("top_k", 64), C_GE("n_expert", 1) };
 static const RadConstraint cMoeRouterTopkBf16[] = { C_IN("dtype", "bf16"), C_GE("top_k", 1),
@@ -2357,6 +2390,19 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGdnRecurrent), NOTUNE,
   nullptr, nullptr, r3dh_rad_gdn_recurrent_update,
+  nullptr, nullptr, nullptr,
+  nullptr, nullptr },
+
+{ "gdn_conv_recurrent_update_k128_v128", "gdn_conv_recurrent_update", "gdn",
+  "The gated-delta-net decode step as one kernel: the rolling-window conv and the recurrent state "
+  "update, with q, k and v never materialised",
+  "head_k 128, head_v 128, conv width 4; the speculative window (state_len_max - 2) must fit the "
+  "register buffer; the gated RMS norm is folded in (z and norm_w are required); the state cache "
+  "is f32 or f16 (libhalo's kernel, r3dh_gdn_recurrent_update.hip)",
+  "bf16 x and o, f32 a, b, A_log, dt_bias and norm_w, the conv state bf16, the state f32 or f16",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGdnConvRecurrent), NOTUNE,
+  nullptr, nullptr, r3dh_rad_gdn_conv_recurrent_update,
   nullptr, nullptr, nullptr,
   nullptr, nullptr },
 
