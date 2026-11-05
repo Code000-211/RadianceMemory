@@ -586,10 +586,11 @@ private:
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
-    /* Window residency store (spec §7.3, KVManager::set_residency_store): pinned host memory, one
-     * slot a block, holding the blocks a sparse consumer's window does not cover. Empty unless a
-     * KV group declared a residency window and --kv-residency-mib gave it a size. */
-    HostArena res_store_;
+    /* Window residency stores (spec §7.3, KVManager::set_residency_store): host-mapped memory,
+     * one per residency group (by group index, null for another), a slot one block of that group,
+     * holding the blocks a sparse consumer's window does not cover. Empty unless a KV group
+     * declared a residency window and --kv-residency-mib gave them a size. */
+    std::vector<std::unique_ptr<HostArena>> res_stores_;
     int  run_server();
     /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned

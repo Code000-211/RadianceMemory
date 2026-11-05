@@ -447,10 +447,10 @@ struct KVBinding final : IKVManager {
         const KV* k = rank > 0 && (size_t)rank <= peers.size() ? peers[(size_t)rank - 1] : m;
         Pager p;
         const KVGroupPlan* pl = k->plan(g);
-        if (!pl || pl->scratch_blocks <= 0 || !k->residency_device_base()) return p;
-        p.store      = k->residency_device_base();
-        p.slot_bytes = k->residency_slot_bytes();
-        p.slots      = p.slot_bytes > 0 ? k->residency_host_cap_bytes() / p.slot_bytes : 0;
+        if (!pl || pl->scratch_blocks <= 0 || !k->residency_device_base(g)) return p;
+        p.store      = k->residency_device_base(g);   /* the group's own store */
+        p.slot_bytes = k->residency_slot_bytes(g);
+        p.slots      = k->residency_slots(g);
         p.layer_off  = k->residency_layer_off(g).data();
         p.scratch    = k->scratch_table(g).data();
         p.paged      = k->residency_paged();

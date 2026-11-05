@@ -261,6 +261,15 @@ struct StateClear {
 };
 
 /* ------------------------------------------------------------------ manager */
+/* The window-residency store's budget split (the engine's bring-up): one store per residency
+ * group, of slots `slot_bytes` wide (a block of that group, every rank's shard), a group's blocks
+ * `block_size` tokens. The groups demote the same tokens, so each store holds the same tokens and
+ * the budget goes in proportion to a group's slot bytes a token. Returns those tokens, the most
+ * whose blocks -- floor(tokens / block_size) slots a group -- fit `cap_bytes` together; group g's
+ * store is then (tokens / block_size) slots. 0 for no group or a budget too small. */
+struct ResidencySplit { int64_t slot_bytes = 0, block_size = 0; };
+int64_t residency_split_tokens(int64_t cap_bytes, const std::vector<ResidencySplit>& groups);
+
 class KVManager {
 public:
     /* ---------------- window residency (spec §7.3) ----------------
@@ -284,14 +293,23 @@ public:
      * consumer, a list of table entries for a selected one -- and this class owns the state, the
      * arena slots and the accounting.
      *
-     * The store is one HostArena of `residency_slot_bytes()` slots, opened by the engine like the
-     * snapshot store, one slot per cold block. Under tensor parallelism a slot holds every rank's
-     * shard at its own offset (set_residency_store's rank_off), and rank 0 hands out slot ids. */
-    /* RAD_E_STATE if this manager still holds cold entries (or in-flight transfers) in the store
-     * it has: their slots would name bytes in a store that is gone. RAD_E_INVAL for a store whose
-     * slot cannot hold this rank's part past `rank_off`. */
+     * The store is a HostArena per residency group, of that group's `residency_slot_bytes(g)`
+     * slots, opened by the engine like the snapshot store, one slot per cold block: a slot holds one
+     * block of one group, so a group's own arena sizes it to that group's (layout's) block and a
+     * mixed recipe's narrow layouts waste no host bytes. A cold entry's slot id is an index into its
+     * group's arena. Under tensor parallelism a slot holds every rank's shard at its own offset
+     * (set_residency_store's rank_off), and rank 0 hands out slot ids.
+     * The two-argument form puts every residency group in one arena (slots as wide as the widest
+     * group's block); the engine opens one per group (the three-argument form). */
+    /* RAD_E_STATE if this manager still holds cold entries (or in-flight transfers) of a group in
+     * the store it has: their slots would name bytes in a store that is gone. RAD_E_INVAL for a
+     * store whose slot cannot hold this rank's part past `rank_off`, or a group with no window. */
     int    set_residency_store(HostArena* store, int64_t rank_off);
-    bool   residency_enabled() const { return res_arena_ != nullptr; }
+    int    set_residency_store(int32_t group, HostArena* store, int64_t rank_off);
+    bool   residency_enabled() const {
+        for (HostArena* a : res_arena_) if (a) return true;
+        return false;
+    }
     /* The pager's counter on this rank's card (RadKVGroupBatch::residency_paged), owned by the
      * engine (TierExec::paged_counter); the manager only carries the address to the batch. */
     void     set_residency_paged(int64_t* dev) { res_paged_ = dev; }
@@ -307,22 +325,33 @@ public:
     void residency_emulate(bool on) { res_emulate_ = on; }
     bool residency_emulating() const { return res_emulate_; }
     bool residency_emulated(int32_t group, int32_t block) const;
-    /* Bytes one block of `group` occupies in its slot, this rank's part of a slot (the widest
-     * residency group's block: a slot holds one block of one group, since a demotion takes a fresh
-     * slot per group and entry, and one arena serves them all), and the slot's whole size (every
-     * rank's part, the open store's slot once one is set). Under a per-layer recipe (--kv-recipe)
-     * the groups are layouts, so a block's bytes, and its layers' fragments, are its layout's --
-     * the demote layout's for a tiered group (KVGroupPlan::residency_bytes). */
+    /* Bytes one block of `group` occupies in its slot; the widest of them (what one arena shared
+     * by every group needs a rank); and a group's slot's whole size (every rank's part: the open
+     * store's slot once one is set, else this rank's offset plus its block, in 256-byte units).
+     * The argumentless residency_slot_bytes() is the widest group's, a shared arena's slot. Under a
+     * per-layer recipe (--kv-recipe) the groups are layouts, so a block's bytes, and its layers'
+     * fragments, are its layout's -- the demote layout's for a tiered group
+     * (KVGroupPlan::residency_bytes). */
     int64_t residency_block_bytes(int32_t group) const;
     int64_t residency_shard_bytes() const;
-    int64_t residency_slot_bytes() const { return res_slot_bytes_; }
-    /* The store as the card addresses it, null when none is open (HostArena::open_mapped). */
-    void*   residency_device_base() const { return res_arena_ ? res_arena_->device_base() : nullptr; }
+    int64_t residency_slot_bytes(int32_t group) const;
+    int64_t residency_slot_bytes() const;
+    /* A group's store as the card addresses it, null when none is open (HostArena::open_mapped),
+     * and its capacity in slots. */
+    void*   residency_device_base(int32_t group) const {
+        const HostArena* a = res_store(group);
+        return a ? a->device_base() : nullptr;
+    }
+    int64_t residency_slots(int32_t group) const {
+        const HostArena* a = res_store(group);
+        return a ? a->capacity() : 0;
+    }
     /* What the pager (`qsa_page`) reads for a group, host side. scratch_table() is
      * [scratch_rows(), scratch_pitch] pool ids, row-major: the same every step, since a row's
      * pages are valid for the step that wrote them only and the next step overwrites them.
      * residency_layer_off() is indexed by model layer: the byte offset of that layer's fragment
-     * inside a store slot (this rank's shard included), -1 for a layer the group does not own.
+     * inside a slot of the group's store (this rank's shard included), -1 for a layer the group
+     * does not own.
      * All empty for a group with no window or no scratch reserved. */
     int64_t scratch_rows() const { return max_seqs_ * (1 + (n_spec_ > 0 ? n_spec_ : 0)); }
     const std::vector<int32_t>& scratch_table(int32_t group) const;
@@ -426,8 +455,8 @@ public:
      * are monotonic, so the oldest go first -- the ones the session view has long dropped. */
     static constexpr size_t kResidencySessions = 4096;
     int64_t residency_scratch_bytes() const;   /* VRAM the pager's scratch pages hold, all groups */
-    int64_t residency_host_bytes() const;      /* bytes of the store in use */
-    int64_t residency_host_cap_bytes() const;  /* the store's capacity, 0 when unset */
+    int64_t residency_host_bytes() const;      /* bytes of the stores in use, every group's */
+    int64_t residency_host_cap_bytes() const;  /* the stores' capacity, 0 when unset */
 
     /* Sizes every group out of one pool, refusing by name and shortfall if the fixed costs alone
      * do not fit. The paged groups are sized to run out at the same total token count; any other
@@ -883,7 +912,7 @@ private:
 
     int  grab_block(int32_t g, int32_t* out);
     void drop_block(int32_t g, int32_t b);
-    /* Where each residency group's bytes sit in a store slot, and how wide that slot is. Depends
+    /* Where each residency group's bytes sit in its store's slot, and how wide that slot is. Depends
      * on the plans (the carve) and on the store's rank offset, so it is redone when either is set:
      * set_residency_store() may arrive after carve(), which is the engine's order. */
     void size_residency();
@@ -923,11 +952,18 @@ private:
      * per-block array to keep in step with it. A cold entry owns its store slot; drop_entry() is
      * the one place a table entry goes away, and it returns the slot (cold) or the block
      * reference (resident), so a preempt, a rollback and a free_sequence leak neither. */
-    HostArena* res_arena_ = nullptr;
+    /* Per group (by group index; a set store survives a re-plan, as the engine owns it): the
+     * group's store, this rank's offset in its slot, and the slot's whole width. */
+    std::vector<HostArena*> res_arena_;
+    std::vector<int64_t>    res_rank_off_;
+    std::vector<int64_t>    res_slot_bytes_;
+    HostArena* res_store(int32_t g) const {
+        return g >= 0 && (size_t)g < res_arena_.size() && res_arena_[(size_t)g] &&
+                       res_arena_[(size_t)g]->enabled() ? res_arena_[(size_t)g] : nullptr;
+    }
+    /* RAD_OK when `store` may become group g's at `rank_off` (see set_residency_store). */
+    int     res_store_check(int32_t g, const HostArena* store, int64_t rank_off) const;
     int64_t*   res_paged_ = nullptr;
-    int64_t    res_rank_off_ = 0;
-    int64_t    res_slot_bytes_ = 0;                   /* the whole shared slot */
-    std::vector<int64_t> res_off_;                    /* per group: its bytes' offset in a slot */
     int64_t    res_cold_ = 0;                         /* cold entries held across all tables */
     /* Blocks a demotion encoded cold whose copy has not been reported landed: still referenced
      * (refcount 1, in no table) so the pool cannot reuse them under the gather. */
@@ -935,14 +971,19 @@ private:
     std::vector<Demoting> res_demoting_;
     /* Drops one table entry: a pool id's reference, or a cold entry's slot. */
     void drop_entry(int32_t g, int32_t entry);
-    /* Slot references (see retain_entry): indexed by slot id, grown on demand. res_slots_ counts
-     * the slots with a reference, which is what set_residency_store() and release_residency() look
-     * at, since the cache holds slots no table does. */
-    std::vector<int32_t> res_refs_;
-    int64_t              res_slots_ = 0;
-    int32_t slot_new();                       /* a store slot at one reference, -1 when full */
-    void    slot_ref(int32_t slot);
-    void    slot_drop(int32_t slot);
+    /* Slot references (see retain_entry): per group, indexed by slot id in the group's store,
+     * grown on demand. res_slots_ counts, per group, the slots with a reference, which is what
+     * set_residency_store() looks at, since the cache holds slots no table does. */
+    std::vector<std::vector<int32_t>> res_refs_;
+    std::vector<int64_t>              res_slots_;
+    int32_t slot_new(int32_t g);              /* a store slot at one reference, -1 when full */
+    void    slot_ref(int32_t g, int32_t slot);
+    void    slot_drop(int32_t g, int32_t slot);
+    int32_t slot_refs(int32_t g, int32_t slot) const {
+        return g >= 0 && (size_t)g < res_refs_.size() && slot >= 0 &&
+                       (size_t)slot < res_refs_[(size_t)g].size()
+                   ? res_refs_[(size_t)g][(size_t)slot] : 0;
+    }
     /* Where a promoted block's bytes came from, per group: block -> slot, while the slot may still
      * hold identical bytes. Each entry owns a slot reference, so the slot cannot be reused under
      * it. Set when the slot has another holder (the cache), or the group is tiered: re-demoting a

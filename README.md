@@ -339,7 +339,7 @@ flowchart TB
 | item | size | where it is charged |
 |---|---|---|
 | scratch pages | `(window/block + 1) × max_seqs × (1 + n_spec)` blocks per residency group, about 208 MiB on Flash-Next at 8 decode rows | fixed costs, before the VRAM split, so the budget resolver sees them |
-| residency store | `--kv-residency-mib`, slot = one block of one group (every rank's shard); under a mixed `--kv-recipe`, the widest layout's block (a `bf16` layer's, twice fp8's, where the recipe has one) | pinned host memory, opened host-mapped |
+| residency store | `--kv-residency-mib`, one store per residency group, its slot one block of that group (every rank's shard) at that group's own layout's size; the budget is split so every store holds the same tokens (in proportion to a group's bytes a token), so it holds (store bytes) / (the groups' real block bytes) blocks a group, not / the widest | pinned host memory, opened host-mapped |
 | per-block bookkeeping | 4 bytes a block (the table entry already holds the slot) | none worth counting |
 
 At 200 K tokens a sequence holds 50 K attention blocks. With a 512-token sink and a 2 048-token tail
@@ -373,8 +373,8 @@ resident, k4h_v4 or k4h_v2h demoted.
   rotate, centre or rescale. Both layouts therefore share the layer's rotation and V mean: a k4h
   demote layout needs a rotated layer, and `vmean` (accepted when either layout has integer V)
   centres the resident and the demoted bytes alike.
-* **Store sizing.** A tiered layer's slot fragment is its rows at the demote width, so a slot is
-  the widest *demote* block (startup prints `stored as k4h_v2h, N KiB a block`). On Flash-Next at
+* **Store sizing.** A tiered layer's slot fragment is its rows at the demote width, so its
+  group's slot is its *demote* block (startup prints `stored as k4h_v2h, N KiB a block`). On Flash-Next at
   `--tp 2` a rank's i8h block (12 layers + the head's, one KV head, 4 tokens) is 13 × 2 064 =
   26.2 KiB in VRAM and 13 × 896 = 11.4 KiB in the store as k4h_v2h, 13 × 1 152 = 14.6 KiB as k4h_v4.
 * **Re-pointing.** A promoted tiered block keeps its origin slot even when no cache holds it, so an

@@ -1955,10 +1955,11 @@ radiance --model flashnext.rad --kv-residency-mib 2048 --kv-residency-sink-token
   again every step.
 - A sweep skips a block the prefix cache indexes, a forked child's block, and the last (partial)
   block an append writes into; `/stats` `kv_residency.skipped` counts those.
-- A store slot holds one block of one group. Under a mixed `--kv-recipe` each layout's group pages
-  on its own, at its own block's bytes, and a slot is as wide as the widest layout's block (every
-  rank's, under `--tp`); the startup line `kv residency: store ...` names each group's block and
-  its layers' fragments. A narrower layout's block leaves the rest of its slot unused.
+- A store slot holds one block of one group, and each residency group has its own store of slots
+  its block's size (every rank's, under `--tp`). Under a mixed `--kv-recipe` each layout's group
+  pages on its own, at its own block's bytes, and `--kv-residency-mib` is split so every group's
+  store holds the same tokens; the startup line `kv residency: store ...` names the blocks the
+  stores hold and each group's slots, block and layers' fragments.
 
 **Status.** Live. With the store open the engine installs the scheduler's mover: after each decode
 step a sweep of at most 64 blocks (between all sequences) leaves the pool for the store, a prefill

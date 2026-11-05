@@ -477,8 +477,7 @@ void KVManager::forget() {
     seqs_.clear(); pending_.clear();
     configured_ = false;
     report_.clear();
-    res_off_.clear();
-    res_slot_bytes_ = 0;
+    res_slot_bytes_.clear();
     res_stats_ = ResidencyStats{};
 }
 
@@ -661,10 +660,9 @@ int KVManager::carve_into(Pool& kv_pool) {
 
     /* ---- window residency ----
      *
-     * One arena serves every residency group, so a slot is as wide as the widest of them and each
-     * group uses its own prefix of it: under tensor parallelism every rank takes the same slot id
-     * for the same block, and only the offsets differ. */
-    res_off_.assign(plans_.size(), 0);
+     * Each residency group has its own arena (or shares one), its slot one block of it: under
+     * tensor parallelism every rank takes the same slot id for the same block, and only the
+     * offsets differ. */
     size_residency();
     /* Row r of the scratch table is pages [r * pitch, (r + 1) * pitch): fixed for the engine's life. */
     scratch_.assign(plans_.size(), {});
@@ -835,7 +833,7 @@ void KVManager::drop_block(int32_t g, int32_t b) {
 void KVManager::drop_entry(int32_t g, int32_t entry) {
     if (entry >= 0) { drop_block(g, entry); return; }
     if (!rad_kv_entry_cold(entry)) return;                 /* -1: nothing was held */
-    slot_drop(rad_kv_entry_slot(entry));
+    slot_drop(g, rad_kv_entry_slot(entry));
     --res_cold_;
 }
 
@@ -1435,24 +1433,44 @@ std::vector<BlockCopy> KVManager::take_pending_copies() {
 
 /* ------------------------------------------------------------------ window residency */
 
+int64_t residency_split_tokens(int64_t cap_bytes, const std::vector<ResidencySplit>& groups) {
+    long double per_token = 0;   /* store bytes a token of every group costs */
+    for (const ResidencySplit& r : groups) {
+        if (r.slot_bytes <= 0 || r.block_size <= 0) return 0;
+        per_token += (long double)r.slot_bytes / (long double)r.block_size;
+    }
+    if (groups.empty() || cap_bytes <= 0) return 0;
+    const auto bytes = [&](int64_t t) {
+        int64_t n = 0;
+        for (const ResidencySplit& r : groups) n += t / r.block_size * r.slot_bytes;
+        return n;
+    };
+    int64_t t = (int64_t)((long double)cap_bytes / per_token);
+    while (t > 0 && bytes(t) > cap_bytes) --t;     /* the rounding of the division, at most */
+    return t;
+}
+
 void KVManager::size_residency() {
-    res_off_.assign(plans_.size(), 0);
-    if (res_origin_.size() != plans_.size()) res_origin_.resize(plans_.size());
-    /* Under tensor parallelism every rank takes the same slot id for the same block, so the slot is
-     * the sum of the ranks' shards and each rank writes only its own window, at `rank_off`. A slot
-     * holds one block of one group (residency_demote takes a fresh slot per group and entry), so
-     * every group's block starts there and the window is as wide as the widest group's block, not
-     * their sum: under a per-layer recipe of two layouts a sum would leave every slot partly empty.
-     * The pitch is the open store's slot, which is every rank's window; without a store, what this
-     * rank would need (the engine sizes the store from residency_shard_bytes() instead).
-     * shortcut: one arena for every group, so a narrower layout's block leaves the rest of its slot
-     * unused; one arena per group if a mixed recipe's store ever needs those host bytes. */
-    for (size_t i = 0; i < plans_.size(); ++i)
-        if (plans_[i].residency()) res_off_[i] = res_rank_off_;
+    const size_t n = plans_.size();
+    if (res_origin_.size() != n) res_origin_.resize(n);
+    if (res_arena_.size() < n) res_arena_.resize(n, nullptr);
+    if (res_rank_off_.size() < n) res_rank_off_.resize(n, 0);
+    res_refs_.resize(std::max(res_refs_.size(), n));
+    res_slots_.resize(std::max(res_slots_.size(), n), 0);
+    /* Under tensor parallelism every rank takes the same slot id for the same block, so a group's
+     * slot is the sum of the ranks' shards of its block and each rank writes only its own window,
+     * at its `rank_off`. A slot holds one block of one group (residency_demote takes a fresh slot
+     * per group and entry), so a group with its own arena wastes none of it; one arena shared by
+     * every group is as wide as the widest. The pitch is the open store's slot; without a store,
+     * what this rank would need (the engine sizes each group's store from residency_block_bytes()). */
     constexpr int64_t unit = 256;
-    res_slot_bytes_ = res_arena_ && res_arena_->enabled()
-                          ? res_arena_->slot_bytes()
-                          : ceil_div(res_rank_off_ + residency_shard_bytes(), unit) * unit;
+    res_slot_bytes_.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (!plans_[i].residency()) continue;
+        const HostArena* a = res_store((int32_t)i);
+        res_slot_bytes_[i] = a ? a->slot_bytes()
+                               : ceil_div(res_rank_off_[i] + plans_[i].residency_bytes(), unit) * unit;
+    }
 
     /* The pager's per-layer view of the same layout: a group's bytes in a slot are its layers'
      * fragments in the order they were bound (residency_ptr / TierExec::issue_moves), each one
@@ -1467,7 +1485,7 @@ void KVManager::size_residency() {
         auto& v = res_layer_off_[i];
         v.assign((size_t)top, -1);
         for (size_t j = 0; j < p.layers.size(); ++j)
-            v[(size_t)p.layers[j]] = res_off_[i] + (int64_t)j * p.residency_frag();
+            v[(size_t)p.layers[j]] = res_rank_off_[i] + (int64_t)j * p.residency_frag();
     }
 }
 
@@ -1480,38 +1498,61 @@ const std::vector<int64_t>& KVManager::residency_layer_off(int32_t g) const {
     return g >= 0 && g < (int32_t)res_layer_off_.size() ? res_layer_off_[(size_t)g] : none;
 }
 
-int KVManager::set_residency_store(HostArena* store, int64_t rank_off) {
-    if (store != res_arena_ && res_arena_ &&
-        (res_cold_ > 0 || res_slots_ > 0 || !res_pending_.empty() || !res_demoting_.empty())) {
-        RAD_ERR("KV residency: the store was replaced with %lld cold entries and %zu transfers "
-                "outstanding -- their slots would name bytes in a store that is gone",
-                (long long)res_cold_, res_pending_.size() + res_demoting_.size());
+int KVManager::res_store_check(int32_t g, const HostArena* store, int64_t rank_off) const {
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->residency()) return RAD_E_INVAL;
+    const size_t gi = (size_t)g;
+    const HostArena* cur = gi < res_arena_.size() ? res_arena_[gi] : nullptr;
+    int64_t moving = 0;
+    for (const Demoting& d : res_demoting_) moving += d.group == g;
+    for (const auto& pr : res_pending_) moving += pr.first == g;
+    const int64_t held = gi < res_slots_.size() ? res_slots_[gi] : 0;
+    if (store != cur && cur && (held > 0 || moving > 0)) {
+        RAD_ERR("KV residency: group '%s's store was replaced with %lld slots held and %lld "
+                "transfers outstanding -- their slots would name bytes in a store that is gone",
+                p->name.c_str(), (long long)held, (long long)moving);
         return RAD_E_STATE;
     }
     /* A slot too small for this rank's window would put its blocks in the next slot's bytes. */
     if (store && store->enabled() &&
-        (rank_off > 0 ? rank_off : 0) + residency_shard_bytes() > store->slot_bytes()) {
-        RAD_ERR("KV residency: a store slot of %s cannot hold this rank's %s at offset %lld",
-                humanb(store->slot_bytes()).c_str(), humanb(residency_shard_bytes()).c_str(),
-                (long long)rank_off);
+        (rank_off > 0 ? rank_off : 0) + p->residency_bytes() > store->slot_bytes()) {
+        RAD_ERR("KV residency: a store slot of %s cannot hold group '%s's %s at offset %lld",
+                humanb(store->slot_bytes()).c_str(), p->name.c_str(),
+                humanb(p->residency_bytes()).c_str(), (long long)rank_off);
         return RAD_E_INVAL;
     }
-    res_arena_ = store;
-    res_rank_off_ = rank_off > 0 ? rank_off : 0;
+    return RAD_OK;
+}
+
+int KVManager::set_residency_store(int32_t g, HostArena* store, int64_t rank_off) {
+    RAD_TRY(res_store_check(g, store, rank_off));
+    size_residency();                                  /* the per-group vectors, sized */
+    res_arena_[(size_t)g] = store;
+    res_rank_off_[(size_t)g] = rank_off > 0 ? rank_off : 0;
     /* The slot size is derived from the plans at carve, so a store set before configure() needs no
      * number here; one set after keeps the size the carve computed. */
     size_residency();
     return RAD_OK;
 }
 
+int KVManager::set_residency_store(HostArena* store, int64_t rank_off) {
+    /* Every group checked before any is set, so a refusal changes nothing. */
+    for (int32_t g = 0; g < (int32_t)plans_.size(); ++g)
+        if (plans_[(size_t)g].residency()) RAD_TRY(res_store_check(g, store, rank_off));
+    for (int32_t g = 0; g < (int32_t)plans_.size(); ++g)
+        if (plans_[(size_t)g].residency()) RAD_TRY(set_residency_store(g, store, rank_off));
+    return RAD_OK;
+}
+
 void KVManager::release_residency() {
     /* Every slot with a reference goes, whoever held it (a table, a promotion in flight, an origin,
      * the prefix cache -- which a re-plan reconfigures); the held blocks go with the pool. */
-    if (res_arena_ && res_arena_->enabled())
-        for (size_t i = 0; i < res_refs_.size(); ++i)
-            if (res_refs_[i] > 0) res_arena_->free((int32_t)i);
+    for (size_t g = 0; g < res_refs_.size(); ++g)
+        if (HostArena* a = res_store((int32_t)g))
+            for (size_t i = 0; i < res_refs_[g].size(); ++i)
+                if (res_refs_[g][i] > 0) a->free((int32_t)i);
     res_refs_.clear();
-    res_slots_ = 0;
+    res_slots_.clear();
     res_origin_.assign(plans_.size(), {});
     res_emul_.assign(plans_.size(), {});
     res_pending_.clear();
@@ -1531,6 +1572,16 @@ int64_t KVManager::residency_shard_bytes() const {
     return b;
 }
 
+int64_t KVManager::residency_slot_bytes(int32_t g) const {
+    return g >= 0 && (size_t)g < res_slot_bytes_.size() ? res_slot_bytes_[(size_t)g] : 0;
+}
+
+int64_t KVManager::residency_slot_bytes() const {
+    int64_t b = 0;
+    for (int64_t x : res_slot_bytes_) b = std::max(b, x);
+    return b;
+}
+
 bool KVManager::residency_emulated(int32_t g, int32_t b) const {
     return g >= 0 && (size_t)g < res_emul_.size() && res_emul_[(size_t)g].count(b) > 0;
 }
@@ -1544,38 +1595,38 @@ bool KVManager::residency_cold(int32_t g, int32_t entry) const {
 }
 
 void* KVManager::residency_ptr(int32_t g, int32_t entry) const {
-    const int32_t slot = residency_slot(g, entry);
-    if (slot < 0 || !res_arena_) return nullptr;
-    auto* p = (char*)res_arena_->at(slot);
-    return p ? p + res_off_[(size_t)g] : nullptr;
+    return residency_slot_ptr(g, residency_slot(g, entry));
 }
 
 void* KVManager::residency_slot_ptr(int32_t g, int32_t slot) const {
-    if (!res_arena_ || g < 0 || g >= (int32_t)res_off_.size()) return nullptr;
-    auto* p = (char*)res_arena_->at(slot);
-    return p ? p + res_off_[(size_t)g] : nullptr;
+    const HostArena* a = res_store(g);
+    auto* p = a && slot >= 0 ? (char*)a->at(slot) : nullptr;
+    return p ? p + res_rank_off_[(size_t)g] : nullptr;
 }
 
-int32_t KVManager::slot_new() {
-    if (!res_arena_ || !res_arena_->enabled()) return -1;
-    const int32_t slot = res_arena_->alloc();
+int32_t KVManager::slot_new(int32_t g) {
+    HostArena* a = res_store(g);
+    if (!a) return -1;
+    const int32_t slot = a->alloc();
     if (slot < 0) return -1;
-    if ((size_t)slot >= res_refs_.size()) res_refs_.resize((size_t)slot + 1, 0);
-    res_refs_[(size_t)slot] = 1;
-    ++res_slots_;
+    auto& refs = res_refs_[(size_t)g];                 /* sized by size_residency() */
+    if ((size_t)slot >= refs.size()) refs.resize((size_t)slot + 1, 0);
+    refs[(size_t)slot] = 1;
+    ++res_slots_[(size_t)g];
     return slot;
 }
 
-void KVManager::slot_ref(int32_t slot) { ++res_refs_[(size_t)slot]; }
+void KVManager::slot_ref(int32_t g, int32_t slot) { ++res_refs_[(size_t)g][(size_t)slot]; }
 
-void KVManager::slot_drop(int32_t slot) {
-    if (slot < 0 || (size_t)slot >= res_refs_.size() || res_refs_[(size_t)slot] <= 0) {
-        RAD_ERR("KV residency: a reference dropped on store slot %d that holds none", slot);
+void KVManager::slot_drop(int32_t g, int32_t slot) {
+    if (slot_refs(g, slot) <= 0) {
+        RAD_ERR("KV residency: a reference dropped on group %d's store slot %d that holds none",
+                g, slot);
         return;
     }
-    if (--res_refs_[(size_t)slot] > 0) return;
-    --res_slots_;
-    if (res_arena_ && res_arena_->enabled()) res_arena_->free(slot);
+    if (--res_refs_[(size_t)g][(size_t)slot] > 0) return;
+    --res_slots_[(size_t)g];
+    if (HostArena* a = res_store(g)) a->free(slot);
 }
 
 void KVManager::forget_origin(int32_t g, int32_t b) {
@@ -1586,32 +1637,31 @@ void KVManager::forget_origin(int32_t g, int32_t b) {
     if (it == res_origin_[(size_t)g].end()) return;
     const int32_t slot = it->second;
     res_origin_[(size_t)g].erase(it);
-    slot_drop(slot);
+    slot_drop(g, slot);
 }
 
 int KVManager::retain_entry(int32_t g, int32_t e) {
     if (e >= 0) return retain_block(g, e);
     if (!rad_kv_entry_cold(e)) return RAD_E_INVAL;
     const int32_t slot = rad_kv_entry_slot(e);
-    if (slot < 0 || (size_t)slot >= res_refs_.size() || res_refs_[(size_t)slot] <= 0) {
+    if (slot_refs(g, slot) <= 0) {
         RAD_ERR("KV group %d: retain of free store slot %d -- the cache is naming a cold entry it "
                 "does not hold", g, slot);
         return RAD_E_STATE;
     }
-    slot_ref(slot);
+    slot_ref(g, slot);
     return RAD_OK;
 }
 
 void KVManager::release_entry(int32_t g, int32_t e) {
     if (e >= 0) release_block(g, e);
-    else if (rad_kv_entry_cold(e)) slot_drop(rad_kv_entry_slot(e));
+    else if (rad_kv_entry_cold(e)) slot_drop(g, rad_kv_entry_slot(e));
 }
 
 int32_t KVManager::entry_refs(int32_t g, int32_t e) const {
     if (e >= 0) return block_refcount(g, e);
     if (!rad_kv_entry_cold(e)) return 0;
-    const int32_t slot = rad_kv_entry_slot(e);
-    return slot >= 0 && (size_t)slot < res_refs_.size() ? res_refs_[(size_t)slot] : 0;
+    return slot_refs(g, rad_kv_entry_slot(e));
 }
 
 bool KVManager::residency_move_pending(const BlockMove& m, bool to_host) const {
@@ -1626,7 +1676,7 @@ bool KVManager::residency_move_pending(const BlockMove& m, bool to_host) const {
 }
 
 void KVManager::residency_complete() {
-    for (const auto& [g, slot] : res_pending_) (void)g, slot_drop(slot);
+    for (const auto& [g, slot] : res_pending_) slot_drop(g, slot);
     res_pending_.clear();
 }
 
@@ -1657,12 +1707,25 @@ int64_t KVManager::residency_scratch_bytes() const {
     return n;
 }
 
+/* Each distinct store once: groups sharing one arena share its bytes. */
 int64_t KVManager::residency_host_bytes() const {
-    return res_arena_ ? res_arena_->used_slots() * res_arena_->slot_bytes() : 0;
+    int64_t n = 0;
+    for (size_t g = 0; g < res_arena_.size(); ++g)
+        if (const HostArena* a = res_store((int32_t)g);
+            a && std::find(res_arena_.begin(), res_arena_.begin() + (ptrdiff_t)g, a) ==
+                     res_arena_.begin() + (ptrdiff_t)g)
+            n += a->used_slots() * a->slot_bytes();
+    return n;
 }
 
 int64_t KVManager::residency_host_cap_bytes() const {
-    return res_arena_ ? res_arena_->cap_bytes() : 0;
+    int64_t n = 0;
+    for (size_t g = 0; g < res_arena_.size(); ++g)
+        if (const HostArena* a = res_store((int32_t)g);
+            a && std::find(res_arena_.begin(), res_arena_.begin() + (ptrdiff_t)g, a) ==
+                     res_arena_.begin() + (ptrdiff_t)g)
+            n += a->cap_bytes();
+    return n;
 }
 
 int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64_t keep_tail,
@@ -1749,13 +1812,13 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
             sr.freed_bytes += p->bytes_per_block;
             continue;
         }
-        if (!res_arena_ || !res_arena_->enabled()) {
+        if (!res_store(g)) {
             RAD_ERR("KV group '%s': residency was asked for with no store open (--qsa-window-mib)",
                     p->name.c_str());
             charge_skips();
             return RAD_E_STATE;
         }
-        const int32_t slot = slot_new();
+        const int32_t slot = slot_new(g);
         if (slot < 0) {                                    /* store full: this one stays */
             ++skipped;
             decided = false;                               /* retried when a slot frees */
@@ -1804,7 +1867,7 @@ int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64
          * owner holds too (the cache) is not ours to free: the block is its copy, and remembering
          * that lets a later demotion point back at it instead of copying it out again. */
         const int32_t slot = rad_kv_entry_slot(e);
-        const bool shared = res_refs_[(size_t)slot] > 1;
+        const bool shared = slot_refs(g, slot) > 1;
         tbl[(size_t)i] = fresh;
         table_changed(s, (size_t)g, i);
         --res_cold_;
@@ -1812,7 +1875,7 @@ int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64
         /* A tiered block keeps its slot too: its pool bytes are the slot's expanded, and a
          * second requantisation from them would round the block twice (KVGroupPlan::tiered). */
         if ((shared || p->tiered()) && (size_t)g < res_origin_.size()) {
-            slot_ref(slot);
+            slot_ref(g, slot);
             res_origin_[(size_t)g][fresh] = slot;
         }
         out->push_back(BlockMove{g, fresh, slot});
@@ -2004,13 +2067,11 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
         if (b >= p->n_blocks) return RAD_E_INVAL;
         if (b >= 0) continue;
         if (!p->residency() || !rad_kv_entry_cold(b)) return RAD_E_INVAL;
-        const int32_t slot = rad_kv_entry_slot(b);
-        if (slot < 0 || (size_t)slot >= res_refs_.size() || res_refs_[(size_t)slot] <= 0)
-            return RAD_E_STATE;
+        if (slot_refs(g, rad_kv_entry_slot(b)) <= 0) return RAD_E_STATE;
     }
     for (int32_t b : blocks) {
         if (b >= 0) add_ref((size_t)g, b);
-        else { slot_ref(rad_kv_entry_slot(b)); ++res_cold_; }
+        else { slot_ref(g, rad_kv_entry_slot(b)); ++res_cold_; }
     }
     s->blocks[(size_t)g] = blocks;
     table_changed(s, (size_t)g, 0);

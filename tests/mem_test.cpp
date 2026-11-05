@@ -8851,8 +8851,9 @@ static std::vector<KVGroupInfo> mixed_residency_groups() {
     return g;
 }
 
-/* A slot holds one block of one group -- a demotion takes a fresh slot for each group's entry --
- * so its size is the widest layout's block, not the sum of every layout's: the sum would leave
+/* One store shared by every group (set_residency_store's two-argument form; the engine opens one a
+ * group, see the next tests): a slot holds one block of one group -- a demotion takes a fresh slot
+ * for each group's entry -- so its size is the widest layout's block, not the sum of every layout's: the sum would leave
  * every slot of a two-layout recipe partly empty and the store holding fewer blocks than its
  * bytes buy. Each group's block starts at the rank's offset in the slot, its layers' fragments
  * one after the other at that layer's own width, which is what the pager's layer offsets name.
@@ -9038,6 +9039,163 @@ TEST(blocks_of_mixed_kv_layouts_demote_and_come_back_byte_for_byte_after_the_poo
 
     CHECK_OK(rad_stream_sync(compute));
     rad_stream_destroy(compute);
+}
+
+/* The budget split the engine runs: one store per residency group, the same tokens of each, so
+ * the budget goes in proportion to a group's slot bytes a token. Exact where the slots divide it,
+ * never over it where they do not. */
+TEST(the_residency_budget_split_holds_the_same_tokens_of_every_group_within_the_budget) {
+    CHECK_EQ(residency_split_tokens(16 * (2048 + 4352), { { 2048, 16 }, { 4352, 16 } }), 256ll);
+    /* Different block sizes: 6.25 + 9.375 bytes a token, 1000 bytes is 64 tokens, 4 + 2 blocks. */
+    CHECK_EQ(residency_split_tokens(1000, { { 100, 16 }, { 300, 32 } }), 64ll);
+    for (int64_t cap : { 6399ll, 6400ll, 6401ll, 123457ll }) {
+        const int64_t t = residency_split_tokens(cap, { { 2048, 16 }, { 4352, 16 } });
+        CHECK(t / 16 * 2048 + t / 16 * 4352 <= cap);
+        CHECK((t / 16 + 1) * (2048 + 4352) > cap);     /* one more block a group would not fit */
+    }
+    CHECK_EQ(residency_split_tokens(6399, { { 2048, 16 }, { 4352, 16 } }) / 16, 0ll);
+    CHECK_EQ(residency_split_tokens(1 << 20, {}), 0ll);
+    CHECK_EQ(residency_split_tokens(1 << 20, { { 0, 16 } }), 0ll);
+}
+
+/* A mixed recipe's store holds as many blocks as the sum of their real sizes allows, not the
+ * budget over the widest layout's block: each group's store is slots of its own block (2048 for
+ * fp8, 4224 -> 4352 for k6_v4), so a budget of 16 blocks of each group holds all 32 of a sequence's
+ * demotable blocks, where one store of the widest slot held 23. Slot ids are per group's store, so
+ * both groups' first block takes slot 0, and the bytes still round-trip without aliasing. */
+TEST(a_mixed_recipes_store_holds_each_groups_blocks_at_their_own_size_not_the_widest) {
+    Pools pools;
+    Config cfg = small_config();
+    REQUIRE_EQ(configure_pools(pools, cfg), RAD_OK);
+    KVManager kv;
+    REQUIRE_EQ(kv.configure(mixed_residency_groups(), cfg, pools.kv()), RAD_OK);
+    const int32_t gs[2] = { G_MIX_F8, G_MIX_K6 };
+    CHECK_EQ(kv.residency_slot_bytes(G_MIX_F8), 2048ll);
+    CHECK_EQ(kv.residency_slot_bytes(G_MIX_K6), 4352ll);
+    CHECK_EQ(kv.residency_slot_bytes(), 4352ll);       /* what one shared store's slot needs */
+    const int64_t cap = 16 * (2048 + 4352);
+    std::vector<ResidencySplit> split;
+    for (int32_t g : gs) split.push_back({ kv.residency_slot_bytes(g), kv.plan(g)->block_size });
+    const int64_t tokens = residency_split_tokens(cap, split);
+    REQUIRE_EQ(tokens, 256ll);
+    HostArena store[2];
+    for (int i = 0; i < 2; ++i) {
+        const int64_t sb = kv.residency_slot_bytes(gs[i]);
+        REQUIRE_EQ(store[i].open(sb, sb * (tokens / 16)), RAD_OK);
+        CHECK_OK(kv.set_residency_store(gs[i], &store[i], 0));
+    }
+    /* A group with no window takes no store. */
+    CHECK_EQ(kv.set_residency_store(G_MIX_KEYS, &store[0], 0), (int)RAD_E_INVAL);
+    CHECK_EQ(kv.residency_host_cap_bytes(), cap);
+    CHECK_EQ(kv.residency_slots(G_MIX_F8), 16ll);
+    CHECK_EQ(kv.residency_slots(G_MIX_K6), 16ll);
+    CHECK(kv.residency_device_base(G_MIX_KEYS) == nullptr);
+    REQUIRE(cap / kv.residency_slot_bytes() < 32);     /* the widest slot's store: 23 blocks */
+
+    CHECK_OK(kv.add_sequence(1));
+    CHECK_OK(kv.ensure(1, 16 * 20));
+    std::vector<BlockMove> down;
+    for (int32_t g : gs)
+        CHECK_OK(kv.residency_demote(1, g, /*keep_head=*/2, /*keep_tail=*/2, &down));
+    CHECK_EQ(down.size(), 32u);                        /* entries [2, 18) of both groups */
+    CHECK_EQ(kv.residency_stats().demote_skipped, 0ll);
+    CHECK_EQ(kv.residency_host_bytes(), 16 * 2048ll + 16 * 4352ll);
+    CHECK_EQ(store[0].used_slots(), 16ll);
+    CHECK_EQ(store[1].used_slots(), 16ll);
+    CHECK_EQ(kv.residency_slot(G_MIX_F8, kv.block_table(1, G_MIX_F8)[2]), 0);
+    CHECK_EQ(kv.residency_slot(G_MIX_K6, kv.block_table(1, G_MIX_K6)[2]), 0);
+    /* The same slot id names a different store's bytes for each group. */
+    CHECK((char*)kv.residency_slot_ptr(G_MIX_F8, 0) == (char*)store[0].at(0));
+    CHECK((char*)kv.residency_slot_ptr(G_MIX_K6, 0) == (char*)store[1].at(0));
+    /* Reference counts are per group's store: the cache's reference on one group's slot 0 does
+     * not keep the other group's slot 0. */
+    const int32_t e8 = kv.block_table(1, G_MIX_F8)[2];
+    CHECK_OK(kv.retain_entry(G_MIX_F8, e8));
+    CHECK_EQ(kv.entry_refs(G_MIX_F8, e8), 2);
+    CHECK_EQ(kv.entry_refs(G_MIX_K6, kv.block_table(1, G_MIX_K6)[2]), 1);
+    kv.residency_demote_landed();
+    kv.free_sequence(1);
+    CHECK_EQ(store[1].used_slots(), 0ll);
+    CHECK_EQ(store[0].used_slots(), 1ll);              /* the cache's */
+    kv.release_entry(G_MIX_F8, e8);
+    CHECK_EQ(store[0].used_slots(), 0ll);
+    CHECK_EQ(kv.residency_host_bytes(), 0ll);
+    for (int32_t g : gs) CHECK_OK(kv.set_residency_store(g, nullptr, 0));
+}
+
+/* The same per-group stores through the mover, byte for byte (the host backend): each group's
+ * blocks go to and come back from its own store at its own pitch. */
+TEST(per_group_residency_stores_round_trip_mixed_layouts_byte_for_byte) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    Pools pools;
+    Config cfg = small_config();
+    REQUIRE_EQ(configure_pools(pools, cfg), RAD_OK);
+    KVManager kv;
+    REQUIRE_EQ(kv.configure(mixed_residency_groups(), cfg, pools.kv()), RAD_OK);
+    const std::vector<int32_t> groups{ G_MIX_F8, G_MIX_K6 };
+    HostArena store[2];
+    for (int i = 0; i < 2; ++i) {
+        const int64_t sb = kv.residency_slot_bytes(groups[(size_t)i]);
+        REQUIRE_EQ(store[i].open(sb, sb * 16), RAD_OK);
+        CHECK_OK(kv.set_residency_store(groups[(size_t)i], &store[i], 0));
+    }
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    CHECK_OK(x.configure(&reg, &kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+    CHECK_OK(kv.add_sequence(1));
+    CHECK_OK(kv.ensure(1, 16 * 20));
+    std::vector<int32_t> orig[3];
+    for (int32_t g : groups) {
+        resid_fill(kv, g, 10 * g);
+        orig[g] = kv.block_table(1, g);
+    }
+    auto run = [&](std::vector<BlockMove>& mv, bool to_host) {
+        for (size_t a = 0; a < mv.size();) {
+            size_t z = a;
+            while (z < mv.size() && z - a < (size_t)TierExec::kMoveBatch &&
+                   mv[z].group == mv[a].group) ++z;
+            const std::vector<BlockMove> part(mv.begin() + (long)a, mv.begin() + (long)z);
+            CHECK_OK(x.issue_moves(part, compute, to_host));
+            x.quiesce();
+            a = z;
+        }
+    };
+    std::vector<BlockMove> down;
+    for (int32_t g : groups)
+        CHECK_OK(kv.residency_demote(1, g, /*keep_head=*/2, /*keep_tail=*/2, &down));
+    REQUIRE_EQ(down.size(), 32u);
+    run(down, /*to_host=*/true);
+    kv.residency_demote_landed();
+    CHECK_EQ(x.move_stats().out_bytes, 16 * 2048ll + 16 * 4224ll);
+    for (int32_t g : groups) resid_scribble(kv, g);
+    std::vector<BlockMove> up;
+    CHECK_OK(kv.residency_promote_all(1, &up));
+    REQUIRE_EQ(up.size(), 32u);
+    run(up, /*to_host=*/false);
+    kv.residency_complete();
+    for (int32_t g : groups) {
+        const std::vector<int32_t> back = kv.block_table(1, g);
+        for (size_t i = 2; i < 18; ++i) {
+            CHECK(back[i] >= 0);
+            CHECK_EQ(resid_mismatches(kv, g, back[i], orig[g][i], 10 * g), 0ll);
+        }
+    }
+    CHECK_EQ(store[0].used_slots() + store[1].used_slots(), 0ll);
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+    kv.free_sequence(1);
+    for (int32_t g : groups) CHECK_OK(kv.set_residency_store(g, nullptr, 0));
 }
 
 /* ------------------------------------------------------------------ window residency: tiered precision */
@@ -9757,6 +9915,7 @@ TEST(the_manager_hands_the_batch_its_store_layer_offsets_and_scratch_table) {
     const IKVManager::Pager p = bind.pager(G_RES, 0);
     CHECK(p.store == f.store.device_base());
     CHECK_EQ(p.slot_bytes, f.kv.residency_slot_bytes());
+    CHECK_EQ(p.slots, 16ll);                           /* the group's store's slots */
     CHECK(p.scratch == f.kv.scratch_table(G_RES).data());
     CHECK_EQ(bind.scratch_pitch(G_RES), 9ll);
     /* Layers 0 and 1 are the group's; each fragment is one block of that layer's pool, in order. */

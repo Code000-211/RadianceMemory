@@ -3639,31 +3639,30 @@ int Engine::configure_kv() {
      * residency_window, set by arch/common/rad_qsa.h); the blocks the window does not cover can
      * then live in a pinned store instead of VRAM. One slot is one block, so this runs after the
      * carve, which is where a block's size exists, and under tensor parallelism the slot holds
-     * every rank's shard at its own offset. A slot holds one block of one group, so a rank's
-     * shard is its widest residency group's block (KVManager::residency_shard_bytes): under a
-     * per-layer recipe the groups are layouts of different widths, all with one window. */
+     * every rank's shard at its own offset. A slot holds one block of one group, and each group
+     * has its own store of slots its block's size (KVManager::set_residency_store): under a
+     * per-layer recipe the groups are layouts of different widths, and one store sized for the
+     * widest would leave every narrower block's slot mostly empty. */
     {
-        std::vector<int64_t> rank_res(ranks_.size(), 0), res_off(ranks_.size(), 0);
-        int64_t slot_bytes = 0, window_tokens = 0, n_groups = 0;
+        /* Per residency group (rank 0's index): every rank's offset in its slot, and the slot. */
+        struct ResGroup { int32_t g; int64_t slot = 0, block_size = 0, slots = 0; std::vector<int64_t> off; };
+        std::vector<ResGroup> rgs;
+        int64_t window_tokens = 0, n_groups = 0;
         std::string per_group;   /* each group's block, for the store's line */
-        for (size_t i = 0; i < ranks_.size(); ++i)
-            rank_res[i] = ranks_[i]->kv.residency_shard_bytes();
-        for (const auto& p : ranks_[0]->kv.plans())
-            if (p.residency()) {
-                window_tokens = std::max(window_tokens, p.residency_window);
-                ++n_groups;
-                per_group += (per_group.empty() ? "" : ", ") + p.name + " " +
-                             humanb(p.bytes_per_block) + " (" + std::to_string(p.n_layers) +
-                             " layers of " + humanb(p.layer_bytes_per_block()) + ")";
-                /* Tiered: what a slot and the pager's link carry instead (RAD_KVQ_DEMOTE). */
-                if (p.tiered())
-                    per_group += fmt(" stored as %s, %s a block (%s a layer paged in)",
-                                     kv_layout_name(p.res_to), humanb(p.residency_bytes()).c_str(),
-                                     humanb(p.residency_frag()).c_str());
+        for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g) {
+            const KVGroupPlan* pp = ranks_[0]->kv.plan(g);
+            if (!pp || !pp->residency()) continue;
+            const KVGroupPlan& p = *pp;
+            window_tokens = std::max(window_tokens, p.residency_window);
+            ++n_groups;
+            ResGroup rg{g};
+            rg.block_size = p.block_size;
+            for (const auto& r : ranks_) {
+                rg.off.push_back(rg.slot);
+                rg.slot += r->kv.residency_block_bytes(g);
             }
-        for (size_t i = 0; i < ranks_.size(); ++i) {
-            res_off[i] = slot_bytes;
-            slot_bytes += rank_res[i];
+            rg.slot = align_up(rg.slot, (int64_t)256);
+            rgs.push_back(rg);
         }
         bool tiered = false;
         for (const auto& p : ranks_[0]->kv.plans()) tiered = tiered || (p.residency() && p.tiered());
@@ -3681,27 +3680,56 @@ int Engine::configure_kv() {
                      "--kv-residency-mib 0 keeps every block of them resident",
                      (long long)n_groups, (long long)window_tokens);
         } else {
-            const int64_t slot = align_up(slot_bytes, 256);
-            const int64_t cap  = cfg_.residency_mib << 20;
-            const int64_t slots = slot > 0 ? cap / slot : 0;
-            if (slots <= 0) {
-                RAD_ERR("kv residency: --kv-residency-mib %lld holds no block of %s. Raise it or "
-                        "pass 0 to keep every block resident", (long long)cfg_.residency_mib,
-                        humanb(slot).c_str());
+            const int64_t cap = cfg_.residency_mib << 20;
+            /* The groups demote the same tokens, so the budget is split to hold the same tokens
+             * of each: in proportion to a group's slot bytes a token. */
+            std::vector<ResidencySplit> split;
+            for (const ResGroup& rg : rgs) split.push_back({ rg.slot, rg.block_size });
+            const int64_t tokens = residency_split_tokens(cap, split);
+            int64_t total_slots = 0, widest = 0;
+            for (ResGroup& rg : rgs) {
+                rg.slots = tokens / rg.block_size;
+                total_slots += rg.slots;
+                widest = std::max(widest, rg.slot);
+            }
+            if (tokens <= 0 || std::any_of(rgs.begin(), rgs.end(),
+                                           [](const ResGroup& rg) { return rg.slots <= 0; })) {
+                RAD_ERR("kv residency: --kv-residency-mib %lld holds no block of every group (the "
+                        "widest slot %s). Raise it or pass 0 to keep every block resident",
+                        (long long)cfg_.residency_mib, humanb(widest).c_str());
                 return RAD_E_NOMEM;
             }
-            /* Host-mapped, because the pager reads it from the card: a host that cannot map the
-             * store refuses by flag name (HostArena::open_mapped says so) rather than opening a
-             * store nothing can page from. */
-            if (const int rc = res_store_.open_mapped(slot, slot * slots); rc == RAD_E_UNSUPPORTED)
-                return rc;
-            else if (rc != RAD_OK) {
-                RAD_ERR("kv residency: the host did not map %s for %lld blocks: %s",
-                        humanb(slot * slots).c_str(), (long long)slots, rad_dev_last_error());
-                return RAD_E_NOMEM;
+            res_stores_.clear();
+            res_stores_.resize((size_t)ranks_[0]->kv.n_groups());
+            int64_t store_bytes = 0;
+            for (const ResGroup& rg : rgs) {
+                auto& st = res_stores_[(size_t)rg.g];
+                st = std::make_unique<HostArena>();
+                /* Host-mapped, because the pager reads it from the card: a host that cannot map
+                 * the store refuses by flag name (HostArena::open_mapped says so) rather than
+                 * opening a store nothing can page from. */
+                if (const int rc = st->open_mapped(rg.slot, rg.slot * rg.slots); rc == RAD_E_UNSUPPORTED)
+                    return rc;
+                else if (rc != RAD_OK) {
+                    RAD_ERR("kv residency: the host did not map %s for %lld blocks of group '%s': %s",
+                            humanb(rg.slot * rg.slots).c_str(), (long long)rg.slots,
+                            ranks_[0]->kv.plan(rg.g)->name.c_str(), rad_dev_last_error());
+                    return RAD_E_NOMEM;
+                }
+                store_bytes += st->cap_bytes();
+                for (size_t i = 0; i < ranks_.size(); ++i)
+                    RAD_TRY(ranks_[i]->kv.set_residency_store(rg.g, st.get(), rg.off[i]));
+                const KVGroupPlan& p = *ranks_[0]->kv.plan(rg.g);
+                per_group += (per_group.empty() ? "" : ", ") + p.name + " " +
+                             std::to_string(rg.slots) + " slots of " + humanb(rg.slot) + " (" +
+                             humanb(p.bytes_per_block) + ", " + std::to_string(p.n_layers) +
+                             " layers of " + humanb(p.layer_bytes_per_block()) + ")";
+                /* Tiered: what a slot and the pager's link carry instead (RAD_KVQ_DEMOTE). */
+                if (p.tiered())
+                    per_group += fmt(" stored as %s, %s a block (%s a layer paged in)",
+                                     kv_layout_name(p.res_to), humanb(p.residency_bytes()).c_str(),
+                                     humanb(p.residency_frag()).c_str());
             }
-            for (auto& r : ranks_)
-                RAD_TRY(r->kv.set_residency_store(&res_store_, res_off[(size_t)(&r - &ranks_[0])]));
             /* What the pager's scratch pages cost the card (KVGroupPlan::scratch_blocks, charged to
              * the KV budget before the split), per rank 0's groups. */
             int64_t scratch_bytes = 0, scratch_pages = 0;
@@ -3709,11 +3737,12 @@ int Engine::configure_kv() {
                 scratch_bytes += p.scratch_blocks * p.bytes_per_block;
                 scratch_pages += p.scratch_blocks;
             }
-            RAD_INFO("kv residency: store %s of host-mapped memory, %lld slots of %s, a slot one "
-                     "block of one group, rank 0's: %s; scratch reservation %s of VRAM (%lld pages "
-                     "for %lld decode rows, charged to the KV budget); window %lld tokens",
-                     humanb(res_store_.cap_bytes()).c_str(), (long long)slots,
-                     humanb(slot).c_str(), per_group.c_str(), humanb(scratch_bytes).c_str(),
+            RAD_INFO("kv residency: store %s of host-mapped memory, %lld blocks in %lld groups' "
+                     "stores (%lld tokens of each group), a slot one block of its group, rank 0's: "
+                     "%s; scratch reservation %s of VRAM (%lld pages for %lld decode rows, charged "
+                     "to the KV budget); window %lld tokens",
+                     humanb(store_bytes).c_str(), (long long)total_slots, (long long)n_groups,
+                     (long long)tokens, per_group.c_str(), humanb(scratch_bytes).c_str(),
                      (long long)scratch_pages, (long long)ranks_[0]->kv.scratch_rows(),
                      (long long)window_tokens);
             /* The transfers (TierExec::issue_moves) on every rank, over the residency groups, and
