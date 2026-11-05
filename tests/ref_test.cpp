@@ -10358,6 +10358,8 @@ std::vector<Geo> geometries() {
         G("dequant", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("dequant_w4", "N", 16, a.i("N", R).i("K", 64).i("group", 64).i("twos", 1)
                                    .s("dtype", "w4a8")),
+        G("dequant_w4", "N", 16, a.i("N", R).i("K", 128).i("group", 128).i("twos", 0)
+                                   .s("dtype", "w4a8")),
         G("rmsnorm_quant_fp8", "M", 3, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
                                        .s("dtype", "bf16")),
         G("gated_quant_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "bf16")
@@ -10445,6 +10447,14 @@ std::vector<Geo> geometries() {
                               .s("a_order", "token").s("dtype", "f32")),
         G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
                                 .i("group", 128).s("a_order", "token").s("dtype", "fp8a8")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "token").s("dtype", "w4a8")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "sorted").s("dtype", "w4a8")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "token").s("dtype", "w4a4")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "sorted").s("dtype", "w4a4")),
         G("moe_gemm_q_mod4", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 5)
                                      .i("top_k", 2).i("group", 128).s("a_order", "sorted")
                                      .s("dtype", "fp8a8")),
