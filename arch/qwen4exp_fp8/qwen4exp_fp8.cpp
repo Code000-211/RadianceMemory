@@ -1700,16 +1700,34 @@ static void step(RadCtx* c, const RadBatch* batch) {
 uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
     if (batch->enc) return 1;
-    /* MTP owns another attention path on the same KV group. The present batch key cannot prove
-     * whether that head's attention row takes a split grid, so keep only those passes live. */
-    if (batch->draft_pass != 0) return 0;
-    /* Mixed batches split the query rows into decode and prefill subsets before attention, and a
-     * speculative verify can choose another q_len band. The whole-batch host summary cannot key
-     * those subset geometries exactly. */
-    if (batch->phase == RAD_PHASE_MIXED || batch->n_spec > 0) return 0;
-    if (batch->phase != RAD_PHASE_PREFILL) return 1;
+    /* Mixed batches split the query rows into decode and prefill subsets before attention; the
+     * whole-batch host summary cannot key those subset geometries exactly. */
+    if (batch->phase == RAD_PHASE_MIXED) return 0;
 
     Model& m = g_model[rad_rank(c)];
+    /* Decode, verify and draft passes (the MTP head attends over the same KV group): every
+     * attention launch covers all the pass's sequences, and the shape fields the core keys (n_tok,
+     * n_seq, max_q_len, n_spec, draft_pass) fix each launch's q_len band and units. The live KV
+     * length enters a split launcher's count only through the cap of eight 48-key tiles a split
+     * (rad_prefill_splits_law; every head_dim 256 launcher has P_TILE 48), and from 64 splits up
+     * the cap no longer binds. Keying that cap level lets these passes be recorded while each launch
+     * still splits by its exact live length: answering 0 left them unrecorded (issue #402), and the
+     * core's keyed bound for a plugin without the callback rounds the length up a bucket, which split
+     * a short single-stream verify into several partials with a merge (x1 203 against 219 tok/s). */
+    if (batch->phase != RAD_PHASE_PREFILL || batch->draft_pass != 0 || batch->n_spec > 0) {
+        if (!m.kv_full || !used_max_h || !batch->kv) return 0;
+        int group = -1;
+        for (int i = 0; i < batch->n_kv_groups; ++i)
+            if (batch->kv[i].group == m.kv_full) { group = i; break; }
+        if (group < 0) return 2;  // no full-attention KV in this pass: nothing splits by length
+        const int used = used_max_h[group];
+        if (used <= 0) return 0;  // Missing host summary is not the same as an empty KV cache.
+        constexpr int tile = 48;
+        const int ctx = (m.g.max_ctx > 0 && used >= m.g.max_ctx) ? (int)m.g.max_ctx : used;
+        const int cap = std::min(((ctx + tile - 1) / tile) / 8, 64);
+        return 3 + (uint64_t)cap;
+    }
+
     bool has_full_attention = false;
     for (const Layer& layer : m.layers) {
         if (!layer.full) continue;

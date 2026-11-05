@@ -1928,13 +1928,60 @@ TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
 
     batch.phase = RAD_PHASE_MIXED;
     CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
-    batch.phase = RAD_PHASE_DECODE; batch.n_spec = 1;
-    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
-    batch.n_spec = 0; batch.draft_pass = -1;
-    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
-    batch.draft_pass = 0; batch.phase = RAD_PHASE_PREFILL; batch.n_seq = 2;
+    batch.phase = RAD_PHASE_PREFILL; batch.draft_pass = 0; batch.n_seq = 2;
     CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
     batch.n_seq = 1; used[0] = 0;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+}
+
+/* Decode, verify and draft passes are recorded, keyed by the cap their live KV length puts on a
+ * split launcher (eight 48-key tiles a split, binding below 64 splits): one key within a level, another
+ * across it, the same past the last level, and none without a host summary or in a mixed pass. A pass
+ * left unkeyed (0) is issued op by op on every step (issue #402). */
+TEST(qwen4exp_pass_key_keys_decode_verify_and_draft_by_the_split_cap) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx build = build_ctx(0, 1);
+    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 5; build.max_ctx = 65536;
+    RadBuilder graph;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&graph, &meta, &build), RAD_OK);
+    rad_kvgroup kv_full = 0;
+    for (size_t i = 0; i < graph.kv_groups.size(); ++i)
+        if (graph.kv_groups[i].name.find("kv_attn") != std::string::npos) {
+            kv_full = (rad_kvgroup)(i + 1);
+            break;
+        }
+    REQUIRE(kv_full != 0);
+
+    RadCtx ctx{};
+    RadKVGroupBatch group{};
+    group.group = kv_full;
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_DECODE; batch.n_spec = 5;
+    batch.n_tok = 6; batch.n_seq = 1; batch.max_q_len = 6;
+    batch.max_ctx_len = 1024; batch.n_kv_groups = 1; batch.kv = &group;
+    int32_t used[1] = {400};                      /* 9 tiles: level 1 (337-720 keys) */
+    const uint64_t verify1 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    CHECK(verify1 != 0);
+    used[0] = 720;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), verify1);
+    used[0] = 721;                                /* 16 tiles: level 2 */
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != verify1);
+    used[0] = 300;                                /* 7 tiles: level 0 */
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != verify1);
+    used[0] = 30000;                              /* past 64 splits' 24,576 keys: one key */
+    const uint64_t verify_long = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    used[0] = 60000;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), verify_long);
+
+    used[0] = 400;
+    batch.n_spec = 0; batch.n_tok = 1; batch.max_q_len = 1;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != 0);   /* plain decode */
+    batch.draft_pass = -1;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != 0);   /* the MTP head's draft pass */
+
+    used[0] = 0;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    used[0] = 400; batch.draft_pass = 0; batch.phase = RAD_PHASE_MIXED;
     CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
 }
 
