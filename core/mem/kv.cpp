@@ -656,6 +656,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     refcount_.resize(plans_.size());
     cached_.resize(plans_.size());
     cache_only_.assign(plans_.size(), 0);
+    res_idle_.assign(plans_.size(), {});
     free_states_.resize(plans_.size());
 
     /* ---- window residency ----
@@ -814,11 +815,15 @@ void KVManager::drop_block(int32_t g, int32_t b) {
     auto& rc = refcount_[(size_t)g][(size_t)b];
     if (rc <= 0) { RAD_ERR("KV group %d: double free of block %d", g, b); return; }
     if (cached_[(size_t)g][(size_t)b]) {
-        if (rc == 2) ++cache_only_[(size_t)g];
+        if (rc == 2) { ++cache_only_[(size_t)g]; note_cache_only((size_t)g, b); }
         else if (rc == 1) { --cache_only_[(size_t)g]; cached_[(size_t)g][(size_t)b] = 0; }
     }
     if (--rc != 0) {
-        if (rc == 1 && !cached_[(size_t)g][(size_t)b]) ++res_skip_epoch_;   /* no longer shared */
+        /* No longer shared with another sequence: one holder left, or one beside the cache, which
+         * follows a demotion (set_residency_cache). */
+        if ((rc == 1 && !cached_[(size_t)g][(size_t)b]) ||
+            (rc == 2 && cached_[(size_t)g][(size_t)b] && res_cache_))
+            ++res_skip_epoch_;
         return;
     }
     forget_origin(g, b);                  /* a freed block is no longer a copy of anything */
@@ -1401,7 +1406,10 @@ void KVManager::cache_reserved_block(int32_t g, int32_t b) {
     if (b < 0 || b >= (int32_t)refcount_[(size_t)g].size()) return;
     if (refcount_[(size_t)g][(size_t)b] <= 0) return;
     uint8_t& mark = cached_[(size_t)g][(size_t)b];
-    if (!mark) { mark = 1; if (refcount_[(size_t)g][(size_t)b] == 1) ++cache_only_[(size_t)g]; }
+    if (!mark) {
+        mark = 1;
+        if (refcount_[(size_t)g][(size_t)b] == 1) { ++cache_only_[(size_t)g]; note_cache_only((size_t)g, b); }
+    }
 }
 
 /* Releasing a marked block releases the cache's reference, so the mark goes with it; other
@@ -1557,6 +1565,7 @@ void KVManager::release_residency() {
     res_emul_.assign(plans_.size(), {});
     res_pending_.clear();
     res_demoting_.clear();
+    res_idle_.assign(plans_.size(), {});
     res_cold_ = 0;
 }
 
@@ -1685,7 +1694,7 @@ void KVManager::residency_demote_landed() {
         drop_block(d.group, d.block);            /* the only reference: the block is free again */
         ++res_stats_.freed_blocks;
         res_stats_.freed_bytes += plans_[(size_t)d.group].bytes_per_block;
-        seq_res(d.seq).freed_bytes += plans_[(size_t)d.group].bytes_per_block;
+        if (d.seq != kCacheSeq) seq_res(d.seq).freed_bytes += plans_[(size_t)d.group].bytes_per_block;
     }
     res_demoting_.clear();
 }
@@ -1768,13 +1777,27 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         if (decided) from = i;
         const int32_t b = tbl[(size_t)i];
         if (b < 0) continue;                               /* already cold (or empty) */
-        /* A block the prefix cache indexes, or a child holds, is read by another sequence's step
-         * that this one cannot promote for. It stays: dropping this table's reference would free
-         * no VRAM, and a cache hit on a resident entry must find pool bytes. */
-        if (cached_[(size_t)g][(size_t)b] || refcount_[(size_t)g][(size_t)b] > 1) {
+        /* A block another live sequence also holds (a child, or a second hit on the same cache
+         * entry) is read by that sequence's step through its own table: it stays, since dropping
+         * this table's reference would free no VRAM. One that only the prefix cache holds beside
+         * this table moves, and the cache's entry follows it into the slot (cache_follows), so
+         * every later reader adopts it cold and promotes a block of its own. */
+        const bool cached = cached_[(size_t)g][(size_t)b] != 0;
+        const bool with_cache = cached && refcount_[(size_t)g][(size_t)b] == 2 && res_cache_;
+        if ((cached || refcount_[(size_t)g][(size_t)b] > 1) && !with_cache) {
             ++skipped;
             continue;
         }
+        /* The cache's entry names `slot` with a reference of its own and drops its block
+         * reference; the block keeps this table's. False: the cache names no such entry, the
+         * block stays as before. */
+        auto cache_follows = [&](int32_t slot) {
+            if (!res_cache_(g, b, rad_kv_cold_entry(slot))) return false;
+            slot_ref(g, slot);
+            uncache((size_t)g, b);
+            --refcount_[(size_t)g][(size_t)b];             /* 2 -> 1: never frees */
+            return true;
+        };
         /* The emulation (residency_emulate): the round trip in place, once, in the order and
          * under the bound the demotion below takes; the entry and the block stay. */
         if (res_emulate_) {
@@ -1798,6 +1821,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         auto& origin = res_origin_[(size_t)g];             /* sized by size_residency() */
         if (auto og = origin.find(b); og != origin.end()) {
             const int32_t slot = og->second;
+            if (with_cache && !cache_follows(slot)) { ++skipped; continue; }
             origin.erase(og);
             tbl[(size_t)i] = rad_kv_cold_entry(slot);
             s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
@@ -1824,6 +1848,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
             decided = false;                               /* retried when a slot frees */
             continue;
         }
+        if (with_cache && !cache_follows(slot)) { slot_drop(g, slot); ++skipped; continue; }
         /* The entry is cold from here; the block keeps its one reference until the copy lands. */
         tbl[(size_t)i] = rad_kv_cold_entry(slot);
         s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
@@ -1840,6 +1865,80 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
     if (decided) from = i;
     charge_skips();
     return RAD_OK;
+}
+
+void KVManager::uncache(size_t g, int32_t b) {
+    uint8_t& mark = cached_[g][(size_t)b];
+    if (!mark) return;
+    mark = 0;
+    if (refcount_[g][(size_t)b] == 1) --cache_only_[g];
+}
+
+void KVManager::note_cache_only(size_t g, int32_t b) {
+    if (res_cache_ && plans_[g].residency() && res_store((int32_t)g) && g < res_idle_.size())
+        res_idle_[g].push_back(b);
+}
+
+int64_t KVManager::residency_demote_cached(std::vector<BlockMove>* out, int64_t max_blocks) {
+    if (!out || !res_cache_) return 0;
+    int64_t n = 0, skipped = 0;
+    for (size_t g = 0; g < res_idle_.size() && g < plans_.size() && n < max_blocks; ++g) {
+        const KVGroupPlan& p = plans_[g];
+        auto& q = res_idle_[g];
+        if (!p.residency() || !p.paged() || !res_store((int32_t)g)) { q.clear(); continue; }
+        while (!q.empty() && n < max_blocks) {
+            const int32_t b = q.front();
+            /* Taken lazily: adopted, released or demoted since it was noted means not now. */
+            if (b < 0 || (size_t)b >= refcount_[g].size() || !cached_[g][(size_t)b] ||
+                refcount_[g][(size_t)b] != 1) {
+                q.pop_front();
+                continue;
+            }
+            if (res_emulate_) {                            /* the round trip in place, once */
+                q.pop_front();
+                if (res_emul_.size() != plans_.size()) res_emul_.resize(plans_.size());
+                if (!res_emul_[g].insert(b).second) continue;
+                out->push_back(BlockMove{(int32_t)g, b, -1});
+                ++n;
+                ++res_stats_.demoted;
+                res_stats_.demoted_bytes += p.residency_bytes();
+                continue;
+            }
+            auto& origin = res_origin_[g];
+            if (auto og = origin.find(b); og != origin.end()) {
+                /* Unchanged since its promotion from a slot: the cache takes the origin's
+                 * reference and the block goes free now, as residency_demote() re-points. */
+                q.pop_front();
+                const int32_t slot = og->second;
+                if (!res_cache_((int32_t)g, b, rad_kv_cold_entry(slot))) { ++skipped; continue; }
+                origin.erase(og);
+                uncache(g, b);
+                drop_block((int32_t)g, b);                 /* the cache's, the last */
+                ++res_stats_.demoted;
+                ++res_stats_.repointed;
+                ++res_stats_.freed_blocks;
+                res_stats_.freed_bytes += p.bytes_per_block;
+                continue;
+            }
+            const int32_t slot = slot_new((int32_t)g);     /* the cache's reference */
+            if (slot < 0) { ++skipped; break; }            /* store full: retried next sweep */
+            q.pop_front();
+            if (!res_cache_((int32_t)g, b, rad_kv_cold_entry(slot))) {
+                slot_drop((int32_t)g, slot);
+                ++skipped;
+                continue;
+            }
+            /* The cache's block reference becomes the landing's, as a table's does. */
+            uncache(g, b);
+            res_demoting_.push_back({ (int32_t)g, b, slot, kCacheSeq });
+            out->push_back(BlockMove{(int32_t)g, b, slot});
+            ++n;
+            ++res_stats_.demoted;
+            res_stats_.demoted_bytes += p.residency_bytes();
+        }
+    }
+    res_stats_.demote_skipped += skipped;
+    return n;
 }
 
 int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64_t>& table_idx,

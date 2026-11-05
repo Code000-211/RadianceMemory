@@ -97,6 +97,12 @@ struct IKVManager {
         (void)seq; (void)group; (void)keep_head; (void)keep_tail; (void)max_blocks; (void)out;
         return RAD_E_INVAL;
     }
+    /* Demote at most `max_blocks` blocks only the prefix cache holds (idle conversations); the
+     * moves are appended like residency_demote()'s. Returns how many were appended. */
+    virtual int64_t residency_demote_cached(int64_t max_blocks, std::vector<BlockMove>* out) {
+        (void)max_blocks; (void)out;
+        return 0;
+    }
     /* The issued copies have landed: demoted pool blocks go free, promoted slots are given back. */
     virtual void residency_demote_landed() {}
     virtual void residency_complete() {}
@@ -411,6 +417,9 @@ struct KVBinding final : IKVManager {
     int residency_demote(uint64_t s, int32_t g, int64_t h, int64_t t, int64_t n,
                          std::vector<BlockMove>* out) override {
         return m->residency_demote(s, g, h, t, out, n);
+    }
+    int64_t residency_demote_cached(int64_t n, std::vector<BlockMove>* out) override {
+        return m->residency_demote_cached(out, n);
     }
     void residency_demote_landed() override { m->residency_demote_landed(); }
     void residency_complete() override { m->residency_complete(); }

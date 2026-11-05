@@ -9769,6 +9769,233 @@ TEST(idle_tiers_are_never_handed_a_cache_entry_with_a_cold_component) {
     CHECK_EQ(store.used_slots(), 0ll);
 }
 
+/* ------------------------------------------------------------------ window residency: blocks the cache holds */
+
+/* A conversation published resident and freed: the cache alone holds its 40 blocks of the
+ * residency group, as at the end of a turn whose last sweep had not yet run (or a hit's resident
+ * entries, which the turn shared with the cache and so never demoted). */
+static std::vector<int32_t> resid_publish_resident(Fixture& f, uint64_t id, int32_t base) {
+    const std::vector<int32_t> tokens = tok_run(base, 16 * 40);
+    CHECK_OK(f.kv.add_sequence(id));
+    CHECK_OK(f.kv.ensure(id, (int64_t)tokens.size()));
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(id, g));
+    CHECK_OK(f.pc.insert(id, tokens, {}, bt, (int64_t)tokens.size()));
+    f.kv.free_sequence(id);
+    return tokens;
+}
+
+/* The finding of the 32 x 128K runs: a block only the prefix cache held never left VRAM, so every
+ * conversation waiting for its next turn kept its chain on the card, the pool filled with idle
+ * conversations, the cache was evicted and follow-ups recomputed. The cache's sweep now moves
+ * them (all of them: the next turn's prefill promotes the whole chain anyway), the chain still
+ * hits, and the follow-up's promotion brings back what the last turn wrote, byte for byte. */
+TEST(an_idle_published_conversation_leaves_vram_and_its_follow_up_comes_back_byte_for_byte) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the residency transfer needs the host backend (%s here)\n",
+                    device_backend_name());
+        return;
+    }
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store, 64);
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0)));
+    RadStream compute = nullptr;
+    REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+    TierExec x;
+    const std::vector<int32_t> groups{ G_RES };
+    CHECK_OK(x.configure(&reg, &f.kv, &t, groups, TierExec::kMoveBatch, 64, 64,
+                         /*leader=*/true, /*device=*/0, /*slot_off=*/0, /*shared=*/nullptr));
+    auto run = [&](const std::vector<BlockMove>& mv, bool to_host) {
+        for (size_t i = 0; i < mv.size(); i += TierExec::kMoveBatch) {
+            const std::vector<BlockMove> batch(
+                mv.begin() + (long)i, mv.begin() + (long)std::min(mv.size(), i + TierExec::kMoveBatch));
+            CHECK_OK(x.issue_moves(batch, compute, to_host));
+            x.quiesce();
+        }
+    };
+    const int64_t pool0 = f.kv.free_blocks(G_RES), keys0 = f.kv.free_blocks(G_KEYS);
+
+    const std::vector<int32_t> tokens = tok_run(7, 16 * 40);
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, (int64_t)tokens.size()));
+    resid_fill(f.kv, G_RES);
+    const std::vector<int32_t> orig = f.kv.block_table(1, G_RES);
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(1, g));
+    CHECK_OK(f.pc.insert(1, tokens, {}, bt, (int64_t)tokens.size()));
+    f.kv.free_sequence(1);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 40);           /* the idle conversation, on the card */
+    CHECK_EQ(f.kv.cache_only_blocks(G_RES), 40ll);
+
+    /* Bounded like a sequence's sweep; the block keys (no window) stay, as they do for a sequence. */
+    std::vector<BlockMove> down;
+    CHECK_EQ(f.kv.residency_demote_cached(&down, 16), 16ll);
+    CHECK_EQ(f.kv.residency_demote_cached(&down, 1000), 24ll);
+    CHECK_EQ(f.kv.residency_demote_cached(&down, 1000), 0ll);
+    REQUIRE_EQ(down.size(), 40u);
+    for (const BlockMove& m : down) CHECK_EQ(m.group, (int32_t)G_RES);
+    run(down, /*to_host=*/true);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 40);           /* held until the copies land */
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);                /* the VRAM came back */
+    CHECK_EQ(f.kv.free_blocks(G_KEYS), keys0 - 40);
+    CHECK_EQ(f.kv.cache_only_blocks(G_RES), 0ll);
+    CHECK_EQ(store.used_slots(), 40ll);
+    CHECK_EQ(f.pc.size(), 40ll);
+    CHECK_EQ(f.kv.residency_stats().demoted, 40ll);
+    resid_scribble(f.kv, G_RES);                             /* the pool moves on to other owners */
+
+    /* The follow-up hits the whole chain, cold, and its dense step promotes it. */
+    std::vector<int32_t> prompt = tokens;
+    prompt.push_back(99999);
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(prompt, {}, &hit);
+    CHECK_EQ(h.n_attn_tokens, 16 * 40);
+    int64_t cold = 0;
+    for (int32_t e : hit[0]) cold += f.kv.residency_cold(G_RES, e);
+    CHECK_EQ(cold, 40ll);
+    CHECK_OK(f.kv.add_sequence(2));
+    for (size_t i = 0; i < hit.size(); ++i)
+        CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[i], hit[i], h.n_attn_tokens));
+    std::vector<BlockMove> up;
+    CHECK_OK(f.kv.residency_promote_all(2, &up));
+    REQUIRE_EQ(up.size(), 40u);
+    run(up, /*to_host=*/false);
+    f.kv.residency_complete();
+    for (int64_t e = 0; e < 40; ++e) {
+        const int32_t now = f.kv.block_table(2, G_RES)[(size_t)e];
+        CHECK(now >= 0);
+        CHECK_EQ(resid_mismatches(f.kv, G_RES, now, orig[(size_t)e]), 0ll);
+    }
+    CHECK_EQ(store.used_slots(), 40ll);                      /* the cache keeps its slots */
+
+    /* The promoted middle is a copy of the cache's slots: its next sweep re-points, no bytes. */
+    const auto before = f.kv.residency_stats();
+    std::vector<BlockMove> again;
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &again));
+    CHECK(again.empty());
+    CHECK_EQ(f.kv.residency_stats().repointed - before.repointed, 30ll);
+
+    f.kv.free_sequence(2);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+    CHECK_EQ(f.kv.free_blocks(G_KEYS), keys0);
+    CHECK_OK(rad_stream_sync(compute));
+    rad_stream_destroy(compute);
+}
+
+/* A block one live sequence shares with the cache (the previous turn's resident entries, which a
+ * follow-up adopts) used to be skipped for good. Its only other reader is a later hit, which adopts
+ * whatever the entry names and promotes a block of its own, so the block moves like the sequence's
+ * own and the cache entry follows it into the same slot. A block a second live sequence also holds
+ * stays: that sequence's step reads it through its table, until it lets go. */
+TEST(a_block_one_live_sequence_shares_with_the_cache_moves_and_the_cache_follows_it_into_the_slot) {
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store);
+    const int64_t pool0 = f.kv.free_blocks(G_RES);
+    const std::vector<int32_t> tokens = resid_publish_resident(f, 1, 3);
+    std::vector<int32_t> prompt = tokens;
+    prompt.push_back(99999);
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(prompt, {}, &hit);
+    REQUIRE_EQ(h.n_attn_tokens, 16 * 40);
+    for (uint64_t id : { 2ull, 3ull }) {
+        CHECK_OK(f.kv.add_sequence(id));
+        for (size_t i = 0; i < hit.size(); ++i)
+            CHECK_OK(f.kv.adopt(id, f.pc.cached_groups()[i], hit[i], h.n_attn_tokens));
+    }
+    CHECK_EQ(f.kv.block_refcount(G_RES, hit[0][20]), 3);
+
+    std::vector<BlockMove> m;
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &m));
+    CHECK(m.empty());                                        /* sequence 3 reads them too */
+    CHECK(f.kv.residency_stats().demote_skipped >= 30);
+    f.kv.free_sequence(3);
+    CHECK_OK(f.kv.residency_demote(2, G_RES, 2, 8, &m));
+    REQUIRE_EQ(m.size(), 30u);
+    const std::vector<int32_t>& t2 = f.kv.block_table(2, G_RES);
+    for (int64_t i = 2; i < 32; ++i) {
+        CHECK(f.kv.residency_cold(G_RES, t2[(size_t)i]));
+        CHECK_EQ(f.kv.entry_refs(G_RES, t2[(size_t)i]), 2);  /* the sequence's and the cache's */
+    }
+    CHECK_EQ(store.used_slots(), 30ll);
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 10);           /* only the sink and the tail */
+
+    /* The cache names the same slots: a later hit adopts them cold. */
+    std::vector<std::vector<int32_t>> hit2;
+    CHECK_EQ(f.pc.lookup(prompt, {}, &hit2).n_attn_tokens, 16 * 40);
+    for (int64_t i = 0; i < 40; ++i)
+        CHECK_EQ(hit2[0][(size_t)i], t2[(size_t)i]);
+
+    /* The sequence going leaves the cache's slots, and its resident sink and tail to the cache's
+     * own sweep. */
+    f.kv.free_sequence(2);
+    CHECK_EQ(store.used_slots(), 30ll);
+    std::vector<BlockMove> idle;
+    CHECK_EQ(f.kv.residency_demote_cached(&idle, 1000), 10ll);
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+    CHECK_EQ(store.used_slots(), 40ll);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+}
+
+/* The tiers hold no entry with a cold component: a demoted entry's host copy goes (the bytes are in
+ * the store), but its conversation stays listed, since its chain still hits. */
+TEST(a_cached_block_the_sweep_demotes_gives_up_its_tier_copy_and_keeps_its_session) {
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store);
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(64 * 1024, 1024)));
+    f.pc.set_tiers(&t);
+    (void)resid_publish_resident(f, 1, 1);
+    CHECK_EQ(copy_now(t).size(), 40u);                       /* every entry copied to host */
+    CHECK_EQ(t.sessions().size(), 1u);
+    std::vector<BlockMove> down;
+    CHECK_EQ(f.kv.residency_demote_cached(&down, 1000), 40ll);
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.pc.drop_clean(), 0ll);                        /* nothing left for the tiers to drop */
+    CHECK_EQ(copy_now(t).size(), 0u);
+    CHECK_EQ(t.sessions().size(), 1u);
+    CHECK_EQ(store.used_slots(), 40ll);
+    f.pc.clear();
+    CHECK_EQ(store.used_slots(), 0ll);
+}
+
+/* RADIANCE_DEBUG_KV_TIER=emulate: the cache's sweep names the blocks residency would demote, once
+ * each, and moves none of them; the entries stay resident. */
+TEST(the_emulation_names_the_cached_blocks_residency_would_demote_and_moves_none) {
+    Fixture f;
+    HostArena store;
+    resid_open_store(f, store);
+    f.kv.residency_emulate(true);
+    const int64_t pool0 = f.kv.free_blocks(G_RES);
+    (void)resid_publish_resident(f, 1, 1);
+    std::vector<BlockMove> down;
+    CHECK_EQ(f.kv.residency_demote_cached(&down, 1000), 40ll);
+    for (const BlockMove& m : down) {
+        CHECK_EQ(m.host_slot, -1);
+        CHECK(f.kv.residency_emulated(G_RES, m.block));
+    }
+    f.kv.residency_demote_landed();
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0 - 40);
+    CHECK_EQ(f.kv.cache_only_blocks(G_RES), 40ll);
+    CHECK_EQ(store.used_slots(), 0ll);
+    CHECK_EQ(f.kv.residency_demote_cached(&down, 1000), 0ll);
+    f.pc.clear();
+    CHECK_EQ(f.kv.free_blocks(G_RES), pool0);
+}
+
 TEST(a_re_plan_with_cold_entries_and_a_demote_in_flight_leaks_no_slot) {
     ResidencyFixture f;
     CHECK_OK(f.build(512, 256));

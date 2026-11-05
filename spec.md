@@ -1225,10 +1225,20 @@ attention always attends). A sweep therefore keeps `--kv-residency-sink-tokens` 
 the tail the declared window leaves, and moves what lies between them. Demoting the sinks would
 promote them again every step, which costs more than it saves.
 
-**What a sweep skips.** A block the prefix cache indexes, or a forked child holds, stays: another
-sequence's step may read it and this one cannot promote it for that reader. So does the last block,
-which is partial and the one an append writes into. Both are counted (`skipped`), as is a sweep
-that found the store full.
+**What a sweep skips.** A block another live sequence also holds (a forked child, or a second
+hit on the same cache entry) stays: that sequence's step reads it through its own table, and
+dropping one table's reference would free nothing. So does the last block, which is partial and
+the one an append writes into. Both are counted (`skipped`), as is a sweep that found the store
+full. A block only this sequence and the prefix cache hold moves, and the cache entry is re-pointed
+at the same slot with a reference of its own (`KVManager::set_residency_cache`): its only other
+reader is a later hit, which adopts the cold entry and promotes a block of its own.
+
+**What only the cache holds moves too.** A conversation waiting for its next turn is held by the
+prefix cache alone. After the sequences, the sweep spends what is left of its budget on such
+blocks (`KVManager::residency_demote_cached`, oldest first), all of them: the next turn's prefill
+promotes the whole chain anyway, so a resident sink or tail would save one small copy a turn at
+the cost of VRAM for every idle conversation. The entry reads cold, still hits, and its host-tier
+copy (if any) goes, since the idle tiers hold no entry with a cold component.
 
 **The read set is device data, so the fetch happens on the card.** `qsa_select` writes the
 selection as the attention's block table, on the card; nothing on the host knows which blocks a

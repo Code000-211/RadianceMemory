@@ -501,6 +501,16 @@ private:
     bool cold_entry(const Entry& e) const;
     /* Gives the entry's block in every group back to the KV manager. */
     void release_blocks(const Entry& e);
+    /* Which entry holds a resident block, for the KV manager's window residency: a block the
+     * cache holds can be demoted, and its entry then names the cold slot instead
+     * (KVManager::set_residency_cache). Kept for every entry on the LRU, by (group, block). */
+    std::unordered_map<uint64_t, BlockHash> by_block_;
+    static uint64_t block_key(int32_t g, int32_t b) { return ((uint64_t)(uint32_t)g << 32) | (uint32_t)b; }
+    void index_blocks(const BlockHash& h, const Entry& e);
+    void unindex_blocks(const Entry& e);
+    /* KVManager's re-point hook: the entry holding `block` of `group` now names `cold`. Its host
+     * tier copy, if any, goes: the idle tiers never hold an entry with a cold component. */
+    bool repoint_cold(int32_t group, int32_t block, int32_t cold);
     /* Takes the cache's reference on the blocks of entry `b` of a sequence's tables `bt` (one per
      * cached group) into `out`, entry_groups_ order; on a refusal releases exactly what it took
      * and returns false. */

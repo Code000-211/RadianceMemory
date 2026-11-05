@@ -1702,6 +1702,10 @@ void Scheduler::res_sweep() {
             left -= (int64_t)(res_moves_.size() - before);
         }
     }
+    /* Then what only the prefix cache holds: a conversation waiting for its next turn, whose
+     * blocks nothing reads until that turn's prefill promotes them. Running sequences first,
+     * since a decode step pays their paging; the cache takes what of the budget they left. */
+    if (left > 0) (void)kv_->residency_demote_cached(left, &res_moves_);
     if (!res_moves_.empty()) (void)res_issue(/*to_host=*/true);
 }
 

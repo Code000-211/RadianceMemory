@@ -172,6 +172,22 @@ struct FakeKV : IKVManager {
         }
         return RAD_OK;
     }
+    /* Blocks only the prefix cache holds, (group, block), oldest first, and the budget each call
+     * of residency_demote_cached was given. */
+    std::vector<std::pair<int32_t, int32_t>> res_idle;
+    std::vector<int64_t> res_idle_asks;
+    int64_t residency_demote_cached(int64_t max, std::vector<BlockMove>* out) override {
+        res_idle_asks.push_back(max);
+        int64_t n = 0;
+        for (; n < max && !res_idle.empty(); ++n) {
+            const auto [g, b] = res_idle.front();
+            res_idle.erase(res_idle.begin());
+            res_held.push_back({ g, b });
+            ++res_slots_out;
+            out->push_back(BlockMove{ g, b, res_next_slot++ });
+        }
+        return n;
+    }
     void residency_demote_landed() override {
         for (auto& [g, b] : res_held) release(g, b);
         res_held.clear();

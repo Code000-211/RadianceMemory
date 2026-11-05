@@ -222,6 +222,15 @@ void IdleTiers::drop_rooted(const BlockHash& key) {
 void IdleTiers::forget(const BlockHash& key) {
     std::lock_guard lk(mu_);
     drop_rooted(key);
+    drop_copy(key);
+}
+
+void IdleTiers::forget_copy(const BlockHash& key) {
+    std::lock_guard lk(mu_);
+    drop_copy(key);
+}
+
+void IdleTiers::drop_copy(const BlockHash& key) {
     auto it = recs_.find(key);
     if (it == recs_.end()) return;
     Rec& r = it->second;

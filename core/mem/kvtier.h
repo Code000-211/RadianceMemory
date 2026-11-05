@@ -126,6 +126,10 @@ public:
     /* The entry left the cache for good; its tier storage is returned. A record with a job out is
      * marked `doomed` instead and erased when the job reports. */
     void forget(const BlockHash& key);
+    /* The entry stays in the cache but its tier storage goes: window residency turned part of it
+     * cold, and the tiers hold no entry with a cold component. Unlike forget(), the session rows
+     * rooted at it stay, since the chain still hits. */
+    void forget_copy(const BlockHash& key);
     /* An off-device entry was recomputed by a request that could not reach the host copy, and the
      * cache took its blocks as the device copy. The tier copy is dropped (two batches' results
      * agree only to batch-shape rounding) and the record is requeued for a fresh copy. */
@@ -352,6 +356,8 @@ private:
     void drop_session(uint64_t id);
     /* Every row whose chain starts at `key`, which has gone for good. */
     void drop_rooted(const BlockHash& key);
+    /* forget_copy() under the lock: the record and its host storage, nothing else. */
+    void drop_copy(const BlockHash& key);
     /* The body of close(), for a caller that already holds the lock. */
     void reset();
 

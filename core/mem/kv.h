@@ -26,6 +26,7 @@
 #include "rad_core.h"
 #include "rad_runtime.h"   /* rad_kv_cold_entry: the cold block-table entry */
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <string>
@@ -278,10 +279,11 @@ public:
      * (RadKVGroupDecl::residency_window). Blocks outside the window may leave VRAM for host memory
      * and give their VRAM back: the pool block returns to the free list and the table entry
      * becomes the cold encoding, rad_kv_cold_entry(slot) (abi/rad_runtime.h), naming the store slot
-     * that holds the bytes. A cold block is therefore no pool block at all: it has no refcount, is
-     * never indexed by the prefix cache and is never shared with a fork (a shared or cached block
-     * is not demoted), so the slot belongs to exactly one table entry and is freed where that
-     * entry goes -- free, preempt, rollback -- or when a promotion's copy has landed.
+     * that holds the bytes. A cold block is therefore no pool block at all: it has no block
+     * refcount; its slot is reference-counted instead (retain_entry), since the prefix cache
+     * indexes cold entries and follows a demotion of a block it holds (set_residency_cache), and
+     * the slot is freed when its last holder -- a table entry, a cache entry, an origin -- goes or
+     * when a promotion's copy has landed. A fork refuses a sequence with cold entries.
      *
      * Every reader of a block table must therefore treat an entry < 0 as not-a-block-id: it is
      * empty (-1) or cold (<= -2). block_table() returns the raw entries, which is the ABI contract
@@ -371,10 +373,13 @@ public:
      * landed with residency_demote_landed(), because the pool must not hand it to another sequence
      * while the gather still reads it. Marks the table changed from the first demoted entry.
      *
-     * A block that is shared (the prefix cache or a forked child holds a reference) is skipped:
-     * another sequence's step may read it, and this sequence cannot promote it for that reader. So
-     * is the sequence's last block, which is partial and the one an append writes.
-     * `demote_skipped` counts both.
+     * A block another live sequence also holds (a forked child, or a second sequence that hit the
+     * same cache entry) is skipped: that sequence's step may read it, and dropping one table's
+     * reference would free nothing. So is the sequence's last block, which is partial and the one
+     * an append writes. `demote_skipped` counts both. A block only this sequence and the prefix
+     * cache hold does move once a cache is attached (set_residency_cache): the cache's entry is
+     * re-pointed at the same slot with a reference of its own, as if it had been published cold,
+     * so a later hit adopts it cold and promotes it into a block of its own.
      *
      * RAD_E_INVAL on a group with no window or a sequence that does not hold its blocks. A full
      * store leaves the rest resident and reports `skipped`: the caller retries after a sweep.
@@ -387,6 +392,21 @@ public:
     /* The copies residency_demote() named have landed: the held pool blocks return to the free
      * list (the VRAM freed) and a later ensure() may hand them to another sequence. */
     void residency_demote_landed();
+
+    /* The prefix cache's side of a demotion: `block` of `group`, which the cache holds, now reads
+     * as `cold` (rad_kv_cold_entry(slot)) and the cache's entry must name that instead. Returns
+     * false, and nothing changes, when no entry of the cache names the block. PrefixCache::
+     * configure installs it; without it a block the cache holds is never demoted. */
+    using ResidencyCacheRepoint = std::function<bool(int32_t group, int32_t block, int32_t cold)>;
+    void set_residency_cache(ResidencyCacheRepoint f) { res_cache_ = std::move(f); }
+    /* Demote blocks ONLY the prefix cache holds (an idle conversation waiting for its next turn,
+     * or a prefix whose readers all finished), oldest first, at most `max_blocks` copies. The
+     * cache's reference becomes the slot's: the entry reads cold, a lookup still hits it and the
+     * next turn's dense step promotes it (residency_promote_all). No sink or tail is kept: the
+     * next turn's prefill promotes the whole chain anyway (a prefill row cannot page). A block
+     * with an origin slot re-points without a copy, as in residency_demote(). Moves are appended
+     * like residency_demote()'s and land with residency_demote_landed(). Returns the moves made. */
+    int64_t residency_demote_cached(std::vector<BlockMove>* out, int64_t max_blocks = INT64_MAX);
 
     /* Promote the named table entries of `group` back before the step that reads them. Each takes
      * a fresh pool block, which becomes the table entry; appends the moves (block = the fresh
@@ -968,6 +988,16 @@ private:
     /* Blocks a demotion encoded cold whose copy has not been reported landed: still referenced
      * (refcount 1, in no table) so the pool cannot reuse them under the gather. */
     struct Demoting { int32_t group, block, slot; uint64_t seq; };
+    static constexpr uint64_t kCacheSeq = UINT64_MAX;   /* Demoting::seq of a cache-only block */
+    ResidencyCacheRepoint res_cache_;
+    /* Per group: blocks that became cache-only (marked, refcount one), oldest first, for
+     * residency_demote_cached(). Lazy: an entry is checked when it is taken, so a block that was
+     * adopted or released since is skipped there. Filled only while a cache and a store are set. */
+    std::vector<std::deque<int32_t>> res_idle_;
+    void note_cache_only(size_t g, int32_t b);
+    /* The cache no longer holds resident block b: the mark is cleared and the cache-only count
+     * kept in step. The reference itself is the caller's to move (to a landing, or dropped). */
+    void uncache(size_t g, int32_t b);
     std::vector<Demoting> res_demoting_;
     /* Drops one table entry: a pool id's reference, or a cold entry's slot. */
     void drop_entry(int32_t g, int32_t entry);

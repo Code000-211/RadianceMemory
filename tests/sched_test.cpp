@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <set>
 #include <string>
 
 #include <unistd.h>
@@ -5354,6 +5355,52 @@ TEST(a_dense_step_the_pool_cannot_promote_preempts_instead_of_retrying_forever) 
     CHECK(f.sch.metrics().preemptions > pre0);   /* something gave its blocks up */
     CHECK(stepped > 0);                          /* and the server kept stepping */
     for (int32_t b : taken) f.kv.freelist[0].push_back(b);
+}
+
+/* What the running sequences leave of a sweep's budget goes to the blocks only the prefix cache
+ * holds (conversations waiting for their next turn), on the same bound and with one sweep in
+ * flight. Without it a block only the cache held never left VRAM: idle conversations filled the
+ * pool. A sequence that is decoding goes first, since its steps pay for paging. */
+TEST(the_sweep_gives_what_running_sequences_leave_of_its_budget_to_blocks_only_the_cache_holds) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/5, /*window=*/64, /*sink=*/32);
+    CHECK_OK(f.start());
+    std::set<int32_t> idle;
+    for (int i = 0; i < 12; ++i) {
+        const int32_t b = f.kv.grab(0);
+        idle.insert(b);
+        f.kv.res_idle.push_back({ 0, b });
+    }
+    const int64_t free0 = f.kv.free_blocks(0);
+    const uint64_t a = f.submit(320, 64);       /* 20 blocks of 16, a 21st once it decodes */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();                            /* a prefill chunk: `a` is not swept, the cache is */
+    REQUIRE_EQ(f.kv.res_idle_asks.size(), (size_t)1);
+    CHECK_EQ(f.kv.res_idle_asks[0], (int64_t)5);
+    CHECK_EQ(rig.moved(true), (int64_t)5);
+    for (const BlockMove& m : rig.runs.back().second) CHECK(idle.count(m.block) == 1);
+
+    rig.landed = true;
+    run_to_decode(f);
+    f.commit_plain();
+    /* The first decode commit's sweep: `a`'s middle took the whole budget, the cache waits. */
+    REQUIRE(!rig.runs.empty());
+    for (const BlockMove& m : rig.runs.back().second) CHECK(idle.count(m.block) == 0);
+    int64_t last = rig.moved(true);
+    for (int step = 0; step < 16; ++step) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK(rig.moved(true) - last <= 5);
+        last = rig.moved(true);
+    }
+    CHECK(f.sch.step() != nullptr);              /* reaps the final batch */
+    CHECK(f.kv.res_idle.empty());                /* every idle block left */
+    int64_t cold = 0;
+    for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
+    CHECK_EQ(rig.moved(true), cold + 12);
+    CHECK(f.kv.free_blocks(0) + 2 >= free0 + 12 + cold - 21);
 }
 
 /* --kv-residency-mib 0 gives the scheduler no mover, and then nothing moves even when the manager

@@ -1953,8 +1953,12 @@ radiance --model flashnext.rad --kv-residency-mib 2048 --kv-residency-sink-token
   resident. A sparse selection is not positional, so a positional window is the wrong shape, but
   the first blocks are the attention sinks every step scores: demoting them would promote them
   again every step.
-- A sweep skips a block the prefix cache indexes, a forked child's block, and the last (partial)
-  block an append writes into; `/stats` `kv_residency.skipped` counts those.
+- A sweep skips a block another live sequence also holds (a forked child, or two requests that hit
+  the same cached prefix) and the last (partial) block an append writes into; `/stats`
+  `kv_residency.skipped` counts those. A block the prefix cache shares with one sequence moves,
+  and the cache entry follows it into the store; a conversation waiting for its next turn (held by
+  the cache alone) leaves the card whole, with whatever of the sweep's budget the running
+  sequences left.
 - A store slot holds one block of one group, and each residency group has its own store of slots
   its block's size (every rank's, under `--tp`). Under a mixed `--kv-recipe` each layout's group
   pages on its own, at its own block's bytes, and `--kv-residency-mib` is split so every group's

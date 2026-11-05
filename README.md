@@ -124,8 +124,9 @@ every step, which costs more than it saves.
 
 * the sink and the tail,
 * the last, partial block, because the next token is written into it,
-* a block another holder has a reference on and cannot follow into the store, such as a forked
-  child. The prefix cache can follow, as described in [§7](#7-the-prefix-cache-cold-blocks-stay-reusable).
+* a block another live sequence also holds, such as a forked child or a second request that hit
+  the same cached prefix: that sequence's step reads it through its own table. The prefix cache
+  follows a demotion instead, as described in [§7](#7-the-prefix-cache-cold-blocks-stay-reusable).
 
 ---
 
@@ -317,7 +318,22 @@ flowchart TB
   bytes move, and the store does not gain a copy of the same prefix every turn.
 * **The idle tiers** (the host tier for finished conversations, `--prefix-cache-mib`) are never handed
   an entry with a cold component. They gather pool blocks, and that part's bytes are already in host
-  memory.
+  memory. An entry that goes cold after its copy was taken gives the copy up (`IdleTiers::forget_copy`);
+  its session row stays, since its chain still hits.
+* **A block the cache shares with one sequence moves.** The sweep used to skip every block the cache
+  held, so a follow-up's adopted resident entries (the last turn's sink and tail) stayed on the card
+  for the whole turn and piled up turn after turn. The only other reader of such a block is a later
+  hit, which adopts whatever the entry names and promotes a block of its own, so the block is
+  demoted like the sequence's own and the cache entry is re-pointed at the same slot with a
+  reference of its own (`KVManager::set_residency_cache`, `PrefixCache::repoint_cold`). A block a
+  second live sequence also holds still stays.
+* **An idle conversation leaves the card.** Published and freed, a conversation waiting for its next
+  turn is held by the cache alone. After the sequences, the sweep spends what is left of its budget on
+  those blocks (`KVManager::residency_demote_cached`, oldest first, re-pointing a block promoted from
+  a slot and unchanged since). All of the chain goes, sink and tail included: the next turn's prefill
+  row promotes the whole chain anyway (§6), so keeping them would save one ~640-block copy a turn and
+  cost that much VRAM for every idle conversation. Before, in 32 × 128K runs, `skipped` ran into the
+  millions, idle conversations filled the pool, the cache was evicted and follow-ups recomputed.
 
 ---
 
@@ -482,7 +498,7 @@ radiance --model flashnext.rad --tp 2 \
 | `demoted`, `promoted` | blocks moved to the store / back to the pool |
 | `freed_bytes` | VRAM the landed demotions gave back to the pool |
 | `paged_in` | cold entries the pager rewrote on the card (summed over QSA layers and decode rows; rank 0) |
-| `skipped` | blocks a sweep left (shared, partial, store full) |
+| `skipped` | blocks a sweep left (held by another live sequence, partial, store full) |
 | `link_bytes` | bytes moved over PCIe, both directions |
 | `host_bytes`, `cap_bytes` | store in use / store size |
 | `scratch_bytes` | VRAM the pager's scratch pages hold |
