@@ -849,6 +849,10 @@ struct Config {
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     double  prefill_interleave_share = 0.25;   /* --prefill-interleave auto[:SHARE] */
+    /* Whether --prefill-interleave was given. Not given, engine bring-up serves auto:1 (decode-only
+     * steps for as long as a chunk step took) except under --deterministic, in KL mode and for a
+     * generator; the Config default 0 is what a Scheduler built directly (tests) gets. */
+    bool    prefill_interleave_set = false;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
                                         * -1 auto (Scheduler::interleave_steps) */
     /* --decode-headroom: rows a step carries for decode rows on top of the prefill budget

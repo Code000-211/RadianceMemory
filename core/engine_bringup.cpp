@@ -1423,6 +1423,21 @@ int Engine::declare() {
                       (long long)kDecodeHeadroomCap);
         }
         decide("--decode-headroom", std::to_string(cfg_.decode_headroom), why);
+        /* --prefill-interleave not given: auto:1, decode-only steps for as long as a chunk step
+         * took, so decoders keep about half their rate while prompts prefill (measured on
+         * Flash-Next: 8 decoders beside a 64K prefill, 12 -> 41 tokens/s each). Not where the
+         * schedule must not follow timing (--deterministic) or nothing decodes. */
+        if (!cfg_.prefill_interleave_set) {
+            if (none || cfg_.deterministic) {
+                decide("--prefill-interleave", "0", none ? none : "--deterministic keeps a "
+                       "timing-independent schedule (--prefill-interleave N or auto overrides it)");
+            } else {
+                cfg_.prefill_interleave = -1;
+                cfg_.prefill_interleave_share = 1.0;
+                decide("--prefill-interleave", "auto:1", "decode-only steps for as long as a chunk "
+                       "step took while prompts prefill beside decoding sequences");
+            }
+        }
     }
 
     /* Control vectors are resolved before any rank declares, because the plugin reads the

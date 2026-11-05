@@ -456,9 +456,11 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     Config d;
     REQUIRE_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.prefill_interleave, 0);
+    CHECK(!d.prefill_interleave_set);   /* not given: bring-up serves auto:1 */
     Config c;
     CHECK_EQ(parse({ "--prefill-interleave", "4" }, &c), RAD_OK);
     CHECK_EQ(c.prefill_interleave, 4);
+    CHECK(c.prefill_interleave_set);
     CHECK_EQ(parse({ "--prefill-interleave", "65" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--prefill-interleave", "-1" }, &c), RAD_E_INVAL);
     /* auto sizes the hold from measured step costs (Scheduler::interleave_steps) */

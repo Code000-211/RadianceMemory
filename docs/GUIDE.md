@@ -1402,6 +1402,11 @@ decoders keep their cadence. A lone prefill is not held, nor is the step after a
 chunk. `0` (the default) schedules as before. `/stats` counts the decode-only steps the hold
 inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
 
+Served default: `--prefill-interleave auto:1` (below), so decoding sessions keep about half their rate
+while prompts prefill; `--deterministic`, KL mode and generators keep 0. Measured on Flash-Next (8
+decoders beside a 64K prefill, MTP on): 12 -> 41 tokens/s a decoder, prefill 3.7K -> 1.8K tokens/s;
+with `--decode-headroom auto` 4.5K and 2.2K. `--prefill-interleave 0` restores the old schedule.
+
 `--prefill-interleave auto` sizes the hold from measured step times instead: after each such chunk,
 as many decode-only steps as fit in a quarter of a chunk step's time at a decode step's (running
 means of both, at most 64 steps; one until a decode step has been timed). `auto:SHARE` uses SHARE
