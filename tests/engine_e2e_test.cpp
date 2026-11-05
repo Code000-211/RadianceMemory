@@ -85,9 +85,12 @@ std::vector<std::string> serving_argv(const std::string& model,
 }
 
 /* The shape the preemption cases run in: four sequences of at most 512 tokens, 256 a step. Their
- * small KV pool comes from a small device, whose size small_device() finds. */
+ * small KV pool comes from a small device, whose size small_device() finds. --prefill-interleave 0
+ * pins the schedule these cases are sized for: the bring-up default auto:1 follows measured step
+ * times, so on a loaded host the four sequences may never overlap enough to preempt. */
 std::vector<std::string> small_pool_args() {
-    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512" };
+    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512",
+             "--prefill-interleave", "0" };
 }
 std::vector<std::string> device_env(int device_mib) {
     return { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(device_mib) };
