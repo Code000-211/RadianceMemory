@@ -1341,7 +1341,7 @@ int ref_dequant_w4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     const int64_t group = gi(p, n_p, "group", 128);
     if (N < 1 || K < 1 || N % 16 || K % 64 || group < 1 || K % group) return RAD_E_UNSUPPORTED;
     Opd o;
-    o.t(RAD_I4,  { N * K / 8 });            /* wq -- packed int4 */
+    o.t(RAD_I4,  { N * K });                /* wq -- packed int4: N*K nibbles = N*K/2 bytes = N*K/8 dwords */
     o.t(RAD_F32, { N * K / group });        /* ws -- scale (f16 in a dword, but declared f32) */
     o.t(RAD_BF16, { N, K });                /* y */
     return o.finish("dequant_w4", operand, out);

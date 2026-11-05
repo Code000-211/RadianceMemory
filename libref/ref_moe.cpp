@@ -884,7 +884,7 @@ int ref_moe_gemm_w4a4(const RadArgs* a, RadStream) {
     if (M <= 0 || numel(AS) < ar * (K / 128) || numel(ST) < T || numel(OF) < n_expert + 1)
         return RAD_E_SHAPE;
 
-    const int64_t a_ld  = A->rank >= 2 ? A->stride[0] : K / 2;   // BYTES per activation row (K int4)
+    const int64_t a_ld  = A->rank >= 2 ? A->stride[0] / 2 : K / 2;   // BYTES per activation row (K int4 = K/2 bytes)
     const int64_t y_ld  = Y->rank >= 2 ? Y->stride[0] : N;
     const int64_t w_ld  = W->stride[1];                 // nibbles per weight row
     const int64_t ws_ld = WS->stride[1];                // scales per weight row
