@@ -1837,7 +1837,7 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
         t = RadTensor{};
         t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
-        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+        rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
     return 0;
 }
@@ -1889,7 +1889,7 @@ static int build_moe_gemm_bf16(Case& c, const RadOpSchema* s) {
         t = RadTensor{};
         t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
-        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+        rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
     return 0;
 }
@@ -1958,7 +1958,93 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
         t = RadTensor{};
         t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
-        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+        rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
+    }
+    return 0;
+}
+
+/* moe_gemm_q dtype w4a8: an int8 activation (an f32 scale per (row, 128 of K)) and two's-complement
+ * int4 experts (a bf16 scale per (row, 128 of K)), two stacked weight tables by parity (the even in
+ * `w` / `w_scale`, the odd in `w_odd` / `w_odd_scale`), token-order a, y bf16. Every sorted row is
+ * owned (no dropped slots), so the kernel writes all of y; the NaN prefill catches a launch that
+ * skips rows. */
+static int build_moe_gemm_w4a8(Case& c, const RadOpSchema* s) {
+    constexpr int NOPD = 9;
+    const long long M = 6, N = 96, K = 256, NE = 4, TK = 4;   // T = 24, six rows per expert
+    const long long T = M * TK;
+    const long long ne0 = (NE + 1) / 2, ne1 = NE / 2;
+    if (s->n_operands != NOPD) { fail("moe_gemm_w4a8: the schema has %d operands, not 9",
+                                       s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
+                            { "K", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "n_expert", RAD_P_INT, NE, 0, nullptr, 0.0 },
+                            { "top_k", RAD_P_INT, TK, 0, nullptr, 0.0 },
+                            { "group", RAD_P_INT, 128, 0, nullptr, 0.0 },
+                            { "a_order", RAD_P_STR, 0, 0, (const char*)"token", 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, (const char*)"w4a8", 0.0 },
+                            { "N_odd", RAD_P_INT, N, 0, nullptr, 0.0 },
+                            { "K_odd", RAD_P_INT, K, 0, nullptr, 0.0 },
+                            { "parts", RAD_P_INT, 1, 0, nullptr, 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x74A8C0Deu;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return (st >> 8) & 0xffu; };
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u; return 0.5f + ((st >> 8) & 0xff) / 255.0f; };
+    auto to_bf16 = [](float f) { return (uint16_t)(__builtin_bit_cast(uint32_t, f) >> 16); };
+    std::vector<int8_t> ha((size_t)M * K);
+    for (auto& x : ha) x = (int8_t)((rnd() & 7) - 4);                 // -4..4
+    std::vector<float> hA((size_t)M * (K / 128));
+    for (auto& x : hA) x = rndf();
+    // The weight codes and bf16 scales for all NE experts, then split by parity.
+    std::vector<uint8_t> hw((size_t)NE * N * (K / 2));
+    for (auto& x : hw) x = (uint8_t)(rnd() & 0xFFu);
+    std::vector<uint16_t> hsce((size_t)NE * N * (K / 128));
+    for (auto& x : hsce) x = to_bf16(rndf());
+    std::vector<int32_t> hs(T), ho(NE + 1);
+    for (long long i = 0; i < T; ++i) hs[i] = (int32_t)i;
+    for (long long e = 0; e < NE; ++e) ho[e] = (int32_t)(e * (T / NE));
+    ho[NE] = (int32_t)T;
+    std::vector<uint16_t> hy((size_t)T * N);
+    for (auto& x : hy) x = 0x7fc0u;   // bf16 NaN prefill
+    std::vector<uint8_t> hwe((size_t)ne0 * N * (K / 2)), hwo((size_t)ne1 * N * (K / 2));
+    std::vector<uint16_t> hse((size_t)ne0 * N * (K / 128)), hso((size_t)ne1 * N * (K / 128));
+    for (long long e = 0; e < NE; ++e) {
+        const bool odd = e & 1;
+        const long long ix = e >> 1;
+        std::memcpy((odd ? hwo.data() : hwe.data()) + (size_t)ix * N * (K / 2),
+                    hw.data() + (size_t)e * N * (K / 2), (size_t)N * (K / 2));
+        std::memcpy((odd ? hso.data() : hse.data()) + (size_t)ix * N * (K / 128),
+                    hsce.data() + (size_t)e * N * (K / 128), (size_t)N * (K / 128) * sizeof(uint16_t));
+    }
+
+    // The contract's order: a, a_scale, w, w_scale, sorted_tok, expert_offset, w_odd, w_odd_scale, y.
+    struct { uint32_t dt; int rank; long long sh[3]; long long nel; } qd[NOPD] = {
+        { RAD_I8, 2, { M, K, 1 }, M * K },
+        { RAD_F32, 2, { M, K / 128, 1 }, M * (K / 128) },
+        { RAD_I4, 3, { ne0, N, K }, ne0 * N * K },
+        { RAD_BF16, 3, { ne0, N, K / 128 }, ne0 * N * (K / 128) },
+        { RAD_I32, 1, { T, 1, 1 }, T },
+        { RAD_I32, 1, { NE + 1, 1, 1 }, NE + 1 },
+        { RAD_I4, 3, { ne1, N, K }, ne1 * N * K },
+        { RAD_BF16, 3, { ne1, N, K / 128 }, ne1 * N * (K / 128) },
+        { RAD_BF16, 2, { T, N, 1 }, T * N } };
+    const uint32_t bits_of[NOPD] = { 8, 32, 4, 16, 32, 32, 4, 16, 16 };
+    const void* src[NOPD] = { ha.data(), hA.data(), hwe.data(), hse.data(), hs.data(), ho.data(),
+                              hwo.data(), hso.data(), hy.data() };
+    for (int o = 0; o < NOPD; ++o) {
+        const size_t bytes = (size_t)((qd[o].nel * bits_of[o] + 7) / 8);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("moe_gemm_w4a8: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (src[o]) std::memcpy(d, src[o], bytes);
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
+        for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
+        rad_tensor_pack(&t);
     }
     return 0;
 }
@@ -2100,7 +2186,7 @@ static int build_moe_gather(Case& c, const RadOpSchema* s, int inv) {
         t = RadTensor{};
         t.data = d; t.dtype = qd[o].dt; t.rank = qd[o].rank;
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
-        for (int r = 0; r + 1 < qd[o].rank; ++r) t.stride[r] = t.shape[r + 1] * t.stride[r + 1];
+        rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
     return 0;
 }
@@ -2241,7 +2327,8 @@ static int run_row(int i) {
         : (0 == std::strcmp(k->name, "moe_gemm_mxfp4a8")) ? 17
         : (0 == std::strcmp(k->name, "moe_router_topk_scatter")) ? 18
         : (0 == std::strcmp(k->name, "moe_router_sigmoid_topk")) ? 19
-        : (0 == std::strcmp(k->name, "moe_gather")) ? 21 : 2;
+        : (0 == std::strcmp(k->name, "moe_gather")) ? 21
+        : (0 == std::strcmp(k->name, "moe_gemm_w4a8")) ? 22 : 2;
     if (hand == 2) { skip("no operand description, so no buffers to build"); return 0; }
     const RadOpSchema* s = find_schema(k->op);
     if (!s) { fail("no schema for '%s'", k->op); return 1; }
@@ -2271,6 +2358,7 @@ static int run_row(int i) {
                         : hand == 18 ? build_moe_router_scatter(c, s)
                         : hand == 19 ? build_moe_router_sigmoid(c, s)
                         : hand == 21 ? build_moe_gather(c, s, 0)
+                        : hand == 22 ? build_moe_gemm_w4a8(c, s)
                         : build_gdn_chunk_scan(c, s);
         if (rc) return 1;
         goto launched;
@@ -2772,6 +2860,7 @@ static void check_moe_numerics() {
                 else compare(what, ref, y, 1e-2);
             }
         }
+
     }
 #endif
 }

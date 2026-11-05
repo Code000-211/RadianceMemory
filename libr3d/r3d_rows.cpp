@@ -359,6 +359,10 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
                                           P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
                                           P_INTO("parts") };
 
+/* moe_gemm_q dtype w4a8: the grouped int4 GEMM (r3d_moe_gemm_w4a8.hip) is a row of the moe_gemm_q
+ * op above (two's-complement int4 experts, a bf16 scale per (row, 128 of K), bf16 out; the int8 or
+ * E4M3 activation arm is picked by `a`'s dtype). It reuses moe_gemm_q's nine-operand parity schema. */
+
  /* moe_gemm: the grouped GEMM with unquantised experts, libref's schema; one weight table. */
 static const RadOperandSpec oMoeGemm[] = { { "a", RAD_OPD_IN, 0 },
                                           { "w", RAD_OPD_WTAB, 0 },
@@ -516,6 +520,57 @@ static const RadOperandSpec oRmsQuantFp8[] = {
     { "x", RAD_OPD_IN, 0 },        { "residual", RAD_OPD_INOUT, 1 }, { "w", RAD_OPD_WEIGHT, 0 },
     { "q", RAD_OPD_OUT, 0 },       { "scale", RAD_OPD_OUT, 0 },      { "out_bf16", RAD_OPD_OUT, 1 }
 };
+
+/* --- new Tier-1 ops --- */
+static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype"),
+                                           P_INT("twos") };
+static const RadOperandSpec oDequantW4[] = { { "wq", RAD_OPD_WEIGHT, 0 },
+                                             { "ws", RAD_OPD_WEIGHT, 0 },
+                                             { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pRowTopkMerge[] = { P_INT("M"), P_INT("R"), P_INT("world_size"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oRowTopkMerge[] = { { "gathered", RAD_OPD_IN, 0 },
+                                                { "idx", RAD_OPD_OUT, 0 },
+                                                { "val", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pNgramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ngram"), P_INT("eos") };
+static const RadOperandSpec oNgramIds[] = { { "tok", RAD_OPD_IN, 0 },
+                                            { "state", RAD_OPD_INOUT, 0 },
+                                            { "cu", RAD_OPD_IN, 0 },
+                                            { "mult", RAD_OPD_WEIGHT, 0 },
+                                            { "vocab_sizes", RAD_OPD_WEIGHT, 0 },
+                                            { "offsets", RAD_OPD_WEIGHT, 0 },
+                                            { "cache_idx", RAD_OPD_IN, 1 },
+                                            { "has_init", RAD_OPD_IN, 1 },
+                                            { "num_accepted", RAD_OPD_IN, 1 },
+                                            { "ids", RAD_OPD_OUT, 0 },
+                                            { "ahead_ids", RAD_OPD_OUT, 1 } };
+static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype") };
+static const RadOperandSpec oGemmQBias[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 0 },
+                                             { "b", RAD_OPD_WEIGHT, 0 },
+                                             { "b_scale", RAD_OPD_WEIGHT, 0 },
+                                             { "bias", RAD_OPD_WEIGHT, 0 },
+                                             { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pGemmQShort[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                            P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
+                                            P_INTO("split_n"), P_INTO("w_rb") };
+static const RadOperandSpec oGemmQShort[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 1 },
+                                              { "b", RAD_OPD_WEIGHT, 0 },
+                                              { "b_scale", RAD_OPD_WEIGHT, 0 },
+                                              { "y", RAD_OPD_OUT, 0 },
+                                              { "a_sum", RAD_OPD_IN, 1 },
+                                              { "b_ref", RAD_OPD_WEIGHT, 1 } };
+static const RadParamSpec pMoeGemmQMod4[] = { P_INT("M"), P_INT("N"), P_INT("K"),
+                                              P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
+                                              P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
+                                              P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
+                                              P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts") };
+static const RadOperandSpec oMoeGemmQMod4[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 1 },
+                                                { "w", RAD_OPD_WTAB, 0 }, { "w_scale", RAD_OPD_WTAB, 0 },
+                                                { "sorted_tok", RAD_OPD_IN, 0 }, { "expert_offset", RAD_OPD_IN, 0 },
+                                                { "w_1", RAD_OPD_WTAB, 0 }, { "w_1_scale", RAD_OPD_WTAB, 0 },
+                                                { "w_2", RAD_OPD_WTAB, 0 }, { "w_2_scale", RAD_OPD_WTAB, 0 },
+                                                { "w_3", RAD_OPD_WTAB, 0 }, { "w_3_scale", RAD_OPD_WTAB, 0 },
+                                                { "y", RAD_OPD_OUT, 0 } };
 
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
@@ -765,6 +820,25 @@ static const RadOpSchema kSchemas[] = {
            "the best `unary + pred[pid] . (hp * succ[cand])` is picked, and becomes the predecessor "
            "of the next step. `cand`/`unary` have one row per (sequence, step); `anchor` is the "
            "block's first predecessor, at `m * anchor_stride`."),
+
+    SCHEMA("dequant_w4", pDequantW4, oDequantW4,
+           "Packed int4 weight to row-major bf16. Each 32-bit word holds 8 codes; the scale is "
+           "f16 in the low 16 bits, the zero point -(1024+zero) as f16 in the high 16 bits."),
+    SCHEMA("row_topk_merge", pRowTopkMerge, oRowTopkMerge,
+           "Top-R of gathered per-rank candidate sets. Each rank contributes a sorted list; the "
+           "merge selects the top-R global candidates by score."),
+    SCHEMA("ngram_ids", pNgramIds, oNgramIds,
+           "Hashed n-gram row ids for PLE. The FNV-1a mix over the ngram-1 token window is "
+            "folded into each head's embedding table; per, W and the ids pitch derive from the "
+            "operands, and `eos` cuts the hash window."),
+    SCHEMA("gemm_nt_q_bias", pGemmQBias, oGemmQBias,
+           "Narrow fp8 GEMM (M <= 16) with per-column bf16 bias fused into the epilogue."),
+    SCHEMA("gemm_nt_q_short", pGemmQShort, oGemmQShort,
+           "Narrow fp8 GEMM (M <= 16) for short-prompt decode, unsplit K."),
+    SCHEMA("moe_gemm_q_mod4", pMoeGemmQMod4, oMoeGemmQMod4,
+           "Grouped GEMM over the expert-sorted rows, quantised operands, four classes by "
+           "expert number mod 4. The E4M3 wave-matrix core over 8 R3dTab tables (class q = "
+           "entry e/4 of tables q); unequal class shapes are refused."),
 };
 
 extern "C" int rad_kernel_schema_count(void) {
@@ -816,6 +890,12 @@ static const int64_t kImpl3[] = { 0, 1, 2 };
 static const int64_t kImpl4[] = { 0, 1, 2, 3 };
 /* The MoE GEMM's row block: 16 (decode), 32, 64 (a tall prefill). A taller block reads the weight
  * T/mrows times, so the tune picks per shape; 64 is the untuned default (the tall band's best). */
+static const int64_t kMrowsMoE[] = { 8, 16 };
+static const int64_t kWvMoE[] = { 4, 8 };
+static const RadTunable tMoeGemmQW4[] = {
+    { "mrows", kMrowsMoE, NELEM(kMrowsMoE), 16, "rows per block: 8 for decode, 16 for prefill" },
+    { "wv", kWvMoE, NELEM(kWvMoE), 8, "waves per block: 8 = 128-col tile, 4 = 64-col tile" },
+};
 static const int64_t kMrows[] = { 16, 32, 64 };
 static const RadTunable tMoeGemm[] = {
     { "mrows", kMrows, NELEM(kMrows), 64, "the block's row count; the weight is read T/mrows times" },
@@ -1079,6 +1159,12 @@ static const RadConstraint cActSigmoid[] = { C_IN("act", "sigmoid"), C_IN("dtype
 /* A fill row is its dtype; the value is a parameter, and every dtype takes every value. */
 static const RadConstraint cFillBf16[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cFillF32[]  = { C_IN("dtype", "f32") };
+static const RadConstraint cDequantW4[] = { C_DIV("N", 16), C_DIV("K", 64) };
+static const RadConstraint cRowTopkMerge[] = { C_GE("R", 1), C_LE("R", 32) };
+static const RadConstraint cNgramIds[] = { C_GE("ngram", 2), C_LE("ngram", 8) };
+static const RadConstraint cGemmQBias[] = { C_IN("dtype", "fp8a8"), C_GE("M", 1), C_LE("M", 16) };
+static const RadConstraint cGemmQShort[] = { C_IN("dtype", "fp8a8"), C_GE("M", 1), C_LE("M", 64) };
+static const RadConstraint cMoeGemmQMod4[] = { C_GE("n_expert", 4) };
 static const RadConstraint cFillI32[]  = { C_IN("dtype", "i32") };
 static const RadConstraint cFillI64[]  = { C_IN("dtype", "i64") };
 
@@ -1196,6 +1282,10 @@ static const RadConstraint cMoeGemmQ[] = { C_IN("dtype", "fp8a8f32"), C_GE("n_ex
                                            C_GE("top_k", 1) };
 static const RadConstraint cMoeGemmMxfp4[] = { C_IN("dtype", "mxfp4a8"), C_GE("n_expert", 1),
                                                C_GE("top_k", 1) };
+static const RadConstraint cMoeGemmQW4A8[] = { C_IN("dtype", "w4a8"), C_GE("n_expert", 1),
+                                               C_GE("top_k", 1) };
+static const RadConstraint cMoeGemmW4A4[] = { C_IN("dtype", "w4a4"), C_GE("n_expert", 1),
+                                                C_GE("top_k", 1) };
 static const RadConstraint cMoeGather[] = { C_GE("M", 1), C_GE("n", 1), C_GE("top_k", 1),
                                              C_IN("dtype", "bf16") };
 /* No constraint on `n_local`: it is optional, and a band that leaves it out (every expert local)
@@ -2126,6 +2216,129 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r3d_rad_moe_gemm_mxfp4a8,
    nullptr, nullptr, nullptr,
    nullptr, nullptr },
+
+  /* ------------------------------------------------------------------ r3d_moe_gemm_w4a8.hip
+   *
+   * The grouped int4 GEMM: the two's-complement int4 weight (nibbles, -8..7) against an int8 or
+   * E4M3 activation, one 128-block of K per scale fold. The int8 arm runs the exact i32 wave-matrix
+   * (no f16 rounding); the E4M3 arm the f16 wave-matrix (libr4d's form). A row of moe_gemm_q,
+   * selected by dtype=w4a8; the even experts in `w` / `w_scale`, the odd in `w_odd` / `w_odd_scale`.
+   */
+  { "moe_gemm_w4a8", "moe_gemm_q", "moe",
+   "The grouped int4 GEMM over the expert-sorted rows: y[i] = a[sorted_tok[i]/top_k] @ w_e^T, e the "
+   "expert of sorted row i; the two's-complement int4 weight (nibbles, -8..7) against an int8 or "
+   "E4M3 activation, one 128-block of K per scale fold",
+   "16 sorted rows per block, eight waves of 16 columns; the block walks its expert runs, the "
+   "padding rows reading the run's first; the decode band (M * top_k <= 16 the tuned point, more "
+   "runs as extra 16-row blocks, prefill falls back to libavx); K % 128, N % 64; the even experts "
+   "are entry e/2 of `w` / `w_scale`, the odd of `w_odd` / `w_odd_scale`; token or sorted a",
+   "I4 (packed, two a byte) weight tables with a bf16 w_scale per (row, 128 of K); int8 a (an f32 "
+   "a_scale per (row, 128 of K)) or E4M3 a (an f32 a_scale); bf16 y in sorted order; the int8 arm is "
+   "bit-exact against the reference, the E4M3 arm to the f16 store ulp",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+   ROW(cMoeGemmQW4A8), tMoeGemmQW4, NELEM(tMoeGemmQW4), nullptr,
+   nullptr, nullptr, r3d_rad_moe_gemm_w4a8,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr },
+   /* ------------------------------------------------------------------ r3d_moe_gemm_w4a4.hip
+   *
+   * The grouped int4xint4 GEMM: the two's-complement int4 weight AND int4 activation, one 128-block
+   * of K per scale fold. Both are widened to int8 and run on the exact i32 wave-matrix (no f16
+   * rounding). A row of moe_gemm_q, selected by dtype=w4a4; the even experts in `w` / `w_scale`, the
+   * odd in `w_odd` / `w_odd_scale`.
+   */
+   { "moe_gemm_w4a4", "moe_gemm_q", "moe",
+    "The grouped int4xint4 GEMM over the expert-sorted rows: y[i] = a[sorted_tok[i]/top_k] @ w_e^T, e "
+    "the expert of sorted row i; the two's-complement int4 weight and int4 activation, one 128-block "
+    "of K per scale fold",
+    "16 sorted rows per block, eight waves of 16 columns; the block walks its expert runs, the "
+    "padding rows reading the run's first; the decode band (M * top_k <= 16 the tuned point, more "
+    "runs as extra 16-row blocks, prefill falls back to libavx); K % 128, N % 64; the even experts "
+    "are entry e/2 of `w` / `w_scale`, the odd of `w_odd` / `w_odd_scale`; token or sorted a",
+    "I4 (packed, two a byte) weight tables with a bf16 w_scale per (row, 128 of K); int4 a (packed, "
+    "two a byte, an f32 a_scale per (row, 128 of K)); bf16 y in sorted order; bit-exact against the "
+    "reference",
+    RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+    ROW(cMoeGemmW4A4), tMoeGemmQW4, NELEM(tMoeGemmQW4), nullptr,
+    nullptr, nullptr, r3d_rad_moe_gemm_w4a4,
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr },
+
+    /* ------------------------------------------------------------------ r3d_dequant_w4_bf16.hip
+   *
+   * The packed 4-bit weight back to a plain row-major bf16 [N, K], for the prefill path where
+   * W4A8 gains nothing.
+   */
+  { "dequant_w4_bf16", "dequant_w4", "quant",
+   "The packed 4-bit weight back to a plain row-major bf16 [N, K]",
+   "One thread per packed dword scatters its eight nibbles to row-major bf16; the scale dword holds "
+   "the f16 scale low and -(1024+zero) high; N % 16, K % 64, group divides K",
+   "I4 (packed, two a byte) wq with an f16 ws scale per (row, group); bf16 y [N, K]; twos 1 = "
+   "symmetric two's-complement nibble, 0 = asymmetric unsigned nibble minus a per-group zero",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+   ROW(cDequantW4), NOTUNE,
+   nullptr, nullptr, r3d_rad_dequant_w4,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr, nullptr },
+
+  { "rowtopk_merge", "row_topk_merge", "select",
+   "The R largest of the all-gathered per-rank candidate sets, one wave per row",
+   "One wave per row over world_size * R pairs; tk_insert into a 32-slot top-R heap, tk_round "
+   "extracts via a 5-step xor-butterfly; ties break on the lower id; R <= 32",
+   "f32 g (M * world_size * R * 2), i32 idx (M * R), f32 val (M * R); R <= 32",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+   ROW(cRowTopkMerge), NOTUNE,
+   nullptr, nullptr, r3d_rad_row_topk_merge,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr, nullptr },
+
+  { "ngram_ids_i32", "ngram_ids", "vocab",
+   "The hashed row ids of the Per-Layer Embedding: mixed(k) = XOR of t_s * mult[s], "
+   "ids[h] = mixed % vocab_sizes[h] + offsets[h]",
+   "One thread a token, looping its heads; n-gram shifts with EOS walk; 64-bit wrapping "
+   "multiply and floor-mod; ngram <= 8, heads divisible by (ngram-1)",
+   "i32 tok, i32 state, i32 cu, i64 mult, i64 vsz, i64 off, i32 ids; "
+   "optional i32 cidx, hini, nacc, ahead",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+   ROW(cNgramIds), NOTUNE,
+   nullptr, nullptr, r3d_rad_ngram_ids,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr, nullptr },
+
+  { "gemm_nt_q_bias_fp8a8_m16", "gemm_nt_q_bias", "gemm",
+   "The narrow fp8 GEMM with a per-column bias epilogue: y = a @ b^T + bias",
+   "M <= 16, K a multiple of the block; fp8a8 codes and scales, bf16 bias and output; "
+   "GEMM then bias-add in two passes",
+   "fp8_e4m3 a and b, f32 scales, bf16 bias [N], bf16 y [M,N]",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
+   ROW(cGemmQBias), tGemmM16, NELEM(tGemmM16), nullptr,
+   nullptr, nullptr, r3d_rad_gemm_nt_q_bias_fp8,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr, nullptr },
+
+  { "gemm_nt_q_short_fp8a8_m16", "gemm_nt_q_short", "gemm",
+   "The narrow fp8 GEMM with the short-prompt split rule: unsplit at N <= 512, K <= 5120, "
+   "41..64 rows",
+   "M <= 64, K a multiple of 128, N a multiple of 16; fp8a8 codes and scales, bf16 output; "
+   "sk=1 forced (no split)",
+   "fp8_e4m3 a and b, f32/bf16 scales, bf16 y [M,N]",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
+   ROW(cGemmQShort), tGemmM16, NELEM(tGemmM16), nullptr,
+   nullptr, nullptr, r3d_rad_gemm_nt_q_short_fp8,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr, nullptr },
+
+  { "moe_gemm_q_mod4_e4m3", "moe_gemm_q_mod4", "moe",
+   "The grouped quantised GEMM with 4 expert classes: y[i] = a[sorted_tok[i]/top_k] @ w_e^T, "
+   "e%4 picks the class",
+   "same as moe_gemm_q_e4m3 but 4-class routing; group = 128; the class shapes default to N/K "
+   "and an unequal N_1..K_3 is refused; token or sorted a",
+   "E4M3 a and weight tables (4 classes), f32 a_scale and w_scale; y bf16 in sorted order",
+   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+   ROW(cMoeGemmQMod4), tMoeGemmQW4, NELEM(tMoeGemmQW4), nullptr,
+   nullptr, nullptr, r3d_rad_moe_gemm_q_mod4,
+   nullptr, nullptr, nullptr,
+   nullptr, nullptr, nullptr },
 
    /* ------------------------------------------------------------------ r3d_gdn_recurrent_update_k128_v128.hip
   *

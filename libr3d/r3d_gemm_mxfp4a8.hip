@@ -690,7 +690,7 @@ static int r3d_mxfp4a8_tiled_dispatch(const RadArgs* a, RadStream s, int alu)
 
     if (!e8_scan_once(r3d_p(BS), N * (K / kMX))) return R3D_NO(RAD_E_INVAL);
 
-    const int nt = (int)r3d_geti_or(a, "nt", 0);
+    const int nt = 0;   /* no `nt` axis in the row's tune table: the non-temporal stream is fixed off */
     const int rc = r3d_gemm_nt_q_mxfp4a8_tiled(r3d_addr(A), r3d_addr(AS), r3d_addr(B),
                                                r3d_addr(BS), r3d_addr(Y), (int)M, (int)N,
                                                (int)K, kGroup, (int)ap, cp, (int)as_p, e8p,

@@ -1564,8 +1564,7 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     if (!r3d_aligned(Q->data, 16) || !r3d_aligned(KV->data, 16) || !r3d_aligned(O->data, 16))
         return R3D_NO(RAD_E_ALIGN);
 
-    int splits = decode ? (int)r3d_geti_or(a, "splits", 0) : 1;
-    if (splits < 0) return R3D_NO(RAD_E_SHAPE);
+    int splits = decode ? 0 : 1;   /* no `splits` param in the spec: 0 auto-selects via pick_splits */
     /* The width the launcher will use; a ragged batch is picked on the average sequence, as in the
      * entry itself. */
     const long long per = ragged ? (rows + n_seq - 1) / n_seq : q_len;

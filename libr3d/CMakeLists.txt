@@ -135,6 +135,15 @@ set(R3D_UNITS
   # The grouped w4a8 GEMM core: int8 activation x two's-complement 4-bit weight, widened to f16 and
   # run on the f16 wave-matrix, a per-(row, 128-of-K) scale fold. Phase 1: dense rows, no gather.
   "r3d_moe_gemm_w4a8|"
+   # The grouped w4a4 GEMM: int4 activation x two-s-complement 4-bit weight, both widened to int8
+   # and run on the exact i32 wave-matrix, a per-(row, 128-of-K) scale fold.
+   "r3d_moe_gemm_w4a4|"
+    "r3d_dequant_w4_bf16|"
+    "r3d_rowtopk_merge|"
+    "r3d_ngram_ids|"
+    "r3d_gemm_fp8a8_bias|"
+    "r3d_gemm_fp8a8_short|"
+    "r3d_moe_gemm_q_mod4|"
   # The grouped E4M3 x E4M3 GEMM (moe_gemm_q): both operands fp8, staged compact and upcast to f16
   # in registers (the FeatherOps bit trick), the f16 wave-matrix, a per-(row, g-of-K) scale fold.
   "r3d_moe_gemm_q|"

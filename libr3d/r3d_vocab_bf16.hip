@@ -95,9 +95,10 @@
  *
  * ---- refusals -----------------------------------------------------------------------------------
  *
- * sk > 1: the grid is vocab-wide at every M (1020 blocks at the band for the prefill arm, 8160 for
- * the decode arm at MT=16), so a split would buy nothing. kb: KC = 32 only, since another pitch is
- * a different swizzle. Also refused: K not a multiple of KC, an x pitch not a multiple of 8, a y
+ * The grid is vocab-wide at every M (1020 blocks at the band for the prefill arm, 8160 for
+ * the decode arm at MT=16), so a split would buy nothing: sk = 1 fixed. kb: KC = 32 only, since
+ * another pitch is a different swizzle. Also refused: K not a multiple of KC, an x pitch not a
+ * multiple of 8, a y
  * pitch not a multiple of 4 (f32) or 8 (bf16), a non-contiguous weight. The head branch, in order:
  *   a quantised head on the bf16-y row (logits are f32)
  *   a `zero` plane: codes+scale+zero is gemm_nt_q's asymmetric grid (r3d_gemm_nt_q_w2a8.hip)
@@ -113,7 +114,7 @@
  *   planes that do not cover the band (codes N x K, scales ceil(N/128) x ceil(K/128)), or a
  *        row_bytes shorter than the row
  * The bf16 branch refuses a plain head that is not bf16, wrong x and y dtypes, bad pitches, a short
- * or non-contiguous head, absurd shapes, misalignment and sk > 1. The launcher refuses a head with
+ * or non-contiguous head, absurd shapes and misalignment. The launcher refuses a head with
  * a null plane, a dtype outside the served set, a row pitch a vector load cannot walk (a 16-bit
  * scale row is 2 bytes a column, so K = 320, 6 bytes a row, is legal), and misaligned addresses.
  */
@@ -664,10 +665,9 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
     if (!r3d_aligned(r3d_p(x), 16) || !r3d_aligned(r3d_p(w), 16) || !r3d_aligned(r3d_p(y), 16))
         return R3D_NO(RAD_E_ALIGN);
 
-    const int sk = (int)r3d_geti_or(a, "sk", 1);
-    if (sk > 1) return R3D_NO(RAD_E_SHAPE);   /* see the header's refusals */
-    const int kb = (int)r3d_geti_or(a, "kb", 0);
-    const int nt = (int)r3d_geti_or(a, "nt", 0);
+    /* No `sk`/`kb`/`nt` in the rows' tune tables (impl only): the grid is vocab-wide, KC = 32 and
+     * the non-temporal stream is off, see the header's refusals. */
+    const int sk = 1, kb = 0, nt = 0;
 
     const HeadQ* hp = joined ? &h : nullptr;
     const int e = y_is_f32

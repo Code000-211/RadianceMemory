@@ -825,7 +825,7 @@ static int r3d_fp8a8_tiled_dispatch(const RadArgs* args, RadStream s, int alu)
         r3d_trace_desc("gemm y", Y);
     }
 
-    const int nt = (int)r3d_geti_or(args, "nt", 0);
+    const int nt = 0;   /* no `nt` axis in the row's tune table: the non-temporal stream is fixed off */
     const int st = launch(r3d_addr(A), r3d_addr(AS), (long)(uintptr_t)bvc, (long)(uintptr_t)bsv,
                           r3d_addr(Y), (int)M, (int)N, (int)K, (int)group, (int)a_ld, b_row,
                           (int)as_ld, bs_row, (int)y_ld, nt, (long)s, sdt, cdt, 0, 0, 0, 0, alu);
@@ -980,7 +980,7 @@ extern "C" int r3d_rad_gemm_nt_q_w2a8_tiled(const RadArgs* args, RadStream s)
     if (!r3d_aligned(r3d_p(A), 8) || !r3d_aligned(r3d_p(Y), 8) ||
         !r3d_aligned(sv, 2) || !r3d_aligned(zv, 1)) return R3D_NO(RAD_E_ALIGN);
 
-    const int nt = (int)r3d_geti_or(args, "nt", 0);
+    const int nt = 0;   /* no `nt` axis in the row's tune table: the non-temporal stream is fixed off */
     const int st = launch(r3d_addr(A), r3d_addr(AS), bvc, (long)(uintptr_t)sv, r3d_addr(Y),
                           (int)M, (int)N, (int)K, (int)group, (int)a_ld, c_row, (int)as_ld,
                           s_row, (int)y_ld, nt, (long)(uintptr_t)s, /*sdt*/ 1, cdt,

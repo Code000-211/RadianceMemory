@@ -215,6 +215,15 @@ int r3d_rad_moe_gemm_mxfp4a8(const RadArgs* a, RadStream s);
 /* --- r3d_moe_gemm_w4a8.hip: the grouped GEMM with int4-weights / int8-activation experts. */
 int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s);
 
+/* --- r3d_moe_gemm_w4a4.hip: the grouped GEMM with int4-weights / int4-activation experts. */
+int r3d_rad_moe_gemm_w4a4(const RadArgs* a, RadStream s);
+int r3d_rad_dequant_w4(const RadArgs* a, RadStream s);
+int r3d_rad_row_topk_merge(const RadArgs* a, RadStream s);
+int r3d_rad_ngram_ids(const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_bias_fp8(const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_short_fp8(const RadArgs* a, RadStream s);
+int r3d_rad_moe_gemm_q_mod4(const RadArgs* a, RadStream s);
+
 /* --- r3d_had_quant_act_i8.hip: a block Hadamard along K, then per-row symmetric int8. */
 int r3d_rad_had_quant_act_i8(const RadArgs* a, RadStream s);
 
