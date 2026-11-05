@@ -7969,11 +7969,13 @@ struct StepFp {
 };
 
 /* Long and short prompts arriving while others prefill and decode, every step fingerprinted. */
-uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_steps) {
+uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_steps,
+                        int64_t headroom = -1) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64, max_tok, /*max_ctx=*/8192);
     f.cfg.checkpoint_interval = interval;
     f.cfg.busy_prefill_chunk = busy;
+    f.cfg.decode_headroom = headroom;
     CHECK_OK(f.start());
     struct Arrival { int at, n_prompt, max_tokens; };
     const Arrival arrivals[] = { { 0, 3000, 6 }, { 0, 200, 9 }, { 3, 1500, 4 }, { 5, 40, 20 },
@@ -8015,6 +8017,10 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
                 (unsigned long long)h);
         CHECK(n > 20);
         CHECK_EQ(h, c.want);
+        /* --decode-headroom 0 is the schedule without the flag, step for step. */
+        int n0 = 0;
+        CHECK_EQ(scripted_steps(c.max_tok, c.interval, c.busy, &n0, /*headroom=*/0), c.want);
+        CHECK_EQ(n0, n);
     }
 }
 
@@ -8023,7 +8029,13 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
  * Not a check: a measurement harness for scheduling policy, run on request only:
  *
  *   RAD_SCHED_SIM=1 [SIM_N=32 SIM_LEN=131072 SIM_OUT=512 SIM_MAXTOK=2048 SIM_INTERVAL=2048
- *                    SIM_BUSY=-1 SIM_IL=0 SIM_SEQS=32 SIM_TRACE=1] sched_test sim_burst
+ *                    SIM_BUSY=-1 SIM_IL=0 SIM_SEQS=32 SIM_HEADROOM=0 SIM_DECODERS=0
+ *                    SIM_TRACE=1] sched_test sim_burst
+ *
+ * SIM_HEADROOM is --decode-headroom (-1 for auto at SIM_SEQS and three drafts). SIM_DECODERS
+ * sequences of 64-token prompts are decoding (SIM_DEC_OUT tokens each, default 4096) before the
+ * burst arrives. The summary counts the steps that carried a chunk per checkpoint interval
+ * prefilled.
  *
  * SIM_N prompts of SIM_LEN tokens arrive at once, each then decodes SIM_OUT tokens with three
  * drafts a step (a uniform 0..3 accepted), the stager arming at 1025 rows, under
@@ -8057,8 +8069,30 @@ TEST(sim_burst_of_long_prompts) {
     f.cfg.max_seqs = (int64_t)sim_env("SIM_SEQS", 32);
     f.cfg.prefix_exact = true;
     f.cfg.n_spec = 3;
+    f.cfg.decode_headroom = (int64_t)sim_env("SIM_HEADROOM", 0);
+    if (f.cfg.decode_headroom < 0)
+        f.cfg.decode_headroom = decode_headroom_auto(f.cfg.max_seqs, f.cfg.n_spec);
     CHECK_OK(f.start());
     f.sch.set_stage_rows(1025);
+    uint32_t rng = 12345;
+    int32_t draft[3] = { 7, 7, 7 };
+    /* The decoders, decoding before the burst arrives. */
+    std::vector<uint64_t> decs;
+    const int ND = (int)sim_env("SIM_DECODERS", 0);
+    const int DOUT = (int)sim_env("SIM_DEC_OUT", 4096);
+    for (int i = 0; i < ND; ++i) decs.push_back(f.submit(64, DOUT, 0, /*ignore_eos=*/true));
+    auto draft_all = [&](const std::vector<uint64_t>& v) {
+        for (uint64_t id : v) {
+            const Request* r = f.sch.find(id);
+            if (r && r->state == ReqState::Running && r->n_computed >= (int64_t)r->prompt.size())
+                (void)f.sch.set_draft(id, draft, 3);
+        }
+    };
+    for (int k = 0; k < 16 && ND > 0; ++k) {
+        draft_all(decs);
+        if (!f.sch.step()) break;
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+    }
     std::vector<uint64_t> ids;
     for (int i = 0; i < N; ++i) {
         auto r = f.request((int)L, OUT);
@@ -8069,16 +8103,11 @@ TEST(sim_burst_of_long_prompts) {
     }
     std::vector<double> ttft(ids.size(), -1), done(ids.size(), -1);
     double t = 0, t_pf = 0, dec_s = 0;
-    int64_t pf_tok = 0, steps = 0, mixed = 0, small = 0, dec_tok = 0;
-    uint32_t rng = 12345;
-    int32_t draft[3] = { 7, 7, 7 };
+    int64_t pf_tok = 0, steps = 0, mixed = 0, small = 0, dec_tok = 0, chunk_steps = 0;
     auto idx = [&](uint64_t id) { return (size_t)(id - ids[0]); };
     while (steps < 200000) {
-        for (uint64_t id : ids) {
-            const Request* r = f.sch.find(id);
-            if (r && r->state == ReqState::Running && r->n_computed >= (int64_t)r->prompt.size())
-                (void)f.sch.set_draft(id, draft, 3);
-        }
+        draft_all(ids);
+        draft_all(decs);
         if (!f.sch.step()) break;
         const StepPlan& p = f.sch.plan();
         int64_t P = 0, D = 0, nd = 0;
@@ -8096,6 +8125,7 @@ TEST(sim_burst_of_long_prompts) {
             std::printf("\n");
         }
         ++steps;
+        chunk_steps += P > 0;
         mixed += P && nd;
         small += P && P < 1025;
         pf_tok += P;
@@ -8106,6 +8136,7 @@ TEST(sim_burst_of_long_prompts) {
             if (done[k] >= 0) continue;
             if (ttft[k] >= 0) ++decoders; else waiting = true;
         }
+        for (uint64_t id : decs) decoders += f.sch.find(id) != nullptr;
         std::vector<std::pair<uint64_t, size_t>> before;
         for (const StepEntry& e : p.e) before.push_back({ e.seq, e.req->output.size() });
         CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
@@ -8115,26 +8146,158 @@ TEST(sim_burst_of_long_prompts) {
         for (const auto& b : before) {
             const Request* r = f.sch.find(b.first);
             if (!r) continue;
-            const size_t k = idx(b.first);
-            if (b.second == 0 && !r->output.empty() && ttft[k] < 0) ttft[k] = t;
+            const bool burst = b.first >= ids[0];
+            if (burst && b.second == 0 && !r->output.empty() && ttft[idx(b.first)] < 0)
+                ttft[idx(b.first)] = t;
             else if (waiting && b.second > 0) dec_tok += (int64_t)(r->output.size() - b.second);
         }
         std::vector<uint64_t> c;
         f.sch.take_completed(&c);
-        for (uint64_t id : c) { done[idx(id)] = t; (void)f.sch.reap(id); }
+        for (uint64_t id : c) {
+            if (id >= ids[0]) done[idx(id)] = t;
+            (void)f.sch.reap(id);
+        }
+        /* The decoders outlive the burst; the run ends with its last prompt. */
+        bool left = false;
+        for (double d : done) left = left || d < 0;
+        if (!left) break;
     }
     std::vector<double> tt;
     for (double x : ttft) if (x >= 0) tt.push_back(x);
     std::sort(tt.begin(), tt.end());
     if (tt.empty()) return;
     auto pct = [&](double q) { return tt[std::min(tt.size() - 1, (size_t)(q * (double)tt.size()))]; };
-    std::printf("sim: %d x %lld tokens, max_tok %lld, busy %lld, interleave %lld: %lld steps (%lld "
-                "mixed, %lld with a chunk under 1025); prefill %.0f tokens/s over the steps with a "
+    const double intervals = (double)pf_tok / (double)std::max<int64_t>(f.cfg.checkpoint_interval, 1);
+    std::printf("sim: %d x %lld tokens beside %d decoders, max_tok %lld, headroom %lld, busy %lld, "
+                "interleave %lld: %lld steps (%lld mixed, %lld with a chunk under 1025, %.2f with a "
+                "chunk per interval); prefill %.0f tokens/s over the steps with a "
                 "chunk, %.0f to the last first token; TTFT p50 %.0f p95 %.0f max %.0f s; decode "
                 "while prompts wait %.1f tokens/s a sequence; all done at %.0f s\n",
-                N, (long long)L, (long long)MT, (long long)f.cfg.busy_prefill_chunk,
+                N, (long long)L, ND, (long long)MT, (long long)f.cfg.decode_headroom,
+                (long long)f.cfg.busy_prefill_chunk,
                 (long long)f.cfg.prefill_interleave, (long long)steps, (long long)mixed,
-                (long long)small, (double)pf_tok / std::max(t_pf, 1e-9),
+                (long long)small, (double)chunk_steps / std::max(intervals, 1e-9),
+                (double)pf_tok / std::max(t_pf, 1e-9),
                 (double)N * (double)L / tt.back(), pct(0.5), pct(0.95), tt.back(),
                 dec_s > 0 ? (double)dec_tok / dec_s : 0.0, t);
+}
+
+/* ================================================================== --decode-headroom */
+namespace {
+
+/* `n_dec` sequences decoding (`drafts` drafts a step each) when a `prompt`-token prefill arrives,
+ * at a 512-token budget and interval. Returns each step's chunk of the prefill until it has
+ * produced its first token, and checks every step against the pools it is built into. */
+std::vector<int32_t> chunks_beside_decoders(int64_t headroom, int n_dec, int drafts, int prompt,
+                                            int priority, int64_t* max_step = nullptr) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = 512;
+    f.cfg.decode_headroom = headroom;
+    f.cfg.n_spec = drafts;
+    CHECK_OK(f.start());
+    std::vector<uint64_t> dec;
+    for (int i = 0; i < n_dec; ++i) dec.push_back(f.submit(64, 4000, 0, /*ignore_eos=*/true));
+    int32_t draft[4] = { 7, 7, 7, 7 };
+    auto set_drafts = [&] {
+        if (drafts <= 0) return;
+        for (uint64_t id : dec) {
+            const Request* r = f.sch.find(id);
+            if (r && r->state == ReqState::Running && r->n_computed >= (int64_t)r->prompt.size())
+                (void)f.sch.set_draft(id, draft, drafts);
+        }
+    };
+    /* Every draft accepted, so the window stays whole. */
+    const auto accept_all = [](const StepEntry& e) { return (int32_t)e.n_spec; };
+    for (int k = 0; k < 8; ++k) {
+        set_drafts();
+        CHECK(f.sch.step() != nullptr);
+        CHECK_OK(f.commit(7, 0, accept_all));
+    }
+    for (uint64_t id : dec) CHECK(!f.sch.find(id)->output.empty());
+    const uint64_t a = f.submit(prompt, 2, priority);
+    std::vector<int32_t> chunks;
+    if (max_step) *max_step = 0;
+    for (int k = 0; k < 200; ++k) {
+        set_drafts();
+        const RadBatch* b = f.sch.step();
+        CHECK(b != nullptr);
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        CHECK(p.n_tok <= step_tok(f.cfg));
+        if (max_step) *max_step = std::max<int64_t>(*max_step, p.n_tok);
+        int ndec = 0;
+        for (const StepEntry& e : p.e) {
+            if (e.seq == a) chunks.push_back(e.n_tokens);
+            else ++ndec;
+        }
+        CHECK_EQ(ndec, n_dec);                  /* every decoder rides in every step */
+        CHECK_OK(f.commit(7, 0, accept_all));
+        if (!f.sch.find(a)->output.empty()) break;
+    }
+    return chunks;
+}
+
+}  /* namespace */
+
+/* Auto: a row per verified position of every other sequence, on the quantum, at most 256. */
+TEST(decode_headroom_auto_is_the_decode_rows_on_the_quantum_capped) {
+    CHECK_EQ(decode_headroom_auto(8, 3), 64);       /* 7 x 4 = 28 rows */
+    CHECK_EQ(decode_headroom_auto(32, 0), 64);      /* 31 */
+    CHECK_EQ(decode_headroom_auto(32, 3), 128);     /* 124 */
+    CHECK_EQ(decode_headroom_auto(256, 3), kDecodeHeadroomCap);
+    CHECK_EQ(decode_headroom_auto(1, 3), 0);        /* nothing decodes beside the prefill */
+    CHECK_EQ(decode_headroom_auto(2, -1), 64);
+    Config c;
+    c.max_tok = 2048;
+    c.checkpoint_interval = 2048;
+    CHECK_EQ(step_tok(c), 2048);                    /* unresolved auto is no headroom */
+    c.decode_headroom = 0;
+    CHECK_EQ(step_tok(c), 2048);
+    c.decode_headroom = 128;
+    CHECK_EQ(step_tok(c), 2176);
+    CHECK_EQ(mixed_step_tok(c), 2176);
+    /* Under a span a shared step is the shared budget plus the headroom, and a lone one the whole
+     * budget. */
+    c.max_tok = 4096;
+    c.prefill_span = 2;
+    CHECK_EQ(prefill_shared_tok(c), 2048);
+    CHECK_EQ(mixed_step_tok(c), 2176);
+    CHECK_EQ(step_tok(c), 4096);
+    c.decode_headroom = 4096;
+    CHECK_EQ(step_tok(c), 6144);
+}
+
+/* The defect: without headroom every interval beside decoding sequences is a chunk short by the
+ * decode rows and a remainder step to the boundary. With it, one step an interval, every chunk
+ * the whole interval, whether the prefill is walked before the decode rows or after them. */
+TEST(decode_headroom_carries_a_whole_interval_beside_decode_rows_in_one_step) {
+    for (int pri = 0; pri < 2; ++pri) {
+        int64_t top = 0;
+        const std::vector<int32_t> with = chunks_beside_decoders(64, 4, 0, 4096, pri, &top);
+        CHECK_EQ(with.size(), 8u);
+        for (int32_t c : with) CHECK_EQ(c, 512);
+        CHECK_EQ(top, 516);
+        const std::vector<int32_t> without = chunks_beside_decoders(0, 4, 0, 4096, pri);
+        CHECK_EQ(without.size(), 16u);
+        for (size_t i = 0; i < without.size(); ++i) CHECK_EQ(without[i], i % 2 ? 64 : 448);
+        /* With drafts: 4 x (1 + 3) rows, still inside 64. */
+        const std::vector<int32_t> spec = chunks_beside_decoders(64, 4, 3, 4096, pri, &top);
+        CHECK_EQ(spec.size(), 8u);
+        for (int32_t c : spec) CHECK_EQ(c, 512);
+        CHECK(top > 512 && top <= 528);
+    }
+}
+
+/* Decode rows past the headroom come out of the prefill budget as without it, and a step never
+ * carries more than the budget plus the headroom. */
+TEST(decode_rows_past_the_headroom_take_the_budget) {
+    for (int pri = 0; pri < 2; ++pri) {
+        int64_t top = 0;
+        /* 8 x 4 = 32 rows against 16: the chunk loses 16, 448 on the quantum, then 64. */
+        const std::vector<int32_t> c = chunks_beside_decoders(16, 8, 3, 2048, pri, &top);
+        CHECK_EQ(c.size(), 8u);
+        for (size_t i = 0; i < c.size(); ++i) CHECK_EQ(c[i], i % 2 ? 64 : 448);
+        CHECK(top <= 512 + 16);
+    }
 }

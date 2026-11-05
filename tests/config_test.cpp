@@ -477,6 +477,22 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "auto:x" }, &c), RAD_E_INVAL);
 }
 
+/* --decode-headroom is auto by default (resolved at bring-up), N rows, or 0 for the budget alone. */
+TEST(decode_headroom_takes_auto_or_a_row_count) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.decode_headroom, -1);
+    Config c;
+    CHECK_EQ(parse({ "--decode-headroom", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.decode_headroom, 0);
+    CHECK_EQ(parse({ "--decode-headroom", "96" }, &c), RAD_OK);
+    CHECK_EQ(c.decode_headroom, 96);
+    CHECK_EQ(parse({ "--decode-headroom", "auto" }, &c), RAD_OK);
+    CHECK_EQ(c.decode_headroom, -1);
+    CHECK_EQ(parse({ "--decode-headroom", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--decode-headroom", "x" }, &c), RAD_E_INVAL);
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
@@ -529,7 +545,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
-        { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } }, { "--decode-headroom", { "64" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },

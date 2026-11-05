@@ -376,7 +376,8 @@ int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeo
 }
 
 int BatchBuilder::layout(Program& prog, const Config& cfg) {
-    max_tok_ = cfg.max_tok;
+    /* A whole step: the prefill budget plus the decode headroom (step_tok), as the declare. */
+    max_tok_ = step_tok(cfg);
     max_seqs_ = cfg.max_seqs;
 
     if (max_tok_ <= 0 || max_seqs_ <= 0) return RAD_E_INVAL;

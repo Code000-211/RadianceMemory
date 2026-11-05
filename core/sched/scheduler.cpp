@@ -1895,6 +1895,11 @@ const RadBatch* Scheduler::step() {
         span_now_ = lone;
         if (!lone) budget = geo_.shared_tok;
     }
+    /* --decode-headroom: rows on top of `budget` that only decode rows take, and take first, so a
+     * prefill chunk keeps the whole budget and still reaches its checkpoint boundary in this step
+     * (plan_chunk). Decode rows past it come out of `budget` as they do without it. 0 is the
+     * schedule without the flag, step for step. */
+    int64_t headroom = decode_headroom(cfg_);
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
      * decode rows and the chunked path over its prefill rows, so a verifying row rolls back as in
@@ -1944,7 +1949,7 @@ const RadBatch* Scheduler::step() {
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
     for (size_t i = 0; i < running_.size(); ) {
-        if ((int64_t)plan_.e.size() >= cfg_.max_seqs || budget <= 0) break;
+        if ((int64_t)plan_.e.size() >= cfg_.max_seqs || (budget <= 0 && headroom <= 0)) break;
 
         int32_t slot = running_[i];
         SchedReq& s = *reqs_[(size_t)slot];
@@ -1961,9 +1966,14 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         int64_t want;
         if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
+        /* Only with headroom left: the budget is spent, and the decode rows behind take the
+         * headroom. */
+        if (prefill && budget <= 0) { ++i; continue; }
         if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
-            const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
+            /* Decode rows behind it ride in what is left of the headroom first. */
+            const int64_t reserve =
+                share_step ? std::max<int64_t>(0, behind_dec - headroom) + share_tok * shares : 0;
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
                                          /*rows_only=*/shares == 0);
             const int64_t end = chunk_end(r, target);
@@ -2024,7 +2034,7 @@ const RadBatch* Scheduler::step() {
             const int64_t spare = ctx_limit_ - 1 - (int64_t)r.n_computed;
             if (ctx_limit_ > 0 && s.n_draft > spare) s.n_draft = spare > 0 ? (int32_t)spare : 0;
             want = 1 + s.n_draft;
-            if (want > budget) want = 0;
+            if (want > budget + headroom) want = 0;
         }
         if (want <= 0) break;   /* the budget is spent; the rest of running_ waits a step */
 
@@ -2106,7 +2116,13 @@ const RadBatch* Scheduler::step() {
         plan_.e.push_back(e);
         plan_.n_tok += want;
         if (!prefill && s.n_draft > plan_.n_spec) plan_.n_spec = s.n_draft;
-        budget -= want;
+        if (prefill) {
+            budget -= want;
+        } else {
+            const int64_t h = std::min(want, headroom);
+            headroom -= h;
+            budget -= want - h;
+        }
         ++i;
     }
 
@@ -3271,11 +3287,12 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
      * (0 when it has backed off). */
     const bool may_draft = draft_.next_depth() > 0;
     /* The query pass is `block` tokens per drafting sequence, and the builder's staging arrays
-     * are sized at max_tok. Unlike a decode step it can put more rows than sequences in a batch,
-     * which on a small token budget would overrun h_tok. Under --prefill-span a step of several
-     * sequences is bounded by the shared budget instead (RadBuildCtx::max_mixed_tok), which is
-     * max_tok without a span. */
-    const int64_t mixed = geo_.shared_tok > 0 ? geo_.shared_tok : cfg_.max_tok;
+     * are sized at step_tok. Unlike a decode step it can put more rows than sequences in a batch,
+     * which on a small token budget would overrun h_tok. A step of several sequences is bounded
+     * by the shared budget plus the decode headroom (RadBuildCtx::max_mixed_tok), which is
+     * step_tok without a span. */
+    const int64_t mixed = geo_.shared_tok > 0 ? geo_.shared_tok + decode_headroom(cfg_)
+                                              : step_tok(cfg_);
     if ((int64_t)max * block > mixed) max = (int)(mixed / block);
     if (max <= 0) return 0;
 

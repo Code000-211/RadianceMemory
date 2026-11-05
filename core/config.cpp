@@ -82,6 +82,11 @@ static const Flag g_flags[] = {
                                         "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
                                         "0 (default) lets every step\n"
                                         "carry a chunk" },
+    { "--decode-headroom",    "MODE",   "rows a step carries for decode rows on top of\n"
+                                        "--max-num-batched-tokens, so a prefill chunk beside\n"
+                                        "decoding sequences fills its checkpoint interval in one\n"
+                                        "step: auto (default) is (max-num-seqs - 1) x (1 + drafts),\n"
+                                        "at most 256; N rows; 0 the budget alone" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -1221,6 +1226,11 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
+        else if (S("--decode-headroom")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->decode_headroom = -1;
+            else if (!parse_int(a.c_str(), v, 0, 1 << 20, &c->decode_headroom)) return RAD_E_INVAL;
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -2095,6 +2105,8 @@ const ShowRow kShow[] = {
           return c.prefill_interleave > 0 ? num(c.prefill_interleave)
                : c.prefill_interleave < 0 ? "auto:" + std::to_string(c.prefill_interleave_share)
                                           : std::string("off"); } },
+    { "--decode-headroom",    [](const Config& c) {
+          return c.decode_headroom < 0 ? std::string("auto") : num(c.decode_headroom); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {

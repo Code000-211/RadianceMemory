@@ -3,6 +3,7 @@
 
 #include "kvstream/carve.h"
 #include "kvstream/plan.h"
+#include "sched/geometry.h"
 
 #include <algorithm>
 #include <cassert>
@@ -104,7 +105,8 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     max_seqs_ = cfg.max_seqs > 0 ? cfg.max_seqs : 1;
     n_spec_   = cfg.n_spec > 0 ? cfg.n_spec : 0;
     max_ctx_  = cfg.max_ctx > 0 ? cfg.max_ctx : 0;
-    max_tok_  = cfg.max_tok > 0 ? cfg.max_tok : 0;
+    /* One step's tokens: the prefill budget plus the decode headroom (step_tok). */
+    max_tok_  = cfg.max_tok > 0 ? step_tok(cfg) : 0;
 
     if (groups.empty()) {
         RAD_ERR("KV manager: no KV groups were declared; the architecture plugin declares at "

@@ -851,6 +851,12 @@ struct Config {
     double  prefill_interleave_share = 0.25;   /* --prefill-interleave auto[:SHARE] */
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
                                         * -1 auto (Scheduler::interleave_steps) */
+    /* --decode-headroom: rows a step carries for decode rows on top of the prefill budget
+     * (max_tok), so a chunk beside decoding sequences still fills its whole checkpoint interval
+     * in one step. -1 is auto, which engine bring-up resolves (decode_headroom_auto in
+     * core/sched/geometry.h) before any declare; 0 is the budget alone, the schedule without the
+     * flag. Read through step_tok() and friends, which treat an unresolved auto as 0. */
+    int64_t decode_headroom = -1;
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */

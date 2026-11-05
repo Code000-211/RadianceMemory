@@ -1065,7 +1065,7 @@ private:
     std::vector<std::vector<int32_t>> scratch_;       /* per group, see scratch_table() */
     std::vector<std::vector<int64_t>> res_layer_off_; /* per group, see residency_layer_off() */
     int64_t   max_ctx_ = 0;
-    int64_t   max_tok_ = 0;      /* --max-num-batched-tokens; the buffer floor is one of these */
+    int64_t   max_tok_ = 0;      /* one step's tokens (step_tok); the buffer floor is one of these */
     bool    snap_drafter_ = false;   /* set_drafter_window_snapshot */
     /* plan_groups() computes these; carve() spends against them and ceiling() reports on them. */
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */

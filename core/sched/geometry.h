@@ -91,6 +91,47 @@ struct ChunkGeometry {
  * (RadBuildCtx::max_mixed_tok) and the scheduler plans by it, so the two agree. */
 int64_t prefill_shared_tok(const Config& cfg);
 
+/* --decode-headroom: decode rows a step may carry beyond the prefill budget.
+ *
+ * A step that carries a prefill chunk plans the chunk at the prefill budget (max_tok, or
+ * shared_tok under a span), which plan_chunk cuts at the checkpoint interval; decode rows riding
+ * along take the headroom first and only then the budget. Without it, every interval beside
+ * decoding sequences is two steps: a chunk short by the decode rows, and the remainder up to the
+ * boundary.
+ *
+ * Auto: a decode row per verified position of every other sequence, (max_seqs - 1) x
+ * (1 + n_spec) -- one sequence is the prefill -- rounded up to kDecodeHeadroomAlign and capped at
+ * kDecodeHeadroomCap. The cap is the activation arena's smallest level (Engine::probe_arena_levels
+ * plans decode steps at no fewer rows) and an eighth of the default 2048-token budget, the share
+ * --busy-prefill-chunk leaves others, so the arena grows by at most that eighth; decode rows past
+ * it come out of the budget as without the headroom, which costs the remainder step it costs
+ * today and no more. The alignment is the chunk quantum (attention block 16, linear-state tile
+ * 64) of every hybrid in the tree; the geometry itself is resolved only after the declare this
+ * sizes. Zero where nothing can decode beside a prefill: one sequence, a generator, KL mode. */
+constexpr int64_t kDecodeHeadroomCap   = 256;
+constexpr int64_t kDecodeHeadroomAlign = 64;
+int64_t decode_headroom_auto(int64_t max_seqs, int64_t n_spec);
+
+/* The resolved headroom, 0 while --decode-headroom is an unresolved auto. */
+inline int64_t decode_headroom(const Config& cfg) {
+    return cfg.decode_headroom > 0 ? cfg.decode_headroom : 0;
+}
+
+/* The most tokens a step of more than one sequence may carry: the shared budget plus the
+ * headroom (RadBuildCtx::max_mixed_tok). */
+inline int64_t mixed_step_tok(const Config& cfg) {
+    return prefill_shared_tok(cfg) + decode_headroom(cfg);
+}
+
+/* The most tokens any step may carry, which everything holding a whole step is sized for (the
+ * declare's RadBuildCtx::max_tok, the batch staging, the KV manager's per-step blocks): the
+ * prefill budget, or a shared step's budget plus the headroom where that is more. Exactly
+ * max_tok with no headroom. */
+inline int64_t step_tok(const Config& cfg) {
+    const int64_t m = mixed_step_tok(cfg);
+    return m > cfg.max_tok ? m : cfg.max_tok;
+}
+
 /* ChunkGeometry::window_ckpt from the program and the configuration alone, without resolving or
  * reporting the geometry: a trunk's sliding window, no linear state, a prefix cache and an
  * interval. Bring-up asks it before the geometry is resolved (Engine::drafter_window_snap). */

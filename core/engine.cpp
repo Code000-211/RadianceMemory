@@ -2233,6 +2233,7 @@ std::string Engine::engine_info() const {
     e["tp_attn_split"]          = cfg_.tp_attn_rows ? "rows" : "heads";
     e["weight_prefetch"]        = cfg_.weight_prefetch;
     e["max_num_batched_tokens"] = cfg_.max_tok;
+    e["decode_headroom"]        = decode_headroom(cfg_);
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
     e["embedding_placement"]    = { { "asked", table_placement_name(cfg_.embedding_placement) },

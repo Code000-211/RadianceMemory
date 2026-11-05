@@ -38,6 +38,12 @@ int64_t prefill_shared_tok(const Config& cfg) {
     return std::max(std::min(cfg.max_tok, I), cfg.max_tok - (cfg.prefill_span - 1) * I);
 }
 
+int64_t decode_headroom_auto(int64_t max_seqs, int64_t n_spec) {
+    const int64_t rows = (max_seqs - 1) * (1 + std::max<int64_t>(n_spec, 0));
+    if (rows <= 0) return 0;
+    return std::min(align_up(rows, kDecodeHeadroomAlign), kDecodeHeadroomCap);
+}
+
 /* What a prefix hit restores beside the cached blocks: linear state, or a trunk's sliding window.
  * Only the trunk's window makes a model take window snapshots; a block drafter's rides in them
  * where they exist (KVManager::set_drafter_window_snapshot) and is recomputed by draft refill

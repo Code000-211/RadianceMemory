@@ -1013,8 +1013,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
      * (core/kld.h); KL mode has no speculation. */
     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
-     * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
-    bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+     * (Scheduler::step) plus the decode headroom, so a wider step is one sequence; 0 without a
+     * span, where a step of several sequences may take the whole step_tok. */
+    bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, mixed_step_tok(cfg_)) : 0;
     /* --kv-resident in tokens, raised to kStreamFloorTokens as kvstream_ring_shape raises it: the
      * arch declares kv_resolve's ring depth from this, and the kernel refuses a carve deeper than
      * the declared table. */
@@ -1391,6 +1392,39 @@ int Engine::declare() {
                        : "the model carries no vision tower");
     }
 
+    /* --decode-headroom, resolved where max_seqs and the speculative window are final and before
+     * any declare, which sizes every buffer holding a whole step at step_tok (geometry.h). Zero
+     * where no decode row can share a step with a prefill chunk (a generator's passes, KL mode's
+     * scoring), and auto is 0 under --deterministic, which keeps the schedule it had. */
+    {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        const char* none = pb.gen_rows > 0 ? "a generator: its passes carry no decode rows"
+                         : cfg_.kld() ? "KL mode scores documents and decodes nothing" : nullptr;
+        const bool asked = cfg_.decode_headroom >= 0;
+        std::string why;
+        if (none) {
+            if (cfg_.decode_headroom > 0)
+                RAD_WARN("--decode-headroom %lld: no headroom, %s", (long long)cfg_.decode_headroom,
+                         none);
+            cfg_.decode_headroom = 0;
+            why = none;
+        } else if (asked) {
+            why = cfg_.decode_headroom > 0 ? "as given" : "as given: the prefill budget alone";
+        } else if (cfg_.deterministic) {
+            cfg_.decode_headroom = 0;
+            why = "--deterministic keeps the schedule without headroom (--decode-headroom N "
+                  "overrides it)";
+        } else {
+            cfg_.decode_headroom = decode_headroom_auto(cfg_.max_seqs, cfg_.n_spec);
+            why = fmt("(max-num-seqs %lld - 1) x (1 + %d drafts) decode rows beside a prefill, "
+                      "rounded up to %lld and at most %lld", (long long)cfg_.max_seqs,
+                      std::max(cfg_.n_spec, 0), (long long)kDecodeHeadroomAlign,
+                      (long long)kDecodeHeadroomCap);
+        }
+        decide("--decode-headroom", std::to_string(cfg_.decode_headroom), why);
+    }
+
     /* Control vectors are resolved before any rank declares, because the plugin reads the
      * direction table from RadBuildCtx. Only `--control-vector off|on` loads one; without it
      * nothing is looked for and the graph declares no projection op. With it, a plugin that does
@@ -1529,7 +1563,8 @@ int Engine::declare() {
                 v.n_head_kv = cfg_.kv_vpred.n_head_kv;
                 v.head_dim  = cfg_.kv_vpred.head_dim;
             }
-            const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
+            /* Sized for a whole step: the prefill budget plus the decode headroom. */
+            const RadBuildCtx bc = build_ctx(ri, step_tok(cfg_));
             LoraDeclare ld;
             ld.cfg = &cfg_.lora;
             ld.targets = lora_targets_;
@@ -1731,6 +1766,12 @@ void Engine::probe_arena_levels() {
     if (!pb.shape_probe_ok) {
         RAD_INFO("activation arena: not lent -- the '%s' plugin does not declare at a smaller step "
                  "size (RadArchProbe::shape_probe_ok)", plugins_.arch_plugin.c_str());
+        if (decode_headroom(cfg_) > 0)
+            RAD_INFO("decode headroom: %lld rows on a %lld-token budget, steps of up to %lld tokens; "
+                     "the activation arena is %s a rank, its cost over --decode-headroom 0 not "
+                     "measured (the plugin declares at no smaller step)",
+                     (long long)decode_headroom(cfg_), (long long)cfg_.max_tok,
+                     (long long)step_tok(cfg_), humanb(ranks_[0]->program.arena_bytes).c_str());
         return;
     }
     int64_t lo = 1;
@@ -1738,12 +1779,23 @@ void Engine::probe_arena_levels() {
     while (lo < rows_min) lo <<= 1;
     lo = std::max<int64_t>(lo, 256);
     std::vector<int64_t> want;
-    for (int64_t R = lo; R < cfg_.max_tok; R *= 4) want.push_back(R);
+    const int64_t top = step_tok(cfg_);
+    for (int64_t R = lo; R < top; R *= 4) want.push_back(R);
     arena_span_rows_ = 0;
-    const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
-    if (span_rows >= lo && span_rows < cfg_.max_tok &&
+    const int64_t span_rows = cfg_.prefill_span > 1 ? mixed_step_tok(cfg_) : 0;
+    if (span_rows >= lo && span_rows < top &&
         std::find(want.begin(), want.end(), span_rows) == want.end()) {
         want.push_back(span_rows);
+        std::sort(want.begin(), want.end());
+    }
+    /* What the decode headroom costs: the arena at the prefill budget alone, declared to be
+     * measured and not kept as a level (a level there would raise the stager's smallest pass
+     * past a whole chunk). */
+    const int64_t bare_rows = decode_headroom(cfg_) > 0 && cfg_.max_tok < top ? cfg_.max_tok : 0;
+    const bool bare_only = bare_rows > 0 &&
+                           std::find(want.begin(), want.end(), bare_rows) == want.end();
+    if (bare_only) {
+        want.push_back(bare_rows);
         std::sort(want.begin(), want.end());
     }
 
@@ -1791,6 +1843,25 @@ void Engine::probe_arena_levels() {
         const int64_t R = want[l];
         size_t bad = nr;
         for (size_t i = 0; i < nr && bad == nr; ++i) if (!ok[l * nr + i]) bad = i;
+        if (R == bare_rows) {
+            /* The headroom's cost, the largest rank's; a level only where it is a level anyway. */
+            if (bad < nr) {
+                RAD_INFO("decode headroom: %lld rows on a %lld-token budget, steps of up to %lld "
+                         "tokens; its activation cost is not measured (no sizing declare at %lld "
+                         "rows: %s)", (long long)decode_headroom(cfg_), (long long)cfg_.max_tok,
+                         (long long)top, (long long)R, why[l * nr + bad].c_str());
+            } else {
+                int64_t extra = 0;
+                for (size_t i = 0; i < nr; ++i)
+                    extra = std::max(extra, ranks_[i]->program.arena_bytes - got[l * nr + i].end);
+                RAD_INFO("decode headroom: %lld rows on a %lld-token budget, steps of up to %lld "
+                         "tokens; the activation arena is %s a rank, %s more than at the budget "
+                         "alone (--decode-headroom 0)", (long long)decode_headroom(cfg_),
+                         (long long)cfg_.max_tok, (long long)top,
+                         humanb(ranks_[0]->program.arena_bytes).c_str(), humanb(extra).c_str());
+            }
+            if (bare_only) continue;
+        }
         if (bad < nr) {
             RAD_WARN("activation arena: no level for %lld-token steps on rank %d -- %s",
                      (long long)R, ranks_[bad]->index, why[l * nr + bad].c_str());
@@ -4343,7 +4414,7 @@ int Engine::start() {
         }
         (void)rad_dev_set(ranks_[0]->device);
         if (ok) {
-            arena_rows_.push_back(cfg_.max_tok);
+            arena_rows_.push_back(step_tok(cfg_));
             for (const ArenaLevel& lv : ranks_[0]->arena_levels) arena_rows_.push_back(lv.rows);
             std::string lv;
             for (size_t k = 1; k < arena_rows_.size(); ++k)
