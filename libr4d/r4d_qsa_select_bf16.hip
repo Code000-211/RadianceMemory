@@ -1171,7 +1171,15 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     /* Never more than the table width. */
     int cap = (M <= kCacheMaxM) ? lds_cap_of() : 0;
     if (cap > nb) cap = nb;
-    return R4D_EMIT(stream, g_r4d_chain_arg ? &r4dchain_qsa_select<Signed> : &qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
+    /* Two launch sites rather than a choice of kernel inside one: each names its kernel alone, and
+     * the emulator test reads the plain one's name (tests/r4d_emu/test_qsa.cpp). */
+    if (g_r4d_chain_arg)
+        return R4D_EMIT(stream, r4dchain_qsa_select<Signed>, dim3((unsigned)M), dim3(kThreads),
+                        (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
+                        (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
+                        (int32_t*)sel, (int32_t*)nsel,
+                        (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+    return R4D_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
                     (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                     (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
                     (int32_t*)sel, (int32_t*)nsel,
