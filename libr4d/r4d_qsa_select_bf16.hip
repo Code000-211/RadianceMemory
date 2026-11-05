@@ -20,6 +20,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_launch.h"   // R4D_DYN_LDS
 #include "r4d_common.h"   // the DPP wave scans
 
@@ -129,7 +130,7 @@ __device__ __forceinline__ void counts_before(const uint32_t* wsum, int lane, in
  * entirely in the query's past when b * ratio + ratio - 1 <= pos. At decode this equals the
  * sequence's complete count. */
 template <bool Signed>
-__global__ __launch_bounds__(kThreads) void qsa_select_kernel(
+__device__ __forceinline__ void qsa_select_kernel_body(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
@@ -292,6 +293,28 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
                                                       (uint32_t)(p % ratio) + 1u);
         if (seqused) seqused[m] = su;
     }
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <bool Signed>
+__global__ __launch_bounds__(kThreads) void qsa_select_kernel(
+    const float* __restrict__ score, const int32_t* __restrict__ bt,
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu,
+    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
+    qsa_select_kernel_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+}
+template <bool Signed>
+__global__ __launch_bounds__(kThreads) void r4dchain_qsa_select(
+    const float* __restrict__ score, const int32_t* __restrict__ bt,
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu,
+    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
+    r4d_chain_wait();
+    qsa_select_kernel_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+    r4d_chain_done();
 }
 
 /* ===================================================== the wide-launch path, for a prefill chunk
@@ -1389,6 +1412,14 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     /* Never more than the table width. */
     int cap = (M <= kCacheMaxM) ? lds_cap_of() : 0;
     if (cap > nb) cap = nb;
+    /* Two launch sites rather than a choice of kernel inside one: each names its kernel alone, and
+     * the emulator test reads the plain one's name (tests/r4d_emu/test_qsa.cpp). */
+    if (g_r4d_chain_arg)
+        return R4D_EMIT(stream, r4dchain_qsa_select<Signed>, dim3((unsigned)M), dim3(kThreads),
+                        (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
+                        (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
+                        (int32_t*)sel, (int32_t*)nsel,
+                        (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
     return R4D_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
                     (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                     (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
@@ -1409,6 +1440,7 @@ enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL
        QL_SEQ = 7 };
 
 extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
+    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     const RadTensor* sc = r4d_opt(a, QL_SCORE);
     const RadTensor* bt = r4d_opt(a, QL_BT);
     const RadTensor* nc = r4d_opt(a, QL_NC);

@@ -149,6 +149,13 @@ run "$W/logs/kbench.log" env HIP_VISIBLE_DEVICES=-1 RADIANCE_HOME="$HH" \
     "$P/bin/rad-kbench" --fixture "$P/share/radiance/kernels.rkb" --max-cases 1 \
     --max-bytes 2048 --op rmsnorm --op quant_act_fp8 --op silu_mul
 grep -E "passed|failed" "$W/logs/kbench.log" | tail -3
+# rad-kbench fails only on a case that ran and failed, so a replay that skipped every case would
+# pass unseen: its summary must name at least one passed case and no failed one.
+sum=$(grep -E '^[0-9]+ checked, [0-9]+ passed, [0-9]+ failed' "$W/logs/kbench.log" | tail -1)
+n_pass=$(printf '%s\n' "$sum" | sed -nE 's/^[0-9]+ checked, ([0-9]+) passed, ([0-9]+) failed.*/\1/p')
+n_fail=$(printf '%s\n' "$sum" | sed -nE 's/^[0-9]+ checked, ([0-9]+) passed, ([0-9]+) failed.*/\2/p')
+[ -n "$n_pass" ] && [ "$n_pass" -gt 0 ] && [ "$n_fail" -eq 0 ] ||
+  fail "the installed rad-kbench replay checked nothing or failed: '$sum' (log: $W/logs/kbench.log)"
 say "4. the installed rad-kbench replays fixture ops from the out-of-tree home: $(ls "$HH/kernels" | tr '\n' ' ')"
 
 # 5. The device library's machine code, against the tree's, object by object. A code object also

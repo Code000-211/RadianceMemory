@@ -551,7 +551,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
-        { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--gpu-memory-mib", { "16384" } }, { "--gpu-headroom-mib", { "128" } },
+        { "--kv-cache-dtype", { "fp8" } },
         { "--kv-recipe", { inventory_recipe(), "--kv-cache-dtype", "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--qsa-bkey-dtype", { "i8" } },
@@ -1724,9 +1725,28 @@ TEST(the_ngram_table_takes_a_directory_for_a_shared_ram_copy) {
     CHECK(s.ngram_placement == TablePlacement::Ram);
     CHECK(s.ngram_share_dir.empty());
     Config c;
-    for (const char* bad : { "ram=", "vram=/tmp/x", "disk=/tmp/x", "auto=/tmp/x" })
+    for (const char* bad : { "ram=", "disk=", "vram=/tmp/x", "auto=/tmp/x" })
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--embedding-placement", "ram=/tmp/x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--embedding-placement", "disk=/tmp/x" }, &c), RAD_E_INVAL);
+}
+
+/* disk=DIR is disk read from the table's own file in DIR (#130); it and ram=DIR replace each
+ * other, and a plain placement drops both directories. */
+TEST(the_ngram_table_takes_a_directory_for_its_own_file_on_disk) {
+    Config s;
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Disk);
+    CHECK_EQ(s.ngram_disk_dir, std::string("/mnt/optane"));
+    CHECK(s.ngram_share_dir.empty());
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane", "--ngram-placement", "ram=/dev/shm" },
+                   &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK(s.ngram_disk_dir.empty());
+    CHECK_EQ(s.ngram_share_dir, std::string("/dev/shm"));
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane", "--ngram-placement", "disk" }, &s),
+             RAD_OK);
+    CHECK(s.ngram_disk_dir.empty());
 }
 
 /* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text
@@ -2208,6 +2228,26 @@ TEST(gpu_headroom_parses_under_both_spellings) {
     CHECK_EQ(b.gpu_headroom_mib, 256ll);
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.gpu_headroom_mib, 96ll);
+}
+
+/* --gpu-memory-mib is the inverse of --gpu-headroom-mib; they cannot be combined. The default
+ * headroom is not "given", so memory alone is legal and leaves the default until the resolver. */
+TEST(gpu_memory_mib_parses_and_excludes_headroom) {
+    Config a;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000" }, &a), RAD_OK);
+    CHECK_EQ(a.gpu_memory_mib, 28000ll);
+    CHECK_EQ(a.gpu_headroom_mib, 96ll);
+    CHECK(a.given.count("--gpu-memory-mib"));
+    CHECK(!a.given.count("--gpu-headroom-mib"));
+
+    Config z;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "0" }, &z), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "-1" }, &z), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "8x" }, &z), RAD_E_INVAL);
+
+    Config b, c;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000", "--gpu-headroom-mib", "96" }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000", "--gpu-headroom", "96" }, &c), RAD_E_INVAL);
 }
 
 TEST(the_kernel_hierarchy_is_separated_by_commas_or_colons_and_ordered) {

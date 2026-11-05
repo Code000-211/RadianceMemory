@@ -9,7 +9,8 @@
 #   docker/build.sh                       HEAD, here
 #   docker/build.sh -s HOST               HEAD, built on and kept by HOST
 #   docker/build.sh -r COMMIT             another commit
-#   docker/build.sh -t 'gfx1200;gfx1201'  other GPU architectures (default gfx1201)
+#   docker/build.sh -t 'gfx1200;gfx1201'  other GPU architectures (default
+#                                         'gfx1201;gfx11-generic;gfx1151')
 #   docker/build.sh -j 8                  fewer compile jobs, for a host that is also serving
 #   docker/build.sh -J 4                  fewer tests at a time (default: the compile jobs)
 #   docker/build.sh -B 5                  multiply every test's CPU budget, for a host slower per
@@ -24,7 +25,7 @@ cd "$(dirname "$0")/.."
 
 REV=HEAD
 HOST=
-TARGETS=gfx1201
+TARGETS='gfx1201;gfx11-generic;gfx1151'
 JOBS=
 TEST_JOBS=
 BUDGET_SCALE=

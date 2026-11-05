@@ -47,6 +47,13 @@
  *     hp          = hidden_projection(x)          the selector's query, rank 256
  *     tokens      = dflash_select(cand, unary, hp, anchor, predecessor, successor)
  *
+ * ============================== LILICORR ==============================
+ *
+ * Config::lili is NVIDIA's LiLiCorr backbone (Nemotron-3.5-Bolt's drafter): the same layers with a
+ * learned sink logit a query head in the attention (attn_paged_sink, `attention_sink_bias`), and no
+ * selector or draft head here. The query pass ends with the gather into `sel_h`; the plugin then
+ * runs rad_block_lilicorr.h's correlator over those rows, which reads the target's own head.
+ *
  * ============================== WHAT IS SHARED WITH THE TARGET ==============================
  *
  * The embedding table and lm_head. The checkpoint (81 tensors) ships neither, and
@@ -68,6 +75,8 @@
  *
  * q/kv and gate_up shard by row, o and down by column with an all-reduce: ten collectives per
  * draft pass, each 5120 * block * 2 bytes (80 KiB at block 8), below the lossy wire's floor.
+ * Fewer KV heads than ranks are replicated (drafter_geom's `kv_repl_ok`): each rank reads its
+ * head's k/v rows at `kv_off` and keeps that head in its cache.
  *
  * fc              [n_embd, n_taps*n_embd], 262 MiB in fp8 at Qwen3.8's width, read whole by the
  *                   context pass every step. Split by rows over the ranks and all-gathered, and
@@ -152,6 +161,9 @@ struct Dflash2 {
          * acceptance, sum min(P, Q). */
         double  q_temp = 1.0;
         int64_t short_rows  = 0;
+        /* LiLiCorr's backbone (the LILICORR section above): sinks, and the head left to the
+         * plugin. sel_rank and sel_topk are then unused. */
+        int     lili = 0;
         int64_t steps() const { return block - 1; }
         int64_t nodes() const { return tree && tree_nodes > 0 ? tree_nodes : steps(); }
         int64_t ng(int64_t n_embd) const { return group ? n_embd / group : 0; }
@@ -294,6 +306,9 @@ struct Dflash2 {
     int64_t block_lo = 0;
     int64_t sel_lo_nodes = 0;   /* a tree's nodes at the short block (op_sel_lo) */
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn = 0;
+    /* LiLiCorr: the attention with each layer's sinks, a weight, so one op a layer. */
+    rad_weight w_sink[MAX_LAYERS] = {};
+    rad_op     op_attn_sink[MAX_LAYERS] = {};
     rad_op op_act = 0, op_ar = 0, op_add = 0, op_final = 0;
     /* The residual add folded into the norm after it (add_rmsnorm), issued in place of op_add and
      * that norm where it resolves: op_afn[i] after layer i's attention (its feed-forward norm),
@@ -353,7 +368,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                 (long long)g.n_layer, MAX_LAYERS);
         return RAD_E_UNSUPPORTED;
     }
-    if (cfg.block < 2 || cfg.n_taps <= 0 || cfg.sel_rank <= 0 || cfg.sel_topk <= 0)
+    if (cfg.block < 2 || cfg.n_taps <= 0 || (!cfg.lili && (cfg.sel_rank <= 0 || cfg.sel_topk <= 0)))
         return RAD_E_INVAL;
 
     const int64_t NG   = cfg.ng(g.n_embd);
@@ -401,23 +416,10 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     }
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.hidden_norm.weight"), nm.ckpt("%s.hidden_norm.weight", ck)));
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.norm.weight"),        nm.ckpt("%s.norm.weight", ck)));
-    RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_proj.weight"),
-                          nm.ckpt("%s.candidate_selector.hidden_projection.weight", ck)));
-    RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_pred"),
-                          nm.ckpt("%s.candidate_selector.predecessor_codebook", ck)));
-    RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_succ"),
-                          nm.ckpt("%s.candidate_selector.successor_codebook", ck)));
-
     w_hnorm = decl_w(b, nm.f("dflash.hidden_norm.weight"), RAD_F32, {g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     w_norm  = decl_w(b, nm.f("dflash.norm.weight"), RAD_F32, {g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    w_selp  = decl_w(b, nm.f("dflash.sel_proj.weight"), RAD_BF16, {cfg.sel_rank, g.n_embd},
-                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    w_pred  = decl_w(b, nm.f("dflash.sel_pred"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
-    w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
 
     /* The 2-bit draft head, declared as the MTP head's is (rad_block_mtp_fp8.h):
      * `dflash.draft_head.weight` is the target's lm_head under its own name, quantised by the
@@ -427,35 +429,53 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      * When sharded, each rank's `row_topk` reports global ids, an all_gather moves R pairs a row,
      * and `row_topk_merge` reduces them to exactly the unsharded global top-R, ties included
      * (docs/OPS.md). This runs before the selector, so every rank holds the same candidates for
-     * the replicated codebooks. The all_gather is `world * R` pairs a row (2 KiB at R = 16). */
+     * the replicated codebooks. The all_gather is `world * R` pairs a row (2 KiB at R = 16).
+     *
+     * LiLiCorr has neither the selector nor this head (its correlator reads the target's). */
     enum { DF_W2_GROUP = 128 };
     const bool dh_shard = head_sharded(g);
     const int  dh_split = dh_shard ? RAD_SHARD_ROW : RAD_SHARD_NONE;
-    const char* dhn = nm.f("dflash.draft_head.weight");
-    RAD_ARCH_TRY(map_copy(b, dhn, ck_lm));
-    /* The 8-bit form: int8 codes, one f16 scale per (row, 128 of K), symmetric, which gemm_nt_q
-     * reads at w8a8 against the same quant_act_i8 activation (without its asum). */
-    {
-        RadEncoding e{};
-        const RadEncPlane* sc = nullptr;
-        head_i8 = weight_enc(b, dhn, &e) && rad_enc_is(&e, "affine") && e.n_planes == 2 &&
-                  !e.transform[0] && e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 &&
-                  (sc = rad_enc_plane(&e, "scale")) && sc->dtype == RAD_F16 &&
-                  sc->block[0] == 1 && sc->block[1] == DF_W2_GROUP;
+    if (!cfg.lili) {
+        RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_proj.weight"),
+                              nm.ckpt("%s.candidate_selector.hidden_projection.weight", ck)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_pred"),
+                              nm.ckpt("%s.candidate_selector.predecessor_codebook", ck)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_succ"),
+                              nm.ckpt("%s.candidate_selector.successor_codebook", ck)));
+        w_selp  = decl_w(b, nm.f("dflash.sel_proj.weight"), RAD_BF16, {cfg.sel_rank, g.n_embd},
+                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        w_pred  = decl_w(b, nm.f("dflash.sel_pred"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
+                         RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+        w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
+                         RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+
+        const char* dhn = nm.f("dflash.draft_head.weight");
+        RAD_ARCH_TRY(map_copy(b, dhn, ck_lm));
+        /* The 8-bit form: int8 codes, one f16 scale per (row, 128 of K), symmetric, which
+         * gemm_nt_q reads at w8a8 against the same quant_act_i8 activation (without its asum). */
+        {
+            RadEncoding e{};
+            const RadEncPlane* sc = nullptr;
+            head_i8 = weight_enc(b, dhn, &e) && rad_enc_is(&e, "affine") && e.n_planes == 2 &&
+                      !e.transform[0] && e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 &&
+                      (sc = rad_enc_plane(&e, "scale")) && sc->dtype == RAD_F16 &&
+                      sc->block[0] == 1 && sc->block[1] == DF_W2_GROUP;
+        }
+        if (head_i8) {
+            w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_I8, {head_rows(g), g.n_embd},
+                              RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+            w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale", RAD_F16,
+                              {head_rows(g), g.n_embd / DF_W2_GROUP}, RAD_ACCESS_PER_TOKEN,
+                              dh_split, grp_model());
+        } else {
+            w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
+                              RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+            w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
+                              {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split,
+                              grp_model());
+        }
+        if (!w_dh || !w_dhs) return RAD_E_INVAL;
     }
-    if (head_i8) {
-        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_I8, {head_rows(g), g.n_embd},
-                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
-        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale", RAD_F16,
-                          {head_rows(g), g.n_embd / DF_W2_GROUP}, RAD_ACCESS_PER_TOKEN, dh_split,
-                          grp_model());
-    } else {
-        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
-                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
-        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
-                          {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
-    }
-    if (!w_dh || !w_dhs) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- per-layer weights */
     for (int64_t l = 0; l < g.n_layer; ++l) {
@@ -492,6 +512,13 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
         RAD_ARCH_TRY(w_v[i].declare(b, nm, nm.f("dflash.blk.%d.attn_v", i), kvd, g.n_embd,
                                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, grp_layer(first_layer + i),
                                     { nm.ckpt("%s.layers.%d.self_attn.v_proj.weight", ck, i) }));
+        /* Fewer KV heads than ranks (drafter_geom's `kv_repl_ok`): k and v are this rank's
+         * replicated head, rows [kv_off, kv_off + kv_dim) of the unsharded projection, where the
+         * even shard would hand a rank part of a head. q stays an even share of the heads. */
+        if (g.world > g.n_head_kv_all) {
+            RAD_ARCH_TRY(w_k[i].span(b, g.kv_off, g.kv_off + kvd));
+            RAD_ARCH_TRY(w_v[i].span(b, g.kv_off, g.kv_off + kvd));
+        }
         w_qn[i]    = decl_w(b, nm.f("dflash.blk.%d.attn_q_norm.weight", i), RAD_F32, {g.head_dim},
                             RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(first_layer + i));
         w_kn[i]    = decl_w(b, nm.f("dflash.blk.%d.attn_k_norm.weight", i), RAD_F32, {g.head_dim},
@@ -520,6 +547,14 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
         w_fcb[i]   = decl_w(b, nm.f("dflash.blk.%d.ffn_conv_base", i), RAD_BF16,
                             {2, cfg.taps, g.n_embd}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                             grp_layer(first_layer + i));
+        /* LiLiCorr's sink logit a query head, split with the heads. */
+        if (cfg.lili) {
+            RAD_ARCH_TRY(map_copy(b, nm.f("dflash.blk.%d.attn_sinks", i),
+                                  nm.ckpt("%s.layers.%d.self_attn.attention_sink_bias", ck, i)));
+            w_sink[i] = decl_w(b, nm.f("dflash.blk.%d.attn_sinks", i), RAD_F32, {g.n_head},
+                               RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, grp_layer(first_layer + i));
+            if (!w_sink[i]) return RAD_E_INVAL;
+        }
 
     }
 
@@ -529,15 +564,35 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      *
      * Declared before both kv_stores, which read the resolved `block_size` back with
      * rad_kv_block_size(); before this declaration it returns zero. */
-    op_attn = rw(b, RAD_OP(b, "attn_paged",
-                    RAD_PARAMS(RAD_RANGE("q_len", 1, cfg.block), RAD_INT("head_dim", g.head_dim),
-                               RAD_INT("gqa", g.gqa()), RAD_INT("causal", cfg.causal),
-                               RAD_INT("window", cfg.window), RAD_INT("n_head", g.n_head),
-                               RAD_INT("block_size", RAD_KV_BLOCK),
-                               RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
-                               RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
-                    RAD_NOWEIGHTS),
-                {w.q}, {w.attn});
+    if (!cfg.lili) {
+        op_attn = rw(b, RAD_OP(b, "attn_paged",
+                        RAD_PARAMS(RAD_RANGE("q_len", 1, cfg.block), RAD_INT("head_dim", g.head_dim),
+                                   RAD_INT("gqa", g.gqa()), RAD_INT("causal", cfg.causal),
+                                   RAD_INT("window", cfg.window), RAD_INT("n_head", g.n_head),
+                                   RAD_INT("block_size", RAD_KV_BLOCK),
+                                   RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                   RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                        RAD_NOWEIGHTS),
+                    {w.q}, {w.attn});
+    } else {
+        for (int64_t l = 0; l < g.n_layer; ++l) {
+            const int i = (int)l;
+            op_attn_sink[i] = rw(b, RAD_OP(b, "attn_paged_sink",
+                                    RAD_PARAMS(RAD_RANGE("q_len", 1, cfg.block),
+                                               RAD_INT("head_dim", g.head_dim),
+                                               RAD_INT("gqa", g.gqa()), RAD_INT("causal", cfg.causal),
+                                               RAD_INT("window", cfg.window),
+                                               RAD_INT("n_head", g.n_head),
+                                               RAD_INT("block_size", RAD_KV_BLOCK),
+                                               RAD_INT("max_seqs", g.max_seqs),
+                                               RAD_INT("max_ctx", g.max_ctx),
+                                               RAD_STR("q_dtype", g.dtype),
+                                               RAD_STR("kv_dtype", g.kv_dtype)),
+                                    RAD_WEIGHTS(w_sink[i])),
+                                {w.q}, {w.attn});
+            if (!op_attn_sink[i]) return RAD_E_INVAL;
+        }
+    }
 
     /* ---------------------------------------------------------------- the context pass */
     /* Every linear is `fp8a8` (or `mxfp4a8` for a 4-bit recipe; DenseFP8 reads which from the
@@ -555,12 +610,15 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     if (fc_rows) {
         /* The split (SHARDING above): this rank's block-aligned rows into `cpart`, its window of
          * them gathered into `c`. The GEMM takes its K split from the whole width. The gather
-         * rides the trunk's all-reduce instance (the same numel bound, so the same instance). */
+         * rides the trunk's all-reduce instance (the same numel bound, so the same instance).
+         * The message is a range, as the all-reduce's: a fixed numel follows max_tok, and the
+         * arena's sizing declare (RadBuildCtx::shape_probe) refuses a fixed parameter that
+         * changes with the step size. */
         op_cfc = w_fc.gemm(b, crows, fc_rows, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.cpart},
                            g.n_embd);
         op_cgath = rw(b, RAD_OP(b, "all_gather",
                          RAD_PARAMS(RAD_INT("world_size", g.world),
-                                    RAD_INT("numel", crows * g.n_embd),
+                                    RAD_RANGE("numel", g.n_embd, crows * g.n_embd),
                                     RAD_STR("dtype", g.dtype), RAD_INT("row", fc_share)),
                          RAD_NOWEIGHTS),
                      {w.cpart}, {w.c});
@@ -884,6 +942,8 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                  RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.h}, {w.sel_h});
+    /* LiLiCorr's head is the plugin's (rad_block_lilicorr.h), over sel_h. */
+    if (cfg.lili) return RAD_OK;
     op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
                       RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
                                  RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
@@ -1090,7 +1150,8 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
     if (fc_rows) {
         RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
                     brows(w.cpart, T), RAD_NONE, w_fc.bref());
-        RAD_ISSUE_N(c, op_cgath, T, bcol(w.cpart, fc_off, fc_share, T), brows(w.c, T));
+        RAD_ISSUE_N(c, op_cgath, T * g.n_embd, bcol(w.cpart, fc_off, fc_share, T),
+                    brows(w.c, T));
     } else {
         RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
                     brows(w.c, T), RAD_NONE, w_fc.bref());
@@ -1188,13 +1249,22 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
             RAD_ISSUE_N(c, op_store, T, brows(w.k, T), brows(w.v, T),
                         praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
         }
-        RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                    brows(w.q, T), kv_cache(kv, first_layer + i),
-                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
-                    praw(used, RAD_I32, batch->n_seq),
-                    RAD_NONE, RAD_NONE,
-                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
-                    brows(w.attn, T));
+        if (cfg.lili)
+            RAD_ISSUE_N(c, op_attn_sink[i], batch->max_q_len,
+                        brows(w.q, T), kv_cache(kv, first_layer + i),
+                        praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                        praw(used, RAD_I32, batch->n_seq),
+                        RAD_NONE, RAD_NONE,
+                        praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                        RAD_W(w_sink[i]), brows(w.attn, T));
+        else
+            RAD_ISSUE_N(c, op_attn, batch->max_q_len,
+                        brows(w.q, T), kv_cache(kv, first_layer + i),
+                        praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                        praw(used, RAD_I32, batch->n_seq),
+                        RAD_NONE, RAD_NONE,
+                        praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                        brows(w.attn, T));
         RAD_ISSUE_N(c, op_qat, T, brows(w.attn, T), brows(w.atq, T), brows(w.ats, T));
         RAD_ISSUE_N(c, op_op[i], T, brows(w.atq, T), brows(w.ats, T),
                     RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h, T), RAD_NONE, w_o[i].bref());
@@ -1238,6 +1308,7 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t S = batch->n_out;
     if (S <= 0) return;
     RAD_ISSUE_N(c, op_gather, S, RAD_B(w.h), praw(batch->out_ids, RAD_I32, S), brows(w.sel_h, S));
+    if (cfg.lili) return;   /* the plugin's correlator takes sel_h from here */
 
     /* `dsum` is group-major, [n_embd/group][ceil(M/16)*16], so it has no row slice; pass it
      * whole. */

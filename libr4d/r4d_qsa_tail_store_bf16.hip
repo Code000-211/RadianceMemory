@@ -22,6 +22,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
@@ -30,11 +31,11 @@ namespace {
 
 constexpr int kThreads = 256;
 
-__global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
+__device__ __forceinline__ void qsa_tail_store_kernel_body(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
     uint16_t* __restrict__ state,
-    int T, int n, int ring, int seqs, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
 
     const int t = (int)blockIdx.x;
     if (t >= T) return;
@@ -48,14 +49,33 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     /* Only the last `ring` tokens of this sequence's chunk -- see the header. */
     if (t < cu[s + 1] - ring) return;
 
-    /* Column 0 is the committed slot; -1 marks a sequence with no state. */
+    /* Column 0 is the committed slot; -1 marks a sequence with no state. A slot past the
+     * state plane's would write past its allocation. */
     const int si = sidx[(size_t)s * sidx_ld];
-    if (si < 0) return;
+    if (si < 0 || si >= slots) return;
 
     const int row = pos[t] % ring;
     const size_t src = (size_t)t * k_ld;
     const size_t dst = (size_t)si * s_slot + (size_t)row * s_row;
     for (int d = (int)threadIdx.x; d < n; d += kThreads) state[dst + d] = k[src + d];
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+__global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
+    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
+    uint16_t* __restrict__ state,
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_qsa_tail_store(
+    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
+    uint16_t* __restrict__ state,
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    r4d_chain_wait();
+    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+    r4d_chain_done();
 }
 
 }  // namespace
@@ -67,17 +87,17 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
 //   state  [slots][ring][n]      bf16, this layer's tail cache; written only, untargeted rows
 //                                keep their contents
 static int r4d_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, long state, int T,
-                                       int n, int ring, int seqs, int k_ld, int s_slot, int s_row,
-                                       int sidx_ld, RadStream stream) {
+                                       int n, int ring, int seqs, int slots, int k_ld, int s_slot,
+                                       int s_row, int sidx_ld, RadStream stream) {
     if (!k || !pos || !cu || !sidx || !state) return R4D_NO(RAD_E_INVAL);
-    if (T <= 0 || n <= 0 || ring <= 0 || seqs <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (T <= 0 || n <= 0 || ring <= 0 || seqs <= 0 || slots <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!k_ld) k_ld = n;
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
-    return R4D_EMIT(stream, qsa_tail_store_kernel, dim3((unsigned)T), dim3(kThreads), 0,
+    return R4D_EMIT(stream, g_r4d_chain_arg ? &r4dchain_qsa_tail_store : &qsa_tail_store_kernel, dim3((unsigned)T), dim3(kThreads), 0,
                     (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,
-                    (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, k_ld, s_slot, s_row,
-                    sidx_ld);
+                    (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, slots, k_ld, s_slot,
+                    s_row, sidx_ld);
 }
 
 // ============================================================== the plugin ABI entry point
@@ -112,9 +132,10 @@ extern "C" int r4d_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
     const long long kp = r4d_row_pitch(k);
     if (kp < 0) return R4D_NO(RAD_E_STRIDE);
     if (k->dtype != RAD_BF16 || st->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     return r4d_qsa_tail_store_bf16_emit(r4d_addr(k), r4d_addr(po), r4d_addr(cu), r4d_addr(sx),
                                         r4d_addr(st), (int)T, (int)n, (int)ring, (int)seqs,
-                                        (int)kp, (int)st->stride[0], (int)st->stride[2],
-                                        (int)sxp, stream);
+                                        (int)st->shape[0], (int)kp, (int)st->stride[0],
+                                        (int)st->stride[2], (int)sxp, stream);
 }
 

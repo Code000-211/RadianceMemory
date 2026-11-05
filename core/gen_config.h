@@ -33,10 +33,13 @@ struct GenSampling {
      * has no field for it; a container states it as `generation.no_repeat_ngram_whitelist`, a
      * JSON array of ids. Empty means not stated. */
     std::vector<int32_t> ngram_whitelist;
+    /* transformers' suppress_tokens: ids never sampled. Empty means not stated. */
+    std::vector<int32_t> suppress;
 
     bool any() const {
         return temp >= 0.0f || top_p >= 0.0f || min_p >= 0.0f || top_k >= 0 ||
-               ngram_ban_n >= 0 || ngram_window >= 0 || !ngram_whitelist.empty();
+               ngram_ban_n >= 0 || ngram_window >= 0 || !ngram_whitelist.empty() ||
+               !suppress.empty();
     }
 
     /* Overlay onto `base` field by field; unstated fields keep base's, so sources stack. */

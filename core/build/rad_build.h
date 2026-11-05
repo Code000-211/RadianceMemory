@@ -140,6 +140,7 @@ public:
     int         declare_generator(const RadGeneratorDecl* d);
     int         declare_audio_generator(const RadAudioGenDecl* d);
     int         declare_video_generator(const RadVideoGenDecl* d);
+    int         declare_shape_generator(const RadShapeGenDecl* d);
     void        note_v       (const char* f, va_list ap);
 
     /* An op's buffer operands (rad_op_reads/rad_op_writes in rad_builder.h), which give the

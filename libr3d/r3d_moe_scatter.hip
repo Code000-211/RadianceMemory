@@ -15,7 +15,11 @@
  * butterfly (a DPP exchange inside the scan's tile loop miscompiles here). Each wave writes its
  * lane's count to LDS, barriers, and takes the serial prefix of its 32 lanes.
  *
- * The general (three-pass) form for T > 1024 is not implemented here; the shim declines it.
+ * Above 1024 slots the sort is three passes (libhalo's general form): a histogram per 256-slot
+ * tile into the caller's scratch, a per-expert scan across the tiles, and the placement (an
+ * expert's offset, plus its count in earlier tiles, plus the slot's rank in its own tile). Stable
+ * too, so both forms give the same bytes. The scan's cross-expert prefix is a serial LDS loop, not
+ * a wave scan, for the same gfx1102 reason as above.
  */
 #include <hip/hip_runtime.h>
 
@@ -142,29 +146,100 @@ __global__ __launch_bounds__(kScatWaves * kSortWave) void scatter_small_kernel(
     scatter_small_place<kScatWaves, INV>(sorted, off, cnt, T, n_expert, sl, inv);
 }
 
-}  // namespace
+/* ================================================================== the general form */
 
-extern "C" {
+constexpr uint32_t kScatterTile = 256;
 
-int r3d_rad_moe_scatter(const RadArgs* a, RadStream s)
+/* Pass 1: each tile's count of every expert, bcnt[tile][expert]. */
+__global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
+    const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
+    int32_t base, Protect prot) {
+    __shared__ int32_t s_h[kMaxExpert];
+    const uint32_t tid = threadIdx.x, b = blockIdx.x;
+    for (uint32_t e = tid; e < n_expert; e += kScatterTile) s_h[e] = 0;
+    R3D_BARRIER();
+    const uint32_t i = b * kScatterTile + tid;
+    if (i < T) {
+        const int32_t e = ids[i] - base;
+        if (e >= 0 && e < (int32_t)n_expert) atomicAdd(&s_h[sort_place(e, n_expert, prot)], 1);
+    }
+    R3D_BARRIER();
+    for (uint32_t e = tid; e < n_expert; e += kScatterTile)
+        bcnt[(size_t)b * n_expert + e] = s_h[e];
+}
+
+/* Pass 2: per expert, the count in earlier tiles (bcnt rewritten in place to it) and the total;
+ * then the offsets, an exclusive prefix over the totals. */
+__global__ __launch_bounds__(kMaxExpert) void scatter_scan_kernel(
+    int32_t* __restrict__ bcnt, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
+    uint32_t n_tile, uint32_t n_expert) {
+    __shared__ int32_t s_run[kMaxExpert];
+    const uint32_t e = threadIdx.x;
+    int32_t run = 0;
+    if (e < n_expert) {
+        for (uint32_t b = 0; b < n_tile; ++b) {
+            const int32_t v = bcnt[(size_t)b * n_expert + e];
+            bcnt[(size_t)b * n_expert + e] = run;
+            run += v;
+        }
+        cnt[e] = run;
+    }
+    s_run[e] = run;
+    R3D_BARRIER();
+    if (e == 0) {
+        int32_t acc = 0;
+        for (uint32_t x = 0; x < n_expert; ++x) { off[x] = acc; acc += s_run[x]; }
+        off[n_expert] = acc;
+    }
+}
+
+/* Pass 3: each routed slot at its expert's offset plus the expert's count in earlier tiles plus
+ * its rank in this tile. Sorted rows past the live count are -1; no placement lands there. INV
+ * also writes each slot's row, -1 when dropped. */
+template <bool INV>
+__global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
+    const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
+    const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
+    uint32_t T, uint32_t n_expert, int32_t base, Protect prot, int32_t* __restrict__ inv) {
+    __shared__ int32_t s_id[kScatterTile];
+    const uint32_t tid = threadIdx.x, b = blockIdx.x;
+    const uint32_t i = b * kScatterTile + tid;
+    const int32_t l = (i < T) ? ids[i] - base : -1;
+    const int32_t e = (l >= 0 && l < (int32_t)n_expert) ? sort_place(l, n_expert, prot) : -1;
+    s_id[tid] = e;
+    const uint32_t live = (uint32_t)off[n_expert];
+    if (i >= live && i < T) sorted[i] = -1;
+    R3D_BARRIER();
+    if (INV && i < T && e < 0) inv[i] = -1;
+    if (i >= T || e < 0) return;
+    int32_t rank = 0;
+    for (uint32_t j = 0; j < tid; ++j) rank += (s_id[j] == e);
+    const int32_t at = off[e] + bcnt[(size_t)b * n_expert + e] + rank;
+    sorted[at] = (int32_t)i;
+    if (INV) inv[i] = at;
+}
+
+/* Both entry points: the small form up to kScatterSmall slots, the three passes above it. */
+int scatter_body(const RadArgs* a, RadStream s, bool with_inv)
 {
-    if (!a || a->n_t < 4) return R3D_NO(RAD_E_INVAL);
+    if (!a || a->n_t < (with_inv ? 5 : 4)) return R3D_NO(RAD_E_INVAL);
     const RadTensor* ids = r3d_opt(a, 0), *sorted = r3d_opt(a, 1), *off = r3d_opt(a, 2),
-                    *cnt = r3d_opt(a, 3);
-    if (!r3d_p(ids) || !r3d_wp(sorted) || !r3d_wp(off) || !r3d_wp(cnt))
+                    *cnt = r3d_opt(a, 3), *inv = with_inv ? r3d_opt(a, 4) : nullptr;
+    if (!r3d_p(ids) || !r3d_wp(sorted) || !r3d_wp(off) || !r3d_wp(cnt) ||
+        (with_inv && !r3d_wp(inv)))
         return R3D_NO(RAD_E_INVAL);
     if (ids->dtype != RAD_I32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
-        cnt->dtype != RAD_I32)
+        cnt->dtype != RAD_I32 || (inv && inv->dtype != RAD_I32))
         return R3D_NO(RAD_E_DTYPE);
-    if (!r3d_contig(ids) || !r3d_contig(sorted) || !r3d_contig(off) || !r3d_contig(cnt))
+    if (!r3d_contig(ids) || !r3d_contig(sorted) || !r3d_contig(off) || !r3d_contig(cnt) ||
+        (inv && !r3d_contig(inv)))
         return R3D_NO(RAD_E_STRIDE);
 
     const long long n_expert = r3d_geti_or(a, "n_expert", 0);
     if (n_expert <= 0 || n_expert > (long long)kMaxExpert) return R3D_NO(RAD_E_SHAPE);
     const long long T = r3d_numel(ids);
     if (T <= 0) return R3D_NO(RAD_E_SHAPE);
-    if (T > (long long)kScatterSmall) return R3D_NO(RAD_E_SHAPE);   // the small form only
-    if (r3d_numel(sorted) < T) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(sorted) < T || (inv && r3d_numel(inv) < T)) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(off) < n_expert + 1 || r3d_numel(cnt) < n_expert) return R3D_NO(RAD_E_SHAPE);
 
     const long long base = r3d_geti_or(a, "expert_base", 0);
@@ -192,65 +267,66 @@ int r3d_rad_moe_scatter(const RadArgs* a, RadStream s)
     int32_t* sp = (int32_t*)r3d_wp(sorted);
     int32_t* op = (int32_t*)r3d_wp(off);
     int32_t* cp = (int32_t*)r3d_wp(cnt);
+    int32_t* ip = inv ? (int32_t*)r3d_wp(inv) : nullptr;
 
-    R3D_KLAUNCH(scatter_small_kernel<false>, dim3(1), dim3(kScatWaves * kSortWave), (hipStream_t)s,
-                idp, sp, op, cp, (uint32_t)T, (uint32_t)n_expert, (int32_t)base, prot,
-                (int32_t*)nullptr);
+    if (T <= (long long)kScatterSmall) {
+        if (ip)
+            R3D_KLAUNCH(scatter_small_kernel<true>, dim3(1), dim3(kScatWaves * kSortWave),
+                        (hipStream_t)s, idp, sp, op, cp, (uint32_t)T, (uint32_t)n_expert,
+                        (int32_t)base, prot, ip);
+        else
+            R3D_KLAUNCH(scatter_small_kernel<false>, dim3(1), dim3(kScatWaves * kSortWave),
+                        (hipStream_t)s, idp, sp, op, cp, (uint32_t)T, (uint32_t)n_expert,
+                        (int32_t)base, prot, ip);
+        return (int)hipGetLastError();
+    }
+
+    const long long n_tile = (T + kScatterTile - 1) / kScatterTile;
+    const long long need = n_tile * n_expert * (long long)sizeof(int32_t);
+    if (!a->scratch || a->scratch_bytes < need) return R3D_NO(RAD_E_SCRATCH);
+    int32_t* bcnt = (int32_t*)a->scratch;
+    R3D_KLAUNCH(scatter_hist_kernel, dim3((unsigned)n_tile), dim3(kScatterTile), (hipStream_t)s,
+                idp, bcnt, (uint32_t)T, (uint32_t)n_expert, (int32_t)base, prot);
+    R3D_KLAUNCH(scatter_scan_kernel, dim3(1), dim3(kMaxExpert), (hipStream_t)s,
+                bcnt, op, cp, (uint32_t)n_tile, (uint32_t)n_expert);
+    if (ip)
+        R3D_KLAUNCH(scatter_place_kernel<true>, dim3((unsigned)n_tile), dim3(kScatterTile),
+                    (hipStream_t)s, idp, bcnt, op, sp, (uint32_t)T, (uint32_t)n_expert,
+                    (int32_t)base, prot, ip);
+    else
+        R3D_KLAUNCH(scatter_place_kernel<false>, dim3((unsigned)n_tile), dim3(kScatterTile),
+                    (hipStream_t)s, idp, bcnt, op, sp, (uint32_t)T, (uint32_t)n_expert,
+                    (int32_t)base, prot, ip);
     return (int)hipGetLastError();
+}
+
+}  // namespace
+
+extern "C" {
+
+int r3d_rad_moe_scatter(const RadArgs* a, RadStream s)
+{
+    return scatter_body(a, s, false);
 }
 
 /* moe_scatter_inv: the same sort, plus the inverse permutation (each slot's row in sorted_tok). */
 int r3d_rad_moe_scatter_inv(const RadArgs* a, RadStream s)
 {
-    if (!a || a->n_t < 5) return R3D_NO(RAD_E_INVAL);
-    const RadTensor* ids = r3d_opt(a, 0), *sorted = r3d_opt(a, 1), *off = r3d_opt(a, 2),
-                    *cnt = r3d_opt(a, 3), *inv = r3d_opt(a, 4);
-    if (!r3d_p(ids) || !r3d_wp(sorted) || !r3d_wp(off) || !r3d_wp(cnt) || !r3d_wp(inv))
-        return R3D_NO(RAD_E_INVAL);
-    if (ids->dtype != RAD_I32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
-        cnt->dtype != RAD_I32 || inv->dtype != RAD_I32)
-        return R3D_NO(RAD_E_DTYPE);
-    if (!r3d_contig(ids) || !r3d_contig(sorted) || !r3d_contig(off) || !r3d_contig(cnt) ||
-        !r3d_contig(inv))
-        return R3D_NO(RAD_E_STRIDE);
+    return scatter_body(a, s, true);
+}
 
+/* The three-pass form's per-tile counts, [n_tile, n_expert] i32; the small form needs none. */
+int64_t r3d_rad_moe_scatter_scratch(const RadArgs* a)
+{
+    if (!a) return 0;
     const long long n_expert = r3d_geti_or(a, "n_expert", 0);
-    if (n_expert <= 0 || n_expert > (long long)kMaxExpert) return R3D_NO(RAD_E_SHAPE);
-    const long long T = r3d_numel(ids);
-    if (T <= 0) return R3D_NO(RAD_E_SHAPE);
-    if (T > (long long)kScatterSmall) return R3D_NO(RAD_E_SHAPE);   // the small form only
-    if (r3d_numel(sorted) < T || r3d_numel(inv) < T) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(off) < n_expert + 1 || r3d_numel(cnt) < n_expert) return R3D_NO(RAD_E_SHAPE);
-
-    const long long base = r3d_geti_or(a, "expert_base", 0);
-    if (base < 0) return R3D_NO(RAD_E_SHAPE);
-
-    Protect prot{};
-    if (const char* str = r3d_gets(a, "protect")) {
-        const char* p = str;
-        long long prev = -1;
-        while (*p) {
-            char* end = nullptr;
-            const long long v = std::strtoll(p, &end, 10);
-            if (end == p || v <= prev || v >= n_expert || prot.n >= kMaxProtect)
-                return R3D_NO(RAD_E_SHAPE);
-            prot.e[prot.n++] = (uint16_t)v;
-            prev = v;
-            p = end;
-            if (*p == ',') ++p;
-            else if (*p) return R3D_NO(RAD_E_SHAPE);
-        }
-    }
-
-    const int32_t* idp = (const int32_t*)r3d_p(ids);
-    int32_t* sp = (int32_t*)r3d_wp(sorted);
-    int32_t* op = (int32_t*)r3d_wp(off);
-    int32_t* cp = (int32_t*)r3d_wp(cnt);
-    int32_t* ip = (int32_t*)r3d_wp(inv);
-
-    R3D_KLAUNCH(scatter_small_kernel<true>, dim3(1), dim3(kScatWaves * kSortWave), (hipStream_t)s,
-                idp, sp, op, cp, (uint32_t)T, (uint32_t)n_expert, (int32_t)base, prot, ip);
-    return (int)hipGetLastError();
+    /* Called at declare with the band's bound, when the ids may carry no data yet: then
+     * M x top_k. */
+    const RadTensor* ids = r3d_opt(a, 0);
+    const long long T = ids ? r3d_numel(ids) : r3d_geti_or(a, "M", 0) * r3d_geti_or(a, "top_k", 1);
+    if (n_expert <= 0 || T <= (long long)kScatterSmall) return 0;
+    const long long n_tile = (T + kScatterTile - 1) / kScatterTile;
+    return n_tile * n_expert * (long long)sizeof(int32_t);
 }
 
 }  // extern "C"

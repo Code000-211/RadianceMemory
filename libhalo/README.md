@@ -16,7 +16,9 @@ Both are built when `RAD_GPU_TARGETS` names gfx1151, and on a Strix Halo libhalo
 - `rad_plugin_open` (`halo_rows.cpp`) declines every machine whose KFD topology lists no gfx1151,
   so on another RDNA3 card libhalo is not loaded at all and declares no schema: libr3d serves it
   alone. The loader would leave libhalo's device rows out there anyway (its code objects are
-  gfx1151's); declining also keeps its schemas out.
+  gfx1151's); declining also keeps its schemas out, and keeps rad-convert, which resolves kernels
+  without that check, from laying weights out for it. A process without `/dev/kfd` (a container
+  given no card, a machine with no amdgpu) sees no gfx1151 and declines it too.
 
 An explicit `--kernels` list orders the libraries as given; name `libhalo` before `libr3d`.
 

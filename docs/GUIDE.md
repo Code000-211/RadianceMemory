@@ -316,6 +316,7 @@ and runs.
 | `fishomni` | Fish Audio drama-3, speech from text with speaker tags and inline direction (§5.15) |
 | `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
 | `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
+| `hunyuan3d2` | Hunyuan3D-2's shape model, an untextured 3-D mesh from one picture (§5.17) |
 
 **4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
 refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
@@ -708,7 +709,8 @@ radiance --model m.rad --debug-placement    # the placement plan only
 
 The card is split into resident weights and the paged KV pool. The engine derives the split from the
 card and the model; no flag states either pool. Its inputs: `--gpu-headroom-mib` leaves card space
-alone, `--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
+alone, `--gpu-memory-mib` claims a size (headroom is the card less that; give one of the two),
+`--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
 experts must stay on the card. The startup receipt prints every term. With no visible card (the host
 backend) half of RAM stands in for the card and is split the same way; the weights pool is then host
 memory, holding the weights a host kernel cannot read where the container stores them.
@@ -785,6 +787,7 @@ Related flags:
 
 ```sh
 --gpu-headroom-mib 96         # VRAM left unclaimed on every card
+# --gpu-memory-mib 28000      # the same knob as a claim; not with --gpu-headroom-mib
 --kv-cache-dtype fp8          # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192          # pinned host tier for weights
 --embedding-placement vram    # keep the token embedding on the card (below)
@@ -860,15 +863,35 @@ the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap
 and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
 cgroup of the engine that filled them.
 
+`--ngram-placement disk=DIR` reads the table from its own file, `DIR/ngram-<id>.bin`, instead of from
+the container: a table on a faster or separate drive (an Optane beside a model on a large NVMe, or a
+model on a hard disk with its table on an SSD) at no host memory. The first start fills the file from
+the container (the table's size free in `DIR`, written under `.part` and renamed, so the real name is
+always complete); later starts check samples of it against the container and reuse it. The `<id>` is
+`ram=DIR`'s, so a file never serves another model; remove the file to have it filled again. Reads go
+to it as `disk` reads the container, through the row cache with direct I/O, so `DIR`'s filesystem must
+support `O_DIRECT` (tmpfs since Linux 6.6 does, but a tmpfs is what `ram` is for).
+
 **`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
-routed layer's first expert op, on every pass, the engine reads all that layer's on-disk experts into
-one of two VRAM buffers (a router's picks are not known on the host, and a prefill chunk routes to
-nearly all of them). The buffers come out of the weight budget (the plan's `file buffers` line), and
-the reads go through four 32 MiB pinned windows out of `--host-pool-mib`, as long runs that skip
-resident experts. It is meant for running a checkpoint as shipped, to calibrate or compare against.
-The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two cards at about 28 s a step, the same at one token as
-at 32K, so use large prefill steps:
+routed layer's first expert op, on every pass, the engine reads the layer's on-disk experts that its
+rows route to into one of two VRAM buffers: the layer's router has run by then, and its counts are
+copied back first (one wait on the card per routed layer), so an expert no row routes stays on the
+drive. A step whose rows route nearly every expert, 64 rows an expert on average (3277 tokens for
+Qwen3.8-Flash-Next's 512 experts at top-10), reads its layers whole instead, each one while the card
+computes the one before, with no wait on the card. The buffers come out of the weight budget (the
+plan's `file buffers` line), and the reads go through four 32 MiB pinned windows out of
+`--host-pool-mib`, as long runs that skip resident experts. Without `--deterministic` the host pool
+is also a cache of the drive: an expert read from it is kept in a free pool slot, and a full pool
+gives its coldest expert back to the drive for a warmer one. It is meant for running a checkpoint
+as shipped, to calibrate or compare against. The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two
+cards at about 28 s a 32K-token step, so use large prefill steps:
+
+GLM-5.3-Flash lays its routed experts out by what the deployment needs. At four and eight cards each
+MXFP4 expert is split by width across every card, the shape its kernels are tuned for, and every expert
+must then fit in VRAM and the host pool. A container with any expert in another format stays whole. `--weights-disk-tier` keeps them whole on one card each, so they
+can stay on the drive, at about a third of the prefill speed and two thirds of the decode speed on 4 x
+R9700. Two cards always keep them whole.
 
 ```sh
 rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o flashnext-bf16.rad --max-ctx 4096   # no recipe: bf16
@@ -885,9 +908,10 @@ plane grows into what it releases, so a model whose experts do not fit never str
 for unused cache.
 
 **Headroom.** `--gpu-headroom-mib` is kept for allocations the engine does not make, chiefly a
-kernel's code object, which HIP loads at the kernel's first launch. With too little left, the first
-kernel that has never run (a draft head's, a sampler chain's) fails its load and faults inside the
-HIP runtime: a segfault in a correct kernel on a server that had been serving.
+kernel's code object, which HIP loads at the kernel's first launch. `--gpu-memory-mib N` is the same
+knob written as a claim: headroom is the card less N. The two flags cannot be combined. With too
+little left, the first kernel that has never run (a draft head's, a sampler chain's) fails its load
+and faults inside the HIP runtime: a segfault in a correct kernel on a server that had been serving.
 
 Once everything is allocated, startup logs `card N settled at ... free`. Memory taken after the budget
 read the card (another process such as a desktop, or a driver allocation) comes out of the headroom,
@@ -912,8 +936,9 @@ takes the model's training context.
 `--kv-cache-dtype fp8` is an E4M3 cache with per-(sequence, head) descales. It halves what a token of
 context costs, which at a production context is most of the pool. It is a real quantisation that
 changes the output slightly, so it is only ever set explicitly. Every architecture serves both
-widths except GLM-5.3-Flash (`glm5next`), whose latent-attention cache is bf16 only and which refuses
-`fp8` at startup. The flag sets every attention cache of the deployment, a drafter's (DSpark,
+widths. On GLM-5.3-Flash (`glm5next`) `fp8` narrows the latent-attention cache alone, to E4M3 at a
+descale of 1 (half its bf16 size); the DSA index, its key tail and the KDA caches keep their own
+widths. The flag sets every attention cache of the deployment, a drafter's (DSpark,
 DFlash2) included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
 widths.
 
@@ -2411,7 +2436,7 @@ by 0.002-0.003 nats.
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--decode-headroom MODE` | auto | rows a step carries for decode rows on top of the budget, so a chunk beside decoders fills its interval in one step (§4.5): `auto` is (max-num-seqs - 1) x (1 + drafts), at most 256; `0` is the budget alone |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time |
-| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step |
+| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
@@ -2422,6 +2447,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
+| `--gpu-memory-mib N` | 0 (use `--gpu-headroom-mib`) | VRAM claimed on every card; inverse of `--gpu-headroom-mib`. Give one (§4.3) |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k5_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, `bf16` (`qwen4exp_fp8`), one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
 | `--qsa-bkey-dtype T` | bf16 | `bf16` or `i8`: the QSA indexer's block keys; i8 is int8 with one f16 scale a key, 1.73 instead of 3.25 KiB a 4-token block on Qwen3.8-Flash-Next (the part window residency never demotes), and moves the selection about as much as an fp8 attention cache does; `qwen4exp_fp8` only (§4.4) |
@@ -2432,7 +2458,7 @@ by 0.002-0.003 nats.
 | `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`--checkpoint-slots`, §4.8) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
-| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
+| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
@@ -2502,7 +2528,7 @@ by 0.002-0.003 nats.
 | `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
 | `--trusted-proxy CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
-| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
+| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.18) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
 | `--http-threads N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
@@ -2599,6 +2625,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
 | `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
 | `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
+| `POST /generate`, `POST /send`, `GET /status/:uid` | Hunyuan3D-2's API server's routes: a 3-D mesh (GLB, OBJ, PLY or STL) from a picture, at once or in the background; needs a shape model (Hunyuan3D-2), else 501 (§5.17) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
@@ -3008,7 +3035,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 |---|---|
 | `model` | accepted and not enforced: one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.17) |
+| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.18) |
 | `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused (§5.8) |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
@@ -3226,6 +3253,7 @@ each field is read, taken without effect, or refused by name.
 | `role: "system"` in `messages` | after the head of the conversation, its text joins a user message at its position, since templates read a system message only at the head: as a text block ahead of the user message right after it, else after the one right before it, else as a user message of its own, so no two user turns follow each other. `clear_at: "next_user_message"` stops rendering it once a later user message (a `tool_result`-only one included) exists. An effort-only message (no text, `output_config: {"effort": ...}`) sets the effort from the next user message on. Blocks other than text (`tool_addition`, ...) are refused |
 | `tools`, `tool_choice` | client tools; server tools (`web_search_…`, `code_execution_…`) are refused. `tool_choice` as an object (`auto`, `any`, `tool`, `none`, `disable_parallel_tool_use`) or a string (`"auto"`, `"none"`, `"any"`); `any` is the chat path's `required` (§5.4) |
 | `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `stream` | as on the chat path; `max_tokens` is optional there too |
+| `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `repeat_last_n` | not Anthropic's: the chat path's fields with its ranges and meaning (§5.7), for clients that speak only this format. The penalties count a token's occurrences in the last `repeat_last_n` tokens of prompt and reply (64 by default, `--repeat-last-n`), as llama.cpp does |
 | `thinking` | `enabled` (its `budget_tokens` is the chat request's `thinking_token_budget`), `adaptive`, `disabled`, `between_tools` (off). `display` and `block_binding` are taken: the reasoning comes back whole, with an empty `signature` |
 | `output_config` | `effort` (`low`, `medium`, `high`, `xhigh`, `max`) is the chat request's `reasoning_effort`, which the template reads in its own level names: a level it does not take is refused with the ones it does, and `--reasoning-effort-map` renames them (§4.9). `format` (`{"type": "json_schema", "schema": ...}`, or the older top-level `output_format`) is a `response_format` (§5.5). `task_budget` is taken |
 | `context_management` | validated; the conversation is served as sent, and the answer says so: `"context_management": {"applied_edits": []}`, on `message_delta` in a stream |
@@ -3896,7 +3924,53 @@ The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 
 Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
 `--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
 
-### 5.17 Documents: Unlimited-OCR
+### 5.17 3-D shapes: `/generate`
+
+A shape generation model (Hunyuan3D-2) makes an untextured 3-D mesh from one picture of an object.
+It answers Hunyuan3D-2's own API server's routes, so that server's clients (its Blender add-on,
+scripts written against it) work unchanged: `POST /generate` makes the shape while the request
+waits and answers with the file; `POST /send` makes it in the background and answers at once with
+`{"uid": ...}`; `GET /status/{uid}` reports `{"status": "processing"}` (with `steps_done` of
+`steps`), then `"completed"` with the file as base64 in `model_base64`, or `"error"` with its
+`message`.
+
+```sh
+# The shape model is tencent/Hunyuan3D-2's hunyuan3d-dit-v2-0 folder: config.yaml and
+# model.fp16.safetensors. Its weights ship in fp16 and are cast to bf16 at conversion.
+rad-convert Hunyuan3D-2/hunyuan3d-dit-v2-0 --recipe data/recipes/hunyuan3d-2-bf16.recipe \
+    -o hunyuan3d-2-bf16.rad
+radiance --model hunyuan3d-2-bf16.rad
+
+curl -s http://localhost:8000/generate -H 'Content-Type: application/json' \
+    -d "{\"image\": \"$(base64 -w0 penguin.png)\"}" -o penguin.glb
+```
+
+- **`image`** is the picture as base64 (a data URL is taken too). Give it an alpha channel that cuts
+  the object out: the reference removes an opaque picture's background with rembg first, which this
+  server does not, so an opaque picture is taken whole, background and all. The picture is prepared
+  as the reference prepares it: the alpha's bounding box scaled to 85% of the square that holds the
+  picture, centred on white, 512 x 512, then the image encoder's 518 x 518.
+- **`num_inference_steps`** counts sigma grid points (50, so 49 evaluations, by default; 2 to
+  200); **`guidance_scale`** is the classifier-free guidance against the unconditioned branch (5
+  by default); **`seed`** makes a shape repeatable (1234 when absent, as the reference).
+- **`octree_resolution`** is the grid's cells a side the field is sampled on (256 by default, 16
+  to 512). The grid is sampled coarse to fine, as FlashVDM's hierarchical decoding does: the whole
+  grid at the coarsest level (the resolution halved while it stays at least 63), then only the
+  points near the surface at each finer level; with `"volume_decoding": "dense"` every point of
+  the finest grid is sampled instead, as the reference's default decoder does (slower, the same
+  field). The surface is marching cubes over the finest grid at level 0.
+- **`type`** is the file: `glb` (the default; positions, smooth normals and faces), `obj`, `ply`
+  (binary) or `stl` (binary). The mesh is the raw surface, as the reference's `/generate` returns
+  it without texturing: no floater removal or face reduction.
+- **`texture`** true (Hunyuan3D-Paint) is refused: this server makes the untextured shape. So are
+  the reference's `text` (its text-to-image front end) and `mesh` (re-texturing) inputs.
+
+A shape is about 3 TFLOP of conditioning, 18 TFLOP a denoising step (both branches) and 34 MFLOP
+a sampled grid point. The model runs on one card (2.2B parameters, 4.4 GiB in bf16); `--tp` above 1
+is refused. The licence (Tencent Hunyuan 3D 2.0 Community License) does not cover the European
+Union, the United Kingdom or South Korea.
+
+### 5.18 Documents: Unlimited-OCR
 
 `unlimited-ocr` (baidu/Unlimited-OCR, bf16; the converted container is
 [Aijuus/unlimited-ocr-bf16](https://huggingface.co/Aijuus/unlimited-ocr-bf16), with its recipe;
@@ -3978,7 +4052,7 @@ completions entry point), so prompt parity with the reference is a chat-endpoint
 
 ### 6.1 The dashboard
 
-Open `http://<host>:<port>/` in a browser. It has three tabs.
+Open `http://<host>:<port>/` in a browser. It has four tabs.
 
 **Dashboard**: the live strip across the top (decode step time, decode and prefill throughput,
 requests in flight, KV cache in VRAM, draft acceptance), then cards for the batch, memory and
@@ -3989,7 +4063,7 @@ The KV cache meter splits what it holds into two segments:
 ```
 KV cache   3.3 / 4.5 GiB  ·  75.5%
 ▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-20.8k tok read by running requests  ·  369.3k kept for reuse
+20.8k tok read by running requests  |  369.3k kept for reuse
 ```
 
 The full-strength segment is context running requests are reading; the dim segment is prefix cache,
@@ -4000,7 +4074,7 @@ from the total fill, since a full pool causes preemption.
 The decode step tile carries two figures and a percentage under the big number:
 
 ```
-best 14.79ms · recent 15.21ms · now 97% of best
+best 14.79ms | recent 15.21ms | now 97% of best
 ```
 
 Both are window means of single-sequence decode steps, measured by the engine:
@@ -4044,14 +4118,17 @@ The decode, prefill, requests-in-flight and draft-acceptance tiles carry a line 
 which the page computes from its own polls:
 
 ```
-best 58 · recent 54 · now 93% of best@c4
+best 58.0 | recent 54.0 | now 93% of best@c4
 ```
 
 `best` (`highest` on requests in flight and acceptance) is the extreme this page has seen at the
-current concurrency, `recent` the mean of its last 30 samples there (15 s at one poll every 500 ms;
-5 s for prefill), and `now` the current value as a share of the extreme. Past one sequence the line
+current concurrency, `recent` the mean of the last 15 s there (5 s for prefill), and `now` the
+current value as a share of the extreme. The windows are kept by elapsed time rather than sample
+count, so a span means the same span whatever rate is set on Advanced. Past one sequence the line
 names its concurrency (`@c4`); requests in flight keeps a single set. Reloading the page resets these
-figures, a server restart does not. While nothing runs, the big figure reads 0 and the line keeps its
+figures, and so does a server restart: the page notices the engine's new start time and
+inherits nothing from the run before it. While nothing runs, the big figure reads 0 and the line
+keeps its
 last figures without `now`.
 
 Draft acceptance is reported as two ratios with different denominators. A draft position is
@@ -4059,8 +4136,8 @@ verified only when every earlier one passed, so:
 
 - **accepted / reached** (conditional): of the drafts verified at a position, the share that passed.
   The acceptance tile, the Speculation panel's large "conditionally accepted" figure and the
-  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the last 30
-  polls that drafted as a ratio of sums.
+  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the polls
+  that drafted in the last 15 s as a ratio of sums.
 - **accepted / drafted**: of every drafted token, the share that became text, since the process
   started. The Speculation panel's "Accepted of drafted", `draft_accept` on `/stats` and
   `radiance:draft_acceptance_ratio` on `/metrics` show it.
@@ -4070,6 +4147,30 @@ passing 56%, 75% and 77% of the time they are reached, a step reaches 1 + 0.56 +
 positions on average and accepts 0.56 + 0.42 + 0.32 = 1.30 tokens: 66% accepted / reached against
 1.30 / 3 = 43% accepted / drafted.
 
+Under the live request table, **history** keeps every finished request a poll saw. A request is in
+`/stats` only while it exists -- a finished row leaves the payload within about 20 ms to half a
+second -- so without this the numbers would be gone before they could be read. The last 200 are
+kept in this browser's `localStorage`, not on the server, and rows are keyed by the engine's start
+and the request id, so a second tab or a reload keys a request alike rather than counting it twice.
+A request that began and finished between two polls cannot be sampled at all; those are counted in
+a grey row so the total still adds up. **clear** empties it, and the marker it leaves is a
+timestamp every tab honours, so a clear in one window is a clear in all of them.
+
+The line above the table summarises those rows: how many are done, then decode rate, prefill rate
+and time to first token. The first two carry their mean over all the rows and, where enough
+rows exist, the same mean over the last 20 and the last 5; time to first token is a median
+over all the rows, with no windows. A window appears only once enough rows
+exist for it to be a different question: with 12 rows stored, the mean over the last 20 would just
+be the mean over all 12, so only *last 5* shows. At exactly 20 rows *last 20* repeats the overall
+mean; from 21 up the three figures are three different questions.
+These are means of per-request rates, not the pooled rate the tiles above show: one long request
+does not get to decide the headline. On this line a dot separates one category from the next and a
+pipe separates the windows within a category.
+
+The download icon beside the **Requests** heading saves those stored rows as
+`radiance-history.json`, indented, from the browser -- it is the same data **clear** would discard,
+so a run worth keeping can be written out before it is cleared.
+
 **Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
 linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
 prompt share its blocks.
@@ -4078,6 +4179,14 @@ On a hybrid model, a session with blocks but no reachable snapshot reuses zero t
 scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's headline.
 
 **Model**: the resolved graph: every op, which library serves it, and what did not resolve.
+
+**Advanced**: two editable poll intervals -- *Idle interval* while nothing runs and *Busy interval*
+while a request is in flight, each clamped to 100-5000 ms. Set them equal for one fixed rate; the
+summary beside the panel title names what is set. The values live in the browser, not on the
+server, so they
+survive a restart and apply to this browser only. Polling pauses on every view but Dashboard, so
+the figures hold while you are reading another page -- for about a minute. Past 60 s the
+next poll drops the windows, since there is nothing left to compare them against.
 
 ### 6.2 The JSON behind it
 
@@ -4148,7 +4257,9 @@ Two pitfalls:
 - Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
 
-`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
+`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics. Its first screen shows
+totals over the selected time range (prompt tokens in, prompt tokens read from cache, prompt tokens
+computed, tokens out, requests) and the live status; the detail panels are below.
 
 ### 6.4 The live terminal view
 
@@ -4265,7 +4376,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.15.1
+I STARTUP REPORT -- radiance 1.17.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

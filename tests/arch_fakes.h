@@ -70,6 +70,7 @@ struct RecMap {
     int                      mode = 0;
     std::vector<std::string> src;
     int                      concat_dim = 0;
+    std::vector<int>         src_index;   /* RadNameMap::src_index, one per source */
 };
 struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false;
                   bool dense = false; };
@@ -99,6 +100,7 @@ struct RadBuilder {
     /* Ops the fake kernel hierarchy refuses, to drive the fused-op fallback; and ops no loaded
      * library declares (rad_op_declared), as without an optional library. */
     std::set<std::string> refuse;
+    std::set<std::pair<std::string, std::string>> refuse_dtype;  /* (op, dtype) forms */
     std::set<std::string> undeclared;
     /* When set, the only ops any loaded library declares (a CPU-only engine's: libref's
      * vocabulary); every other op is undeclared. */
@@ -217,7 +219,10 @@ extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* par
         r.p.push_back(p);
     }
     for (int i = 0; i < n_weights; ++i) r.w.push_back(weights[i]);
-    r.resolved = b->refuse.count(r.op) == 0;
+    bool dtype_refused = false;
+    for (const auto& p : r.p)
+        if (p.key == "dtype" && b->refuse_dtype.count({r.op, p.sval})) dtype_refused = true;
+    r.resolved = b->refuse.count(r.op) == 0 && !dtype_refused;
     b->ops.push_back(r);
     /* Declare always completes. An unresolved op is RAD_NULL_HANDLE, an error only if the plugin
      * issues it (rad_builder.h). */
@@ -285,7 +290,10 @@ extern "C" int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
     r.declared   = m->declared;
     r.mode       = m->mode;
     r.concat_dim = m->concat_dim;
-    for (int i = 0; i < m->n_src; ++i) r.src.push_back(m->src[i]);
+    for (int i = 0; i < m->n_src; ++i) {
+        r.src.push_back(m->src[i]);
+        r.src_index.push_back(m->src_index[i]);
+    }
     b->maps.push_back(r);
     return RAD_OK;
 }
@@ -535,6 +543,7 @@ extern "C" int rad_step_fail(RadCtx* c, const char* what) {
 extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
+extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
 extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
 extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }

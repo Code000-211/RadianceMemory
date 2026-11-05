@@ -17,6 +17,11 @@
 
 namespace rad {
 
+/* The widest conventional op is gdn_conv_prep at sixteen operands (docs/OPS.md). Thirty-two leaves
+ * room for an architecture plugin's private ops without a variable-length array on the hot path.
+ * The plugin loader refuses a schema with more, so no issue carries more. */
+constexpr int MAX_OPERANDS = 32;
+
 namespace mm { struct Item; struct PromptMedia; }
 
 class Registry;
@@ -451,9 +456,15 @@ public:
         std::vector<int64_t>     decoder_max_area;
     } vgen_str;
     bool is_video_generator() const { return video_gen.max_lanes != 0; }
+    /* The declared shape generator (rad_declare_shape_generator); `max_lanes` 0 when none. Its
+     * name points at `sgen_name`. */
+    RadShapeGenDecl shape_gen{};
+    std::string     sgen_name;
+    bool is_shape_generator() const { return shape_gen.max_lanes != 0; }
     /* Driven by passes, not token steps: any generator. */
     bool is_pass_driven() const {
-        return is_generator() || is_audio_generator() || is_video_generator();
+        return is_generator() || is_audio_generator() || is_video_generator() ||
+               is_shape_generator();
     }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
@@ -671,6 +682,10 @@ struct SamplingParams {
      * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
      * no-whitelist form. */
     std::vector<int32_t> ngram_whitelist;
+    /* Token ids this request never samples (generation_config.json's suppress_tokens: Gemma 4's
+     * end-of-image and end-of-audio markers). Global ids, duplicates ignored; empty is off. The
+     * sampler takes them out of the row as it does a grammar's mask. */
+    std::vector<int32_t> suppress_tokens;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
@@ -884,6 +899,9 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
+     * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
+    int64_t gpu_memory_mib = 0;
     /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
      * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
      * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),
@@ -948,6 +966,10 @@ struct Config {
     /* --ngram-placement ram=DIR: the pinned n-gram copy is the file DIR/ngram-<id>.tab (a tmpfs),
      * mapped shared, so engines on separate cards hold one table. Empty: a private copy. */
     std::string    ngram_share_dir;
+    /* --ngram-placement disk=DIR: the table is read from its own file, DIR/ngram-<id>.bin, filled
+     * from the container at the first start, instead of from the container (a faster drive than
+     * the model's). Empty: from the container. */
+    std::string    ngram_disk_dir;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to

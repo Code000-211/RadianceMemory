@@ -19,6 +19,9 @@
 #include "ngram.h"
 
 #include <chrono>
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+#include <functional>
+#endif
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -42,6 +45,9 @@ struct SchedReq {
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
     int64_t  first_tok_us = 0;   /* 0 until the first output token: this request's TTFT */
+    int64_t  admitted_us = 0;    /* 0 until the first admission: where the queue ends, so a
+                                  * prefill rate can divide by the prefill alone. ttft covers
+                                  * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
 
@@ -274,6 +280,7 @@ public:
         int32_t  slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
+        double   prefill_s = -1;       /* first token minus admission; negative until both */
         double   decode_tps = 0;       /* this request's own, since its first token */
     };
     /* Oldest first, since the oldest is the one most likely stuck. Returns how many were
@@ -463,7 +470,15 @@ public:
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
     int64_t plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
-                       int64_t* checkpoint_pos, int64_t keep_at = 0) const;
+                       int64_t* checkpoint_pos, int64_t keep_at = 0,
+                       const Request* r = nullptr) const;
+    /* Visible for tests: `want` tokens of `r` from `n_computed` cut so the chunk ends inside no run
+     * the language model reads both ways (RadEncoderDecl::bidirectional): before the run on a
+     * quantum, or at its end when the chunk starts in it and `budget` holds that, else 0. A run
+     * longer than any step keeps the cut where it falls. `want` unchanged for a program with no
+     * such runs. */
+    int64_t bidi_fit(const Request& r, int64_t n_computed, int64_t n_target, int64_t want,
+                     int64_t budget) const;
 
     /* The smallest step the prefill stager overlaps, in tokens (0 = no stager), set once by the
      * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap).
@@ -528,6 +543,13 @@ public:
     void    note_step_cost(bool chunk, double seconds);
 
 private:
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    friend class Engine;
+    /* Test-build-only observer at the concrete rollback operation. */
+    void set_kv_rollback_test_hook(std::function<void(uint64_t, int, int, int64_t, bool)> hook) {
+        kv_rollback_test_hook_ = std::move(hook);
+    }
+#endif
     Program*      prog_ = nullptr;
     Config        cfg_{};
     ChunkGeometry geo_{};
@@ -554,11 +576,15 @@ private:
     bool res_dense_rows(const StepPlan& p) const;
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
+    bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
     IKVManager*   kv_ = nullptr;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
+#endif
     IPrefixCache* pc_ = nullptr;
 
     /* Does a prefix-cache hit leave a hole in a block drafter's own KV? Only if some paged group
@@ -854,7 +880,8 @@ private:
     const Request* serial_req(const SerialSeq& m) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
-    void preempt_back();
+    bool preempt_back();                                      /* true: the victim published its prefix */
+    bool publish_prefix(SchedReq& s);
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets

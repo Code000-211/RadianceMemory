@@ -418,21 +418,26 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         g->tcq_L = (int)L;
         g->tcq_k = k;
         g->tcq_rows = rad_param_geti(o, n_o, "tcq_rows", 256);
-        if (g->tcq_rows < 1) {
-            if (why) *why = "tcq_rows= is the rows one trellis runs over, 1 or more";
+        /* A run holds its seam state in its rows' codes, so it needs at least a state's worth
+         * of them; the decoder refuses a shorter run. */
+        if (g->tcq_rows < (L + k - 1) / k) {
+            if (why) *why = "tcq_rows= is the rows one trellis runs over, at least the " +
+                            std::to_string((L + k - 1) / k) + " whose codes hold one state";
             return RAD_E_INVAL;
         }
         const int64_t S = (int64_t)1 << L;
         double lut_unit = 0.0;
         if (const char* code = rad_param_gets(o, n_o, "tcq_code", nullptr)) {
-            if (std::strcmp(code, "mad") != 0 || rad_param_gets(o, n_o, "tcq_lut", nullptr)) {
-                if (why) *why = "tcq_code=mad computes the states' values: no tcq_lut=";
+            const bool wide = std::strcmp(code, "mad16") == 0;
+            if ((!wide && std::strcmp(code, "mad") != 0) || rad_param_gets(o, n_o, "tcq_lut", nullptr)) {
+                if (why) *why = "tcq_code=mad or mad16 computes the states' values: no tcq_lut=";
                 return RAD_E_INVAL;
             }
-            g->tcq_mad = true;
+            g->tcq_mad = !wide;
+            g->tcq_wide = wide;
             g->tcq_a = (uint32_t)rad_param_geti(o, n_o, "tcq_a", 0xB5297B) & 0xFFFFFFu;
             g->tcq_b = (uint32_t)rad_param_geti(o, n_o, "tcq_b", 0x2545F491);
-            g->tcq_lut = tcq_lut_mad((int)L, g->tcq_a, g->tcq_b);
+            g->tcq_lut = tcq_lut_mad((int)L, g->tcq_a, g->tcq_b, wide);
         } else if (const char* lf = rad_param_gets(o, n_o, "tcq_lut", nullptr)) {
             /* The states' values, integers in -127..127 separated by white space, in state order;
              * a line "# unit X" names the units a unit-rms block spans (default: the values' rms). */
@@ -1143,11 +1148,12 @@ void grid_tcq_run(const Grid& g, const float* x, const float* s, int64_t n, int3
     }
 }
 
-std::vector<float> tcq_lut_mad(int L, uint32_t a, uint32_t b) {
+std::vector<float> tcq_lut_mad(int L, uint32_t a, uint32_t b, bool wide) {
     std::vector<float> lut((size_t)1 << L);
     for (uint32_t st = 0; st < (1u << L); ++st) {
-        const uint32_t h = (((st & 0xFFFFFFu) * (a & 0xFFFFFFu)) + b) & 0x3F3F3F3Fu;
-        lut[st] = (float)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+        const uint32_t h = (((st & 0xFFFFFFu) * (a & 0xFFFFFFu)) + b) & (wide ? 0xFFFFFFFFu : 0x3F3F3F3Fu);
+        lut[st] = (float)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) -
+                          (wide ? 510 : 126));
     }
     return lut;
 }

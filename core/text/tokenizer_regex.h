@@ -18,7 +18,9 @@
  *     the `onig` crate does.
  *
  * Anything else is refused at compile time with the construct named: backreferences, atomic
- * groups and possessive quantifiers, lookaround wider than one codepoint, unbounded repetition of
+ * groups, possessive quantifiers except where the greedy reading provably matches the same (one
+ * class at the top level, followed only by classes it shares no codepoint with, as in Ling-3.0's
+ * pattern), lookaround wider than one codepoint, unbounded repetition of
  * something that can match empty, `(?i)` over a character that folds to several (U+00DF vs "ss"),
  * and properties the tables do not carry. There is no fallback matcher; a pattern that does not
  * compile fails the vocabulary load.

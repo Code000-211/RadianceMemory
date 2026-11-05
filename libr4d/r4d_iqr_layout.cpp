@@ -136,7 +136,8 @@ bool classify(const RadEncoding* enc, const char* tr, Form* f, int64_t* entries)
         return true;
     }
     const int b = unsigned_bits(cp.dtype);
-    if (!b || b > 7) return false;
+    /* eight bits only under a zero: the embedding's u8 table (no GEMM form takes it) */
+    if (!b || b > 8 || (b == 8 && !rad_enc_plane(enc, "zero"))) return false;
     if (const RadEncPlane* zp = rad_enc_plane(enc, "zero")) {
         if (!scale_form(enc, 3, &sc) || sc != kBf16 || !unsigned_bits(zp->dtype) ||
             zp->block[0] != 1 || zp->block[1] != 128)
@@ -732,4 +733,70 @@ extern "C" int r4d_rad_unrelayout_iqr_logits(const RadParam* p, int n_p, int ope
     }
     std::memcpy(v.aux->data, s + lm_tab(f, rows, dim), (size_t)entries);
     return RAD_OK;
+}
+
+/* ==================================================================== logits_gemm_vocab's classes
+ *
+ * Each width class of the head is a gemm_nt_q weight of its own rows (operands 1 + 3i its codes,
+ * 2 + 3i its scales), stored as that row stores it, with the class's rows (`rows<i>`) and n_embd
+ * as its geometry and the rotated forms (the classes are fwht128). A class's vocabulary ids
+ * (3 + 3i) are read as stored. */
+namespace {
+int vocab_geom(const RadParam* p, int n_p, int operand, RadParam (&q)[4], int* il) {
+    if (operand < 1 || operand > 12 || (operand - 1) % 3 == 2) return RAD_E_UNSUPPORTED;
+    static const char* kRows[] = { "rows0", "rows1", "rows2", "rows3" };
+    const int i = (operand - 1) / 3;
+    std::memset(q, 0, sizeof q);
+    q[0].key = "N";
+    q[0].kind = RAD_P_INT;
+    q[0].ival = r4d_pgeti_or(p, n_p, kRows[i], 0);
+    q[1].key = "K";
+    q[1].kind = RAD_P_INT;
+    q[1].ival = r4d_pgeti_or(p, n_p, "n_embd", 0);
+    q[2].key = "group";
+    q[2].kind = RAD_P_INT;
+    q[2].ival = 128;
+    q[3].key = "dtype";
+    q[3].kind = RAD_P_STR;
+    q[3].sval = "i8a8h";
+    *il = (operand - 1) % 3 == 0 ? IL_B : IL_BSCALE;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_iqr_vocab(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                        int n, RadLayout* out) {
+    RadParam q[4];
+    int il = 0;
+    const int rc = vocab_geom(p, n_p, operand, q, &il);
+    if (rc != RAD_OK) return rc;
+    Form f;
+    int64_t entries = 0;
+    if (!classify(enc, "fwht128", &f, &entries) || f.kind != kTrellisMad || f.scale != kRowF32 ||
+        f.lrb != 0 || f.lrun != 8)
+        return RAD_E_DTYPE;
+    return r4d_rad_layout_iqr(q, 4, il, enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_iqr_vocab(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, void* dst,
+                                          int64_t dst_bytes) {
+    RadParam q[4];
+    int il = 0;
+    const int rc = vocab_geom(p, n_p, operand, q, &il);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_relayout_iqr(q, 4, il, enc, sel, pl, n, dst, dst_bytes);
+}
+
+extern "C" int r4d_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const void* src, int64_t src_bytes,
+                                            const RadTensor* pl, int n) {
+    RadParam q[4];
+    int il = 0;
+    const int rc = vocab_geom(p, n_p, operand, q, &il);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_unrelayout_iqr(q, 4, il, enc, sel, src, src_bytes, pl, n);
 }

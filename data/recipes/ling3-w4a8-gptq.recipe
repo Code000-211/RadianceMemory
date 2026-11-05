@@ -1,0 +1,18 @@
+# ling3-w4a8-gptq.recipe -- Ling-3.0-flash or a fine-tune of it (Ling-3.0-flash-Sante) from the bf16
+# checkpoint: the routed experts at four bits, an int4 code and a bf16 scale per 128 of K, chosen by
+# GPTQ against the Hessians of a calibration run (docs/MOE-W4.md "Calibration"); everything else as
+# the checkpoint holds it. The format is ling3-w4a8-rtn.recipe's, so the same kernels serve both.
+#
+#   1. rad-convert <checkpoint> --recipe data/recipes/ling3-w4a8-rtn.recipe -o ling3-w4a8-rtn.rad
+#   2. RADIANCE_CALIB_DIR=<calib dir> radiance --model ling3-w4a8-rtn.rad ...   (a calibration run:
+#      whole experts per rank; push a corpus that looks like the traffic through prefill)
+#   3. CALIB=<calib dir> rad-convert <checkpoint> --recipe data/recipes/ling3-w4a8-gptq.recipe \
+#          --reuse ling3-w4a8-rtn.rad -o ling3-w4a8-gptq.rad
+#
+# A routed expert's down projection takes its own Hessian where the calibration routed it enough rows,
+# the layer's pooled one otherwise (libquant says which on stderr).
+#
+# Measured on Ling-3.0-flash-Sante as ling3-w4a8-rtn.recipe is: mean KL 0.036, top-1 agreement
+# 92.96%, from 1.26M calibration tokens of medical text, documents, code, tool calls and chat.
+
+blk.*.ffn_*_exps.*.weight  gptq  codes=i4 group=128 scale=bf16 calib=$CALIB

@@ -50,7 +50,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
-namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
+namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
 namespace server { class Sink; }
 struct TierPump;
 struct TierJob;
@@ -169,6 +169,7 @@ private:
     std::vector<const char*> meta_kv_kp_, meta_kv_vp_;
 
     void (*arch_step_)(RadCtx*, const RadBatch*) = nullptr;
+    uint64_t (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
 
     int load_plugins();
     int read_metadata();
@@ -254,6 +255,11 @@ private:
      * copies are freed, because the holder that leaves last deletes the file. */
     std::vector<TableShare> table_shares_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
+    /* --ngram-placement disk=DIR: the table's own file, mapped read-only in place of the
+     * container's range (table_file_map); unmapped in ~Engine. */
+    std::vector<TableCopy> table_files_;
+    std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
+    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
@@ -431,14 +437,16 @@ private:
     int  collect_pooled_issue(const RadBatch* b, StepOut& so);
     int  collect_pooled(const RadBatch* b, StepOut& so);
     /* A generator (rad_declare_generator, rad_declare_audio_generator,
-     * rad_declare_video_generator): the driver that turns requests into passes and the loop that
-     * runs them, replacing the scheduler and step loop (engine_gen.cpp). Null for every other
-     * program. `img_gen_`, `aud_gen_` and `vid_gen_` are the same driver by its kind, for the
-     * endpoints; one of them is set when `gen_` is. */
+     * rad_declare_video_generator, rad_declare_shape_generator): the driver that turns requests
+     * into passes and the loop that runs them, replacing the scheduler and step loop
+     * (engine_gen.cpp). Null for every other program. `img_gen_`, `aud_gen_`, `vid_gen_` and
+     * `shp_gen_` are the same driver by its kind, for the endpoints; one of them is set when
+     * `gen_` is. */
     std::unique_ptr<gen::IPassDriver> gen_;
     gen::Driver*                      img_gen_ = nullptr;
     gen::AudioDriver*                 aud_gen_ = nullptr;
     gen::VideoDriver*                 vid_gen_ = nullptr;
+    gen::ShapeDriver*                 shp_gen_ = nullptr;
     int  gen_loop();
     /* Zeroes the state slots the KV manager granted since the last step, on every rank's stream,
      * before the step or pass that first reads them. */

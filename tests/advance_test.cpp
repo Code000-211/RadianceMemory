@@ -158,7 +158,7 @@ TEST(the_cards_acceptance_is_accept_greedy_and_the_end_of_generation_cut) {
         int32_t cards[Slab::kSeq];
         for (int i = 0; i < Slab::kSeq; ++i) cards[i] = i;
         for (int i = Slab::kSeq - 1; i > 0; --i) std::swap(cards[i], cards[lcg(rng) % (i + 1)]);
-        struct Want { int card, rout, acc, tok, head; } want[4];
+        struct Want { int card, rout, acc, tok, head, hrow; } want[4];
         for (int i = 0; i < n_rows; ++i) {
             const int kind = (int)(lcg(rng) % 4);      /* 0: mid-prefill, 1: last chunk, else decode */
             const int n_spec = kind >= 2 ? (int)(lcg(rng) % 9) : 0;
@@ -178,7 +178,7 @@ TEST(the_cards_acceptance_is_accept_greedy_and_the_end_of_generation_cut) {
                                                               : 1 + (int32_t)(lcg(rng) % 3);
                 if (rout >= 0) s.src[rout + j] = target[j];
             }
-            want[i] = { cards[i], rout, -1, 0, 0 };
+            want[i] = { cards[i], rout, -1, 0, 0, 0 };
             if (rout >= 0) {
                 int32_t out[9] = {}, acc = -1;
                 CHECK_OK(accept_greedy(draft, n_spec, target, out, &acc));
@@ -188,6 +188,7 @@ TEST(the_cards_acceptance_is_accept_greedy_and_the_end_of_generation_cut) {
                 want[i].acc = cut;
                 want[i].tok = out[cut];
                 want[i].head = ctx + (rtok - k) + cut;
+                want[i].hrow = rtok + cut;   /* the row of the last accepted position */
                 out_row += 1 + n_spec;
             }
             k += n_tok;
@@ -202,7 +203,8 @@ TEST(the_cards_acceptance_is_accept_greedy_and_the_end_of_generation_cut) {
                 ok = std::memcmp(&S, &untouched, sizeof S) == 0;
             } else {
                 ok = S.acc == want[i].acc && S.tok[0] == want[i].tok && S.n_acc == want[i].acc + 1 &&
-                     S.head == want[i].head && S.ctx == want[i].head + 1;
+                     S.head == want[i].head && S.ctx == want[i].head + 1 &&
+                     S.hrow == want[i].hrow;
             }
             if (!ok) {
                 bad = 1;
@@ -244,7 +246,7 @@ TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
 
         const int n_rows = 1 + (int)(lcg(rng) % 4);
         int k = 0, out_row = 0;
-        struct Want { int card, acc, tok, head; int32_t path[8]; } want[4];
+        struct Want { int card, acc, tok, head, hrow; int32_t path[8]; } want[4];
         for (int i = 0; i < n_rows; ++i) {
             const int n_spec = (int)(lcg(rng) % 9);
             const int n_tok = 1 + n_spec;
@@ -270,7 +272,8 @@ TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
             const int32_t cut = accept_cut_at_eog(out, acc, is_eog);
             deep += cut >= 2;
             cut_cases += cut < acc;
-            want[i] = { i, cut, out[cut], ctx + cut, {} };
+            /* the row of the last node on the accepted path: rows are nodes, in order */
+            want[i] = { i, cut, out[cut], ctx + cut, rtok + (cut == 0 ? 0 : path[cut - 1]), {} };
             std::memcpy(want[i].path, path, sizeof path);
             out_row += 1 + n_spec;
             k += n_tok;
@@ -279,7 +282,8 @@ TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
         for (int i = 0; i < n_rows && !bad; ++i) {
             const StepSlot& S = s.st[want[i].card];
             bool ok = S.acc == want[i].acc && S.tok[0] == want[i].tok && S.n_acc == want[i].acc + 1 &&
-                      S.head == want[i].head && S.ctx == want[i].head + 1 && S.npath == want[i].acc;
+                      S.head == want[i].head && S.ctx == want[i].head + 1 && S.npath == want[i].acc &&
+                      S.hrow == want[i].hrow;
             for (int t = 0; ok && t < want[i].acc; ++t) ok = S.path[t] == want[i].path[t];
             if (!ok) {
                 bad = 1;

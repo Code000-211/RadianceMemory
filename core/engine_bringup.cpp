@@ -11,6 +11,7 @@
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
+#include "gen/shape_driver.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -478,6 +479,35 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     }
     table_copy_of_.push_back({ src, base });
     *out = base;
+    return RAD_OK;
+}
+
+/* --ngram-placement disk=DIR: the container's [src, src + n) at file offset `foff` read from its own
+ * file, DIR/ngram-<id>.bin (the table's bytes and nothing else, the id table_share_id's: the
+ * container's path, size and mtime and the table's place in it). The first start fills it from the
+ * container through a temporary name and renames it, so a file under the real name is complete; a
+ * later start checks samples of it against the container. Mapped read-only in place of the
+ * container's range, which is all the disk gather needs: it finds the file behind the mapping and
+ * reads it directly (libavx avx_ngram.cpp, table_file). */
+int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
+                           std::string* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string id = table_share_id(file_->path(), foff, n);
+    if (id.empty()) {
+        *why = fmt("the container %s cannot be stat'ed, which names the table's file", file_->path());
+        return RAD_E_IO;
+    }
+    const std::string& dir = cfg_.ngram_disk_dir;
+    const std::string path = dir + (dir.back() == '/' ? "" : "/") + "ngram-" + id + ".bin";
+    TableCopy c;
+    bool filled = false;
+    const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
+    if (rc != RAD_OK) return rc;
+    table_files_.push_back(c);
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+             filled ? ", filled from the container" : "",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    *out = c.base;
     return RAD_OK;
 }
 
@@ -967,6 +997,7 @@ int Engine::load_plugins() {
 
     const Plugin* ap = rad_tools_registry().plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
+    arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
 }
 
@@ -1006,6 +1037,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.kv_residency = cfg_.residency_mib > 0;   /* the pager op is declared only when asked for */
+    bc.expert_file_tier = cfg_.weights_disk_tier ? 1 : 0;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
     bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
@@ -1122,6 +1154,25 @@ int Engine::declare() {
                 decide("--max-model-len", std::to_string(cfg_.max_ctx),
                        "an audio generator: the longest prompt and every frame of the longest "
                        "piece");
+            }
+            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
+        } else if (pb.gen_rows > 0 && pb.gen_shape) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "a shape generator: a denoising step's two branches or a query pass's "
+                       "points, whichever is more");
+            }
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 1;
+                decide("--max-num-seqs", "1", "a shape generator: a pass is one request's");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "a shape generator: a pass's rows");
             }
             if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
@@ -2040,6 +2091,7 @@ int Engine::plan() {
             f.staging = r->program.is_generator()       ? gen::Driver::device_bytes(r->program)
                       : r->program.is_audio_generator() ? gen::AudioDriver::device_bytes(r->program)
                       : r->program.is_video_generator() ? gen::VideoDriver::device_bytes(r->program)
+                      : r->program.is_shape_generator() ? gen::ShapeDriver::device_bytes(r->program)
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
@@ -3265,6 +3317,26 @@ int Engine::load_weights() {
                                "rows are read from the container%s", into, why.c_str(),
                                card ? " by the host gather" : ""));
                 }
+                /* --ngram-placement disk=DIR: the table's own file instead of the container. */
+                if (cfg_.ngram_resolved == TablePlacement::Disk && !cfg_.ngram_disk_dir.empty() &&
+                    is_ngram_table(r->program, (rad_weight)i) && n >= kTableShareMin) {
+                    void* m = nullptr;
+                    for (size_t k = 0; k < table_files_.size() && !m; ++k)
+                        if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;
+                    std::string why;
+                    if (!m) {
+                        const int fs = table_file_map((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
+                                                      &m, &why);
+                        if (fs != RAD_OK) {
+                            RAD_ERR("--ngram-placement disk=%s: '%s': %s",
+                                    cfg_.ngram_disk_dir.c_str(), w.name.c_str(), why.c_str());
+                            return fs;
+                        }
+                        table_file_src_.push_back(w.host_ptr);
+                    }
+                    w.ptr = m;
+                    w.host_ptr = m;
+                }
                 /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
                  * too large to be resident, so the default 128 KiB readahead would read 32 pages
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
@@ -4249,6 +4321,7 @@ int Engine::start() {
         /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
+        d.arch_pass_key = arch_pass_key_;
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
@@ -4294,10 +4367,15 @@ int Engine::start() {
                                 },
                                 &r->ctx));
         if (r->fstager.enabled() && r->index == 0)
-            RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
-                     "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+            RAD_INFO("file stager: it covers %zu routed layers (a pool-cached unit of one may "
+                     "be read from the container); each pass reads a layer's (up to %s) into one "
+                     "of two VRAM buffers before its first expert op, so every step is paced by the drive%s",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
+                     r->fstager.whole_rows() > 0
+                         ? fmt("; a pass of %lld tokens or more reads its layers whole, each "
+                               "while the card computes the one before",
+                               (long long)r->fstager.whole_rows()).c_str()
+                         : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);
@@ -4516,10 +4594,16 @@ int Engine::start() {
                      : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
+            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
+            const std::string fix = cfg_.gpu_memory_mib > 0
+                ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
+                      "for one.",
+                      (long long)(props.vram_bytes / MiB - need_head))
+                : fmt("Set --gpu-headroom-mib to at least %lld: what is left here rises with it "
+                      "one for one.", (long long)need_head);
             RAD_WARN("card %d settled at %s free against %s, which leaves %s for a kernel's first "
                      "launch to load its code object and size its scratch in -- under the %s this "
-                     "engine allows for its own. %s Set --gpu-headroom-mib to at least %lld: what "
-                     "is left here rises with it one for one.",
+                     "engine allows for its own. %s %s",
                      r->device, humanb(got).c_str(), asked.c_str(),
                      humanb(std::max<int64_t>(room, 0)).c_str(), humanb(allowance).c_str(),
                      got < want
@@ -4527,7 +4611,7 @@ int Engine::start() {
                                "another process on it or an allocation the budget does not "
                                "count.", humanb(want - got).c_str()).c_str()
                          : "",
-                     (long long)(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib));
+                     fix.c_str());
         } else if (got < want) {
             RAD_INFO("card %d settled at %s free against %s: %s of the headroom was taken after "
                      "the budget read the card, by another process on it or an allocation the "
@@ -4589,6 +4673,8 @@ int Engine::load_vocab() {
             return RAD_E_FORMAT;
         }
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), vs.h, vb));
+    } else if (meta_textless(rad_meta_gets(&meta_, "radiance.text", nullptr))) {
+        vocab_textless(vb);
     } else if (ckpt_->is_gguf()) {
         /* GGUF names its pre-tokeniser; the chain is reconstructed from the name or refused (a
          * container converted with --tokenizer bakes in the declared one). */

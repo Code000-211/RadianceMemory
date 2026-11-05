@@ -1,0 +1,20 @@
+# Ling-3.0-flash-Sante w4a8 on two cards: the same file as ling-3.0-flash-sante-w4a8.yaml. Two cards do
+# not hold all 66 GiB, so part of the routed experts stay in pinned host memory (expert_tiered, 16 GiB
+# a rank; the host needs about 40 GiB free RAM). With --max-model-len 262144 the cache holds
+# 1,048,592 tokens: four full-length sessions.
+#
+# On 2x R9700 at 215 W, BetterBench with thinking off: 157 tok/s single-stream and 249 tok/s aggregate
+# at 4 users. Prefill reads the whole cache for each query row, so it slows with depth: 4,800 tok/s at
+# 2k, 1,230 at 24k, 650 at 47k.
+name: radiance-ling-3.0-flash-sante-w4a8-tp2
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-ling-3.0-flash-sante-w4a8-tp2
+    command: >
+      --model /models/ling-3.0-flash-sante-w4a8.rad
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
+      --tp 2 --placement expert_tiered --host-pool-mib 16384
+      --max-num-seqs 4 --max-model-len 262144 --kv-cache-dtype bf16
+      --max-num-batched-tokens 2048 --num-speculative-tokens 3
+      --temp 1.0 --top-p 0.95

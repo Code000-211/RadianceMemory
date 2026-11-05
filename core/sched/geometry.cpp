@@ -9,11 +9,13 @@
 
 namespace rad {
 
-/* lcm, with a non-positive side meaning "no constraint yet". */
+/* lcm, with a non-positive side meaning "no constraint yet". The sides are plugin-declared; an lcm
+ * past int64 saturates, so the quantum check refuses it rather than wrapping to a small one. */
 static int64_t lcm64(int64_t a, int64_t b) {
     if (a <= 0) return b;
     if (b <= 0) return a;
-    return std::lcm(a, b);
+    const int64_t q = a / std::gcd(a, b);
+    return q > INT64_MAX / b ? INT64_MAX : q * b;
 }
 
 /* The op's sequence-chunk parameter, found by role (RAD_PROLE_SEQ_CHUNK) in its schema. Steps

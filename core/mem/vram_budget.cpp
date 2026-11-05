@@ -76,6 +76,21 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         if (f.unified) b.host_pinned = std::max(b.host_pinned, f.host_pinned);
     }
     if (!b.unified) b.host_pinned = 0;
+    /* --gpu-memory-mib is the inverse of --gpu-headroom-mib: N + headroom = the card, in MiB.
+     * Convert once the smallest rank capacity is known. A device that reports no capacity has
+     * nothing to claim, so the flag does not apply. */
+    if (b.capacity > 0 && cfg.gpu_memory_mib > 0) {
+        const int64_t cap_mib = b.capacity / kMiB;
+        if (cfg.gpu_memory_mib > cap_mib) {
+            b.report = fmt("--gpu-memory-mib %lld is above this card's %lld MiB",
+                           (long long)cfg.gpu_memory_mib, (long long)cap_mib);
+            if (log) RAD_ERR("%s", b.report.c_str());
+            if (out) *out = b;
+            return RAD_E_INVAL;
+        }
+        cfg.gpu_headroom_mib = cap_mib - cfg.gpu_memory_mib;
+        cfg.given["--gpu-headroom-mib"] = "derived from --gpu-memory-mib";
+    }
     b.headroom = std::max<int64_t>(cfg.gpu_headroom_mib, 0) * kMiB;
     int64_t host_reserve = 0;
     for (const VramFacts& f : per_rank) host_reserve = std::max(host_reserve, f.host_reserve);
@@ -116,6 +131,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                                 b.queues + b.prefetch + b.host_pinned);
 
     if (b.claimable < 0) {
+        const char* how = cfg.gpu_memory_mib > 0
+            ? "Raise --gpu-memory-mib, lower --max-num-batched-tokens (the arena scales with it), "
+              "or free the card.\n"
+            : "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
+              "or free the card.\n";
         b.report = fmt(
             "VRAM does not cover the fixed costs before a single pool is sized:\n"
             "  card total         %10s\n"
@@ -128,12 +148,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  expert prefetch    %10s   (its ring of expert units and buffers)\n"
             "  ------------------------------\n"
             "  short by           %10s\n"
-            "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
-            "or free the card.\n",
+            "%s",
             humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
-            humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str());
+            humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str(), how);
         if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
         return RAD_E_NOMEM;

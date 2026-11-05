@@ -1144,7 +1144,7 @@ TEST(input_reference_takes_the_models_h264_round_trip) {
     guided(v, 18);
     const std::string pic = png_rgb(301, 171, 200, 40, 90);
     HttpResponse r = v.create(Videos::body({ { "input_reference", png_url(pic) } }));
-    if (r.status == 503) return;   /* a build without libx264 refuses it, as it should */
+    if (r.status == 501) return;   /* a build without an H.264 encoder refuses it, as it should */
     REQUIRE_EQ(r.status, 200);
     const gen::VideoRequest& q = v.gen.last();
     REQUIRE_EQ(q.image.size(), (size_t)256 * 256 * 3);

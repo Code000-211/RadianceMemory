@@ -106,6 +106,12 @@ struct SamplerConfig {
     int64_t max_seqs      = 0;    /* the largest number of sequences one step may carry */
     int64_t max_hist      = 2048; /* the penalty window bound; a longer request is truncated */
     int     max_spec      = 0;
+    /* The step's token bound (--max-num-batched-tokens), 0 for none. A step samples one row per
+     * token it verifies or completes, and the model's logits rows are capped here too
+     * (rad_arch.h, max_logit_rows), so rows past it could never be staged; the planes are sized
+     * for min(max_seqs * (max_spec + 1), max(max_tok, max_seqs)). Never below max_seqs: a drafter
+     * pass stages one greedy row per sequence it drafts for (build_greedy). */
+    int64_t max_tok       = 0;
     int     rank          = 0;
     int     world_size    = 1;
     /* This rank's first vocabulary row. sample_topk adds it to the candidate ids it packs into
@@ -218,6 +224,9 @@ public:
      * meaningful only where the row carries RAD_SP_MASK. */
     const uint32_t* staged_mask(int64_t row) const { return mask_stage_ + row * mask_words_; }
     int64_t         mask_words() const { return mask_words_; }
+    /* Staged row `row`'s n-gram ban pair {n, window}, as the last build_step staged it: a greedy
+     * build leaves it, since that step's upload may not have read it yet. */
+    const int32_t*  staged_ngram(int64_t row) const { return ngram_stage_ + 2 * row; }
     /* Staged row `row`'s bound coupled state, as `run` uploads it: all-zero where the row carries
      * none (bonus row, greedy row, uncoupled step). Lets a build be checked without a device. */
     const RadMtpCoupleState& staged_couple(int64_t row) const { return couple_stage_[row]; }
@@ -267,6 +276,9 @@ private:
      * inside the block. A grammar mask on the row wins: the close is forced only where the
      * grammar admits it, otherwise at a later position. */
     void force_close(DeviceSampleParams& p, int64_t row, int32_t close);
+    /* Take `ids` out of the row: from the grammar's mask where it has one, from a full row where
+     * not. */
+    void suppress(DeviceSampleParams& p, int64_t row, const std::vector<int32_t>& ids);
 
     SamplerConfig    cfg_{};
     const VocabView* vocab_ = nullptr;
@@ -341,8 +353,9 @@ private:
     /* Whether any DRY row this step has breakers; only then is the breaker plane uploaded and
      * passed to sample_dry. */
     bool    any_brk_    = false;
-    /* Whether any row this step runs the n-gram ban. Its history is the plane the penalties use,
-     * so this only decides whether that plane is uploaded and the op issued. */
+    /* Whether any row this step runs the n-gram ban over a history at least its n-gram long; a
+     * shorter one bans nothing. Its history is the plane the penalties use, so this only decides
+     * whether that plane is uploaded and the op issued. Cleared by build_greedy. */
     bool    any_ngram_  = false;
     /* Whether any banned row this step whitelists a column of this rank's shard; only then is
      * the exemption plane uploaded and passed to sample_ngram_ban. */

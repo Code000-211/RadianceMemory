@@ -615,6 +615,34 @@ TEST(lora_map_refusals_name_the_target_the_sums_or_the_flag) {
     CHECK(!exists(d / "c.rad"));
 }
 
+/* A checkpoint tensor no declared weight reads is not written (a tower or head the plugin does not
+ * know), and the run names it; a tensor beside one that is read (its scale) is not named, nor is
+ * anything when every tensor is read. */
+TEST(a_checkpoint_tensor_no_weight_reads_is_named) {
+    World& w = world();
+    REQUIRE(w.ok);
+    CHECK(w.log.find("read by no declared weight") == std::string::npos);
+    tiny::TempDir d("convert_u");
+    const std::string ck = d / "llama";
+    REQUIRE(mkdir(ck.c_str(), 0755) == 0);
+    for (const char* f : { "config.json", "tokenizer.json" })
+        REQUIRE(copy_file(w.ckpt + "/" + f, ck + "/" + f));
+    std::vector<tiny::Tensor> ts = tiny::read_safetensors(w.ckpt + "/model.safetensors");
+    const size_t n = ts.size();
+    ts.push_back({ "model.vision_embedder.patch_dense.weight", "BF16", { 4, 4 },
+                   std::vector<uint8_t>(32, 0) });
+    ts.push_back({ "model.layers.0.mlp.down_proj.weight_scale", "BF16", { 1 },
+                   std::vector<uint8_t>(2, 0) });
+    REQUIRE(tiny::write_safetensors(ck + "/model.safetensors", ts));
+    std::string log;
+    REQUIRE_EQ(convert(ck, { "-o", d / "u.rad", "--recipe", w.recipe }, &log), 0);
+    const std::string want = "1 of " + std::to_string(n + 2) + " checkpoint tensors are read by no "
+                             "declared weight and are not written: model.vision_embedder.patch_dense.weight";
+    if (log.find(want) == std::string::npos) fprintf(stderr, "    log:\n%s\n", log.c_str());
+    CHECK(log.find(want) != std::string::npos);
+    CHECK(log.find("down_proj.weight_scale") == std::string::npos);
+}
+
 /* ================================================================== --in-place */
 
 /* Extending a container with nothing new keeps every weight at its offset, and the .pre-append

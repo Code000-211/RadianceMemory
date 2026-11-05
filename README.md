@@ -674,7 +674,7 @@ decode rows, and the sweep drains a middle in ~60 steps), how often a follow-up'
 
 | part | files |
 |---|---|
-| ABI: cold entries, batch fields, window declaration | `abi/rad_runtime.h`, `abi/rad_builder.h`, `abi/rad_abi.h` (ABI 33; the page cache 46) |
+| ABI: cold entries, batch fields, window declaration | `abi/rad_runtime.h`, `abi/rad_builder.h`, `abi/rad_abi.h` (ABI 38; the page cache 51) |
 | block states, slots, demote / promote / re-point | `core/mem/kv.{h,cpp}` |
 | host-mapped store | `core/mem/hostarena.{h,cpp}` (`open_mapped`) |
 | prefix cache with cold entries | `core/mem/prefix.{h,cpp}` |

@@ -678,6 +678,19 @@ uint64_t kf_weight_seed(const KfOperand& d, size_t k) {
     return rad_splitmix(s);
 }
 
+KfOperand kf_table_entry(const KfOperand& d) {
+    KfOperand one = d;
+    one.role = RAD_OPD_WEIGHT;
+    if (!d.shape.empty()) one.shape.assign(d.shape.begin() + 1, d.shape.end());
+    return one;
+}
+
+void kf_draw_entry_planes(const KfOperand& d, size_t k, int64_t e,
+                          std::vector<std::vector<uint8_t>>* out) {
+    uint64_t es = kf_weight_seed(d, k) ^ (0xC2B2AE3D27D4EB4Full * (uint64_t)(e + 1));
+    kf_draw_planes(kf_table_entry(d), rad_splitmix(es), out);
+}
+
 int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::string* why) {
     out->clear();
     if (!d.has_enc || d.shape.size() < 2 || d.shape[0] <= 0) {
@@ -686,21 +699,17 @@ int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::
     }
     const int64_t ne = d.shape[0];
     /* One expert: the table's selection over its shape without the leading dimension. */
-    KfOperand one = d;
-    one.role = RAD_OPD_WEIGHT;
-    one.shape.assign(d.shape.begin() + 1, d.shape.end());
+    const KfOperand one = kf_table_entry(d);
     const int64_t per = rad_dtype_bytes(d.dtype, rad_numel(one.shape));
     if (per <= 0) {
         if (why) *why = "a dtype the core cannot size";
         return RAD_E_DTYPE;
     }
     out->assign((size_t)(per * ne), 0);
-    const uint64_t base = kf_weight_seed(d, k);
     std::vector<std::vector<uint8_t>> pl;
     std::vector<uint8_t> logical;
     for (int64_t e = 0; e < ne; ++e) {
-        uint64_t es = base ^ (0xC2B2AE3D27D4EB4Full * (uint64_t)(e + 1));
-        kf_draw_planes(one, rad_splitmix(es), &pl);
+        kf_draw_entry_planes(d, k, e, &pl);
         std::string w;
         const int rc = kf_planes_logical(one, pl, &logical, &w);
         if (rc != RAD_OK || (int64_t)logical.size() != per) {
@@ -710,6 +719,38 @@ int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::
             return rc != RAD_OK ? rc : RAD_E_SHAPE;
         }
         std::memcpy(out->data() + per * e, logical.data(), (size_t)per);
+    }
+    return RAD_OK;
+}
+
+int kf_lay_table(const RadKernelInfo* info, const RadParam* p, int n_p, int operand,
+                 const KfOperand& d, const KfEntryPlanes& planes, RadLayout* lay,
+                 std::vector<uint8_t>* out) {
+    out->clear();
+    if (!info || !info->layout || !d.has_enc) return RAD_E_UNSUPPORTED;
+    if (d.shape.size() < 2 || d.shape[0] <= 0) return RAD_E_SHAPE;
+    const KfOperand one = kf_table_entry(d);
+    std::vector<std::vector<uint8_t>> pl;
+    std::vector<uint8_t> laid;
+    for (int64_t e = 0; e < d.shape[0]; ++e) {
+        int rc = planes(e, &pl);
+        if (rc != RAD_OK) return rc;
+        RadLayout le{};
+        rc = kf_lay_weight(info, p, n_p, operand, one, pl, &le, &laid);
+        if (rc != RAD_OK) return rc;
+        if (e == 0) {
+            /* The kernel strides a stacked table by the declared entry in the stored dtype, so a
+             * layout that changes an entry's size (an fp8 lm_head's appended scales) cannot be
+             * stacked. A plugin-private dtype has no size the core knows; its kernel reads the
+             * entry it laid out. */
+            const int64_t declared = rad_dtype_bytes(le.dtype, rad_numel(one.shape));
+            if (declared > 0 && declared != le.bytes) return RAD_E_SHAPE;
+            *lay = le;
+            out->reserve((size_t)(le.bytes * d.shape[0]));
+        } else if (le.bytes != lay->bytes || le.dtype != lay->dtype) {
+            return RAD_E_SHAPE;
+        }
+        out->insert(out->end(), laid.begin(), laid.end());
     }
     return RAD_OK;
 }

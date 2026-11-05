@@ -262,6 +262,38 @@ TEST(a_stacked_vector_is_cut_in_every_part) {
     CHECK(why.find("declared parts") != std::string::npos);
 }
 
+/* A vector's parts may differ in width: a Mamba convolution's bias is [x | B | C], and a rank takes
+ * its heads' x and its groups' B and C. The parts lie end to end as one row of the share. */
+TEST(a_stacked_vector_may_have_parts_of_different_widths) {
+    const RadEncoding e = rad_enc_plain(RAD_BF16);
+    WeightInfo w;
+    w.enc = e;
+    w.enc_known = true;
+    w.decl.shard = RAD_SHARD_ROW;
+    w.decl.rank = 1;
+    w.decl.shape[0] = 12;
+    w.decl.n_row_parts = 3;
+    w.decl.row_parts[0] = 8;
+    w.decl.row_parts[1] = 2;
+    w.decl.row_parts[2] = 2;
+    w.n_sel = 1;
+    w.sel[0] = 0;
+    w.sel_rows[0] = 1;
+    w.sel_cols[0] = 12;
+    /* entry [24]: x 0..15, B 16..19, C 20..23; rank 1 owns x 8..15, B 18..19 and C 22..23 */
+    const int64_t shape[1] = { 24 };
+    PlaneShare s[RAD_ENC_MAX_PLANES];
+    REQUIRE_EQ(weight_share(w, e, 1, shape, 2, 1, s, nullptr), RAD_OK);
+    REQUIRE_EQ(s[0].rects.size(), (size_t)3);
+    CHECK_EQ(s[0].rects[0].byte0, (int64_t)(8 * 2));
+    CHECK_EQ(s[0].rects[0].bytes, (int64_t)(8 * 2));
+    CHECK_EQ(s[0].rects[1].byte0, (int64_t)(18 * 2));
+    CHECK_EQ(s[0].rects[1].bytes, (int64_t)(2 * 2));
+    CHECK_EQ(s[0].rects[2].byte0, (int64_t)(22 * 2));
+    CHECK_EQ(s[0].rects[2].bytes, (int64_t)(2 * 2));
+    CHECK_EQ(s[0].dense_bytes(), (int64_t)(12 * 2));
+}
+
 /* A reshape: a conv kernel [O, C, T, H, W] declared as the [O, C*T*H*W] matrix it is. The bytes
  * do not move, so the share is the whole plane in the declared view; a shard of a reshape would
  * be a different cut, so it is refused. */

@@ -33,7 +33,8 @@
     { "tcq_rb", RAD_P_INT, "0",                                                                \
       "R: a trellis's values on the int8 grid of one scale per R rows (the block's largest)" },  \
     { "tcq_code", RAD_P_STR, nullptr,                                                          \
-      "mad: the states' values computed, bytesum((st*A+B) & 0x3F3F3F3F) - 126 (no tcq_lut=)" }, \
+      "mad: the states' values computed, bytesum((st*A+B) & 0x3F3F3F3F) - 126 (no tcq_lut=); "  \
+      "mad16: bytesum(st*A+B) - 510, wider than int8, for the 16-bit path (gptqsim only)" },     \
     { "tcq_a", RAD_P_INT, "11872635", "tcq_code=mad's multiplier A (24 bits)" },               \
     { "tcq_b", RAD_P_INT, "625341585", "tcq_code=mad's addend B" },                             \
     { "tcq_colf", RAD_P_INT, "0",                                                              \

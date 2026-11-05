@@ -220,6 +220,12 @@ void Server::handle_realtime(const HttpRequest& req, WsConn& ws) {
                       "this model does not transcribe: its architecture plugin states no "
                       "transcription format (rad_arch_audio_format), or it was started without "
                       "its audio encoder", 1008);
+    /* An open turn is cut at the encoder's clip length; without one it would grow for as long as
+     * the client appends audio. */
+    if (deps_.mm->audio_max_samples() <= 0)
+        return refuse("invalid_request_error", "model_not_supported",
+                      "this model's audio encoder states no clip length, which a realtime turn "
+                      "is cut at", 1008);
     /* A session holds a connection's thread and one of its own for its whole life, and runs one
      * pass at a time: more sessions than the engine has sequences would only queue. */
     const int64_t cap = std::max<int64_t>(1, opt_.max_seqs);

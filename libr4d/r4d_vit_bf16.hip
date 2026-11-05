@@ -170,6 +170,54 @@ __global__ __launch_bounds__(kThr) void grid_embed_aa_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- grid_embed_cpe
+// ref_grid_embed_cpe: RADIO's cropped position embedding, torch's half-pixel bilinear without
+// antialias onto a square of the grid's larger side, cropped to the grid. Two taps an axis, the
+// row blended first as libref does; rounded once before the add.
+__device__ __forceinline__ void cpe_taps(int at, int d, int side, int* t, float* w) {
+    d = d < 1 ? 1 : d;
+    at = at < 0 ? 0 : (at >= d ? d - 1 : at);
+    float src = (float)side / (float)d * ((float)at + 0.5f) - 0.5f;
+    src = src < 0.0f ? 0.0f : src;
+    int i0 = (int)src;
+    i0 = i0 > side - 1 ? side - 1 : i0;
+    t[0] = i0;
+    t[1] = i0 < side - 1 ? i0 + 1 : i0;
+    w[1] = src - (float)i0;
+    w[0] = 1.0f - w[1];
+}
+
+template <bool TF32>
+__global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
+    unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
+    uint32_t n, int side, uint32_t x_ld, uint32_t plane, const unsigned short* __restrict__ pre,
+    int npre) {
+    const uint32_t m = blockIdx.x;
+    const int g[4] = { crd[m], crd[plane + m], crd[2 * plane + m], crd[3 * plane + m] };
+    unsigned short* __restrict__ xr = x + (size_t)m * x_ld;
+    if (g[0] < 0) {
+        // A row ahead of its segment's patches: the learned bf16 row its column names.
+        if (!pre || npre <= 0) return;
+        const int k = g[1] < 0 ? 0 : (g[1] >= npre ? npre - 1 : g[1]);
+        for (uint32_t i = threadIdx.x; i < n; i += kThr)
+            xr[i] = f32_to_bf16(bf2f(xr[i]) + bf2f(pre[(size_t)k * n + i]));
+        return;
+    }
+    const int d = g[2] > g[3] ? g[2] : g[3];
+    int th[2], tw[2];
+    float wh[2], ww[2];
+    cpe_taps(g[0], d, side, th, wh);
+    cpe_taps(g[1], d, side, tw, ww);
+    for (uint32_t i = threadIdx.x; i < n; i += kThr) {
+        const float r0 = ww[0] * ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[0]) * n + i) +
+                         ww[1] * ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[1]) * n + i);
+        const float r1 = ww[0] * ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[0]) * n + i) +
+                         ww[1] * ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[1]) * n + i);
+        const float pe = bf2f(f32_to_bf16(wh[0] * r0 + wh[1] * r1));
+        xr[i] = f32_to_bf16(bf2f(xr[i]) + pe);
+    }
+}
+
 // ---------------------------------------------------------------------------- gemm_nt_bias
 #define VB_BK 64
 #define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows, as in gemm_bf16_nt_tiled (bank spread)
@@ -619,6 +667,41 @@ extern "C" int r4d_rad_grid_embed_aa(const RadArgs* a, RadStream stream) {
     return R4D_EMIT(stream, grid_embed_aa_kernel<false>, dim3((uint32_t)M), dim3(kThr), lds,
                     (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
+}
+
+/* grid_embed_cpe: grid_embed's operands and checks, RADIO's cropped resample. */
+extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
+    const RadTensor* x   = r4d_opt(a, GE_X);
+    const RadTensor* tab = r4d_opt(a, GE_TAB);
+    const RadTensor* crd = r4d_opt(a, GE_CRD);
+    if (!x || !tab || !crd) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || crd->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (tab->dtype != RAD_BF16 && tab->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(tab)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(tab, (int)tab->rank - 1));
+    const long long side = r4d_geti_or(a, "side", 0);
+    if (n <= 0 || side <= 0 || r4d_numel(tab) < side * side * n) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < M || !r4d_contig(crd))
+        return R4D_NO(RAD_E_SHAPE);
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t plane = (uint32_t)crd->shape[1];
+    /* The prefix rows: bf16, contiguous, n_prefix rows of n. */
+    const long long npre = r4d_geti_or(a, "n_prefix", 0);
+    const RadTensor* pre = npre > 0 ? r4d_opt(a, 3) : nullptr;
+    if (npre > 0 && (!pre || pre->dtype != RAD_BF16 || !r4d_contig(pre) ||
+                     r4d_numel(pre) < npre * n))
+        return R4D_NO(pre && pre->dtype != RAD_BF16 ? RAD_E_DTYPE : RAD_E_SHAPE);
+    const unsigned short* pp = pre ? (const unsigned short*)r4d_p(pre) : nullptr;
+    if (tab->dtype == RAD_F32)
+        return R4D_EMIT(stream, grid_embed_cpe_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+                        (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                        (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
+    return R4D_EMIT(stream, grid_embed_cpe_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+                    (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                    (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
 }
 
 /* ------------------------------------------------------------------ gemm_nt_bias */

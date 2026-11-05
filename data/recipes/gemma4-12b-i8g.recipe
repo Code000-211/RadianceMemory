@@ -1,0 +1,18 @@
+# gemma4-12b-i8g.recipe -- Gemma 4 12B ("unified": text, images, audio, Google's assistant head) from its bf16
+# release: every trunk linear int8 with a bf16 scale per 128 columns, served at i8a8, the trunk's and the
+# assistant's lm_heads int8; the assistant's layers and the image and audio embedders bf16, the position
+# table's two taps stored bf16 (gemma4-12b-bf16.recipe).
+#
+#   rad-convert <gemma-4-12B-it> --draft-model <gemma-4-12B-it-assistant> \
+#       --recipe data/recipes/gemma4-12b-i8g.recipe \
+#       --set quantization_config.quant_method=compressed-tensors -o gemma4-12b-i8g.rad
+
+blk.*.attn_qkv.weight    rtn  codes=i8 group=128 scale=bf16
+blk.*.attn_o.weight      rtn  codes=i8 group=128 scale=bf16
+blk.*.ffn_down.weight    rtn  codes=i8 group=128 scale=bf16
+blk.*.ffn_gate_up.weight rtn  codes=i8 group=128 scale=bf16
+
+output.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+mtp.output.weight        rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+v.pos_*.weight           cast dtype=bf16

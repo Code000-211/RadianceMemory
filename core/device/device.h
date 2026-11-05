@@ -406,7 +406,8 @@ int64_t dev_stuck_ms();
 constexpr int kTapeOverlapRun = 6;
 
 /* ------------------------------------------------------------------ the allocation ledger
- * What rad_dev_alloc has handed out since process start, by RAD_MEM_* kind. It does not see a
+ * By RAD_MEM_* kind: the bytes rad_dev_alloc has handed out and rad_dev_free has not taken back,
+ * and the number of allocations since process start. It does not see a
  * kernel plugin that calls hipMalloc directly; see the ledger in dispatch.cpp. */
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count);
 

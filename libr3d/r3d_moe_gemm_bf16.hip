@@ -3,8 +3,9 @@
  *   y[i, n] = sum_k a[tok(i), k] * w_e[n, k],   e = the expert of sorted row i
  *
  * One block per 16 expert-sorted rows, walking the runs (contiguous rows per expert) in its tile.
- * bf16 activation, bf16 weight as the checkpoint stores it ([n_expert, N, K] row-major, no layout
- * hook, every expert in class 0), f32 accumulate over the whole of K, bf16 out. The 16-row tile is
+ * bf16 activation, bf16 weight as the checkpoint stores it (each expert an [N, K] row-major entry
+ * of one weight table, r3d_moe_tab.h; no layout hook, every expert in class 0), f32 accumulate over
+ * the whole of K, bf16 out. The 16-row tile is
  * the same run-walk / gather structure as moe_gemm_q, minus the E4M3 decode and the scale fold:
  * the operands are bf16, so they stage to LDS and load straight into the bf16 wave-matrix
  * fragments (v_wmma_f32_16x16x16_bf16, f32 accumulate).
@@ -18,6 +19,7 @@
 #include "r3d_common.h"
 #include "r3d_codecs.h"
 #include "r3d_launch.h"
+#include "r3d_moe_tab.h"
 
 namespace {
 
@@ -87,11 +89,11 @@ __device__ __forceinline__ float r3d_moe_acc_read(const typename R3dMoeAcc<ACC>:
 __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves)                                      \
 __attribute__((amdgpu_num_vgpr(MBE_VGPR))) void MBE_KNAME(                                   \
     const uint16_t* __restrict__ a,                                                           \
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,                      \
-    const uint16_t* __restrict__ w,                                                           \
-    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int w_ld, int y_ld,              \
-    int n_expert, int top_k)                                                                  \
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dTab tw,           \
+    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int y_ld,                        \
+    int n_expert, int top_k, int a_sorted)                                                    \
 {                                                                                             \
+    const int w_ld = tw.ld;                  /* elements between an expert's rows */         \
     constexpr int kMBlock = MBE_MR;          /* a block is MBE_MR rows x 128 cols */              \
     constexpr int kRB     = MBE_MR / 16;     /* row-blocks a wave accumulates */              \
     constexpr int kStageA = MBE_MR * kDW / kThreads;   /* dwords a thread stages of the activation */ \
@@ -114,7 +116,7 @@ __attribute__((amdgpu_num_vgpr(MBE_VGPR))) void MBE_KNAME(                      
     if (tid < kMBlock) {                                                          \
         const uint32_t i = r0 + tid;                                              \
         const int32_t f = (i < (uint32_t)T) ? sorted[i] : -1;                     \
-        s_tok[tid] = (f < 0) ? -1 : (f / top_k);                                  \
+        s_tok[tid] = (f < 0) ? -1 : (a_sorted ? (int32_t)i : f / top_k);         \
     }                                                                             \
     /* The runs in [r0, r1): each a contiguous set of rows for one expert. The block walks them. */ \
     if (tid == 0) {                                                               \
@@ -143,7 +145,7 @@ __attribute__((amdgpu_num_vgpr(MBE_VGPR))) void MBE_KNAME(                      
         for (int rb = 0; rb < kRB; ++rb)                                          \
             acc[rb] = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };           \
         if (e >= 0) {                                                        \
-        const uint16_t* wbase = w + (size_t)e * (size_t)N * w_ld;                 \
+        const uint16_t* wbase = (const uint16_t*)r3d_tab_at(tw, e);              \
                                                                                  \
         const int ntile = (K + kKT - 1) / kKT;                                    \
         /* Prologue: stage tile 0 into buffer 0. */                               \
@@ -289,21 +291,19 @@ extern "C" {
 
 int r3d_rad_moe_gemm_bf16(const RadArgs* a, RadStream s)
 {
-    if (!a || a->n_t < 5) return R3D_NO(RAD_E_INVAL);
-    const RadTensor* at = r3d_opt(a, 0), *wt = r3d_opt(a, 1), *st = r3d_opt(a, 2),
-                    *ot = r3d_opt(a, 3), *yt = r3d_opt(a, 4);
-    if (!r3d_p(at) || !r3d_p(wt) || !r3d_p(st) || !r3d_p(ot) || !r3d_wp(yt))
-        return R3D_NO(RAD_E_INVAL);
-    long long M = 0, K = 0;
-    if (r3d_rows_of(at, &M, &K) != 0) return R3D_NO(RAD_E_INVAL);
-    const long long T = (st->rank >= 1) ? st->shape[0] : 0;
-    const long long N = (wt->rank >= 3) ? wt->shape[1] : 0;
-    if (M <= 0 || T <= 0 || N <= 0 || K <= 0 || (K & 63)) return R3D_NO(RAD_E_SHAPE);   // N tail clamps
-    const int n_expert = (int)r3d_geti_or(a, "n_expert", 1);
-    const int top_k = (int)r3d_geti_or(a, "top_k", 1);
-    const int a_ld = (int)at->stride[0];
-    const int w_ld = (int)wt->shape[2];
-    const int y_ld = (int)yt->stride[0];
+    R3dMoeCall mc;
+    int rc = r3d_moe_call(a, false, &mc);
+    if (rc != RAD_OK) return rc;
+    if (mc.a->dtype != RAD_BF16 || mc.y->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
+    const long long T = mc.T, N = mc.N, K = mc.K;
+    if (K & 63) return R3D_NO(RAD_E_SHAPE);   // N tail clamps
+    R3dTab tw;
+    rc = r3d_tab_of(mc.w, RAD_BF16, 16, mc.n_expert, N, K, &tw);
+    if (rc != RAD_OK) return rc;
+    const int n_expert = (int)mc.n_expert, top_k = (int)mc.top_k, a_sorted = mc.a_sorted;
+    const int a_ld = (int)mc.a->stride[0];
+    const int y_ld = (int)mc.y->stride[0];
+    const RadTensor *at = mc.a, *st = mc.sorted, *ot = mc.off, *yt = mc.y;
 
     R3dMoeCfg c; r3d_cfg_moe(a, &c);   // the tune's row count (16, 32 or 64), 64 untuned
 #define R3D_LM(MR, KERN)                                                                            \
@@ -311,9 +311,8 @@ int r3d_rad_moe_gemm_bf16(const RadArgs* a, RadStream s)
         dim3 grid((unsigned)((N + kNBlock - 1) / kNBlock), (unsigned)((T + MR - 1) / MR)),          \
              blk(kThreads);                                                                         \
         KERN<<<grid, blk, 0, (hipStream_t)s>>>(                                                     \
-            (const uint16_t*)r3d_p(at), (const int32_t*)r3d_p(st), (const int32_t*)r3d_p(ot),       \
-            (const uint16_t*)r3d_p(wt), (uint16_t*)r3d_wp(yt), (int)T, (int)N, (int)K, a_ld, w_ld,  \
-            y_ld, n_expert, top_k);                                                                 \
+            (const uint16_t*)r3d_p(at), (const int32_t*)r3d_p(st), (const int32_t*)r3d_p(ot), tw,   \
+            (uint16_t*)r3d_wp(yt), (int)T, (int)N, (int)K, a_ld, y_ld, n_expert, top_k, a_sorted);  \
     } while (0)
     if (c.mrows <= 16) {
         if (c.acc) R3D_LM(16, moe_bf16_kernel16_a1);

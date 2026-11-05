@@ -97,7 +97,10 @@ static const Flag g_flags[] = {
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
                                         "keys, no reconvert (docs/YARN.md); none: off" },
 
-    { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
+    { "--gpu-memory-mib",     "N",      "VRAM claimed on every card; the rest is left unclaimed.\n"
+                                        "Not with --gpu-headroom-mib" },
+    { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96).\n"
+                                        "Not with --gpu-memory-mib" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
@@ -1251,14 +1254,15 @@ int config_parse(int argc, char** argv, Config* c) {
          * old launch lines at the flags that move the split. */
         else if (S("--vram-weights-mib") || S("--vram-kv-mib")) {
             RAD_ERR("%s was removed: the card is split between the weights and the cache from what "
-                    "the model needs. --gpu-headroom-mib takes card space away, --max-model-len and "
-                    "--max-num-seqs bound the cache, and --host-pool-mib decides which experts stay "
-                    "on the card", a.c_str());
+                    "the model needs. --gpu-headroom-mib or --gpu-memory-mib take card space away, "
+                    "--max-model-len and --max-num-seqs bound the cache, and --host-pool-mib "
+                    "decides which experts stay on the card", a.c_str());
             return RAD_E_INVAL;
         }
         /* --gpu-headroom is accepted as an alias of --gpu-headroom-mib. */
         else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
                                                { if (!num(0, INT64_MAX, &c->gpu_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--gpu-memory-mib"))         { if (!num(1, INT64_MAX, &c->gpu_memory_mib)) return RAD_E_INVAL; }
         else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1397,7 +1401,7 @@ int config_parse(int argc, char** argv, Config* c) {
                     RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
                 return RAD_E_INVAL;
             }
-            std::string share_dir;
+            std::string share_dir, disk_dir;
             if (!emb && !std::strncmp(v, "ram=", 4)) {
                 share_dir = v + 4;
                 if (share_dir.empty()) {
@@ -1406,11 +1410,23 @@ int config_parse(int argc, char** argv, Config* c) {
                     return RAD_E_INVAL;
                 }
                 p = TablePlacement::Ram;
+            } else if (!emb && !std::strncmp(v, "disk=", 5)) {
+                disk_dir = v + 5;
+                if (disk_dir.empty()) {
+                    RAD_ERR("--ngram-placement disk= needs a directory: disk=DIR, where the table "
+                            "is read from its own file");
+                    return RAD_E_INVAL;
+                }
+                p = TablePlacement::Disk;
             } else if (!emb && !parse_table_placement(v, &p)) {
-                RAD_ERR("%s takes auto, vram, ram, ram=DIR or disk, not '%s'", a.c_str(), v);
+                RAD_ERR("%s takes auto, vram, ram, ram=DIR, disk or disk=DIR, not '%s'", a.c_str(),
+                        v);
                 return RAD_E_INVAL;
             }
-            if (!emb) c->ngram_share_dir = share_dir;
+            if (!emb) {
+                c->ngram_share_dir = share_dir;
+                c->ngram_disk_dir = disk_dir;
+            }
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
         }
@@ -1890,6 +1906,14 @@ int config_parse(int argc, char** argv, Config* c) {
         return RAD_E_INVAL;
     }
 
+    /* --gpu-memory-mib claims the card; --gpu-headroom-mib leaves it unclaimed. The alias
+     * --gpu-headroom is recorded as --gpu-headroom-mib, so it is covered. */
+    if (c->given.count("--gpu-memory-mib") && c->given.count("--gpu-headroom-mib")) {
+        RAD_ERR("--gpu-memory-mib claims the card and --gpu-headroom-mib leaves it unclaimed; "
+                "give one");
+        return RAD_E_INVAL;
+    }
+
     /* Prompt lookup alone: the window is its K, stated once. */
     if (c->spec_ngram_min > c->spec_ngram_max) {
         RAD_ERR("--spec-ngram-min %d is longer than --spec-ngram-max %d", c->spec_ngram_min,
@@ -2114,6 +2138,8 @@ const ShowRow kShow[] = {
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },
     { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
+    { "--gpu-memory-mib",     [](const Config& c) {
+          return c.gpu_memory_mib ? num(c.gpu_memory_mib) : std::string("0 (use --gpu-headroom-mib)"); } },
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
     { "--kv-recipe",          [](const Config& c) { return or_none(c.kv_recipe_path, "none"); } },
@@ -2130,7 +2156,8 @@ const ShowRow kShow[] = {
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) {
           std::string v = table_placement_name(c.ngram_placement);
-          return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
+          const std::string& dir = c.ngram_share_dir.empty() ? c.ngram_disk_dir : c.ngram_share_dir;
+          return dir.empty() ? v : v + "=" + dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--prefix-cache-mib",   [](const Config& c) {

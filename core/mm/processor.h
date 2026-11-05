@@ -50,6 +50,8 @@ enum class Kind { Image, Video, Audio };
  *           channel) as 2 * (u / 255) - 1, the reference model's own input scaling; a video is
  *           frames sampled at `fps` (at most `max_frames`, thinned evenly), each its own segment
  *           at the per-frame budget, each spelled <boi> placeholders <eoi> with no timestamp.
+ *           Gemma 4 12B ("unified", no tower) is the same with a whole pooling window as one
+ *           patch (patch = 48, merge 1) and its values u / 255 (`unit_pixels`).
  *   Lfm2    LFM2-VL's: a picture within its token budget (times a tolerance) is resized whole --
  *           sides multiples of patch * merge, pixels within the budget's band -- and one past it
  *           is cut into tile x tile crops, min_tiles..max_tiles of them in the ratio nearest its
@@ -79,8 +81,19 @@ enum class Kind { Image, Video, Audio };
  *   Pixtral  Nemotron 3.5's noncausal Mistral3 wrapper: longest-edge resize, then ceil each side
  *           to patch * merge; PIL bicubic and CLIP normalization. Raster (channel, y, x) patches;
  *           image placeholders per merged grid row, each followed by IMG_BREAK (last: IMG_END).
- *           Every token has ordinary 1-D positions, and separators retain their token embedding. */
-enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral };
+ *           Every token has ordinary 1-D positions, and separators retain their token embedding.
+ *   Radio   NVIDIA's Nemotron-H Omni with C-RADIO: a picture becomes one tile whose patch grid
+ *           falls between min_num_patches and max_num_patches, aspect ratio kept and both sides
+ *           even (the pixel shuffle's factor), resized with torch's antialiased bicubic on float
+ *           pixels; a video frame the same at about video_target_num_patches. Values are
+ *           (u / 255 - mean) / std in f32, rounded to bf16. A patch row is the tubelet's frames
+ *           (frame, channel, y, x) and then the picture's (channel, y, x), the part not in use
+ *           zero, so one embedding GEMM serves both projections. Each segment carries `n_prefix`
+ *           zero rows ahead of its patches, which the tower fills with its class and register
+ *           tokens. Pictures are spelled <img> placeholders </img>; a video one such run a
+ *           tubelet, each after its "Frame i sampled at T seconds and frame i+1 ...: " label,
+ *           runs joined by a newline. Tokens at their positions (NoPE). */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -88,6 +101,8 @@ struct VisionConfig {
     /* Gemma4: soft tokens (output rows) an image and a video frame may take. One of 70, 140,
      * 280, 560, 1120, the budgets the model was trained at. */
     int32_t image_soft_tokens = 0, video_soft_tokens = 0;
+    /* Gemma4: patch values u / 255 rather than 2 * (u / 255) - 1 (the 12B's embedder). */
+    bool    unit_pixels = false;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
     /* Glm5Next: the band an image's canvas falls in, in output rows (tokens). */
@@ -104,6 +119,11 @@ struct VisionConfig {
     /* Lfm2: the tiling (see Family). `max_segment_patches` is the tower's longest segment. */
     int32_t min_tiles = 0, max_tiles = 0, tile = 0;
     bool    use_thumbnail = false;
+    /* Radio: a picture's patch budget [radio_min_patches, radio_max_patches] (with the global cap
+     * radio_max_len tokens), the per-frame target of a video, the frames a tubelet packs and the
+     * learned rows (class and register tokens) a segment carries ahead of its patches. */
+    int32_t radio_min_patches = 0, radio_max_patches = 0, radio_max_len = 0;
+    int32_t radio_video_patches = 0, radio_tubelet = 0, radio_prefix = 0;
     double  max_pixels_tolerance = 0.0;
     int64_t max_segment_patches = 0;
 
@@ -135,7 +155,11 @@ struct VisionConfig {
      * engine again after command-line overrides. */
     int check(std::string* why) const;
 
-    int64_t patch_dim() const { return 3LL * temporal * patch * patch; }
+    int64_t patch_dim() const {
+        /* Radio's row is a tubelet's frames and then the picture's patch (Family::Radio). */
+        if (family == Family::Radio) return 3LL * (1 + radio_tubelet) * patch * patch;
+        return 3LL * temporal * patch * patch;
+    }
     int32_t factor() const { return patch * merge; }
 
     /* Read from the container; refuses one with no vision tower. Processor-only keys the
@@ -165,6 +189,9 @@ struct ImageMode {
  *             through an fft-point FFT, magnitudes through an HTK mel bank, log(x + mel_floor).
  *             The clip's real frames, then zero frames to whole output rows.
  *
+ *   Gemma4Unified  Gemma4UnifiedAudioFeatureExtractor (the 12B's): no spectrum; a frame is
+ *             `frame_length` samples as they are, the last zero-padded, one frame a row.
+ *
  *   Qwen3ASR  Qwen3ASRFeatureExtractor (Whisper's): a clip shorter than `min_samples` is
  *             zero-padded to it; frames are torch.stft's, centred with a reflected n_fft / 2 at
  *             each end, a periodic Hann window and power spectra, the last frame dropped, so n
@@ -176,7 +203,7 @@ struct ImageMode {
  *             padding, and, where that exceeds a whole chunk, frames past it that the encoder
  *             reads as zero. Plane 1 of the coordinates marks those (RadBatch::enc_coord), which
  *             keeps one chunk's convolution from seeing the next. */
-enum class AudioFamily { Gemma4, Qwen3ASR };
+enum class AudioFamily { Gemma4, Qwen3ASR, Gemma4Unified };
 
 /* Audio features, configured from the container: Gemma 4's framing from `preprocessor.*` (the
  * checkpoint's preprocessor_config.json), Qwen3-ASR's from `processor.feature_extractor.*`
@@ -257,6 +284,10 @@ struct Item {
     /* Patches are in raster order (row by row), not merge-block order: the coordinate planes
      * invert the one or the other (Unlimited-OCR's tower reads a picture patch by patch). */
     bool patch_raster = false;
+    /* Rows ahead of each segment's patches that the encoder fills itself (Family::Radio: C-RADIO's
+     * class and register tokens): zero pixels, coordinate (-1, k), counted in patch_at and
+     * n_patch but never in a segment's output rows. */
+    int32_t seg_prefix = 0;
 
     int32_t seg_h(int32_t s) const { return segments.empty() ? grid_h : segments[(size_t)s].h; }
     int32_t seg_w(int32_t s) const { return segments.empty() ? grid_w : segments[(size_t)s].w; }
@@ -265,7 +296,7 @@ struct Item {
     bool seg_is_sep(int32_t s) const { return !segments.empty() && segments[(size_t)s].sep; }
     /* Segment s's first patch and first output row; s == n_seg is the end of the item. */
     int64_t patch_at(int32_t s) const {
-        if (segments.empty()) return (int64_t)s * grid_h * grid_w;
+        if (segments.empty()) return (int64_t)s * (seg_prefix + (int64_t)grid_h * grid_w);
         return s >= n_seg ? n_patch : segments[(size_t)s].patch0;
     }
     int64_t row_at(int32_t s) const {
@@ -424,6 +455,8 @@ private:
                            std::string* why) const;
     int image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int video_radio(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
     std::vector<int32_t> tok_tiles_;
@@ -434,6 +467,8 @@ private:
     bool         audio_on_ = false;
     int audio_qwen3asr(const std::vector<float>& samples, std::shared_ptr<Item>* out,
                        std::string* why) const;
+    int audio_unified(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                      std::string* why) const;
 
     std::vector<float>  hann_;          /* the window, float32 as the reference stores it */
     std::vector<double> mel_;           /* [n_mels, fft/2 + 1]: filter b's weight on bin k */
@@ -459,6 +494,15 @@ std::vector<int64_t> sample_frames_gemma4(const VideoInfo& info, double fps, int
  * within `max_patches`, aspect ratio kept (get_aspect_ratio_preserving_size). */
 int gemma4_size(int64_t h, int64_t w, int32_t patch, int32_t pool, int64_t max_patches,
                 int64_t* oh, int64_t* ow, std::string* why);
+/* Radio's tile for a picture of w x h pixels (NVIDIA's _compute_target_patches, Python's
+ * round-half-even included) and for a video frame (_compute_target_patches_video), in patches. */
+void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp);
+void radio_video_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp);
+/* torch's F.interpolate(mode="bicubic", align_corners=False, antialias=True) of packed RGB bytes
+ * taken as float, without rounding or clamping: [h, w, 3] f32 in 0..255 give or take the
+ * filter's overshoot. Separable, width first, as ATen's CPU kernel; a side that keeps its size is
+ * the identity. */
+void resize_bicubic_aa_f32(const Frame& in, int32_t w, int32_t h, std::vector<float>* out);
 /* PIL's antialiased bicubic resample of packed RGB, bit for bit: fixed-point coefficients, a
  * horizontal pass into an 8-bit intermediate and then a vertical one. */
 void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out);

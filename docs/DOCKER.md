@@ -7,7 +7,8 @@ Docker, an AMD GPU and an `amdgpu` kernel driver that supports ROCm 10.1. It doe
 compiler or FFmpeg.
 
 The image is published as [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance),
-with its kernels built for `gfx1201`: `docker pull stilldeadcode/radiance`. Build it yourself for
+with its kernels built for RDNA4 (`gfx1201`, libr4d), RDNA3 (`gfx11-generic`, libr3d) and Strix Halo
+(`gfx1151`, libhalo): `docker pull stilldeadcode/radiance`. Build it yourself for
 other cards or another commit. The examples below use `radiance`, the tag a local build gets; with
 the published image, write `stilldeadcode/radiance` instead.
 
@@ -26,7 +27,7 @@ docker/build.sh -j 8                   # cap compile jobs (a device kernel takes
 docker/build.sh -J 4                   # tests at a time (default: the compile jobs)
 docker/build.sh -B 5                   # every test's CPU budget times 5, for a host slower per thread
 docker/build.sh -E tokenizer_perf_test # leave tests matching a regex out of the test stage
-docker/build.sh -t 'gfx1200;gfx1201'   # GPU architectures to compile kernels for (default gfx1201)
+docker/build.sh -t 'gfx1200;gfx1201'   # GPU architectures (default 'gfx1201;gfx11-generic;gfx1151')
 docker/build.sh -r <commit>            # any other commit
 docker/build.sh --target build         # stop at a stage, tagged radiance-<stage>
 ```
@@ -143,13 +144,18 @@ the cards the engine runs on.
 | `sage-a1.5-mxfp4-df2.yaml` | `sage-a1.5-mxfp4-df2.rad` | The same with the trunk, the experts and the drafter at MXFP4; ten 262,144-token sessions |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
+| `qwen3.8-27b-iqr-v4.yaml` | `qwen3.8-27b-${IQR_V4}.rad` | Qwen3.8-27B in IQR-V4 at the size `IQR_V4` names (default `iq4r-s-v4`), its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-paro.yaml` | `qwen3.8-27b-paro-int4.rad` | Qwen3.8-27B ParoQuant int4 (learned rotations) with its DFlash2 drafter and vision tower, on one card; the int5 and MXFP4 containers serve from it too |
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
 | `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |
 | `gemma4-31b-heretic-ara-w4a8.yaml` | `gemma4-31b-heretic-ara-w4a8.rad` | The same for Gemma 4 31B heretic-ara (refusals removed) |
+| `gemma4-12b-bf16.yaml` | `gemma4-12b-bf16.rad` | Gemma 4 12B in bf16, its assistant head as the MTP drafter, pictures and audio through the 12B's embedders, on two cards |
+| `gemma4-12b-i8g.yaml` | `gemma4-12b-i8g.rad` | The same with the trunk at int8 (i8a8), on one card |
 | `nemotron-3.5-bolt-e4b-bf16.yaml` | `nemotron-3.5-bolt-e4b-bf16.rad` | NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B) in bf16 with NVIDIA's DFlash drafter, the vision tower in pinned host memory, on one card |
 | `nemotron-3.5-bolt-e4b-i8g.yaml` | `nemotron-3.5-bolt-e4b-i8g.rad` | The same with the trunk at int8 (i8a8) |
 | `nemotron-3.5-bolt-e4b-a4.yaml` | `nemotron-3.5-bolt-e4b-a4.rad` | The same with the feed-forward at four bits (GPTQ), attention and layers 19-23 at i8a8 |
+| `nemotron-3.5-bolt-74b-w4a8.yaml` | `nemotron-3.5-bolt-74b-w4a8.rad` | NVIDIA-Nemotron-3.5-Bolt-74B-A9B with four-bit experts and a block-FP8 trunk, NVIDIA's LiLiCorr drafter, vision, on two cards |
+| `nemotron-3.5-bolt-74b-fp8.yaml` | `nemotron-3.5-bolt-74b-fp8.rad` | NVIDIA-Nemotron-3.5-Bolt-74B-A9B in block FP8 with NVIDIA's LiLiCorr drafter, vision, on four cards |
 | `translategemma-27b.yaml` | `translategemma-27b-mxfp4-gptq.rad` | TranslateGemma 27B MXFP4 with its chat template (`gemma3.jinja`) |
 | `glm53-flash.yaml` | `glm53-flash-mxfp4.rad` | GLM-5.3-Flash, MXFP4 experts and block-FP8 attention, on eight cards |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |

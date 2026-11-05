@@ -463,13 +463,50 @@ TEST(match_at_is_leftmost_first_not_longest) {
 
 /* Every construct outside the dialect is refused by name. The checked phrase is what a reader of
  * the load error needs to find the construct in a 200-character pattern. */
+/* A possessive repetition is taken only where the greedy reading gives the same matches: one class
+ * at the top level, its tail classes that cannot take its codepoints. Ling-3.0's pattern is such a
+ * case, and it splits as its greedy spelling does. */
+TEST(possessive_quantifiers_with_a_disjoint_tail_read_as_greedy) {
+    const char* ling = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}"
+                       "| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+";
+    const char* greedy = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}"
+                         "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+";
+    auto a = compile(ling), b = compile(greedy);
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    const char* texts[] = {
+        "Hello, world! It's 2026... \"quoted\"   spaces\n\nnew lines\r\n--dashes--",
+        "Die Patientin (67) hat seit 2 h Thoraxschmerzen; RR 158/94 mmHg, SpO\xe2\x82\x82 93 %.",
+        "  ...!!!??? x\t\ty  \xe4\xb8\xad\xe6\x96\x87\xe5\xad\x97 ,,; 'LL 'Ve",
+    };
+    for (const char* t : texts) {
+        std::vector<rad::TokSpan> x, y;
+        a->find_iter(t, x);
+        b->find_iter(t, y);
+        REQUIRE_EQ(x.size(), y.size());
+        for (size_t i = 0; i < x.size(); ++i) {
+            CHECK_EQ(x[i].begin, y[i].begin);
+            CHECK_EQ(x[i].end, y[i].end);
+        }
+    }
+    auto plus = compile("a++"), star = compile("[^b]*+b?");
+    REQUIRE(plus != nullptr);
+    REQUIRE(star != nullptr);
+    CHECK_EQ(plus->match_at("aaab", 0), (int64_t)3);
+    CHECK_EQ(star->match_at("xyzb", 0), (int64_t)4);
+}
+
 TEST(constructs_outside_the_dialect_are_refused_by_name) {
     const struct { const char* pattern; const char* says; } refused[] = {
         { "(a)\\1",                 "backreference" },
         { "\\k<n>",                 "backreference" },
         { "(?>a+)",                 "atomic group" },
-        { "a++",                    "possessive" },
-        { "a*+",                    "possessive" },
+        { "a++a",                   "possessive" },
+        { "[ab]*+b",                "possessive" },
+        { "(?:a++)",                "possessive" },
+        { "(a*+)b",                 "possessive" },
+        { "(?:ab)++",               "possessive" },
+        { "\\s++(?!\\S)",            "possessive" },
         { "a{2}{3}",                "quantifier applied to a quantifier" },
         { "a{1,2}+",                "quantifier applied to a quantifier" },
         { "a**",                    "quantifier applied to a quantifier" },

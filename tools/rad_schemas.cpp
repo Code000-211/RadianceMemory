@@ -9,6 +9,7 @@
  *     rad-schemas libr4d.so libref.so          diff them, in hierarchy order
  */
 #include "rad_abi.h"
+#include "rad_abi_layout.h"
 
 #include <dlfcn.h>
 #include <cstdio>
@@ -70,6 +71,14 @@ int load(const char* path, Loaded* out) {
     if (!abi || !cnt || !at) { fprintf(stderr, "%s: not a kernel plugin\n", path); return -1; }
     if (abi() != RAD_ABI_VERSION) {
         fprintf(stderr, "%s: ABI %u, this build is %u\n", path, abi(), RAD_ABI_VERSION);
+        return -1;
+    }
+    /* One version can name two layouts; the engine refuses a mismatched fingerprint, and so does
+     * this tool, which reads the same structs. */
+    auto layout = (uint64_t (*)(void))dlsym(out->h, "rad_plugin_abi_layout");
+    if (!layout || layout() != rad_abi_layout()) {
+        fprintf(stderr, "%s: built against another layout of ABI %u, or exports no "
+                        "rad_plugin_abi_layout\n", path, RAD_ABI_VERSION);
         return -1;
     }
     out->name = inf && inf()->name ? inf()->name : path;

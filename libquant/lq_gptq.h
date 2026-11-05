@@ -32,6 +32,11 @@ namespace lq {
 Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, double damp,
                  const int32_t* perm = nullptr);
 
+/* gptq_factor in act order (gptq_act_order's), the order into `order`: one read of the calibration
+ * for both, cached with the factor. */
+Gram gptq_factor_ordered(const char* dir, const char* name, int64_t K, int64_t domain, double damp,
+                         std::vector<int32_t>* order);
+
 /* Act order: columns by descending Hessian diagonal (the input energy each carries), ties in
  * column order. The identity when `dir` holds nothing for the weight. */
 std::vector<int32_t> gptq_act_order(const char* dir, const char* name, int64_t K, int64_t domain);
@@ -72,6 +77,15 @@ void gptq_tcq_col_scales(const Grid& g, const Scales& scales, int64_t n0, int64_
  * updated in place with `codes`. `h` is the undamped Gram (calib_gram's); null means no-op. */
 void gptq_refine(const Grid& g, const float* x, float* w, int32_t* codes, const Scales& scales,
                  int64_t N, int64_t K, const float* h, double damp, int passes);
+
+/* Each row's scale refitted after the loop, the codes held: the row's decoded values w scaled by
+ * a = (w H x^T) / (w H w^T), the factor minimising (a w - x) H (a w - x)^T. GPTQ chooses a row's
+ * codes against a scale fixed beforehand from the weight alone; the refit is the least-squares
+ * scale for the codes it chose, under the same (undamped) Hessian. Rows with one static scale
+ * (Scales with one block a row, f32 so the stored value moves exactly); `x`, `w` and `h` as for
+ * gptq_refine, `w` scaled in place. A factor that is not positive leaves its row alone. */
+void gptq_rescale_rows(const float* x, float* w, Scales& scales, int64_t N, int64_t K,
+                       const float* h);
 
 
 }  /* namespace lq */

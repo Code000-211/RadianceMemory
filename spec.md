@@ -935,11 +935,14 @@ utilisation fraction:
 | flag | |
 |---|---|
 | `--gpu-headroom-mib` | VRAM left unclaimed on every card (default 96) |
+| `--gpu-memory-mib` | VRAM claimed on every card; inverse of `--gpu-headroom-mib` (headroom is the card less N). The two cannot be combined |
 | `--host-pool-mib` | the pinned host tier |
 | `--host-headroom-mib` | host RAM left free for the system at startup (default 4096); a snapshot store's floor takes back the shortfall from it, down to 1 GiB |
 | `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
 | `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
 | `--kv-resident` | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card; off by default. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing; ignored with a warning on an architecture that cannot stream (docs/KV-STREAMING.md) |
+
+`--gpu-memory-mib N` is the same input as `--gpu-headroom-mib` written as a claim. Give one.
 
 Nothing is inferred from the free VRAM at startup, which would size pools differently depending on
 what else is open. Each term is a fixed property, a computed quantity, or a measurement printed on
@@ -1265,7 +1268,7 @@ store block, between 64 and the 1 024 entries of the index ring (Flash-Next `--t
 measurement asks for a knob.
 
 **The pager's counter.** The card cannot say which blocks a step read, so `qsa_page` counts what it
-rewrote: one int64 a rank (`RadKVGroupBatch::residency_paged`, ABI 30), added to by the kernel and
+rewrote: one int64 a rank (`RadKVGroupBatch::residency_paged`, ABI 38), added to by the kernel and
 read back by `/stats` with one small copy on the transfer stream (`TierExec::paged_in`), never on
 the step path. `kv_residency.paged_in` is rank 0's count, in cold entries summed over QSA layers and
 decode rows (a block paged for 12 layers counts 12), and is not per session: the card cannot
@@ -1293,7 +1296,7 @@ batch carrying the counter; `ref_test` the op's count; `r4d_selftest` the kernel
 reference. No tiny checkpoint is sparse, so `engine_e2e_test` holds the other half -- a flag on a
 model without a window changes no token and moves nothing.
 
-**The pager contract (ABI 28).** Releasing a cold block's VRAM means its table entry can no longer
+**The pager contract (ABI 38).** Releasing a cold block's VRAM means its table entry can no longer
 name a pool block, so a paged block-table entry is one of three things: a pool block id (`>= 0`),
 empty (`-1`), or cold (`-2 - slot`), `slot` indexing the residency store. Only a group declaring a
 residency window ever holds a cold entry; `rad_kv_cold_entry` and its inverses in `rad_runtime.h`
@@ -1304,7 +1307,7 @@ valid for one step. The op `qsa_page` (`docs/OPS.md`) sits between `qsa_select` 
 and rewrites each cold entry of the selection to a scratch page it has filled from the store, one
 writer per position and no atomics; the attention is unchanged. Dense steps (prefill, mixed) promote
 a sequence's cold blocks from the host before they run, because only the host knows the cold set.
-ABI 30 adds `residency_paged`, the card-side counter above. ABI 46 adds the page cache:
+The same ABI 38 adds `residency_paged`, the card-side counter above. ABI 51 adds the page cache:
 `residency_tags` (per layer the group holds, one i32 tag a scratch page: `1 + slot` of the block the
 page holds) and `residency_hits`. With them `qsa_page` rewrites a cold entry whose slot a page of
 its row already holds to that page without a copy, and copies only the rest; the engine zeroes the

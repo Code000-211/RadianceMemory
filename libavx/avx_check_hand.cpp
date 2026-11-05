@@ -572,6 +572,49 @@ void shape_cases(std::vector<Hand>& hs) {
           .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
         hs.push_back(std::move(ga));
 
+        /* RADIO's cropped resample: two prefix rows (row -1, the column naming which), three of a
+         * 3 x 5 grid upsampling the 4 x 4 table and one of a 2 x 2 grid shrinking it. */
+        static const int32_t kCpeCrd[4][6] = { { -1, -1, 0, 2, 1, 0 }, { 0, 2, 0, 4, 3, 1 },
+                                               { 3, 3, 3, 3, 3, 2 }, { 5, 5, 5, 5, 5, 2 } };
+        Hand gc("prefix rows and a 4 x 4 table onto 3 x 5 and 2 x 2 grids", "grid_embed_cpe", 1e-6);
+        gc.dense(RAD_F32, { 6, N }, hfill(61), true)
+          .dense(RAD_F32, { 16, N }, hfill(62))
+          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kCpeCrd[i / 6][i % 6]; })
+          .dense(RAD_F32, { 3, N }, hfill(63))
+          .pi("M", 6).pi("n", N).pi("side", 4).pi("n_prefix", 3).ps("dtype", "f32");
+        hs.push_back(std::move(gc));
+
+        /* LiLiCorr's candidates over two ranks' sample_logprobs rows: a merge that interleaves the
+         * ranks, an equal value on both (the lower id first), a rank with an unfilled slot. Rows
+         * of (max, sum, 4 (id, logit) pairs descending) a rank, k = 4, steps 3, n = 24. */
+        {
+            constexpr int64_t K = 4, W = 2, M = 3, NW = 24;
+            static const float kSt[M][W][2 + 2 * K] = {
+                { { 2.0f, 7.5f, 10, 2.0f, 11, 1.5f, 40, 0.25f, 41, -1.0f },
+                  { 1.5f, 9.0f, 70, 1.5f, 77, 1.0f, 72, 0.5f, 73, 0.25f } },
+                { { 0.5f, 3.0f, 5, 0.5f, 3, 0.25f, 9, 0.0f, 2, -3.0f },
+                  { 0.5f, 2.0f, 4, 0.5f, 8, 0.4f, -1, -INFINITY, -1, -INFINITY } },
+                { { -1.0f, 12.0f, 100, -1.0f, 101, -1.25f, 102, -2.0f, 103, -2.5f },
+                  { 3.0f, 1.5f, 200, 3.0f, 201, -4.0f, 202, -5.0f, 203, -6.0f } },
+            };
+            Hand lc("two ranks merged, a tie and an unfilled slot", "lili_cand", 2e-5);
+            lc.dense(RAD_F32, { M, W * (2 + 2 * K) },
+                     [](int64_t i) { return (&kSt[0][0][0])[i]; })
+              .dense(RAD_F32, { M, NW }, hfill(71))
+              .dense(RAD_F32, { 5 }, hfill(72))
+              .dense(RAD_F32, { 5 }, hfill(73))
+              .dense(RAD_F32, { NW, 5 }, hfill(74))
+              .dense(RAD_F32, { NW }, hfill(75))
+              .dense(RAD_F32, { 3, NW }, hfill(76))
+              .dense(RAD_F32, { K, NW }, hfill(77))
+              .dense(RAD_I32, { M, K }, [](int64_t) { return 0.0f; }, true)
+              .dense(RAD_F32, { M * K, NW }, [](int64_t) { return 0.0f; }, true)
+              .dense(RAD_F32, { M * K, NW }, [](int64_t) { return 0.0f; }, true)
+              .pi("M", M).pi("k", K).pi("world", W).pi("steps", 3).pi("n", NW).ps("dtype", "f32")
+              .pf("eps", 1e-5);
+            hs.push_back(std::move(lc));
+        }
+
         Hand n("M = 64 over 5 rows, verifies of 3 and 2", "ngram_ids", 0.0);
         n.idx({ 11, 12, 13, 21, 22 })
          .dense(RAD_I32, { 2, 2 + 2 }, [](int64_t i) { return (float)(100 + i); }, true)
@@ -622,6 +665,46 @@ void shape_cases(std::vector<Hand>& hs) {
                     .pf("lower_bound", -5)
                     .pf("scale", 1.0 / std::sqrt(128.0))
                     .pf("l2_eps", 1e-6)
+                    .ps("mode", mode)
+                    .ps("dtype", "bf16")
+                    .ps("state_form", "anchor");
+                hs.push_back(std::move(h));
+            }
+    /* Nemotron-H's Mamba-2 under the same two-copy state: a scratch holding three records of
+     * 1 + head_dim + d_state floats (decay, u, B) behind the count. */
+    for (const char* mode : { "prefill", "verify" })
+        for (int accepted : { 1, 2, 3 })
+            for (int cold : { 0, 1 }) {
+                constexpr int64_t P = 16, N = 32, R = 1 + P + N;
+                Hand h("SSD anchor accepted-prefix replay", "ssd_update", 0.01);
+                h.dense(RAD_BF16, { 2, 1, P }, hfill(221, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, N }, hfill(222, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, N }, hfill(223, 0.25f))
+                    .dense(RAD_BF16, { 2, 1 }, hfill(224, 0.25f))
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return 0.0f; })
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return -1.0f; })
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return 0.5f; })
+                    .dense(
+                        RAD_F32, { 2, 1, P, N },
+                        [](int64_t i) {
+                            if (i < P * N) return 0.125f;
+                            i -= P * N;
+                            if (!i) return 3.0f;
+                            if (i > 3 * R) return 0.0f;
+                            const int64_t at = (i - 1) % R;
+                            return at == 0 ? 0.75f : at <= P ? 0.01f : 0.125f;
+                        },
+                        true)
+                    .dense(RAD_I32, { 1, 6 }, [](int64_t i) { return i < 3 ? 0.0f : 1.0f; })
+                    .idx({ 0, 2 })
+                    .idx({ accepted })
+                    .idx({ cold ? 0 : 1 })
+                    .dense(RAD_BF16, { 2, 1, P }, hfill(225), true)
+                    .pi("M", 2)
+                    .pi("heads", 1)
+                    .pi("head_dim", P)
+                    .pi("d_state", N)
+                    .pi("groups", 1)
                     .ps("mode", mode)
                     .ps("dtype", "bf16")
                     .ps("state_form", "anchor");

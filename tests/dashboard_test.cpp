@@ -32,6 +32,7 @@ struct StatsScheduler : FakeScheduler {
         r.slot = 2;
         r.age_s = 4.5;
         r.ttft_s = 0.25;
+        r.prefill_s = 0.20;
         r.decode_tps = 61.0;
         out->assign(1, r);
         return 1;
@@ -223,6 +224,7 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(r.value("state", ""), std::string("decode"));
     CHECK_EQ(r.value("kv_tokens", (int64_t)0), (int64_t)960);
     CHECK_NEAR(r.value("ttft_s", -1.0), 0.25, 1e-12);
+    CHECK_NEAR(r.value("prefill_s", -1.0), 0.20, 1e-12);
     REQUIRE(s["cards"].size() == 1);
     CHECK_EQ(s["cards"][0].value("name", ""), std::string("R9700"));
     REQUIRE(s["experts"]["tiers"].size() == (size_t)kTierCount);

@@ -390,10 +390,13 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
 
 /* ================================================================== the launchers */
 
-static int mt_for(int M)
+/* The tile's rows: the power of two that holds M, widened while its chunk (2048 / mt codes) does
+ * not divide K. The extra rows are idle. At 16 rows the chunk is 128, which the row's constraints
+ * (K a multiple of 128) always divide. */
+static int mt_for(int M, int K)
 {
     int mt = 1;
-    while (mt < M && mt < kMTMax) mt *= 2;
+    while ((mt < M || K % (2048 / mt)) && mt < kMTMax) mt *= 2;
     return mt;
 }
 
@@ -407,7 +410,7 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
     if (group != kGroup) return -2;
     if (K % kGroup) return -2;                /* the activation's scale group */
     if (K % kMX) return -2;                   /* the weight's 32-block */
-    const int mt = mt_for(M);
+    const int mt = mt_for(M, K);
     const int chunk = 2048 / mt;
     if (K % chunk) return -2;
     if (!a_ld) a_ld = K;
@@ -433,6 +436,13 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
                         (const uint8_t*)b_scale, (int)e8_row, (uint16_t*)y, M, N, K, chunk, a_ld,      \
                         y_ld);                                                                        \
     } while (0)
+    switch (mt) {
+        case 1:  R3D_MXFP4A8_M16(1);  break;
+        case 2:  R3D_MXFP4A8_M16(2);  break;
+        case 4:  R3D_MXFP4A8_M16(4);  break;
+        case 8:  R3D_MXFP4A8_M16(8);  break;
+        default: R3D_MXFP4A8_M16(16); break;
+    }
 #undef R3D_MXFP4A8_M16
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -472,8 +482,18 @@ int launch_mxfp4a8_tiled(long av, long asv, long bvc, long bsv, long yv, int M, 
 
     const dim3 blk(kBlockThreads);
     const dim3 grd((unsigned)((N + kTN - 1) / kTN), (unsigned)((M + kTM - 1) / kTM));
-    ActQ aq{(const float*)(uintptr_t)asv, (long long)as_ld, 1};
-    MxWQ h{(const uint8_t*)(uintptr_t)bvc, (const uint8_t*)(uintptr_t)bsv, b_row, e8_row};
+    /* Value-init so the ActQ's 4-byte padding hole is deterministic: the tape audit byte-compares
+     * the serialized kernel arguments, and aggregate-init leaves that padding indeterminate, which
+     * reads as "the key does not carry" the argument and stops the engine. See fp8a8's launcher. */
+    ActQ aq{};
+    aq.scale = (const float*)(uintptr_t)asv;
+    aq.row = as_ld;
+    aq.gmode = 1;
+    MxWQ h{};
+    h.codes = (const uint8_t*)(uintptr_t)bvc;
+    h.e8 = (const uint8_t*)(uintptr_t)bsv;
+    h.code_row = b_row;
+    h.e8_row = e8_row;
     hipStream_t s = (hipStream_t)(uintptr_t)stream;
     if (alu) {
         if (nt) mxfp4a8_tiled_kernel<1,1><<<grd, blk, 0, s>>>(
@@ -670,7 +690,7 @@ static int r3d_mxfp4a8_tiled_dispatch(const RadArgs* a, RadStream s, int alu)
 
     if (!e8_scan_once(r3d_p(BS), N * (K / kMX))) return R3D_NO(RAD_E_INVAL);
 
-    const int nt = (int)r3d_geti_or(a, "nt", 0);
+    const int nt = 0;   /* no `nt` axis in the row's tune table: the non-temporal stream is fixed off */
     const int rc = r3d_gemm_nt_q_mxfp4a8_tiled(r3d_addr(A), r3d_addr(AS), r3d_addr(B),
                                                r3d_addr(BS), r3d_addr(Y), (int)M, (int)N,
                                                (int)K, kGroup, (int)ap, cp, (int)as_p, e8p,

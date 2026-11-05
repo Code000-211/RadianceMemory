@@ -25,7 +25,13 @@
  * safetensors file per input, <dir>/<stem>.safetensors, holding `hessian_upper`, f32
  * [k * (k + 1) / 2], row i's entries k2 = i .. k-1 after row i-1's, and metadata naming `k`, the
  * rows summed and the checkpoint linears that read the input. H is the raw sum; divide by `rows`
- * for the mean second moment. */
+ * for the mean second moment.
+ *
+ * An int8 trunk (site_i8, one rank only) is recorded from the codes and scales its GEMMs actually
+ * read, so H includes what the model's own quantisation did to the input -- the input a quantised
+ * model feeds each layer, for GPTQ against the error it inherits. Codes a rotating producer wrote
+ * are in the rotated domain; the file's metadata then names it (`domain`: the Hadamard width), as
+ * RADGRAM2's header does, and the reader converts. */
 #pragma once
 
 #include <arch/rad_arch.h>
@@ -52,6 +58,8 @@ struct CalibFull {
         rad_op      op_gather = 0;     /* the columns of every rank into `gathered`; 0 when replicated */
         rad_op      op_gram = 0;       /* declared on the owner only */
         bool        owner = false;
+        rad_buf     q8 = 0, s8 = 0;    /* site_i8: the int8 codes and their f32 (row, 128) scales */
+        uint32_t    domain = 0;        /* site_i8: the codes' rotation width, 0 for none */
         std::vector<float> tri;        /* the owner's accumulator, upper triangle packed */
     };
 
@@ -156,6 +164,32 @@ struct CalibFull {
         return RAD_OK;
     }
 
+    /* One input of layer `layer` from an int8 trunk's codes `q8` and scales `s8` (see the file
+     * comment): the whole input on one rank, `domain` the Hadamard width the codes were rotated by
+     * (0 for none). */
+    int site_i8(RadBuilder* b, const Geom& g, int64_t layer, std::string stem, std::string linears,
+                rad_buf q8, rad_buf s8, int64_t K, uint32_t domain) {
+        if (world > 1 || !q8 || !s8 || K > kmax) return RAD_E_INVAL;
+        Site s;
+        s.stem    = std::move(stem);
+        s.linears = std::move(linears);
+        s.K = s.k_local = K;
+        s.owner   = true;
+        s.q8 = q8;
+        s.s8 = s8;
+        s.domain  = domain;
+        (void)layer;
+        s.op_gram = rw(b, RAD_OP(b, "gram_accum",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
+                                      RAD_INT("group", 128), RAD_STR("dtype", "i8a8"),
+                                      RAD_INT("upper", 1)),
+                           RAD_NOWEIGHTS),
+                       { q8, s8, scratch }, { scratch });
+        if (!s.op_gram) return RAD_E_INVAL;
+        sites.push_back(std::move(s));
+        return RAD_OK;
+    }
+
     /* Site `i` over a step's T rows: gather (every rank), then on the owner the Gram into the
      * scratch, copied to a free square, the scratch zeroed, and the square handed to the worker. */
     void tap(RadCtx* c, size_t i, int64_t T) {
@@ -186,7 +220,10 @@ struct CalibFull {
             }
         }
         const int64_t K = s.K;
-        RAD_ISSUE_N(c, s.op_gram, T, a, RAD_NONE, praw2(dev, RAD_F32, K, K));
+        if (s.q8)
+            RAD_ISSUE_N(c, s.op_gram, T, brows(s.q8, T), brows(s.s8, T), praw2(dev, RAD_F32, K, K));
+        else
+            RAD_ISSUE_N(c, s.op_gram, T, a, RAD_NONE, praw2(dev, RAD_F32, K, K));
         /* `upper` 1 writes no entry below the diagonal, so only the upper triangle comes back:
          * band by band of kBand rows, each from its first row's diagonal on, about half the
          * square's bytes. The link is what a step's taps wait on, 25 GB a step on each rank of
@@ -317,7 +354,9 @@ private:
         const uint64_t bytes = (uint64_t)s.tri.size() * 4;
         std::string hdr = "{\"__metadata__\":{\"k\":\"" + std::to_string(s.K) + "\",\"rows\":\"" +
                           std::to_string(seen) + "\",\"layout\":\"upper triangle, row-major, packed\","
-                          "\"linears\":\"" + s.linears + "\"},\"hessian_upper\":{\"dtype\":\"F32\","
+                          "\"linears\":\"" + s.linears + "\"" +
+                          (s.domain ? ",\"domain\":\"" + std::to_string(s.domain) + "\"" : std::string()) +
+                          "},\"hessian_upper\":{\"dtype\":\"F32\","
                           "\"shape\":[" + std::to_string(s.tri.size()) + "],\"data_offsets\":[0," +
                           std::to_string(bytes) + "]}}";
         while (hdr.size() % 8) hdr += ' ';

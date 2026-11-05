@@ -1240,6 +1240,52 @@ TEST(a_weight_tables_experts_are_drawn_from_its_encoding) {
     CHECK(via_draw == cb);
 }
 
+/* A kernel that lays out its experts (libr4d's 4-bit tables) is handed each expert's arrangement of
+ * the planes kf_draw_table decodes, stacked one laid expert apart; a kernel with no layout reads the
+ * decoded table, and a layout that changes an expert's size cannot be stacked. */
+TEST(a_weight_tables_experts_are_each_laid_out_by_the_kernel) {
+    KfOperand codes = fp8_weight(128, 256, { "codes" });
+    codes.role = RAD_OPD_WTAB;
+    codes.shape.insert(codes.shape.begin(), 3);
+    const KfEntryPlanes drawn = [&](int64_t e, std::vector<std::vector<uint8_t>>* pl) {
+        kf_draw_entry_planes(codes, 2, e, pl);
+        return (int)RAD_OK;
+    };
+    RadKernelInfo ki{};
+    RadLayout lay{};
+    std::vector<uint8_t> out;
+    CHECK_EQ(kf_lay_table(&ki, nullptr, 0, 2, codes, drawn, &lay, &out), RAD_E_UNSUPPORTED);
+    ki.layout = lay_identity;
+    CHECK_EQ(kf_lay_table(&ki, nullptr, 0, 2, codes, drawn, &lay, &out), RAD_E_UNSUPPORTED);
+    ki.layout = lay_reverse;
+    ki.relayout = relay_reverse;
+    REQUIRE_EQ(kf_lay_table(&ki, nullptr, 0, 2, codes, drawn, &lay, &out), RAD_OK);
+    const size_t per = (size_t)128 * 256;
+    REQUIRE_EQ(out.size(), 3 * per);
+    CHECK_EQ(lay.bytes, (int64_t)per);
+    std::vector<std::vector<uint8_t>> pl;
+    for (int64_t e = 0; e < 3; ++e) {
+        kf_draw_entry_planes(codes, 2, e, &pl);
+        CHECK(std::equal(out.begin() + (long)(per * e), out.begin() + (long)(per * (e + 1)),
+                         pl[0].rbegin()));
+    }
+    /* The entries the kernel reads are the ones the oracle decodes. */
+    std::vector<uint8_t> logical;
+    std::string why;
+    REQUIRE_EQ(kf_draw_table(codes, 2, &logical, &why), RAD_OK);
+    kf_draw_entry_planes(codes, 2, 1, &pl);
+    CHECK(std::equal(logical.begin() + (long)per, logical.begin() + (long)(2 * per),
+                     pl[0].begin()));
+    /* Laid out to a size the declared expert does not stride by. */
+    ki.layout = [](const RadParam*, int, int, const RadEncoding*, const int*,
+                   const RadTensor* t, int, RadLayout* o) {
+        o->dtype = t[0].dtype;
+        o->bytes = rad_dtype_bytes(t[0].dtype, t[0].shape[0] * t[0].shape[1]) + 256;
+        return (int)RAD_OK;
+    };
+    CHECK_EQ(kf_lay_table(&ki, nullptr, 0, 2, codes, drawn, &lay, &out), RAD_E_SHAPE);
+}
+
 /* ================================================================== routing */
 
 /* moe_scatter's offsets are a prefix array: non-decreasing from 0 to the row count. A uniform draw

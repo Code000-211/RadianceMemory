@@ -328,8 +328,10 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                       RAD_WEIGHTS(w_a_log, w_dt_bias, w_out_norm)),
                   {w.q, w.k, w.v, w.ab, w.in.x}, {w.o.x});
     /* The epilogue's codes for an fp8 or int8 out-projection (int8 when ActFP8::q8_fed; the codes
-     * dtype picks the quantiser). A bf16 out-projection reads only `o.x` and these stay absent. */
-    if (op_recur && w.o.cq()) {
+     * dtype picks the quantiser). A bf16 out-projection reads only `o.x` and these stay absent.
+     * Rotated int8 codes (ActFP8::q8_rot) only the conv fold writes (gdn_conv_recurrent_update_had);
+     * rows this update serves are quantised by q_o. */
+    if (op_recur && w.o.cq() && !w.o.q8_rot) {
         const rad_buf oq[2] = { w.o.cq(), w.o.cs() };
         RAD_ARCH_TRY(rad_op_writes(b, op_recur, oq, 2));
     }
@@ -337,7 +339,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * tokens per sequence. Optional (no RAD_ARCH_TRY): without it the pair runs. */
     {
         const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
-        op_cr = rw(b, RAD_OP(b, "gdn_conv_recurrent_update",
+        op_cr = rw(b, RAD_OP(b, w.o.q8_rot ? "gdn_conv_recurrent_update_had" : "gdn_conv_recurrent_update",
                        RAD_PARAMS(RAD_RANGE("q_len", 1, hi), RAD_INT("head_k", cfg.head_k),
                                   RAD_INT("head_v", cfg.head_v),
                                   RAD_INT("conv_width", cfg.conv_width),
@@ -518,8 +520,10 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                     praw2(st_idx, RAD_I32, D, st_w), praw(batch->num_accepted, RAD_I32, D),
                     praw(batch->cu_seqlens, RAD_I32, D + 1),
                     bcol(w.in.x, conv_dim, v_dim, DT), RAD_W(w_out_norm), brows(w.o.x, DT),
-                    w.o.cq() ? brows(w.o.cq(), DT) : RAD_NONE,
-                    w.o.cq() ? brows(w.o.cs(), DT) : RAD_NONE);
+                    w.o.cq() && !w.o.q8_rot ? brows(w.o.cq(), DT) : RAD_NONE,
+                    w.o.cq() && !w.o.q8_rot ? brows(w.o.cs(), DT) : RAD_NONE);
+        /* Rotated codes come only from the fold; here the decode rows take the quantiser. */
+        if (w.o.q8_rot) q_o.step(c, T, 0, DT);
     }
 
     /* The output a piece at a time where the caller takes the all-reduce that way (ArPieces): the

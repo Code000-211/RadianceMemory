@@ -87,6 +87,11 @@ static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("he
 static const RadOperandSpec oKdaUpdate[] = { OPD("q"), OPD("k"), OPD("v"), OPD("a"), OPD("b"),
     WGT("A_log"), WGT("dt_bias"), INOUT("state"), OPD("state_idx"), OPD("cu"),
     OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
+static const RadParamSpec pSsdUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
+    P_INT("d_state"), P_INT("groups"), P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
+static const RadOperandSpec oSsdUpdate[] = { OPD("x"), OPD("B"), OPD("C"), OPD("dt"),
+    WGT("A_log"), WGT("dt_bias"), WGT("D"), INOUT("state"), OPD("state_idx"), OPD("cu"),
+    OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
 
 static const RadParamSpec pNgramIds[]   = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
                                             P_INT("eos") };
@@ -106,6 +111,11 @@ static const RadParamSpec pPleConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                            OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
                                            OPD_O("num_accepted"), OUT("y") };
+/* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
+static const RadOperandSpec oPleConvBias[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                               OPD_O("resid"), OPD_O("cache_idx"),
+                                               OPD_O("has_init"), OPD_O("num_accepted"), WGT("b"),
+                                               OUT("y") };
 static const RadParamSpec pCausalConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"),
                                               P_STR("dtype") };
 static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
@@ -134,14 +144,38 @@ static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+static const RadParamSpec pGridEmbedCpe[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+                                                P_INTO("n_prefix") };
+static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"), WGT_O("prefix") };
+/* LiLiCorr's correlator (avx_lili.cpp; libref/ref_lili.cpp has the contracts). */
+static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
+                                          P_INT("n"), P_STR("dtype"), P_F64O("eps"),
+                                          P_INTO("row_k") };
+static const RadOperandSpec oLiliCand[] = { OPD("stats"), OPD("pas"), WGT("ln_w"), WGT("ln_b"),
+                                            WGT("up_w"), WGT("up_b"), WGT("slot"), WGT("rank"),
+                                            OUT("cand"), OUT("feat"), OUT("base") };
+static const RadParamSpec pLiliAttn[] = { P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n_head"),
+                                          P_INT("head_dim"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oLiliAttn[] = { OPD("qkv"), WGT("rel"), WGT("same"), OUT("out") };
+static const RadParamSpec pLiliFactor[] = { P_INT("M"), P_INT("L"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLiliFactor[] = { OPD("h"), OPD("a"), OUT("y") };
+static const RadParamSpec pLiliWalk[] = { P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n"),
+                                          P_STR("dtype"), P_F64O("eps"), P_F64O("scale") };
+static const RadOperandSpec oLiliWalk[] = { OPD("edges"), OPD("aout"), OPD("cand"), OUT("tokens"),
+                                            OUT_O("scores") };
 
 static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
+/* `kv_dtype`: the latent cache's dtype when it is not the query's (fp8_e4m3, at descale 1). */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT("heads"),
-    P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+    P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"), P_STRO("kv_dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
     P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
+static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPaged[] = { OPD("q"), OPD_O("q_rope"), OPD("kv"),
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), OPD_O("gate"), OUT("out") };
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
     P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
@@ -151,6 +185,8 @@ static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT(
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
+static const RadParamSpec pRouterSigmoidGroup[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("n_group"), P_INT("topk_group"), P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `add`'s `div` divides the rounded sum (libref's pAdd). */
 static const RadParamSpec pAdd[]      = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("div") };
@@ -165,6 +201,8 @@ static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y")
 static const RadParamSpec pSegPool[]  = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
+                                          P_STR("dtype") };
+static const RadParamSpec pPointFourier[]  = { P_INT("M"), P_INT("n"), P_INT("freqs"), P_INTO("pi"),
                                           P_STR("dtype") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oUnary[]  = { OPD("x"), OUT("y") };
@@ -306,6 +344,12 @@ static const RadOperandSpec oAttnPaged[] = {
 static const RadOperandSpec oAttnPagedTree[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
+};
+
+/* attn_paged with a learned sink logit a query head; a name of its own (libref's file comment). */
+static const RadOperandSpec oAttnPagedSink[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), WGT("sinks"), OUT("out")
 };
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
@@ -919,7 +963,7 @@ static const RadOperandSpec oTopk[]      = { OPD("logits"), OPD("params"),
 static const RadOperandSpec oArgmax[]    = { OPD("logits"), OPD("params"), OUT("token") };
 static const RadParamSpec pLogprobs[]    = { P_INT("M"), P_INT("n_vocab"), P_INT("k"),
                                              P_INTO("vocab_off") };
-static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD("params"), OUT("stats") };
+static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD_O("params"), OUT("stats") };
 static const RadOperandSpec oNarrow[]    = { INOUT("cand_idx"), INOUT("cand_val"), OPD("params") };
 static const RadOperandSpec oPick[]      = { OPD("cand_idx"), OPD("cand_val"), OPD("params"),
                                              OUT("token") };
@@ -933,6 +977,12 @@ static const RadParamSpec pDflashSelect[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                  OPD("anchor"), WGT("pred"), WGT("succ"),
                                                  OUT("tokens") };
+static const RadParamSpec pDflashMarkov[]    = { P_INT("M"), P_INT("steps"), P_INT("rank"),
+                                                 P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                                 P_STR("dtype") };
+static const RadOperandSpec oDflashMarkov[]  = { OPD("logits"), OPD("anchor"), WGT("pred"),
+                                                 WGT("succ"), OUT("tile_scores"),
+                                                 OUT("tile_tokens"), OUT("tokens") };
 static const RadParamSpec pDflashTree[]      = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                                  P_INT("rank"), P_INT("n_vocab"),
                                                  P_INTO("anchor_stride"), P_INT("nodes"),
@@ -969,6 +1019,7 @@ static const RadOpSchema kSchemas[] = {
 { "mhc_post", ARR(pHcWrite), ARR(oMhcPost), "Source-to-destination manifold residual update." },
 { "mhc_contract", ARR(pHcWrite), ARR(oMhcContract), "Mean over manifold residual streams." },
 { "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate), "Bounded per-channel KDA with candidate-state rollback." },
+{ "ssd_update", ARR(pSsdUpdate), ARR(oSsdUpdate), "Mamba-2 scalar-decay state update with candidate-state rollback, per_candidate or anchor." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
   "block-scaled fp8 form of x and its Hadamard-rotated twin. See docs/OPS.md for the three facts "
@@ -987,6 +1038,20 @@ static const RadOpSchema kSchemas[] = {
   "x += a side x side position table resampled bilinearly to the row's grid." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
+{ "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
+  "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
+  "layernorm, the up projection and silu, and the lattice rows' additive part." },
+{ "lili_attn", ARR(pLiliAttn), ARR(oLiliAttn),
+  "attention over each sequence's candidate lattice with a learned bias on slot distance and the "
+  "same slot." },
+{ "lili_factor", ARR(pLiliFactor), ARR(oLiliFactor),
+  "[h | a | h * a] a lattice row, a its sequence's anchor." },
+{ "lili_walk", ARR(pLiliWalk), ARR(oLiliWalk),
+  "LiLiCorr's normalised edge scores and their greedy walk." },
+{ "grid_embed_cpe", ARR(pGridEmbedCpe), ARR(oGridEmbedCpe),
+  "x += the table resampled half-pixel bilinear (no antialias) onto a square of the grid's larger "
+  "side and cropped to the grid: RADIO's cropped position embedding. A row with a negative row "
+  "coordinate gets the learned prefix row its column names." },
 { "add", ARR(pAdd), ARR(oBinary),
   "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows. With "
   "`div`, y = rd(rd(a + b) / div), bit for bit libref's." },
@@ -994,7 +1059,8 @@ static const RadOpSchema kSchemas[] = {
 { "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
   "y = x * w, `w` a weight of one element or one row, broadcast; f32 product rounded once." },
 { "act_mul", ARR(pActMul), ARR(oBinary),
-  "y = act(a) * b, act silu / gelu / gelu_tanh, the activation rounded to y's dtype first." },
+  "y = act(a) * b, act silu / gelu / gelu_tanh / sigmoid / quick_gelu / relu, the activation "
+  "rounded to y's dtype first." },
 { "seg_mean_bf16_sum", ARR(pSegMean), ARR(oSegMean),
   "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
@@ -1020,8 +1086,16 @@ static const RadOpSchema kSchemas[] = {
 { "pool_cols", ARR(pPoolRows), ARR(oUnary),
   "y[m][c] = the mean of x[m]'s columns [c*k, c*k + k), rounded to y's dtype, times mult, rounded "
   "again." },
+{ "point_fourier", ARR(pPointFourier), ARR(oUnary),
+  "A point's Fourier features: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)] over x's n values, "
+  "sines then cosines each i-major then j, f_j = 2^j for j < freqs (times pi with `pi` 1); the "
+  "products f32, the sine and cosine f32 rounded once to y's dtype. y is [M, n (2 freqs + 1)]." },
 { "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
   "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
+{ "mla_attn_paged", ARR(pMlaAttnPaged), ARR(oMlaAttnPaged),
+  "Dense causal latent attention over a paged cache whose token row is the latent then the rotated "
+  "key part: score = scale * (q . latent + q_rope . rope), value = the latent; sequences as in "
+  "attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
@@ -1032,6 +1106,8 @@ static const RadOpSchema kSchemas[] = {
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
 { "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
   "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
+{ "swiglu_step", ARR(pSwigluClamped), ARR(oGateUp),
+  "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half." },
 { "swiglu_clamped", ARR(pSwigluClamped), ARR(oGateUp),
   "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
@@ -1049,6 +1125,8 @@ static const RadOpSchema kSchemas[] = {
   "PLE gate: three grouped norms, a dot, a signed sqrt." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
   "PLE's dilated depthwise conv, silu and residual add." },
+{ "ple_conv_bias", ARR(pPleConv), ARR(oPleConvBias),
+  "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)." },
 { "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
   "depthwise causal conv with ple_conv's window, no activation and no residual (LFM2)." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds), "hashed n-gram row ids for PLE." },
@@ -1123,11 +1201,17 @@ static const RadOpSchema kSchemas[] = {
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "paged causal / sliding-window attention, any query length, online-softmax so one pass over the "
   "cache suffices." },
+{ "attn_paged_anchor_window", ARR(pAttnPaged), ARR(oAttnPaged),
+  "attn_paged with one window anchor at each sequence's first query position: every row keeps keys "
+  "with anchor - key < window, and a causal row none after the anchor." },
 { "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
   "attn_paged over a tree verify (rad_drafter_tree): spec_parent is -2 for an ordinary causal row, "
   "else the row's parent's index within its sequence's rows (-1 for the block's first). Inside the "
   "block such a row sees itself and its ancestors only; its window is measured from the block's "
   "first position plus its depth." },
+{ "attn_paged_sink", ARR(pAttnPaged), ARR(oAttnPagedSink),
+  "attn_paged with `sinks` [n_head] f32, one logit a query head beside the keys in the softmax's "
+  "maximum and denominator, with no value." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
   "(`window_right`)." },
@@ -1211,6 +1295,9 @@ static const RadOpSchema kSchemas[] = {
 { "qk_norm_rope", ARR(pQkNormRope), ARR(oQkNormRope), "per-head QK norm then rotary embedding." },
 { "scale_rows", ARR(pScaleRows), ARR(oScaleRows),
   "one scalar per row, optionally through an activation, broadcast across the row." },
+{ "router_sigmoid_group_topk", ARR(pRouterSigmoidGroup), ARR(oRouterSigmoid),
+  "Group-limited sigmoid routing: groups rank by the sum of their two best p + bias, selection "
+  "runs over the topk_group best groups; correction bias selects, original scores weight." },
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
 { "router_topk", ARR(pRouter), ARR(oRouter), "softmax then exact top-k routing." },
@@ -1488,6 +1575,11 @@ static const RadOpSchema kSchemas[] = {
 { "dflash_conv", ARR(pDflashConv), ARR(oDflashConv),
   "DFlash2's grouped dynamic depthwise convolution: out[t][h] = sum over taps j, j == 0 or "
   "t % block_size >= j, of (base[j][h] + delta[t][j][h / group_size]) * x[t - j][h]." },
+{ "dflash_markov_greedy", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "DSpark's walk: every vocabulary id scores draft_logit[token] + sum_r pred[previous][r] * "
+  "succ[token][r], the greatest wins (lower id on a tie) and is the next predecessor." },
+{ "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "dflash_markov_greedy with f32 draft logits and bf16 codebooks." },
 { "dflash_select", ARR(pDflashSelect), ARR(oDflashSelect),
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
@@ -1628,6 +1720,7 @@ SIMPLE("avx_mhc_pre_finish", "mhc_pre_finish", "norm", "manifold gates from proj
 SIMPLE("avx_mhc_post", "mhc_post", "norm", "manifold residual update", DT_FLOAT, L(mhc_post)),
 SIMPLE("avx_mhc_contract", "mhc_contract", "norm", "mean of residual streams", DT_FLOAT, L(mhc_contract)),
 SIMPLE("avx_kda_update", "kda_update", "gdn", "bounded KDA and candidate-state rollback", DT_FLOAT, L(kda_update)),
+SIMPLE("avx_ssd_update", "ssd_update", "gdn", "Mamba-2 recurrence and candidate-state rollback", DT_FLOAT, L(ssd_update)),
 ROWL("avx_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",
      DT_FLOAT ", or mixing matrices of E4M3 / int8 codes with a scale plane, joined", L(hc_read),
@@ -1648,6 +1741,17 @@ SIMPLE("avx_grid_embed", "grid_embed", "elem",
 SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        L(grid_embed_aa)),
+SIMPLE("avx_grid_embed_cpe", "grid_embed_cpe", "elem",
+       "half-pixel bilinear resample of a position grid onto a square, cropped, added in", DT_FLOAT,
+       L(grid_embed_cpe)),
+SIMPLE("avx_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features", DT_FLOAT,
+       L(lili_cand)),
+SIMPLE("avx_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",
+       DT_FLOAT, L(lili_attn)),
+SIMPLE("avx_lili_factor", "lili_factor", "draft", "LiLiCorr factor input [h | a | h * a]",
+       DT_FLOAT, L(lili_factor)),
+SIMPLE("avx_lili_walk", "lili_walk", "draft", "LiLiCorr edge scores and greedy walk", DT_FLOAT,
+       L(lili_walk)),
 SIMPLE("avx_add", "add", "elem", "elementwise sum", DT_FLOAT, L(add)),
 SIMPLE("avx_mul", "mul", "elem", "elementwise product, broadcasting b", DT_FLOAT, L(mul)),
 SIMPLE("avx_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, L(act_mul)),
@@ -1664,6 +1768,8 @@ SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, 
        DT_FLOAT, L(pool_rows)),
 SIMPLE("avx_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
        "multiplier", DT_FLOAT, L(pool_cols)),
+SIMPLE("avx_point_fourier", "point_fourier", "elem", "a point's sines and cosines at octaves",
+       DT_FLOAT, L(point_fourier)),
 SIMPLE("avx_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, L(relu)),
 SIMPLE("avx_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, L(clamp)),
 SIMPLE("avx_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",
@@ -1681,6 +1787,8 @@ SIMPLE("avx_seg_sinusoid", "seg_sinusoid", "elem",
 SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
        "local attention with a relative-position term and a softcap", DT_FLOAT,
        L(attn_local_rel)),
+SIMPLE("avx_mla_attn_paged", "mla_attn_paged", "attn", "dense paged latent attention with a rotary part",
+       DT_FLOAT, L(mla_attn_paged)),
 SIMPLE("avx_mla_attn", "mla_attn", "attn", "absorbed latent MQA attention", DT_FLOAT,
        L(mla_attn)),
 SIMPLE("avx_dsa_score", "dsa_score", "attn", "weighted FP8 index scoring", DT_FLOAT,
@@ -1693,6 +1801,8 @@ SIMPLE("avx_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FL
        L(gemm_nt_f32)),
 SIMPLE("avx_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
        L(mla_project)),
+SIMPLE("avx_swiglu_step", "swiglu_step", "elem", "SwiGLU clipped after the SiLU", DT_FLOAT,
+       L(swiglu_step)),
 SIMPLE("avx_swiglu_clamped", "swiglu_clamped", "elem", "asymmetrically clipped SwiGLU", DT_FLOAT,
        L(swiglu_clamped)),
 SIMPLE("avx_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
@@ -1715,6 +1825,9 @@ SIMPLE("avx_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot
        DT_FLOAT, L(ple_gate)),
 SIMPLE("avx_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, L(ple_conv)),
+SIMPLE("avx_ple_conv_bias", "ple_conv_bias", "norm",
+       "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)", DT_FLOAT,
+       L(ple_conv_bias)),
 SIMPLE("avx_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
        DT_FLOAT, L(causal_conv1d)),
 SIMPLE("avx_cast", "cast", "elem", "dtype conversion", DT_ANY, L(cast)),
@@ -1798,10 +1911,19 @@ ROW("avx_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged)),
+ROW("avx_attn_paged_anchor_window", "attn_paged_anchor_window", "attn",
+    "paged attention with one shared anchor-aligned sliding window a sequence",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    L(attn_paged_anchor_window)),
 ROW("avx_attn_paged_tree", "attn_paged_tree", "attn",
     "paged causal / sliding-window attention with a tree verify block (spec_parent)",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_tree)),
+ROW("avx_attn_paged_sink", "attn_paged_sink", "attn",
+    "paged causal / sliding-window attention with a sink logit a head, any query length",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; f32 sinks",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_sink)),
 SIMPLE("avx_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        L(attn_dense)),
 SIMPLE("avx_attn_cross", "attn_cross", "attn",
@@ -1861,6 +1983,8 @@ SIMPLE("avx_qsa_work", "qsa_work", "attn",
 
 SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
        L(router_topk)),
+SIMPLE("avx_router_sigmoid_group_topk", "router_sigmoid_group_topk", "moe",
+       "group-limited sigmoid correction-bias routing", DT_FLOAT, L(router_sigmoid_group_topk)),
 SIMPLE("avx_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        L(router_sigmoid_topk)),
 SIMPLE("avx_router_topk_scatter", "router_topk_scatter", "moe",
@@ -2123,6 +2247,13 @@ SIMPLE("avx_dflash_conv", "dflash_conv", "draft",
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),
+SIMPLE("avx_dflash_markov_greedy", "dflash_markov_greedy", "draft",
+       "DSpark's full-vocabulary greedy Markov walk",
+       "bf16 logits and codebooks, f32/i32 tile winners, i32 tokens out", L(dflash_markov_greedy)),
+SIMPLE("avx_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
+       "Full-vocabulary greedy Markov walk with f32 draft logits",
+       "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
+       L(dflash_markov_greedy_f32)),
 SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, tokens and parents, float unary and codebooks", L(dflash_tree)),

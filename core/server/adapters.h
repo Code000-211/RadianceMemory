@@ -326,6 +326,7 @@ public:
             o.slot            = r.slot;
             o.age_s           = r.age_s;
             o.ttft_s          = r.ttft_s;
+            o.prefill_s       = r.prefill_s;
             o.decode_tps      = r.decode_tps;
             out->push_back(std::move(o));
         }

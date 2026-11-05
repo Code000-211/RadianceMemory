@@ -467,9 +467,25 @@ int launch(long av, long asv, long bvc, long bsv, long yv, int M, int N, int K, 
 
     const dim3 blk(kBlockThreads);
     const dim3 grd((unsigned)((N + kTN - 1) / kTN), (unsigned)((M + kTM - 1) / kTM));
-    ActQ aq{ (const float*)(uintptr_t)asv, (long long)as_ld, as_ld != 1 };
-    WQ h{ (const uint8_t*)(uintptr_t)bvc, (const uint8_t*)(uintptr_t)bsv,
-          (const uint8_t*)(uintptr_t)zv, b_row, bs_row, z_row, sdt, cdt, srows };
+    /* Value-init (not aggregate-init): the tape audit byte-compares the serialized kernel
+     * arguments, and aggregate-init leaves a struct's trailing padding indeterminate. A padding
+     * byte that differs between a pass's recording and its audit is read as "the key does not
+     * carry" this argument and stops the engine (the ActQ/WQ holes are 4 bytes each). Zero the
+     * whole struct so the padding is deterministic; the kernel reads none of it. */
+    ActQ aq{};
+    aq.scale = (const float*)(uintptr_t)asv;
+    aq.row = as_ld;
+    aq.gmode = as_ld != 1;
+    WQ h{};
+    h.codes = (const uint8_t*)(uintptr_t)bvc;
+    h.scale = (const uint8_t*)(uintptr_t)bsv;
+    h.zero = (const uint8_t*)(uintptr_t)zv;
+    h.code_row = b_row;
+    h.scale_row = bs_row;
+    h.zero_row = z_row;
+    h.sdt = sdt;
+    h.cdt = cdt;
+    h.srows = srows;
     hipStream_t s = (hipStream_t)(uintptr_t)stream;
 #define R3D_RUN(NT, ARM, CD, AL)                                                \
     fp8a8_tiled_kernel<NT, ARM, CD, AL><<<grd, blk, 0, s>>>(                   \
@@ -809,7 +825,7 @@ static int r3d_fp8a8_tiled_dispatch(const RadArgs* args, RadStream s, int alu)
         r3d_trace_desc("gemm y", Y);
     }
 
-    const int nt = (int)r3d_geti_or(args, "nt", 0);
+    const int nt = 0;   /* no `nt` axis in the row's tune table: the non-temporal stream is fixed off */
     const int st = launch(r3d_addr(A), r3d_addr(AS), (long)(uintptr_t)bvc, (long)(uintptr_t)bsv,
                           r3d_addr(Y), (int)M, (int)N, (int)K, (int)group, (int)a_ld, b_row,
                           (int)as_ld, bs_row, (int)y_ld, nt, (long)s, sdt, cdt, 0, 0, 0, 0, alu);
@@ -964,7 +980,7 @@ extern "C" int r3d_rad_gemm_nt_q_w2a8_tiled(const RadArgs* args, RadStream s)
     if (!r3d_aligned(r3d_p(A), 8) || !r3d_aligned(r3d_p(Y), 8) ||
         !r3d_aligned(sv, 2) || !r3d_aligned(zv, 1)) return R3D_NO(RAD_E_ALIGN);
 
-    const int nt = (int)r3d_geti_or(args, "nt", 0);
+    const int nt = 0;   /* no `nt` axis in the row's tune table: the non-temporal stream is fixed off */
     const int st = launch(r3d_addr(A), r3d_addr(AS), bvc, (long)(uintptr_t)sv, r3d_addr(Y),
                           (int)M, (int)N, (int)K, (int)group, (int)a_ld, c_row, (int)as_ld,
                           s_row, (int)y_ld, nt, (long)(uintptr_t)s, /*sdt*/ 1, cdt,

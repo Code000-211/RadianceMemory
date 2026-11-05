@@ -1,0 +1,20 @@
+# Ling-3.0-flash-Sante, inclusionAI's medical fine-tune of Ling-3.0-flash (124B, 5.1B active), with
+# its routed experts at four bits (int4, a bf16 scale per 128 of K, GPTQ;
+# data/recipes/ling3-w4a8-gptq.recipe), everything else bf16 as the checkpoint holds it, and its own
+# MTP head: 66 GiB, every weight in VRAM on four cards. The latent and KDA caches are bf16 only.
+# With --max-model-len 262144 the cache holds 1,048,576 tokens at 4 sequences, four full-length
+# sessions, and 1,608,032 at 8. Sampling is inclusionAI's evaluation setting.
+#
+# On 4x R9700 at 215 W, BetterBench with thinking off: 236 tok/s single-stream (weighted over its
+# categories; JSON 270, code 258, prose 172) and 460 / 572 tok/s aggregate at 4 / 8 users.
+name: radiance-ling-3.0-flash-sante-w4a8
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-ling-3.0-flash-sante-w4a8
+    command: >
+      --model /models/ling-3.0-flash-sante-w4a8.rad
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
+      --tp 4 --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype bf16
+      --num-speculative-tokens 3
+      --temp 1.0 --top-p 0.95

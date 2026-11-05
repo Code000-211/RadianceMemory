@@ -1,0 +1,15 @@
+# hunyuan3d-2-bf16.recipe -- Hunyuan3D-2's shape model (hunyuan3d-dit-v2-0) served at bf16.
+#
+#   rad-convert <Hunyuan3D-2>/hunyuan3d-dit-v2-0 \
+#       --recipe data/recipes/hunyuan3d-2-bf16.recipe -o hunyuan3d-2-bf16.rad
+#
+# The folder holds config.yaml and model.fp16.safetensors (the DiT, the DINOv2 image encoder and
+# the shape VAE in one file), read as one checkpoint. The release ships fp16; every weight is cast
+# to bf16 but the two projections that read f32 inputs (the picture's patches and the query points'
+# embedding) and the DiT's q and k norm gains, which are widened to f32 exactly.
+
+dino.patch.*                         cast dtype=f32
+geo.query_proj.*                     cast dtype=f32
+dit.*.q_norm                         cast dtype=f32
+dit.*.k_norm                         cast dtype=f32
+*                                    cast dtype=bf16

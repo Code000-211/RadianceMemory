@@ -1,0 +1,29 @@
+# Full, opt-in speed/size variant for Spark X2.6 4B (Spark2_5ForCausalLM) on IQ8R's rotated int8 grid.
+# For the tested quality-preferred allocation retaining layers 0..11 in BF16, use
+# spark-x26-4b-iq8r-keep12.recipe instead. Neither allocation guarantees task quality for every use.
+# Every trunk linear rotated by fwht128 and fitted by GPTQ against calibration
+# Hessians (RADGRAM2), an int8 code with a bf16 scale per [1 x 128] (docs/IQR.md). Served by
+# arch/spark25_w8a8 at gemm_nt_q dtype i8a8h behind had_quant_act_i8g.
+#
+# The tap is arch/spark25_bf16's: serve the BF16 container with RADIANCE_CALIB_DIR set and push a
+# corpus through prefill. The f32 [K,K] accumulators are 533 MB a layer, so calibrate a slice at a
+# time -- RADIANCE_SPARK_CALIB_LAYERS=lo:hi, once per slice, same directory:
+#
+#   RADIANCE_CALIB_DIR=$CALIB RADIANCE_CALIB_TOKENS=65536 RADIANCE_SPARK_CALIB_LAYERS=0:12 \
+#     radiance --model spark-x2.6-4b-radiance-bf16.rad ...      # and drive prompts at max_tokens=1
+#
+#   CALIB=$CALIB rad-convert <XHToken-Spark-X2.6-4B> --recipe data/recipes/spark-x26-4b-iq8r.recipe \
+#       --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+#       -o spark-x2.6-4b-radiance-iq8r.rad
+#
+# Left unquantised, as arch/spark25_w8a8 declares them: the two norms a layer, the head's norm, the
+# embedding (which `blk.*.attn_gate.weight`-sized bf16 aside, the tied table the gather reads) and
+# the 16-row attention gate projection, which is 41k parameters and serves a sigmoid per head.
+
+blk.*.attn_q.weight         gptq  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.attn_k.weight         gptq  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.attn_v.weight         gptq  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.attn_output.weight    gptq  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.ffn_gate_up.weight    gptq  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.ffn_down.weight       gptq  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search calib=$CALIB
+output.weight               rtn   codes=i8 group=128 scale=bf16 clamp=sym rule=search

@@ -320,6 +320,12 @@ int parse_tokenizer_json(const char* path, VocabBuild& out);
 /* Same, from an in-memory buffer, for a tokenizer.json that arrived some other way. */
 int parse_tokenizer_json_buf(std::string_view json, const char* origin, VocabBuild& out);
 
+/* The vocabulary of a model that reads no text (container metadata `radiance.text` = none: a
+ * picture-to-shape generator): one control token, which no request reaches, since such a program
+ * serves no text endpoint. rad-convert bakes it and the engine builds it for a checkpoint. */
+void vocab_textless(VocabBuild& out);
+inline bool meta_textless(const char* v) { return v && std::string_view(v) == "none"; }
+
 /* Read a standalone chat template file into out.chat_template, trailing newlines stripped.
  * A release that ships no template (DeepSeek's does not) needs one from elsewhere; the caller
  * passes the file. An unreadable or empty file is an error, never a silent skip. Returns

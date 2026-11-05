@@ -16,7 +16,11 @@
  * before the layer's attention, `join` (the residual add and the proposal rows' selection) between
  * its attention and its feed-forward, `head` after it. The embedding and lm_head are the trunk's.
  * Its names live under the `mtp.` scope (Names), its weights in layer 45's group. eh_proj
- * (4096 x 8192 bf16, 64 MiB) is replicated and read whole in every draft pass. */
+ * (4096 x 8192 bf16, 64 MiB) is replicated and read whole in every draft pass.
+ *
+ * The same head serves another DeepSeek-style drafter by its checkpoint layout, set before
+ * declare_inputs: the residual width, the layer's checkpoint prefix and index, and the name of the
+ * head's final norm (Ling-3.0: 2560, `model.layers.42`, 42, `final_layernorm.weight`). */
 #ifndef RAD_BLOCK_GLM_MTP_H
 #define RAD_BLOCK_GLM_MTP_H
 #include "rad_glm_tp.h"
@@ -31,6 +35,10 @@ struct GlmMtp {
         rad_weight token = 0, head = 0;
     };
     static constexpr int kDepth = 3;   /* --num-speculative-tokens auto */
+    int64_t     width = 4096;
+    const char* prefix = "model.language_model.layers.45";
+    int         layer = 45;
+    const char* norm_src = "shared_head.norm.weight";
     Names nm{ "mtp" };
     Geom g{};
     Wire w{};
@@ -50,47 +58,48 @@ struct GlmMtp {
         w = wire;
         if (!b || !w.final_hidden || !w.logits || !w.token || !w.head || g.max_spec < 1)
             return RAD_E_INVAL;
-        x = decl_b(b, nm.f("x"), RAD_BF16, { g.max_tok, 4096 });
-        hidden = decl_b(b, nm.f("hidden"), RAD_BF16, { g.max_tok, 4096 }, RAD_BUF_PERSIST);
-        embedding = decl_b(b, nm.f("embedding"), RAD_BF16, { g.max_tok, 4096 });
-        concat = decl_b(b, nm.f("concat"), RAD_BF16, { g.max_tok, 8192 });
-        out = decl_b(b, nm.f("final"), RAD_BF16, { g.max_tok, 4096 });
-        const char* pre = "model.language_model.layers.45";
+        const int64_t E = width;
+        x = decl_b(b, nm.f("x"), RAD_BF16, { g.max_tok, E });
+        hidden = decl_b(b, nm.f("hidden"), RAD_BF16, { g.max_tok, E }, RAD_BUF_PERSIST);
+        embedding = decl_b(b, nm.f("embedding"), RAD_BF16, { g.max_tok, E });
+        concat = decl_b(b, nm.f("concat"), RAD_BF16, { g.max_tok, 2 * E });
+        out = decl_b(b, nm.f("final"), RAD_BF16, { g.max_tok, E });
+        const char* pre = prefix;
         auto gain = [&](const char* n, const char* src) {
             const char* name = nm.f("%s", n);
             if (map_copy(b, name, nm.ckpt("%s.%s", pre, src)) < 0) return (rad_weight)0;
-            return decl_w(b, name, RAD_F32, { 4096 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
-                          grp_layer(45));
+            return decl_w(b, name, RAD_F32, { E }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                          grp_layer(layer));
         };
         en = gain("enorm.weight", "enorm.weight");
         hn = gain("hnorm.weight", "hnorm.weight");
-        norm = gain("output_norm.weight", "shared_head.norm.weight");
+        norm = gain("output_norm.weight", norm_src);
         RAD_ARCH_TRY(map_copy(b, nm.f("eh_proj.weight"), nm.ckpt("%s.eh_proj.weight", pre)));
-        eh = decl_w(b, nm.f("eh_proj.weight"), RAD_BF16, { 4096, 8192 }, RAD_ACCESS_PER_TOKEN,
-                    RAD_SHARD_NONE, grp_layer(45));
+        eh = decl_w(b, nm.f("eh_proj.weight"), RAD_BF16, { E, 2 * E }, RAD_ACCESS_PER_TOKEN,
+                    RAD_SHARD_NONE, grp_layer(layer));
         if (!x || !hidden || !embedding || !concat || !out || !en || !hn || !norm || !eh)
             return RAD_E_INVAL;
         op_prev = rw(b,
                      RAD_OP(b, "gather_rows",
-                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 4096),
+                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", E),
                                        RAD_STR("dtype", "bf16")),
                             RAD_NOWEIGHTS),
                      { w.final_hidden }, { hidden });
         op_embed = rw(b,
                       RAD_OP(b, "embed_lookup",
-                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", 4096),
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", E),
                                         RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", "bf16"),
                                         RAD_INT("vocab_offset", g.vocab_off)),
                              RAD_WEIGHTS(w.token)),
                       {}, { embedding });
-        if (media) RAD_ARCH_TRY(mrows.declare(b, g.max_tok, 4096, embedding));
+        if (media) RAD_ARCH_TRY(mrows.declare(b, g.max_tok, E, embedding));
         op_embed_ar = GlmTp::reduce(b, g, embedding, true);
         op_en = rmsnorm(b, en, embedding, concat);
         op_hn = rmsnorm(b, hn, hidden, concat);
         op_eh = rw(b,
                    RAD_OP(b, "gemm_nt",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", 4096),
-                                     RAD_INT("K", 8192), RAD_STR("dtype", "bf16")),
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", E),
+                                     RAD_INT("K", 2 * E), RAD_STR("dtype", "bf16")),
                           RAD_WEIGHTS(eh)),
                    { concat }, { x });
         return op_prev && op_embed && op_en && op_hn && op_eh && (g.world == 1 || op_embed_ar)
@@ -102,14 +111,14 @@ struct GlmMtp {
     int declare_join(RadBuilder* b, rad_buf y) {
         op_residual = rw(b,
                          RAD_OP(b, "add",
-                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 4096),
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", width),
                                            RAD_STR("dtype", "bf16")),
                                 RAD_NOWEIGHTS),
                          { x, y }, { x });
         // All history rows fill the draft cache; only proposal rows need its FFN.
         op_select = rw(b,
                        RAD_OP(b, "gather_rows",
-                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", 4096),
+                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", width),
                                          RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
                        { x }, { hidden });
@@ -124,7 +133,7 @@ struct GlmMtp {
         op_head = rw(b,
                      RAD_OP(b, "logits_gemm",
                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                       RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", 4096),
+                                       RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", width),
                                        RAD_STR("dtype", "bf16")),
                             RAD_WEIGHTS(w.head)),
                      { hidden }, { w.logits });
@@ -150,9 +159,9 @@ struct GlmMtp {
         RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w.token),
                     brows(embedding, T));
         mrows.step(c, batch, embedding, T);
-        if (op_embed_ar) RAD_ISSUE_N(c, op_embed_ar, T * 4096, brows(embedding, T), RAD_NONE);
-        RAD_ISSUE_N(c, op_en, T, brows(embedding, T), RAD_W(en), bcol(concat, 0, 4096, T));
-        RAD_ISSUE_N(c, op_hn, T, brows(hidden, T), RAD_W(hn), bcol(concat, 4096, 4096, T));
+        if (op_embed_ar) RAD_ISSUE_N(c, op_embed_ar, T * width, brows(embedding, T), RAD_NONE);
+        RAD_ISSUE_N(c, op_en, T, brows(embedding, T), RAD_W(en), bcol(concat, 0, width, T));
+        RAD_ISSUE_N(c, op_hn, T, brows(hidden, T), RAD_W(hn), bcol(concat, width, width, T));
         RAD_ISSUE_N(c, op_eh, T, brows(concat, T), RAD_W(eh), brows(x, T));
     }
     void step_join(RadCtx* c, const RadBatch* batch, rad_buf y) const {
@@ -175,7 +184,7 @@ private:
     rad_op rmsnorm(RadBuilder* b, rad_weight gain, rad_buf in, rad_buf out) const {
         return rw(b,
                   RAD_OP(b, "rmsnorm",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 4096),
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", width),
                                     RAD_F64("eps", g.eps), RAD_STR("dtype", "bf16")),
                          RAD_WEIGHTS(gain)),
                   { in }, { out });
@@ -183,7 +192,7 @@ private:
     rad_op cast(RadBuilder* b, rad_buf in, rad_buf out) const {
         return rw(b,
                   RAD_OP(b, "cast",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 4096),
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", width),
                                     RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
                          RAD_NOWEIGHTS),
                   { in }, { out });

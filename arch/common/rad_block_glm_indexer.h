@@ -27,6 +27,9 @@ struct DsaCache {
         rad_buf query = 0, codes = 0, scales = 0, gate = 0, kg = 0;
         rad_buf stage = 0, page = 0, bpos = 0, nc = 0, pooled = 0, pool_scale = 0;
         rad_buf score = 0, selected = 0, nsel = 0, length = 0;
+        /* A taking-all step's zero scores, [max_tok, topk + 1]: such a step does not split, and
+         * the score plane holds only a run of rows when the step may. */
+        rad_buf unscored = 0;
         /* TP only: a rank's rebased bounds, page tables and lengths before the gathers. */
         rad_buf cu_part = 0, sel_part = 0, len_part = 0;
     };
@@ -44,6 +47,7 @@ struct DsaCache {
     rad_kvgroup index = 0, tail = 0, attention = 0;
     rad_weight ape = 0;
     rad_op op_query = 0, op_work = 0, op_pool = 0, op_tail = 0, op_score = 0, op_select = 0;
+    rad_op op_unscored = 0, op_select_all = 0;
     rad_op op_score_part = 0, op_select_part = 0, op_gather_sel = 0, op_gather_len = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Config& cfg,
@@ -112,6 +116,15 @@ struct DsaCache {
                                        RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", "bf16")),
                             RAD_NOWEIGHTS),
                      { w.kg }, {});
+        /* A step whose every row reaches topk or fewer blocks selects them all (takes_all), and
+         * qsa_select takes any finite scores in block order then: zeros serve as well as the
+         * scorer's. The fill spans topk + 1 columns, at least the live reach of such a step. */
+        op_unscored = rw(b,
+                         RAD_OP(b, "fill",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                           RAD_INT("n", unscored_cols()), RAD_STR("dtype", "f32")),
+                                RAD_NOWEIGHTS),
+                         {}, { w.unscored });
         op_score = rw(b,
                       RAD_OP(b, "dsa_score",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 128),
@@ -139,6 +152,14 @@ struct DsaCache {
                                          RAD_INT("seqs", g.max_seqs), RAD_INT("signed", 1)),
                               RAD_NOWEIGHTS),
                        { w.score, w.nc }, { w.selected, w.nsel, w.length });
+        op_select_all = rw(b,
+                           RAD_OP(b, "qsa_select",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                             RAD_INT("blocks", unscored_cols()),
+                                             RAD_INT("topk", 512), RAD_INT("ratio", 4),
+                                             RAD_INT("seqs", g.max_seqs), RAD_INT("signed", 1)),
+                                  RAD_NOWEIGHTS),
+                           { w.unscored, w.nc }, { w.selected, w.nsel, w.length });
         if (split) {
             op_select_part = rw(
                 b,
@@ -165,8 +186,12 @@ struct DsaCache {
             if (!op_score_part || !op_select_part || !op_gather_sel || !op_gather_len)
                 return RAD_E_INVAL;
         }
-        return op_query && op_work && op_tail && op_score && op_select ? RAD_OK : RAD_E_INVAL;
+        return op_query && op_work && op_tail && op_unscored && op_score && op_select &&
+                       op_select_all
+                   ? RAD_OK
+                                                                                      : RAD_E_INVAL;
     }
+    int64_t unscored_cols() const { return c.topk + 1 < c.blocks ? c.topk + 1 : c.blocks; }
     /* The columns a step scores: the live reach the batch bounds on the host. */
     int64_t live_blocks(const RadBatch* batch) const {
         const auto* ib = kv_batch(batch, index);
@@ -179,13 +204,19 @@ struct DsaCache {
     }
     /* The decision reads the same host bound as the score plane's width (max_ctx_len, rounded by
      * the core), so every rank takes the same path and a recorded decode pass changes it only when
-     * that bound moves. */
+     * that bound moves. A step that takes all its blocks never splits: with nothing to score, every
+     * rank selects the whole step itself, and the gathers have nothing to save. */
     bool splits(const RadBatch* batch) const {
         const int64_t T = batch->n_tok;
-        return op_score_part && (GlmTp::splits(T, g.world) ||
-                                 (T >= GlmTp::kSplitWorkRows &&
-                                  T * live_blocks(batch) >= GlmTp::kSplitWork));
+        return op_score_part && live_blocks(batch) > c.topk &&
+               (GlmTp::splits(T, g.world) ||
+                (T >= GlmTp::kSplitWorkRows && T * live_blocks(batch) >= GlmTp::kSplitWork));
     }
+    /* Every row's history fits the selection, so the query side (projection, head gates,
+     * quantiser, scorer) has nothing to decide: the selected table is every live block in order,
+     * bit for bit what scoring would select. Read from the same host bound as splits(), so every
+     * rank agrees. */
+    bool takes_all(const RadBatch* batch) const { return live_blocks(batch) <= c.topk; }
     /* The query rows this rank runs: the whole step, or its run of a split step (GlmTp::run_of).
      * A rank whose run lies wholly past a small step runs the step's first R rows instead: no
      * sequence holds its run, so its scores are -inf, and its answers land past T. The caller's
@@ -210,11 +241,13 @@ struct DsaCache {
         const int64_t T = batch->n_tok, S = batch->n_seq;
         const int64_t work = (T + 3) / 4 + S,
                       pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
+        const bool all = takes_all(batch);
         int64_t q0 = 0, qn = T;
         query_rows(batch, &q0, &qn);
-        RAD_ISSUE_N(ctx, op_query, qn * 32, brow_slice(w.query, q0 * 32, qn * 32, 128),
-                    brow_slice(w.codes, q0 * 32, qn * 32, 128),
-                    brow_slice(w.scales, q0 * 32, qn * 32, 1));
+        if (!all)
+            RAD_ISSUE_N(ctx, op_query, qn * 32, brow_slice(w.query, q0 * 32, qn * 32, 128),
+                        brow_slice(w.codes, q0 * 32, qn * 32, 128),
+                        brow_slice(w.scales, q0 * 32, qn * 32, 1));
         RAD_ISSUE_N(ctx, op_work, T, brows(w.kg, T), praw(batch->positions, RAD_I32, T),
                     praw(batch->cu_seqlens, RAD_I32, S + 1), kv_cache(tail, layer),
                     praw2(tb->state_index, RAD_I32, S, pitch),
@@ -230,6 +263,16 @@ struct DsaCache {
         const int64_t live = live_blocks(batch);
         if (splits(batch)) {
             step_split(ctx, batch, live);
+            return;
+        }
+        if (all) {
+            const int64_t U = unscored_cols();
+            RAD_ISSUE_N(ctx, op_unscored, T, brows(w.unscored, T));
+            RAD_ISSUE_N(ctx, op_select_all, T, bcol_at(w.unscored, 0, U, 0, live, T),
+                        praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch),
+                        brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.selected, T),
+                        brows(w.nsel, T), brows(w.length, T));
             return;
         }
         // dsa_score declares ten operands, cu_part the optional tenth; the engine counts them.
@@ -348,23 +391,29 @@ struct GlmIndexer {
         };
         int64_t r0 = 0, rows = T;
         cache.query_rows(batch, &r0, &rows);
+        /* The key side runs on every step, since the index cache must stay current; the query
+         * side only where the selection is a choice (DsaCache::takes_all). */
+        const bool all = cache.takes_all(batch);
         /* Every output row of these ops is independent of the others and of how many there are,
          * except the bf16 projection's at 64 rows and under, a band whose split count a tuned
          * configuration may set: it stays on the step's rows unless every run is wider. */
         const bool runs = cache.splits(batch);
-        if (runs && T - (g.world - 1) * DsaCache::part_rows(T, g.world) > 64)
-            query.step(ctx, act(w.q_low), w.q_wide, T, r0, rows);
-        else
-            query.step(ctx, act(w.q_low), w.q_wide, T);
-        RAD_ISSUE_N(ctx, op_query_copy, rows * 32, brow_slice(w.q_wide, r0, rows, 4096),
-                    brow_slice(w.cache.query, r0 * 32, rows * 32, 128));
+        if (!all) {
+            if (runs && T - (g.world - 1) * DsaCache::part_rows(T, g.world) > 64)
+                query.step(ctx, act(w.q_low), w.q_wide, T, r0, rows);
+            else
+                query.step(ctx, act(w.q_low), w.q_wide, T);
+            RAD_ISSUE_N(ctx, op_query_copy, rows * 32, brow_slice(w.q_wide, r0, rows, 4096),
+                        brow_slice(w.cache.query, r0 * 32, rows * 32, 128));
+        }
         key_gate.step(ctx, act(w.input), w.kg_raw, T);
         RAD_ISSUE_N(ctx, op_norm, T, bcol(w.kg_raw, 0, 128, T), RAD_W(gain), RAD_W(bias),
                     bcol(w.cache.kg, 0, 128, T));
         RAD_ISSUE_N(ctx, op_gate_copy, T, bcol(w.kg_raw, 128, 128, T),
                     bcol(w.cache.kg, 128, 128, T));
-        RAD_ISSUE_N(ctx, op_head, rows, brow_slice(w.input, r0, rows, 4096), RAD_W(head_weight),
-                    brow_slice(w.cache.gate, r0, rows, 32));
+        if (!all)
+            RAD_ISSUE_N(ctx, op_head, rows, brow_slice(w.input, r0, rows, 4096),
+                        RAD_W(head_weight), brow_slice(w.cache.gate, r0, rows, 32));
         cache.step(ctx, batch);
     }
 };

@@ -1,0 +1,23 @@
+# NVIDIA-Nemotron-3.5-Bolt-74B-A9B on two cards: the routed experts as 4-bit codebook codes at E4M3
+# scales per 64 weights (w4nl64a8h, round to nearest), every other linear block FP8, NVIDIA's
+# LiLiCorr drafter and the C-RADIO vision tower. Converted with
+# data/recipes/nemotron74-w4nl64-gptq.recipe (CALIB an empty directory) and the drafter, or
+# downloaded from https://huggingface.co/keptn/nemotron-3.5-bolt-74b-w4a8. Thinking is switched per
+# request (chat_template_kwargs).
+#
+# LiLiCorr proposes 7 tokens in one block pass, its trained block of 8 less the anchor. The KV cache
+# stays bf16. 8 sequences of up to 65536 tokens; --max-model-len 262144 --max-num-seqs 2 serves the
+# whole context.
+#
+# On 2x R9700 at 215 W, BetterBench 0.6.1 with thinking off: 207 tok/s single-stream, 351 tok/s
+# aggregate at 4 users, and 5272 tok/s prefill at 24k tokens.
+name: radiance-nemotron-3.5-bolt-74b-w4a8
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-nemotron-3.5-bolt-74b-w4a8
+    command: >
+      --model /models/nemotron-3.5-bolt-74b-w4a8.rad
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
+      --tp 2 --max-num-seqs 8 --max-model-len 65536 --max-num-batched-tokens 8192
+      --num-speculative-tokens 7

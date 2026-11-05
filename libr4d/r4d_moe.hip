@@ -42,6 +42,7 @@
 #include "r4d_fp8_wmma.h"
 #include "r4d_plugin.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_gemm_args.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
@@ -677,8 +678,7 @@ constexpr uint32_t moe_waves(uint32_t ntl, int w4, bool es, bool al, uint32_t fk
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
           bool RS = false>
-__global__ __launch_bounds__(WGM * WGN * kWave) R4D_WAVES(moe_waves(NTL, W4, ES, AL, FK, RS))
-void moe_gemm_q_kernel(
+__device__ __forceinline__ void moe_gemm_q_kernel_body(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
@@ -1431,6 +1431,36 @@ void moe_gemm_q_kernel(
     }
 }
 
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
+          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
+          bool RS = false>
+__global__ __launch_bounds__(WGM * WGN * kWave) R4D_WAVES(moe_waves(NTL, W4, ES, AL, FK, RS))
+void moe_gemm_q_kernel(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    moe_gemm_q_kernel_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
+}
+template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
+          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
+          bool RS = false>
+__global__ __launch_bounds__(WGM * WGN * kWave) R4D_WAVES(moe_waves(NTL, W4, ES, AL, FK, RS))
+void r4dchain_moe_gemm_q(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    r4d_chain_wait();
+    moe_gemm_q_kernel_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
+    r4d_chain_done();
+}
+
 /* ================================================================== moe_gemm_q, the down decode form
  *
  * The sorted-operand projection at decode: one block per run tile, G column tiles per block.
@@ -1463,7 +1493,7 @@ void moe_gemm_q_kernel(
  * Sorted operand only: a run's activation rows are [rs, re) of `Aq` with no gather. Every row in a
  * run is a placed slot (the scatter fills exactly [0, off[n_expert])), so `sorted` is not read. */
 template <int W4>
-__global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
+__device__ __forceinline__ void moe_down_dec_kernel_body(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
@@ -1767,6 +1797,28 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
         }
         cur = nxt;
     }
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <int W4>
+__global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+    const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
+}
+template <int W4>
+__global__ __launch_bounds__(4 * kWave) void r4dchain_moe_down_dec(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+    const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    r4d_chain_wait();
+    moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
+    r4d_chain_done();
 }
 
 /* One or a few routed rows at I4 with BF16 scales per 128 K (signed or a 16-entry codebook).
@@ -2848,6 +2900,9 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
      * rows take the aligned 32-row form; r4d_moe_decode_band has the crossover. */
     const uint32_t ny = (uint32_t)(N / 64);
     const int form = g_moe_prefill_form;
+    /* The chained forms (r4d_chain.h) where the row resolved with `chain`, at decode heights. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 &&
+                    r4d_chain_rows_ok(a_sorted ? (T + top_k - 1) / top_k : M);
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
         /* The decode grid is (tile, run) wide (the kernel's ES note); decode has one tile of rows,
          * which alone would give only N/64 workgroups. */
@@ -2861,7 +2916,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         if (dn_dec && g2 > 0) {
             const unsigned slots  = (unsigned)(std::min(T, n_expert) + (T + 15) / 16);
             const unsigned groups = (unsigned)((N + 64 * g2 - 1) / (64 * g2));
-            emit_rc = R4D_EMIT(stream, (moe_down_dec_kernel<W4>),
+            emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_moe_down_dec<W4> : &moe_down_dec_kernel<W4>),
                                dim3(slots + 1u, groups), dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)off->data, (uint16_t*)Y->data,
@@ -2878,6 +2933,9 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         const bool rs = n_expert <= (long long)kMaxExpert;
         auto pick = [&](auto fk) {
             constexpr uint32_t F = decltype(fk)::value;
+            if (ch)
+                return rs ? &r4dchain_moe_gemm_q<1, 4, 1, 4, W4, true, false, false, F, true, true>
+                          : &r4dchain_moe_gemm_q<1, 4, 1, 4, W4, true, false, false, F, true, false>;
             return rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true>
                       : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, false>;
         };
@@ -3404,7 +3462,7 @@ struct RgGeom {
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
 template <uint32_t MAXOWN, uint32_t NW>
-__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
+__device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
@@ -3470,6 +3528,28 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
         router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, snk);
     lds_barrier();
     scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <uint32_t MAXOWN, uint32_t NW>
+__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot) {
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
+}
+template <uint32_t MAXOWN, uint32_t NW>
+__global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot) {
+    r4d_chain_wait();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
+    r4d_chain_done();
 }
 
 /* The arrival counter belongs to the op instance and is taken at init, not on the launch path.
@@ -3645,9 +3725,12 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     g.sk = (uint32_t)cr.sk;          g.tpb = (uint32_t)tpb;
     g.nrb = (uint32_t)nrb;           g.skg = wg ? (uint32_t)cg.sk : 0u;
     const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
+    /* The chained form (r4d_chain.h) where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M);
 
 #define R4D_RG_L(OWN, NWV)                                                                      \
-    emit_rc = R4D_EMIT(stream, (router_gemm_topk_scatter_kernel<OWN, NWV>), grid,               \
+    emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter<OWN, NWV>               \
+                                   : &router_gemm_topk_scatter_kernel<OWN, NWV>), grid,         \
                        dim3((NWV) * kWave), lds,                                                \
                        (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
                        wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \

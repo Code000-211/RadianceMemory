@@ -390,7 +390,7 @@ json Server::capabilities() const {
     caps["reasoning"] = !rerank && deps_.chat && deps_.chat->supports_reasoning();
     /* An image model reads pictures only for edits and writes no text a grammar could constrain,
      * whatever its conditioning network's processor would take. */
-    const bool img = opt_.image_model || opt_.video_model;
+    const bool img = opt_.image_model || opt_.video_model || opt_.shape_model;
     caps["grammar"]   = !img && !rerank && deps_.grammar != nullptr;
     /* Laya runs on the embedding path, but answers /v1/systemone, not /v1/embeddings. */
     caps["embedding"] = deps_.embed != nullptr && !rerank && opt_.decision_type != "laya";
@@ -403,11 +403,13 @@ json Server::capabilities() const {
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
     caps["audio_generation"] = deps_.audio != nullptr;
     caps["video_generation"] = deps_.videos != nullptr;
+    caps["shape_generation"] = deps_.shapes != nullptr;
     /* The decision protocol /v1/systemone serves (ServerOptions::decision_type), so a proxy can
      * route to a decision model without trying a generation; null when it serves none. */
     caps["decision"] = opt_.decision_type.empty() ? json(nullptr) : json(opt_.decision_type);
     /* What a video request may carry. */
     if (deps_.videos) video_caps(caps, deps_.videos);
+    if (deps_.shapes) shape_caps(caps, deps_.shapes);
     /* The efforts a chat request may send, probed from the template at startup; null when it
      * takes any word. "none" and "minimal" are this server's and turn thinking off. */
     if (lim_.reasoning_efforts.empty()) {

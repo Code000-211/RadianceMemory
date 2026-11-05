@@ -36,7 +36,7 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
     uint16_t* __restrict__ state,
-    int T, int n, int ring, int seqs, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
 
     const int t = (int)blockIdx.x;
     if (t >= T) return;
@@ -50,9 +50,10 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     /* Only the last `ring` tokens of this sequence's chunk -- see the header. */
     if (t < cu[s + 1] - ring) return;
 
-    /* Column 0 is the committed slot; -1 marks a sequence with no state. */
+    /* Column 0 is the committed slot; -1 marks a sequence with no state. A slot past the
+     * state plane's would write past its allocation. */
     const int si = sidx[(size_t)s * sidx_ld];
-    if (si < 0) return;
+    if (si < 0 || si >= slots) return;
 
     const int row = pos[t] % ring;
     const size_t src = (size_t)t * k_ld;
@@ -69,17 +70,17 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
 //   state  [slots][ring][n]      bf16, this layer's tail cache; written only, untargeted rows
 //                                keep their contents
 static int halo_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, long state, int T,
-                                       int n, int ring, int seqs, int k_ld, int s_slot, int s_row,
-                                       int sidx_ld, RadStream stream) {
+                                       int n, int ring, int seqs, int slots, int k_ld, int s_slot,
+                                       int s_row, int sidx_ld, RadStream stream) {
     if (!k || !pos || !cu || !sidx || !state) return HALO_NO(RAD_E_INVAL);
-    if (T <= 0 || n <= 0 || ring <= 0 || seqs <= 0) return HALO_NO(RAD_E_SHAPE);
+    if (T <= 0 || n <= 0 || ring <= 0 || seqs <= 0 || slots <= 0) return HALO_NO(RAD_E_SHAPE);
     if (!k_ld) k_ld = n;
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
     return HALO_EMIT(stream, qsa_tail_store_kernel, dim3((unsigned)T), dim3(kThreads), 0,
                     (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,
-                    (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, k_ld, s_slot, s_row,
-                    sidx_ld);
+                    (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, slots, k_ld, s_slot,
+                    s_row, sidx_ld);
 }
 
 // ============================================================== the plugin ABI entry point
@@ -116,7 +117,7 @@ extern "C" int halo_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
     if (k->dtype != RAD_BF16 || st->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
     return halo_qsa_tail_store_bf16_emit(halo_addr(k), halo_addr(po), halo_addr(cu), halo_addr(sx),
                                         halo_addr(st), (int)T, (int)n, (int)ring, (int)seqs,
-                                        (int)kp, (int)st->stride[0], (int)st->stride[2],
-                                        (int)sxp, stream);
+                                        (int)st->shape[0], (int)kp, (int)st->stride[0],
+                                        (int)st->stride[2], (int)sxp, stream);
 }
 

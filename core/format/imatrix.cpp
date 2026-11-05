@@ -56,6 +56,9 @@ struct Cursor {
             case GT_ARR: {
                 uint32_t et = 0; uint64_t n = 0;
                 if (!get(&et) || !get(&n)) return false;
+                /* An array of arrays is refused, as the GGUF reader refuses it: each level costs a
+                 * file 12 bytes and this walker a stack frame. */
+                if (et == GT_ARR) { ok = false; return false; }
                 for (uint64_t i = 0; i < n && ok; ++i) if (!skip_value(et)) return false;
                 return ok;
             }

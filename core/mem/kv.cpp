@@ -439,12 +439,16 @@ int KVManager::declare_runtime_window(int32_t g, int64_t window_tokens) {
         fixed_ += align_up(max_seqs_ * q.ring_blocks_max() * q.bytes_per_block, RAD_ALIGN_UNIT);
         if (counted) {
             const int64_t was = q.window_blocks * q.bytes_per_block;
-            /* The plan counted this group's snapshot section, so both totals carry `was`.
-             * Saturating hides an accounting bug; surface it in debug builds. */
-            assert(window_ck_bytes_ >= was && checkpoint_bytes_ >= was &&
-                   "runtime window: snapshot byte totals below the section being removed");
-            window_ck_bytes_ = window_ck_bytes_ > was ? window_ck_bytes_ - was : 0;
-            checkpoint_bytes_ = checkpoint_bytes_ > was ? checkpoint_bytes_ - was : 0;
+            /* The plan counted this group's snapshot section, so both totals carry `was`; less
+             * is an accounting bug, and the pool would be sized from a wrong total. */
+            if (window_ck_bytes_ < was || checkpoint_bytes_ < was) {
+                RAD_ERR("kv group %d: runtime window: the snapshot byte totals (%lld, %lld) are "
+                        "below the %lld-byte section being removed", (int)g,
+                        (long long)window_ck_bytes_, (long long)checkpoint_bytes_, (long long)was);
+                return RAD_E_STATE;
+            }
+            window_ck_bytes_ -= was;
+            checkpoint_bytes_ -= was;
         }
     }
     return RAD_OK;
@@ -585,8 +589,8 @@ int KVManager::carve_into(Pool& kv_pool) {
                 "  vram_kv            %10s\n"
                 "  short by           %10s\n"
                 "Lower --max-num-seqs, or give the cache more of the card: a smaller "
-                "--gpu-headroom-mib or a larger --host-pool-mib. The engine will not shrink one of "
-                "them for you (spec §6).",
+                "--gpu-headroom-mib, a larger --gpu-memory-mib, or a larger --host-pool-mib. The "
+                "engine will not shrink one of them for you (spec §6).",
                 humanb(fixed).c_str(), (long long)max_seqs_, humanb(budget_bytes).c_str(),
                 humanb(fixed - budget_bytes + 1).c_str());
         return RAD_E_NOMEM;
@@ -615,8 +619,8 @@ int KVManager::carve_into(Pool& kv_pool) {
         }
         if (p.n_blocks <= 0) {
             RAD_ERR("KV group '%s': a %s KV pool leaves 0 blocks (%s a page) after the fixed "
-                    "linear/conv costs of %s. Raise --host-pool-mib or lower --gpu-headroom-mib, or "
-                    "lower --max-num-seqs.",
+                    "linear/conv costs of %s. Raise --host-pool-mib or --gpu-memory-mib, or lower "
+                    "--gpu-headroom-mib or --max-num-seqs.",
                     p.name.c_str(), humanb(budget_bytes).c_str(),
                     humanb(p.bytes_per_block).c_str(), humanb(fixed).c_str());
             return RAD_E_NOMEM;

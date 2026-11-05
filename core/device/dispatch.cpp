@@ -18,6 +18,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <utility>
 #include <cstdint>
@@ -143,6 +144,26 @@ struct Ledger {
     std::atomic<int64_t> count{0};
 };
 Ledger g_ledger[4];        /* indexed by RAD_MEM_*; rad_dev_alloc bounds the kind */
+/* Each live allocation's size, so rad_dev_free (which has none) takes it back off the ledger's
+ * bytes: pinned ranges are freed and taken again during bring-up, and the pin-cap check reads the
+ * ledger as what the process holds. Allocations are rare, never per step. */
+struct LiveAlloc { int64_t bytes; int kind; };
+std::mutex                           g_ledger_mu;
+std::unordered_map<void*, LiveAlloc> g_ledger_live;
+
+void ledger_add(void* p, int64_t bytes, int kind) {
+    g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_ledger_mu);
+    g_ledger_live[p] = LiveAlloc{ bytes, kind };
+}
+void ledger_drop(void* p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_ledger_mu);
+    const auto it = g_ledger_live.find(p);
+    if (it == g_ledger_live.end()) return;
+    g_ledger[it->second.kind].bytes.fetch_sub(it->second.bytes, std::memory_order_relaxed);
+    g_ledger_live.erase(it);
+}
 
 /* Live event handles, counted here so the number is backend-independent; the only place an
  * event leaked at teardown shows. */
@@ -421,7 +442,7 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     thread_local int64_t t_device_ordinal = 0;
     void* p = dev()->alloc(bytes, kind);
     if (p && kind >= 0 && kind < (int)std::size(rad::g_ledger)) {
-        rad::g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
+        rad::ledger_add(p, bytes, kind);
         const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
         const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
         const int64_t floor_ = rad::trace_floor();
@@ -447,8 +468,7 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     return p;
 }
 void  rad_dev_free(void* p, int kind) {
-    /* The ledger counts allocations, not live bytes: rad_dev_free has no size. The engine frees
-     * only at teardown, so the two agree while running. */
+    rad::ledger_drop(p);
     dev()->free(p, kind);
 }
 void* rad_dev_host_ptr(void* p)                   { return dev()->host_ptr(p); }
@@ -665,7 +685,7 @@ void* rad_dev_map_file(int fd, int64_t foff, int64_t bytes) {
     }
     void* p = f(fd, foff, bytes);
     if (p) {
-        rad::g_ledger[RAD_MEM_HOST_MAPPED].bytes.fetch_add(bytes, std::memory_order_relaxed);
+        rad::ledger_add(p, bytes, RAD_MEM_HOST_MAPPED);
         rad::g_ledger[RAD_MEM_HOST_MAPPED].count.fetch_add(1, std::memory_order_relaxed);
     }
     return p;

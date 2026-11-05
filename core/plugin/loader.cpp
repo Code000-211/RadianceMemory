@@ -52,9 +52,10 @@ bool target_covers(const std::string& declared, const char* arch) {
 }
 
 /* Two schemas for one op are the same when every positional slot means the same thing: parameter
- * keys, types and requiredness (what the selector matches on) and operand count, roles and
- * optionality (arguments are positional). Operand names are for diagnostics only (ABI), so "b"
- * and "w_gate" in slot 1 agree. */
+ * keys, types, requiredness (what the selector matches on) and roles (the core reads the first
+ * registrant's: a chunk or a capacity named by one plugin applies to every plugin's rows), and
+ * operand count, roles and optionality (arguments are positional). Operand names are for
+ * diagnostics only (ABI), so "b" and "w_gate" in slot 1 agree. */
 bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string* diff) {
     if (a.n_params != b.n_params) {
         *diff = fmt("%d parameters vs %d", a.n_params, b.n_params);
@@ -75,6 +76,10 @@ bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string* diff) 
         if (x.required != y.required) {
             *diff = fmt("parameter '%s' is %s vs %s", or_empty(x.key),
                         x.required ? "required" : "optional", y.required ? "required" : "optional");
+            return false;
+        }
+        if (x.role != y.role) {
+            *diff = fmt("parameter '%s' has role %d vs %d", or_empty(x.key), x.role, y.role);
             return false;
         }
     }
@@ -212,6 +217,8 @@ int Registry::commit_(Staged& s, int order) {
         p.arch_declare = dl_fn<int (*)(RadBuilder*, const RadModelMeta*, const RadBuildCtx*)>(
                              s.handle, "rad_arch_declare");
         p.arch_step = dl_fn<void (*)(RadCtx*, const RadBatch*)>(s.handle, "rad_arch_step");
+        p.arch_pass_key = dl_fn<uint64_t (*)(RadCtx*, const RadBatch*, const int32_t*)>(
+                              s.handle, "rad_arch_pass_key");
         if (!id_fn || !p.arch_declare || !p.arch_step) {
             err_("architecture plugin '%s' is missing rad_arch_id, rad_arch_declare or "
                  "rad_arch_step", p.name.c_str());
@@ -291,6 +298,27 @@ int Registry::commit_(Staged& s, int order) {
                 unstage_(s);
                 return RAD_E_INVAL;
             }
+            /* The counts are the plugin's word; the tables they index are walked at every
+             * selection and every issue, so a null table or an operand count past what an issue
+             * can carry (MAX_OPERANDS) is refused here, by name, rather than read there. */
+            if (sch->n_params < 0 || (sch->n_params && !sch->params) || sch->n_operands < 0 ||
+                sch->n_operands > MAX_OPERANDS || (sch->n_operands && !sch->operands)) {
+                err_("kernel plugin '%s': op '%s' declares %d parameters and %d operands, a table "
+                     "missing, or more operands than an issue carries (%d)", p.name.c_str(),
+                     sch->op, sch->n_params, sch->n_operands, MAX_OPERANDS);
+                unstage_(s);
+                return RAD_E_INVAL;
+            }
+            for (int q = 0; q < sch->n_params; ++q) {
+                const RadParamSpec& ps = sch->params[q];
+                if (!ps.key || !ps.key[0] || ps.role < RAD_PROLE_NONE ||
+                    ps.role > RAD_PROLE_CAPACITY) {
+                    err_("kernel plugin '%s': op '%s' parameter %d has no key or an unknown role "
+                         "(%d)", p.name.c_str(), sch->op, q, ps.role);
+                    unstage_(s);
+                    return RAD_E_INVAL;
+                }
+            }
             std::string diff;
             auto it = schemas_.find(sch->op);
             if (it != schemas_.end()) {
@@ -338,6 +366,23 @@ int Registry::commit_(Staged& s, int order) {
                 unstage_(s);
                 return RAD_E_INVAL;
             }
+            /* The selector reads every constraint of every row at every query, and the tuner every
+             * tunable, so their tables must exist wherever a count says they do. */
+            if (k->n_tunables < 0 || (k->n_tunables && !k->tunables) || k->n_constraints < 0 ||
+                (k->n_constraints && !k->constraints)) {
+                err_("kernel '%s' in plugin '%s' declares %d tunables and %d constraints with a "
+                     "missing table", k->name, p.name.c_str(), k->n_tunables, k->n_constraints);
+                unstage_(s);
+                return RAD_E_INVAL;
+            }
+            for (int c = 0; c < k->n_constraints; ++c)
+                if (!k->constraints[c].key || !k->constraints[c].key[0] ||
+                    (k->constraints[c].op == RAD_C_IN && !k->constraints[c].sval)) {
+                    err_("kernel '%s' in plugin '%s' declares constraint %d with no key, or an IN "
+                         "with no set", k->name, p.name.c_str(), c);
+                    unstage_(s);
+                    return RAD_E_INVAL;
+                }
             /* Every tunable axis must carry a default that is one of its own values. Untuned
              * shapes (no cache, an unmeasured shape, another card's cache) run the defaults, with
              * no other fallback (spec §15). Checked at load rather than first use so a bad axis
@@ -382,8 +427,15 @@ int Registry::commit_(Staged& s, int order) {
         if (no_device_code_)
             why = "no card is visible, so this process runs on the host backend and no GPU code "
                   "object runs here";
-        if (n_device > 0 && s.code_to > s.code_from &&
-            (no_device_code_ || rad::dev_code_runs(s.code_from, s.code_to, code_device_, &why) == 0)) {
+        /* The code range decides only the per-card test: on the host backend the rows go even when
+         * this dlopen registered no fat binary (no HIP in the build, or the library already
+         * mapped by another registry). */
+        const bool no_code_here =
+            n_device > 0 &&
+            (no_device_code_ ||
+             (s.code_to > s.code_from &&
+              rad::dev_code_runs(s.code_from, s.code_to, code_device_, &why) == 0));
+        if (no_code_here) {
             std::vector<std::pair<const RadKernelInfo*, int>> keep;
             for (const auto& r : staged_rows)
                 if (r.first->domain != RAD_DOMAIN_DEVICE) keep.push_back(r);

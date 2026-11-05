@@ -1,13 +1,13 @@
 /* r3d_moe_gemm_fp8_f32scale.hip -- moe_gemm_q (the wave-matrix form): the grouped GEMM with E4M3
  * experts and exact F32 block scales.
  *
- *   y[i, n] = sum_g as[tok(i), g] * wsb[e, n/grid_rows][g] * sum_{k in g} a[tok(i), k] * w_e[n, k]
+ *   y[i, n] = sum_g as[tok(i), g] * ws_e[n/128][g] * sum_{k in g} a[tok(i), k] * w_e[n, k]
  *
- * The moe_gemm_q contract: a and the weight planes are E4M3, one F32 scale per (row, 128 of K)
- * for the activation and one per (plane expert, n/grid_rows, 128 of K) for the weight; the even
- * experts live in w / w_scale and the odd in w_odd / w_odd_scale, at index e/2; y is f32 in sorted
- * order. E4M3 activation and E4M3 weight (the checkpoint stores the plane as [n_expert/2, N, K]
- * row-major, one byte a code). f32 accumulate over the whole of K.
+ * The moe_gemm_q contract at fp8a8f32: a and the weight entries are E4M3, one F32 scale per (row,
+ * 128 of K) for the activation and one per 128x128 tile for the weight; expert e is entry e/2 of
+ * class e%2's weight tables (r3d_moe_tab.h: a pointer per expert, or a stacked plane), each entry
+ * the checkpoint's own [N, K] row-major codes; y is bf16 in sorted order. f32 accumulate over the
+ * whole of K.
  *
  * gfx11 has no native FP8 wave-matrix, so the codes widen to f16 (exact: every E4M3 grid point is
  * an f16 grid point) and the multiply runs on the 16x16x16 f16 tile. K is walked in 128-deep
@@ -23,6 +23,7 @@
 #include "r3d_codecs.h"
 #include "r3d_fp8_dequant.h"
 #include "r3d_launch.h"
+#include "r3d_moe_tab.h"
 
 namespace {
 
@@ -86,11 +87,9 @@ __device__ __forceinline__ float r3d_moe_acc_f16_read(const typename R3dMoeAccF1
 __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves)                                       \
 __attribute__((amdgpu_num_vgpr(MFS_VGPR))) void MFS_KNAME(                                   \
     const uint8_t* __restrict__ a, const float* __restrict__ as,                               \
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,                       \
-    const uint8_t* __restrict__ w, const float* __restrict__ ws,                               \
-    const uint8_t* __restrict__ w_odd, const float* __restrict__ w_ws,                         \
-    float* __restrict__ y, int T, int N, int K, int a_ld, int w_ld, int y_ld,                 \
-    int n_expert, int top_k, int grid_rows)                                                    \
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,        \
+    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,             \
+    int n_expert, int top_k, int a_sorted)                                                     \
 {                                                                                              \
     constexpr int kMBlock = 16;                                                                \
     constexpr int kRB     = 1;                                                                 \
@@ -116,7 +115,7 @@ __attribute__((amdgpu_num_vgpr(MFS_VGPR))) void MFS_KNAME(                      
     if (tid < kMBlock) {                                                            \
         const uint32_t i = r0 + tid;                                                \
         const int32_t f = (i < (uint32_t)T) ? sorted[i] : -1;                       \
-        s_tok[tid] = (f < 0) ? -1 : (f / top_k);                                    \
+        s_tok[tid] = (f < 0) ? -1 : (a_sorted ? (int32_t)i : f / top_k);           \
     }                                                                               \
     if (tid == 0) {                                                                 \
         int nruns = 0, i = (int)r0;                                                 \
@@ -143,12 +142,12 @@ __attribute__((amdgpu_num_vgpr(MFS_VGPR))) void MFS_KNAME(                      
             _Pragma("unroll")                                                          \
             for (int g = 0; g < 8; ++g) acc[rb][g] = 0.f;                           \
         if (e >= 0) {                                                       \
-        /* Expert e's plane: even e in w / ws, odd e in w_odd / w_ws, at index e/2. */ \
-        const int e2 = e >> 1;                                                      \
-        const uint8_t* wbase = (e & 1) ? w_odd + (size_t)e2 * (size_t)N * w_ld      \
-                                       : w + (size_t)e2 * (size_t)N * w_ld;         \
-        const float* wsb = (e & 1) ? w_ws + (size_t)e2 * (size_t)(N / grid_rows) * ((K + 127) / 128) \
-                                   : ws + (size_t)e2 * (size_t)(N / grid_rows) * ((K + 127) / 128); \
+        /* Expert e's entry: e/2 of class e%2's tables. */                           \
+        const int cls = e & 1, e2 = e >> 1;                                         \
+        const uint8_t* wbase = r3d_tab_at(tw.w[cls], e2);                           \
+        const int w_ld = tw.w[cls].ld;                                              \
+        const float* wsb = (const float*)r3d_tab_at(tw.s[cls], e2);                 \
+        const int ws_ld = tw.s[cls].ld;                                             \
                                                                                     \
                                                                                     \
         const int ntile = (K + kKT - 1) / kKT;                                      \
@@ -169,8 +168,8 @@ __attribute__((amdgpu_num_vgpr(MFS_VGPR))) void MFS_KNAME(                      
                 s_w[(size_t)col * kP16 + k] = s_tbl[wbase[(size_t)nn * w_ld + kt + k]]; \
             }                                                                       \
             group_barrier();                                                        \
-            /* The activation scale for this tile (per row) and the weight scale (per grid_rows cols). */ \
-            const float wscale = wsb[(size_t)(n_real / grid_rows) * ((K + 127) / 128) + t]; \
+            /* The activation scale for this tile (per row) and the weight scale (per 128x128 tile). */ \
+            const float wscale = wsb[(size_t)(n_real / 128) * ws_ld + t];             \
             /* Eight 16-wide f16 WMMA steps; f16 values read directly from LDS. The fragment */  \
             /* elements are f16 BIT PATTERNS, so the LDS halfs must be bit-cast into the */       \
             /* _Float16 vector: any assignment from a uint16_t source into a _Float16 (a plain */ \
@@ -204,21 +203,21 @@ __attribute__((amdgpu_num_vgpr(MFS_VGPR))) void MFS_KNAME(                      
                     const int row = rb * 16 + g * 2 + (int)(lane >> 4);             \
                     const int src = (rs <= (int)(r0 + row) && (int)(r0 + row) < re) \
                                     ? s_tok[row] : s_tok[rs - (int)r0];              \
-                    const float ascale = (src < 0) ? 0.f : as[(size_t)src * ((K + 127) / 128) + t] * wscale; \
+                    const float ascale = (src < 0) ? 0.f : as[(size_t)src * as_ld + t] * wscale; \
                     acc[rb][g] += r3d_moe_acc_f16_read<MFS_ACC>(blk, g) * ascale;   \
                 }                                                                   \
             }                                                                       \
             group_barrier();                                                        \
         }                                                                           \
         } \
-        /* Store only the run's rows (f32: the moe_gemm_q contract's output). */      \
+        /* Store only the run's rows and the real columns, as bf16. */                \
         _Pragma("unroll")                                                              \
         for (int rb = 0; rb < kRB; ++rb)                                            \
             _Pragma("unroll")                                                          \
             for (int g = 0; g < 8; ++g) {                                           \
                 const int m = (int)r0 + rb * 16 + g * 2 + (int)(lane >> 4);         \
-                if (m < re && m >= rs)                                              \
-                    y[(size_t)m * y_ld + nc] = acc[rb][g];                           \
+                if (m < re && m >= rs && nc < (uint32_t)N)                          \
+                    y[(size_t)m * y_ld + nc] = f32_to_bf16(acc[rb][g]);              \
             }                                                                       \
     }                                                                               \
 }
@@ -246,93 +245,42 @@ R3D_MFS_BODY
 
 }  // namespace
 
-static int r3d_moe_gemm_fp8_f32scale_v(long a, long as, long sorted, long off, long w, long ws,
-                                       long w_odd, long w_ws, long y,
-                                       int T, int N, int K, int a_ld, int w_ld, int y_ld,
-                                       int n_expert, int top_k, int grid_rows, int vgpr, int acc,
-                                       long stream)
-{
-    if (!a || !as || !sorted || !off || !w || !ws || !w_odd || !w_ws || !y) return -1;
-    if (T < 1 || N < 1 || K < 1 || grid_rows < 1) return -2;
-    if (!a_ld) a_ld = K;
-    if (!w_ld) w_ld = K;
-    if (!y_ld) y_ld = N;
-    if (K % kKT) return -2;
-    const int ntiles = (N + kNBlock - 1) / kNBlock;
-    const int mrowblk = (T + 16 - 1) / 16;
-    const dim3 grid(ntiles, mrowblk), block(kThreads);
-    if (vgpr == 128) {
-        if (acc)
-            R3D_KLAUNCH(moe_fp8_f32scale_kernel16_c128_a1, grid, block, (hipStream_t)stream,
-                        (const uint8_t*)a, (const float*)as, (const int32_t*)sorted,
-                        (const int32_t*)off, (const uint8_t*)w, (const float*)ws,
-                        (const uint8_t*)w_odd, (const float*)w_ws, (float*)y,
-                        T, N, K, a_ld, w_ld, y_ld, n_expert, top_k, grid_rows);
-        else
-            R3D_KLAUNCH(moe_fp8_f32scale_kernel16_c128, grid, block, (hipStream_t)stream,
-                        (const uint8_t*)a, (const float*)as, (const int32_t*)sorted,
-                        (const int32_t*)off, (const uint8_t*)w, (const float*)ws,
-                        (const uint8_t*)w_odd, (const float*)w_ws, (float*)y,
-                        T, N, K, a_ld, w_ld, y_ld, n_expert, top_k, grid_rows);
-    }
-    else {
-        if (acc)
-            R3D_KLAUNCH(moe_fp8_f32scale_kernel16_a1, grid, block, (hipStream_t)stream,
-                        (const uint8_t*)a, (const float*)as, (const int32_t*)sorted,
-                        (const int32_t*)off, (const uint8_t*)w, (const float*)ws,
-                        (const uint8_t*)w_odd, (const float*)w_ws, (float*)y,
-                        T, N, K, a_ld, w_ld, y_ld, n_expert, top_k, grid_rows);
-        else
-            R3D_KLAUNCH(moe_fp8_f32scale_kernel16, grid, block, (hipStream_t)stream,
-                        (const uint8_t*)a, (const float*)as, (const int32_t*)sorted,
-                        (const int32_t*)off, (const uint8_t*)w, (const float*)ws,
-                        (const uint8_t*)w_odd, (const float*)w_ws, (float*)y,
-                        T, N, K, a_ld, w_ld, y_ld, n_expert, top_k, grid_rows);
-    }
-    return hipGetLastError() == hipSuccess ? 0 : -4;
-}
-
-/* The direct launcher: the tune's default budget (128, the 8-wave cap). */
-extern "C" int r3d_moe_gemm_fp8_f32scale(long a, long as, long sorted, long off, long w, long ws,
-                                          long w_odd, long w_ws, long y,
-                                          int T, int N, int K, int a_ld, int w_ld, int y_ld,
-                                          int n_expert, int top_k, int grid_rows, long stream)
-{
-    return r3d_moe_gemm_fp8_f32scale_v(a, as, sorted, off, w, ws, w_odd, w_ws, y, T, N, K, a_ld,
-                                       w_ld, y_ld, n_expert, top_k, grid_rows, 128, 0, stream);
-}
-
-/* The RadArgs dispatch: the row's entry. The tensors are a, a_scale, sorted_tok, expert_offset,
- * w, w_scale, w_odd, w_odd_scale, y (the moe_gemm_q contract: even experts in w / w_scale, odd in
- * w_odd / w_odd_scale, at index e/2; y is f32). The params are n_expert, top_k, grid_rows. */
+/* The RadArgs dispatch, moe_gemm_q's arm 2 (r3d_moe_gemm_q.hip): the contract's operands
+ * (r3d_moe_tab.h) at fp8a8f32, the tune's register budget and accumulator. */
 extern "C" int r3d_moe_gemm_fp8_f32scale_run(const RadArgs* a, RadStream s, int vgpr, int acc)
 {
-    if (!a || a->n_t < 9) return R3D_NO(RAD_E_INVAL);
-    const RadTensor* at = &a->t[0], *ast = &a->t[1], *st = &a->t[2], *ot = &a->t[3];
-    const RadTensor* wt = &a->t[4], *wst = &a->t[5], *wot = &a->t[6], *wost = &a->t[7];
-    const RadTensor* yt = &a->t[8];
-    if (!r3d_p(at) || !r3d_p(ast) || !r3d_p(st) || !r3d_p(ot) ||
-        !r3d_p(wt) || !r3d_p(wst) || !r3d_p(wot) || !r3d_p(wost) || !r3d_wp(yt))
-        return R3D_NO(RAD_E_INVAL);
-    long long M = 0, K = 0;
-    if (r3d_rows_of(at, &M, &K) != 0) return R3D_NO(RAD_E_INVAL);
-    const long long T = (st->rank >= 1) ? st->shape[0] : 0;
-    const long long N = (wt->rank >= 3) ? wt->shape[1] : 0;   // the plane is [n_expert/2, N, K]
-    const int n_expert = (int)r3d_geti_or(a, "n_expert", 1);
-    const int top_k = (int)r3d_geti_or(a, "top_k", 1);
-    const int grid_rows = (int)r3d_geti_or(a, "grid_rows", 1);  // 1 (per col) or 128 (per 128)
-    if (M <= 0 || T <= 0 || N <= 0 || K <= 0 || K % 128 || n_expert <= 0 || top_k <= 0)
-        return R3D_NO(RAD_E_SHAPE);
-    const int a_ld = (int)at->stride[0];
-    const int w_ld = (int)wt->shape[2];
-    const int y_ld = (int)yt->stride[0];
-    return r3d_moe_gemm_fp8_f32scale_v((long)(uintptr_t)r3d_p(at), (long)(uintptr_t)r3d_p(ast),
-                                       (long)(uintptr_t)r3d_p(st), (long)(uintptr_t)r3d_p(ot),
-                                       (long)(uintptr_t)r3d_p(wt), (long)(uintptr_t)r3d_p(wst),
-                                       (long)(uintptr_t)r3d_p(wot), (long)(uintptr_t)r3d_p(wost),
-                                       (long)(uintptr_t)r3d_wp(yt), (int)T, (int)N, (int)K, a_ld,
-                                       w_ld, y_ld, n_expert, top_k, grid_rows, vgpr, acc,
-                                       (long)(uintptr_t)s);
+    R3dMoeCall c;
+    int rc = r3d_moe_call(a, true, &c);
+    if (rc != RAD_OK) return rc;
+    if (!c.a_scale) return R3D_NO(RAD_E_INVAL);
+    if (c.a->dtype != RAD_F8E4M3 || c.a_scale->dtype != RAD_F32 || c.y->dtype != RAD_BF16)
+        return R3D_NO(RAD_E_DTYPE);
+    if (c.K % kKT) return R3D_NO(RAD_E_SHAPE);
+    R3dMoeTabs tw;
+    rc = r3d_moe_q_tabs(c, RAD_F8E4M3, 8, RAD_F32, 32, (c.N + 127) / 128, c.K / 128, &tw);
+    if (rc != RAD_OK) return rc;
+    const int T = (int)c.T, N = (int)c.N, K = (int)c.K;
+    const int a_ld = (int)c.a->stride[0], as_ld = (int)c.a_scale->stride[0];
+    const int y_ld = (int)c.y->stride[0];
+    const uint8_t* pa = (const uint8_t*)r3d_p(c.a);
+    const float* pas = (const float*)r3d_p(c.a_scale);
+    const int32_t* ps = (const int32_t*)r3d_p(c.sorted);
+    const int32_t* po = (const int32_t*)r3d_p(c.off);
+    uint16_t* py = (uint16_t*)r3d_wp(c.y);
+    const dim3 grid((N + kNBlock - 1) / kNBlock, (T + 16 - 1) / 16), block(kThreads);
+#define R3D_MFS_LAUNCH(KERN)                                                                  \
+    R3D_KLAUNCH(KERN, grid, block, (hipStream_t)s, pa, pas, ps, po, tw, py, T, N, K, a_ld,    \
+                as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted)
+    if (vgpr == 128) {
+        if (acc) R3D_MFS_LAUNCH(moe_fp8_f32scale_kernel16_c128_a1);
+        else     R3D_MFS_LAUNCH(moe_fp8_f32scale_kernel16_c128);
+    }
+    else {
+        if (acc) R3D_MFS_LAUNCH(moe_fp8_f32scale_kernel16_a1);
+        else     R3D_MFS_LAUNCH(moe_fp8_f32scale_kernel16);
+    }
+#undef R3D_MFS_LAUNCH
+    return (int)hipGetLastError();
 }
 
 extern "C" int r3d_rad_moe_gemm_fp8_f32scale(const RadArgs* a, RadStream s)

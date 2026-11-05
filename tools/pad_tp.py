@@ -20,7 +20,7 @@ does, so rank w-1 carries them.
 
 bf16 is handled as raw u16 (no arithmetic happens here), so numpy alone suffices.
 """
-import argparse, json, os, re, shutil, struct, sys
+import argparse, json, os, re, shutil, struct, subprocess, sys
 import numpy as np
 
 DT = {"BF16": (np.uint16, 2), "F16": (np.float16, 2), "F32": (np.float32, 4), "I64": (np.int64, 8),
@@ -111,6 +111,10 @@ def main():
     os.makedirs(a.dst, exist_ok=True)
     idx_path = os.path.join(a.src, "model.safetensors.index.json")
     files = sorted(set(json.load(open(idx_path))["weight_map"].values())) if os.path.exists(idx_path) else ["model.safetensors"]
+    # Shard names come from the checkpoint's own index: each must be a bare file name in it.
+    for fn in files:
+        if not isinstance(fn, str) or not fn or fn != os.path.basename(fn) or fn in (".", ".."):
+            sys.exit(f"{idx_path}: shard name {fn!r} is not a file name in the checkpoint directory")
 
     def parts(w_, sizes, news, axis=0):
         """pad each consecutive segment of `sizes` along `axis` to `news` (zeros after the real rows)."""
@@ -170,7 +174,8 @@ def main():
         if a.sparse:
             dstf = os.path.join(a.dst, fn)
             if not os.path.exists(dstf):
-                r = os.system(f"cp --reflink=always '{os.path.join(a.src, fn)}' '{dstf}' 2>/dev/null") or 0
+                r = subprocess.run(["cp", "--reflink=always", os.path.join(a.src, fn), dstf],
+                                   stderr=subprocess.DEVNULL).returncode
                 if r: os.link(os.path.join(a.src, fn), dstf)      # not btrfs/xfs: hard link, still no copy
         else:
             st_write_stream(os.path.join(a.dst, fn), meta, items); print(f"  wrote {fn} ({len(items)} tensors)", flush=True)

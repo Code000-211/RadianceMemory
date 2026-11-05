@@ -87,6 +87,25 @@ __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { retu
 __host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
     int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
 }
+// Segments the combine reads for output row `tok`. The decode kernel cuts the tiles of the launch's
+// context (the last row's) into segments of `tps` tiles. A causal row ends earlier than that: its
+// own context is ctx - q_len + 1 + row, and the segments past it hold nothing it needs. Reading
+// them anyway changes how the merge groups the live ones (the chains' tail), so a verify row
+// would differ in the last bit from the single-row decode at its position, and greedy text with a
+// drafter from the text without. `nef` is the launch's tile count after the window's floor, `win`
+// whether this is a windowed row (kept as the launch's: its floor is row 0's). Same segments as
+// before for a plain decode, a window, a non-causal row and a tree.
+__device__ __forceinline__ int r4d_row_segments(const R4DArgs& a, int seq, int tok, int ctx, int tile,
+                                                int tps, int nef, int win) {
+    const int cz = a.causal_seq ? (int)((const unsigned char*)a.causal_seq)[seq] : a.causal;
+    if (win || !cz || a.spec_parent) return (nef + tps - 1) / tps;
+    const int qlen = r4d_q_len(a.cu_q, seq, a.q_len);
+    const int row  = tok - r4d_q_off(a.cu_q, seq, a.q_len);
+    const int rctx = ctx - qlen + 1 + row;
+    const int tiles = rctx < ctx ? r4d_attn_tiles(rctx > 0 ? rctx : 1, tile) : nef;
+    return (tiles + tps - 1) / tps;
+}
+
 // First KV position query row `qrow` may attend to under a sliding window: the row's
 // causal limit, less the window, floored at zero. window <= 0 means no window.
 __host__ __device__ __forceinline__ int r4d_attn_wlo(int ctx, int q_len, int qrow, int window) {
@@ -829,7 +848,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     const int nef = r4d_attn_tiles(ctx, tile)
                   - (WIN ? r4d_attn_wlo(ctx, r4d_q_len(a.cu_q, seq, a.q_len), 0, a.window) / tile : 0);
     const int tp_ = (nef + splits - 1) / splits;
-    const int u   = (nef + tp_ - 1) / tp_;
+    const int u   = r4d_row_segments(a, seq, tok, ctx, tile, tp_, nef, WIN);
     const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * splits;
     const size_t base = (size_t)job * splits;
 
@@ -1002,7 +1021,7 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     const int nef = r4d_attn_tiles(ctx, tile)
                   - (WIN ? r4d_attn_wlo(ctx, r4d_q_len(a.cu_q, seq, a.q_len), 0, a.window) / tile : 0);
     const int tp_ = (nef + splits - 1) / splits;
-    const int u   = (nef + tp_ - 1) / tp_;
+    const int u   = r4d_row_segments(a, seq, tok, ctx, tile, tp_, nef, WIN);
     const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * splits;
     const size_t base = (size_t)job * splits;
 

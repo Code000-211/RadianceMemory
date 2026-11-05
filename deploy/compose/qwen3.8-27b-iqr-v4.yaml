@@ -1,0 +1,13 @@
+# Qwen3.8-27B in IQR-V4 (docs/IQR.md), one size of the ladder from 2.5 to 8 bits a weight, with the
+# DFlash2 block-diffusion drafter and the vision tower in the container. IQR_V4 names the size, the
+# part of the file name between qwen3.8-27b- and .rad (default iq4r-s-v4, 15 GiB); the speculation
+# depth is the drafter's own operating point.
+name: radiance-qwen3.8-27b-iqr-v4
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-qwen3.8-27b-iqr-v4
+    command: >
+      --model /models/qwen3.8-27b-${IQR_V4:-iq4r-s-v4}.rad
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
+      --tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8

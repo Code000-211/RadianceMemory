@@ -23,6 +23,7 @@
 #include "rad_core.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -188,6 +189,27 @@ uint64_t kf_weight_seed(const KfOperand& d, size_t k);
  * from the table's identity seed and e, and decoded as kf_planes_logical does. RAD_OK, or the
  * refusal with `why`. */
 int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::string* why);
+
+/* One entry of a weight table: the table's encoding and selection over its shape without the
+ * leading expert dimension, as a weight operand. */
+KfOperand kf_table_entry(const KfOperand& d);
+
+/* Entry e's planes as kf_draw_table draws them. */
+void kf_draw_entry_planes(const KfOperand& d, size_t k, int64_t e,
+                          std::vector<std::vector<uint8_t>>* out);
+
+/* Entry e's selected planes, from the fixture's draw or a container. RAD_OK, or the refusal. */
+using KfEntryPlanes = std::function<int(int64_t e, std::vector<std::vector<uint8_t>>* out)>;
+
+/* The bytes kernel `info` reads for the weight table `operand`: every entry laid out from its
+ * planes as kf_lay_weight lays out a weight, stacked one laid entry apart, which is how a kernel
+ * reads a table it is handed whole rather than through the engine's pointers. `lay` is the first
+ * entry's. Returns kf_lay_weight's answer for the entries: RAD_E_UNSUPPORTED when the kernel reads
+ * them as decoded (kf_draw_table's bytes); RAD_E_SHAPE when the entries lay out to different
+ * sizes, or to a size the declared entry does not stride by. */
+int kf_lay_table(const RadKernelInfo* info, const RadParam* p, int n_p, int operand,
+                 const KfOperand& d, const KfEntryPlanes& planes, RadLayout* lay,
+                 std::vector<uint8_t>* out);
 
 /* ================================================================== drawing an input
  *

@@ -334,6 +334,22 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         std::memset(calm_, 0, 8 << 20);
     }
 
+    /* ---- the file tier's cache cycle (stage_file_units) -------------------------------------
+     *
+     * The stager covers the plan's file-tier units from the start; it may cover more
+     * (cover_file_units). Each layer's file-tier bytes start as the plan's, which the plan sized
+     * the stager's buffers for. */
+    file_ok_.assign(plan.units.size(), 0);
+    layer_file_.assign((size_t)std::max(n_layers_, 1), 0);
+    file_cap_ = file_buf_bytes_;
+    for (size_t u = 0; u < plan.units.size(); ++u) {
+        const MoveUnit& mu = plan.units[u];
+        if (mu.tier != Tier::SSD || mu.access != RAD_ACCESS_CONDITIONAL) continue;
+        file_ok_[u] = 1;
+        if (mu.layer >= 0) layer_file_[(size_t)mu.layer] += align_up(mu.bytes, RAD_ALIGN_UNIT);
+    }
+    victims_.assign(plan.classes.size(), VictimRank{});
+
     /* ---- streams, events, move records ------------------------------------------------------ */
     RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
     /* Every event here is local: they order the mover's queue against this card's compute queue
@@ -664,18 +680,6 @@ int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) c
 /* ---- a routed layer read from the container (see mover.h) ---------------------------------- */
 namespace {
 
-/* One weight's bytes: where they are in the container and where they go. */
-struct FileExt {
-    int64_t foff = 0, bytes = 0;
-    char*   dst = nullptr;
-    /* Into a hot-cache slot rather than the layer buffer: counted as
-     * ssd_promoted_bytes, and the copy leaves the unit resident. */
-    bool    hot = false;
-    /* Into a host pool slot rather than the layer buffer: counted as
-     * ssd_deposit_bytes, and the copy leaves the unit resident in RAM. */
-    bool    deposit = false;
-};
-
 /* The largest gap a run reads through instead of starting another pread. A routed layer's
  * weights sit together in the container, each on RAD_ALIGN_UNIT, so a gap between two file-tier
  * weights is either alignment padding (cheaper to read than a second pread) or units on another
@@ -685,36 +689,125 @@ constexpr int64_t kReadThrough = (int64_t)256 << 10;
 
 }  /* namespace */
 
+bool Mover::on_file_tier(const std::vector<int32_t>& units) const {
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier == Tier::SSD && us.slab_slot < 0 && us.klass >= 0) return true;
+    }
+    return false;
+}
+
+bool Mover::routes_any(const std::vector<int32_t>& units, const int32_t* ecnt,
+                       int32_t n_expert) const {
+    if (!plan_ || !ecnt) return !units.empty();
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= plan_->units.size()) continue;
+        const int32_t e = plan_->units[(size_t)u].expert;
+        if (e < 0 || e >= n_expert || ecnt[e] != 0) return true;
+    }
+    return false;
+}
+
+void Mover::cover_file_units(const std::vector<int32_t>& more) {
+    /* A unit whose container bytes are not its kernel's layout cannot be read back. */
+    for (int32_t u : more)
+        if (u >= 0 && (size_t)u < file_ok_.size() && plan_->units[(size_t)u].file_direct)
+            file_ok_[(size_t)u] = 1;
+}
+
+/* A full pool's relabel victim for a deposit of class `klass`: its coldest pooled unit that the
+ * file stager reads back (Mover::file_ok_), with nothing in flight, outside the `protect` layers,
+ * and whose layer's file-tier part still fits the stager's buffer with it. -1 when none, or when
+ * that unit is not colder than `below` (the unit being read): trading a pooled unit for a colder
+ * one would only make the next step read the warmer one from the drive.
+ *
+ * The protected layers are the one being read and any whose ops are about to be issued: a
+ * relabelled unit's weights are published at the zero region at once, so taking one of theirs
+ * would hand the next GEMM zeros for a routed expert. Every other layer is safe: one already
+ * issued this pass read the pool slot, which the quarantine keeps until those kernels are done,
+ * and a later one is read back by its own trigger, since the stager covers the unit. The
+ * routing counts protect nothing here: they are the counts of the layer being read, and indexing
+ * them by another layer's expert number protected a random set while a whole-layer read (no
+ * counts) protected nothing at all.
+ *
+ * The cap keeps every read of a layer within the stager's buffer: the plan sized it for the
+ * largest layer's file-tier part, and a relabel adds to its victim's. */
+int32_t Mover::pick_victim(int32_t klass, const int32_t* protect, int n_protect, float below) {
+    if (klass < 0 || (size_t)klass >= victims_.size() || !heat_) return -1;
+    VictimRank& vr = victims_[(size_t)klass];
+    if (vr.at != dispatch_) {
+        vr.at = dispatch_;
+        vr.by_heat.clear();
+        for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+            const UnitState& vs = unit_[(size_t)v];
+            if (vs.klass != klass || vs.tier != Tier::HostPinned || vs.pool_slot < 0 ||
+                vs.slab_slot >= 0 || !file_ok_[(size_t)v])
+                continue;
+            vr.by_heat.push_back({ heat_->heat(v), v });
+        }
+        /* Hottest first; on equal heat the higher unit first, so the back is the coldest and,
+         * among equally cold ones, the lowest: the unit a scan keeping its first strict minimum
+         * would pick. */
+        std::sort(vr.by_heat.begin(), vr.by_heat.end(),
+                  [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
+                      return a.first != b.first ? a.first > b.first : a.second > b.second;
+                  });
+    }
+    for (size_t k = vr.by_heat.size(); k-- > 0;) {
+        const int32_t v = vr.by_heat[k].second;
+        if (v < 0) continue;
+        const UnitState& vs = unit_[(size_t)v];
+        /* Within a dispatch a unit leaves the pool only by a relabel, so one that is not there any
+         * more is gone for the rest of it. A copy in flight or a protected layer only waits. */
+        if (vs.klass != klass || vs.tier != Tier::HostPinned || vs.pool_slot < 0 ||
+            vs.slab_slot >= 0) {
+            vr.by_heat[k].second = -1;
+            continue;
+        }
+        if (copying_[(size_t)v]) continue;
+        const int32_t layer = plan_->units[(size_t)v].layer;
+        bool held = layer < 0 || (size_t)layer >= layer_file_.size();
+        for (int p = 0; p < n_protect && !held; ++p) held = protect[p] >= 0 && protect[p] == layer;
+        if (held) continue;
+        if (layer_file_[(size_t)layer] + align_up(vs.bytes, RAD_ALIGN_UNIT) > file_cap_) continue;
+        /* Every candidate further in is at least as warm. */
+        if (!(vr.by_heat[k].first < below)) return -1;
+        vr.by_heat[k].second = -1;
+        while (!vr.by_heat.empty() && vr.by_heat.back().second < 0) vr.by_heat.pop_back();
+        return v;
+    }
+    return -1;
+}
+
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                            RadEvent after, RadEvent done, std::vector<int32_t>* staged,
-                            std::vector<int32_t>* skipped, const int32_t* ecnt,
-                            int32_t n_expert, std::vector<int32_t>* promoted) {
-    if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
-    staged->clear();
-    if (skipped) skipped->clear();
-    if (promoted) promoted->clear();
+                            RadEvent after, RadEvent done, FileRead* rd, const int32_t* ecnt,
+                            int32_t n_expert, const int32_t* protect, int n_protect) {
+    if (!plan_ || !dst || !rd || !done) return RAD_E_INVAL;
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
 
-    /* The layout in `dst`, unit by unit in the order given, and every weight's extent. */
-    std::vector<FileExt> ext;
-    std::vector<int64_t> at;
-    std::vector<char*>   pbases;              /* hot-cache units' slot bases, in promoted order */
-    int64_t off = 0, hot_bytes = 0;
+    /* The layout in `dst`, unit by unit in the order given after what earlier calls for the
+     * layer packed, and every weight's extent. */
+    fext_.clear();
+    fat_.clear();
+    fbase_.clear();
+    frec_.clear();
+    const size_t staged0 = rd->staged.size(), skipped0 = rd->skipped.size(),
+                 promoted0 = rd->promoted.size();
+    const int64_t used0 = rd->used;
+    int64_t off = rd->used, hot_bytes = 0;
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) return RAD_E_INVAL;
         UnitState& us = unit_[(size_t)u];
         if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
-        /* Routing-aware reads: the layer's router has run by the time the stager triggers
-         * (the trigger is the layer's first expert op), so `ecnt` holds this pass's counts.
-         * An expert counted zero has no sorted rows, so no GEMM run names it and nothing
-         * reads its weights: leave its bytes on the drive. The dummy publication below
-         * keeps every table entry valid for the pass. */
-        if (ecnt && skipped) {
-            const MoveUnit& mu = plan_->units[(size_t)u];
-            if (mu.expert >= 0 && mu.expert < n_expert && ecnt[mu.expert] == 0) {
-                skipped->push_back(u);
-                continue;
-            }
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        /* Routing-aware reads: `ecnt` holds the counts of the rows about to run, taken at the
+         * layer's trigger behind its router. An expert counted zero has no sorted rows, so no
+         * GEMM run names it and nothing reads its weights: leave its bytes on the drive. The
+         * dummy publication below keeps every table entry valid for the pass. */
+        if (ecnt && mu.expert >= 0 && mu.expert < n_expert && ecnt[mu.expert] == 0) {
+            rd->skipped.push_back(u);
+            continue;
         }
         /* The hot VRAM cache: heat past the admission bar and a free
          * budgeted slot, and this pass's read lands in the slot and stays there. The read is
@@ -722,7 +815,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
          * bookkeeping (the container is ground truth), so a mistake costs one future
          * re-read. No free slot, no heat, or no move record: the buffer path below, as
          * before. */
-        if (promoted && plan_->dynamic && heat_ && heat_->admit_hot(u) && !unit_in_flight(u)) {
+        if (plan_->dynamic && heat_ && heat_->admit_hot(u) && !unit_in_flight(u)) {
             ClassPools& cp = pools_[(size_t)us.klass];
             const int rec = free_move_record();
             int64_t slot = -1;
@@ -730,7 +823,6 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             else slot = cp.slab.take_where([&](int64_t s) { return s < cp.n_fixed; });
             if (slot >= 0 && record_gate() < 0) { cp.slab.add_free(slot); slot = -1; }
             if (slot >= 0) {
-                const MoveUnit& mu = plan_->units[(size_t)u];
                 char* const base = cp.slot_ptr(slot);
                 Move& m = moves_[(size_t)rec];
                 m.state = Move::State::Copying;
@@ -746,74 +838,58 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 for (size_t k = 0; k < mu.weights.size(); ++k) {
                     const WeightInfo& w = prog_->weights[mu.weights[k]];
                     if (w.stored_bytes <= 0) continue;  /* nothing to read, nothing to place */
-                    ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                           base + mu.offset[k], true });
+                    fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
+                                             base + mu.offset[k], true, false });
                 }
-                promoted->push_back(u);
-                pbases.push_back(base);
+                rd->promoted.push_back(u);
+                fbase_.push_back(base);
+                frec_.push_back((int32_t)rec);
                 hot_bytes += us.bytes;
                 continue;
             }
         }
-        /* A free pool slot and this read deposits the unit into the pool -- the O_DIRECT
-         * read's destination IS the slot, and the unit becomes a pool unit: the GEMM reads it
+        /* A free pool slot and this read deposits the unit into the pool: its window's copy list
+         * carries it into the slot, and the unit becomes a pool unit -- the GEMM reads it
          * zero-copy this step, heat promotes it at PCIe speed, and its demotion is a copyless
-         * drop. The pool is ALL cache: no free slot and the coldest idle pool unit -- native
-         * or deposited, the container is ground truth for both -- relabels back to the file
-         * tier, copyless. Its slot feeds a future deposit after the
-         * coldest idle pool unit -- native or deposited, the container is ground truth for both --
-         * relabels back to the file tier, copyless. Its slot feeds a future deposit after the
-         * quarantine; this read takes the buffer path. */
-        if (promoted && plan_->dynamic && heat_ && !unit_in_flight(u)) {
+         * drop. The pool is all cache: with no free slot, its coldest unit the stager covers is
+         * relabelled back to the file tier, copyless (the container holds every unit's bytes),
+         * provided it is colder than this one (pick_victim). The slot it gives up feeds a later
+         * deposit after the quarantine; this read takes the buffer path. */
+        if (plan_->dynamic && heat_ && !unit_in_flight(u)) {
             ClassPools& cp = pools_[(size_t)us.klass];
             const int rec = free_move_record();
             int64_t g = -1;
             if (rec < 0) ++stats_.no_record;
             else if (record_gate() >= 0) g = cp.pool.take();
-            if (g < 0 && heat_) {
-                /* The pool is full. Eviction is a copyless relabel: the
-                 * container holds every unit's bytes, so the victim loses nothing but its slot --
-                 * it becomes a file-tier unit whose next read deposits again. The victim is the
-                 * coldest idle unit of the class, however it got there: the cache adapts to the
-                 * workload, not to where a unit started. The freed slot feeds a future deposit
-                 * after the quarantine; this read takes the buffer path. */
-                int32_t victim = -1;
-                float best = 0;
-                for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
-                    UnitState& vs = unit_[(size_t)v];
-                    if (vs.klass != us.klass ||
-                        vs.tier != Tier::HostPinned || vs.pool_slot < 0 ||
-                        vs.slab_slot >= 0 || copying_[(size_t)v] || unit_in_flight(v))
-                        continue;
-                    const MoveUnit& mv = plan_->units[(size_t)v];
-                    if (mv.expert >= 0 && mv.expert < n_expert && ecnt && ecnt[mv.expert] > 0)
-                        continue;                     /* routed this pass: still wanted */
-                    const float h = heat_->heat(v);
-                    if (victim < 0 || h < best) { victim = v; best = h; }
-                }
+            if (g < 0 && rec >= 0) {
+                /* The deposit's own record is still free (nothing uses it this read), so the
+                 * relabel may take the same one. */
+                const int r2 = free_move_record();
+                const int32_t victim =
+                    r2 >= 0 ? pick_victim(us.klass, protect, n_protect, heat_->heat(u)) : -1;
                 if (victim >= 0) {
-                    const int r2 = free_move_record();
-                    if (r2 >= 0) {
-                        UnitState& vs = unit_[(size_t)victim];
-                        const MoveUnit& mv = plan_->units[(size_t)victim];
-                        Move& m2 = moves_[(size_t)r2];
-                        m2.state = Move::State::Published;  /* nothing to copy: the drive has it */
-                        m2.kind = Move::Kind::Evict;
-                        m2.unit = victim;
-                        m2.slab_slot = -1;
-                        m2.pool_slot = vs.pool_slot;
-                        for (size_t k = 0; k < mv.weights.size(); ++k)
-                            res_.publish(mv.weights[k], calm_);
-                        vs.tier = Tier::SSD;
-                        vs.site = Site::DeviceStaged;
-                        vs.pool_slot = -1;
-                        heat_->set_tier(victim, Tier::SSD);
-                        ++stats_.pool_evictions;
-                    }
+                    UnitState& vs = unit_[(size_t)victim];
+                    const MoveUnit& mv = plan_->units[(size_t)victim];
+                    Move& m2 = moves_[(size_t)r2];
+                    m2.state = Move::State::Published;  /* nothing to copy: the drive has it */
+                    m2.kind = Move::Kind::Evict;
+                    m2.unit = victim;
+                    m2.slab_slot = -1;
+                    m2.pool_slot = vs.pool_slot;
+                    for (size_t k = 0; k < mv.weights.size(); ++k)
+                        res_.publish(mv.weights[k], calm_);
+                    vs.tier = Tier::SSD;
+                    vs.site = Site::DeviceStaged;
+                    vs.pool_slot = -1;
+                    layer_file_[(size_t)mv.layer] += align_up(vs.bytes, RAD_ALIGN_UNIT);
+                    heat_->set_tier(victim, Tier::SSD);
+                    /* No pool slot to promote from until a read deposits it again, which makes
+                     * it movable once more; its layer's trigger reads it meanwhile. */
+                    heat_->set_movable(victim, false);
+                    ++stats_.pool_evictions;
                 }
             }
             if (g >= 0) {
-                const MoveUnit& mu = plan_->units[(size_t)u];
                 Move& m = moves_[(size_t)rec];
                 m.state = Move::State::Copying;
                 m.kind = Move::Kind::Deposit;
@@ -824,20 +900,23 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 us.pool_slot = g;
                 us.tier = Tier::HostPinned;
                 us.site = Site::DeviceZeroCopy;
+                if (mu.layer >= 0 && (size_t)mu.layer < layer_file_.size())
+                    layer_file_[(size_t)mu.layer] -= align_up(us.bytes, RAD_ALIGN_UNIT);
                 heat_->set_tier(u, Tier::HostPinned);
                 heat_->set_movable(u, true);   /* the slot makes it a PCIe-speed promotion candidate */
                 heat_->set_busy(u, true);
                 ++stats_.ssd_deposits;
+                char* const slot = (char*)cp.pool_base + g * cp.stride;
                 for (size_t k = 0; k < mu.weights.size(); ++k) {
                     const WeightInfo& w = prog_->weights[mu.weights[k]];
                     if (w.stored_bytes <= 0) continue;   /* nothing to read, nothing to place */
-                    ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                           (char*)cp.pool_base + g * cp.stride + mu.offset[k],
-                                           false, true });
+                    fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
+                                             slot + mu.offset[k], false, true });
                 }
                 for (size_t k = 0; k < mu.weights.size(); ++k)
                     res_.publish(mu.weights[k],
                                  (char*)cp.pool_dev + g * cp.stride + mu.offset[k]);
+                frec_.push_back((int32_t)rec);
                 continue;
             }
         }
@@ -847,42 +926,58 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                     "the plan sized for the largest one", humanb(cap).c_str());
             return RAD_E_SCRATCH;
         }
-        const MoveUnit& mu = plan_->units[(size_t)u];
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
-            ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
+            fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
+                                     dst + off + mu.offset[k], false, false });
         }
-        staged->push_back(u);
-        at.push_back(off);
+        rd->staged.push_back(u);
+        fat_.push_back(off);
         off += need;
     }
-    /* Skipped units' table entries must not name their stale addresses either: point them
-     * into the layer buffer, whose base is a valid allocation no zero-count expert reads
-     * through (a dead row would read row 0 of a real expert's region and discard it). The
-     * caller nulls them again with the staged units. Published even when EVERY unit of the
-     * layer was skipped -- a decode step can route nothing to a layer -- because the kernels
-     * still issue the layer's table and a null entry fails the step. */
-    if (skipped) {
-        for (int32_t u : *skipped) {
-            const MoveUnit& mu = plan_->units[(size_t)u];
-            for (size_t j = 0; j < mu.weights.size(); ++j)
-                res_.publish(mu.weights[j], calm_);
-            stats_.ssd_skipped_bytes += (uint64_t)unit_[(size_t)u].bytes;
-        }
-        stats_.ssd_skipped_units += (uint64_t)skipped->size();
+    rd->used = off;
+
+    /* Publish before the reads: nothing resolves these addresses until the caller's layer op,
+     * which waits on `done` first. Skipped units' entries must not name stale addresses either:
+     * they point at the zero region, which no zero-count expert reads through (a dead row reads
+     * zeros and discards them). Published even when EVERY unit of the layer was skipped -- a
+     * decode step can route nothing to a layer -- because the kernels still issue the layer's
+     * table and a null entry fails the step. The caller nulls them again with the staged units.
+     * Hot-cache units publish at their slots and stay published: nothing unstages them, and
+     * retire() finishes their admission when the copies land. */
+    for (size_t k = skipped0; k < rd->skipped.size(); ++k) {
+        const int32_t u = rd->skipped[k];
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (size_t j = 0; j < mu.weights.size(); ++j) res_.publish(mu.weights[j], calm_);
+        stats_.ssd_skipped_bytes += (uint64_t)unit_[(size_t)u].bytes;
     }
-    if (ext.empty()) return RAD_OK;
+    stats_.ssd_skipped_units += (uint64_t)(rd->skipped.size() - skipped0);
+    for (size_t k = staged0; k < rd->staged.size(); ++k) {
+        const int32_t u = rd->staged[k];
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (size_t j = 0; j < mu.weights.size(); ++j)
+            res_.publish(mu.weights[j], dst + fat_[k - staged0] + mu.offset[j]);
+        stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
+    }
+    for (size_t k = promoted0; k < rd->promoted.size(); ++k) {
+        const int32_t u = rd->promoted[k];
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (size_t j = 0; j < mu.weights.size(); ++j)
+            res_.publish(mu.weights[j], fbase_[k - promoted0] + mu.offset[j]);
+        stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
+    }
+    if (fext_.empty()) return RAD_OK;
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
-    std::stable_sort(ext.begin(), ext.end(),
+    std::stable_sort(fext_.begin(), fext_.end(),
                      [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
 
     /* The dashboard's SSD panel and /stats ssd_reads read these: the file tier's container
      * reads are the expert SSD traffic the metric names. The scheduled prefetch path counted
      * its own link reads here; the file stager's were invisible, so the panels showed zero
      * however much the drive streamed. */
-    stats_.ssd_reads += (uint64_t)ext.size();
-    for (const FileExt& e : ext) {
+    stats_.ssd_reads += (uint64_t)fext_.size();
+    for (const FileExt& e : fext_) {
         stats_.ssd_bytes += (uint64_t)e.bytes;
         /* The copies below move the same bytes from the windows to their destination, which
          * crosses the link either way: into the layer buffer when the unit is discarded at the
@@ -902,8 +997,8 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     std::vector<Seg> segs;
     std::vector<Cp>  cps;
     size_t  i = 0;
-    int64_t piece = 0;                                  /* bytes of ext[i] already placed */
-    while (i < ext.size()) {
+    int64_t piece = 0;                                  /* bytes of fext_[i] already placed */
+    while (i < fext_.size()) {
         const int w = win_next_;
         win_next_ = (win_next_ + 1) % n_windows_;
         char* win = windows_ + (int64_t)w * W;
@@ -921,8 +1016,8 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
          * cannot finish across this window and the next. */
         segs.clear();
         cps.clear();
-        while (i < ext.size()) {
-            const FileExt& e = ext[i];
+        while (i < fext_.size()) {
+            const FileExt& e = fext_[i];
             const int64_t fo = e.foff + piece, left = e.bytes - piece;
             int64_t wo;
             if (!segs.empty() && fo >= segs.back().fs && fo <= segs.back().fe + kReadThrough) {
@@ -958,26 +1053,14 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         win_rec_[(size_t)w] = 1;
     }
     RAD_TRY(rad_event_record(done, mover_));
+    /* The hot-cache admissions and deposits are copies like the staged units': their records
+     * land behind them, so retire() finishes a move when its bytes are in its slot. */
+    for (int32_t rec : frec_) RAD_TRY(rad_event_record(moves_[(size_t)rec].ev, mover_));
+    rd->copied = true;
 
-    for (size_t k = 0; k < staged->size(); ++k) {
-        const int32_t u = (*staged)[k];
-        const MoveUnit& mu = plan_->units[(size_t)u];
-        for (size_t j = 0; j < mu.weights.size(); ++j)
-            res_.publish(mu.weights[j], dst + at[k] + mu.offset[j]);
-        stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
-    }
-    /* Hot-cache units publish at their slots and stay published: nothing unstages them, and
-     * retire() finishes their admission when the copies land. */
-    for (size_t k = 0; k < pbases.size(); ++k) {
-        const int32_t u = (*promoted)[k];
-        const MoveUnit& mu = plan_->units[(size_t)u];
-        for (size_t j = 0; j < mu.weights.size(); ++j)
-            res_.publish(mu.weights[j], pbases[k] + mu.offset[j]);
-        stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
-    }
     ++stats_.ssd_layers;
-    stats_.ssd_units += (uint64_t)(staged->size() + pbases.size());
-    stats_.h2d_bytes += (uint64_t)(off + hot_bytes);
+    stats_.ssd_units += (uint64_t)((rd->staged.size() - staged0) + (rd->promoted.size() - promoted0));
+    stats_.h2d_bytes += (uint64_t)(off - used0 + hot_bytes);
     return RAD_OK;
 }
 
@@ -1809,6 +1892,7 @@ int Mover::retire(HeatEngine* heat) {
                 break;
             case Move::Kind::Release:
             case Move::Kind::Drop:
+            case Move::Kind::Evict:   /* published at issue, never Copying */
                 break;
         }
         /* Safe without synchronisation: both copies of the bytes are valid now (see

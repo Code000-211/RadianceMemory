@@ -80,6 +80,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_block_attn_gated_fp8.h>
 #include <arch/rad_block_gdn_fp8.h>
+#include <arch/rad_calib_full.h>
 #include <arch/rad_block_mlp_fp8.h>
 #if QWEN35_MOE
 #include <arch/rad_block_moe_fp8.h>
@@ -134,6 +135,9 @@ struct Layer {
      * beside the feed-forward's; 0 where none is declared. */
     rad_op       op_pf_gu = 0, op_pf_next = 0;
     rad_weight   pf_gu_w = 0, pf_next_w = 0;
+    /* The layer's calibration inputs (rad_calib_full.h, site_i8), -1 where this run does not record
+     * it: the mixer's input and its output projection's, the feed-forward's and its down's. */
+    int          cs_in = -1, cs_o = -1, cs_mlp = -1, cs_down = -1;
 };
 
 struct Model {
@@ -214,6 +218,12 @@ struct Model {
     rad_op   op_tap = 0;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
+    /* A vocabulary-weighted head (logits_gemm_vocab): its width classes' codes, scales and rows'
+     * vocabulary ids, and this rank's rows of each. */
+    enum { MAX_VCLS = 4 };
+    int        n_vcls = 0;
+    rad_weight w_vw[MAX_VCLS] = {}, w_vs[MAX_VCLS] = {}, w_vi[MAX_VCLS] = {}, w_vrow = 0;
+    int64_t    vcls_rows[MAX_VCLS] = {};
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
     /* Set by a plugin built over this one whose head answers a request from its words
      * (RadBatch::plugin_words): a `fill` of the logits rows that plugin declared. A step every
@@ -230,6 +240,7 @@ struct Model {
     MediaRows   mrows{};
 
     std::vector<Layer> layers;
+    CalibFull          calib;   /* --calib-dir over an int8 trunk (rad_calib_full.h) */
 
     /* The pipelined prefill (step_pipelined): on where declare allowed it; the bounds buffer it
      * cuts a step by, rewritten by every pipelined step from the pinned table `pipe_tbl` of
@@ -973,6 +984,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         (g.world != 2 || rad_op_declared(b, "ar_rmsnorm_had_quant_i8g")))
         m.a_h.q8_fed = m.a_h.q8_rot = true;
     if (rad_op_declared(b, "gated_had_quant_i8g")) m.a_ffn.q8_fed = m.a_ffn.q8_rot = true;
+    /* The delta net's output likewise, from the decode conv fold's epilogue
+     * (gdn_conv_recurrent_update_had) and had_quant_act_i8g on the other rows (GdnFP8::q_o). */
+    if (rad_op_declared(b, "gdn_conv_recurrent_update_had") && rad_op_declared(b, "had_quant_act_i8g"))
+        m.a_go.q8_fed = m.a_go.q8_rot = true;
+    /* And the gated attention's output, from its gate (gate_had_quant_i8g). */
+    if (rad_op_declared(b, "gate_had_quant_i8g") && rad_op_declared(b, "had_quant_act_i8g"))
+        m.a_attn.q8_fed = m.a_attn.q8_rot = true;
 #endif
 
     m.b_hout    = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
@@ -1031,10 +1049,45 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.w_out_norm = decl_w(b, nm.f("output_norm.weight"), RAD_F32, {g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    /* Row-sharded with the vocabulary: g.n_vocab is this rank's share (rad_arch.h). */
-    m.w_lm_head = decl_w(b, nm.f("output.weight"),
-                         weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
-                         {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    /* A vocabulary-weighted head, where the model holds one in place of output.weight: the rows
+     * sorted by their token's probability into classes of one computed-trellis width each,
+     * `output.k<B>.weight`, with `output.k<B>.ids` [rows, 1] each row's vocabulary id, and
+     * `output.vrow` [n_vocab, 1] the inverse (each id's class width and row). Each class is
+     * row-sharded like any lm_head, the converter keeping an id's row among its rank's rows
+     * (libr4d's logits_gemm_vocab). */
+    for (int B = 7; B >= 2; --B) {
+        const char* wn = nm.f("output.k%d.weight", B);
+        RAD_ARCH_TRY(map_copy(b, wn, nm.ckpt("lm_head.k%d.weight", B)));
+        RadEncoding e{};
+        int64_t shp[RAD_MAX_RANK] = {};
+        if (rad_weight_encoding(b, wn, &e, shp, nullptr) != RAD_OK) continue;
+        if (m.n_vcls == Model::MAX_VCLS || shp[0] % (256 * g.world) || shp[1] != g.n_embd) {
+            fprintf(stderr, "radiance: '%s' is not a head class this build reads (at most %d "
+                            "classes, rows a multiple of 256 a rank)\n", wn, (int)Model::MAX_VCLS);
+            return RAD_E_SHAPE;
+        }
+        const int64_t n = shp[0] / g.world;
+        const int k = m.n_vcls++;
+        m.w_vw[k] = decl_view(b, wn, nullptr, "codes,trellis,trellis.mad", e.plane[0].dtype,
+                              {n, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        m.w_vs[k] = decl_view(b, nm.f("output.k%d.scale", B), wn,
+                              rad_enc_plane(&e, "scale.col") ? "scale,scale.col" : "scale",
+                              RAD_F32, {n, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        const char* in = nm.f("output.k%d.ids", B);
+        RAD_ARCH_TRY(map_copy(b, in, nm.ckpt("lm_head.k%d.ids", B)));
+        m.w_vi[k] = decl_w(b, in, RAD_I32, {n, 1}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        m.vcls_rows[k] = n;
+    }
+    if (m.n_vcls) {
+        RAD_ARCH_TRY(map_copy(b, nm.f("output.vrow"), nm.ckpt("lm_head.vrow")));
+        m.w_vrow = decl_w(b, nm.f("output.vrow"), RAD_I32, {g.n_vocab, 1}, RAD_ACCESS_VOCAB,
+                          RAD_SHARD_ROW, grp_model());
+    } else {
+        /* Row-sharded with the vocabulary: g.n_vocab is this rank's share (rad_arch.h). */
+        m.w_lm_head = decl_w(b, nm.f("output.weight"),
+                             weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
+                             {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    }
 
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
@@ -1130,6 +1183,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * unfolded: it is a separate chain over its own residual buffer and saves only two launches a
      * step. */
     m.layers.resize((size_t)m.n_main);
+#if !QWEN35_MOE
+    /* GPTQ calibration over the trunk's own int8 codes (rad_calib_full.h, site_i8): one rank, the
+     * serial step. The scratch is the widest input's square, the feed-forward's. */
+    if (ctx->calib_dir && *ctx->calib_dir && g.world > 1) {
+        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only\n");
+        return RAD_E_INVAL;
+    }
+    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0, std::max<int64_t>(g.n_ff, g.n_embd)));
+#endif
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.full = is_full_attention(l, interval) ? 1 : 0;
@@ -1200,6 +1262,36 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 #endif
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, true, f.mlp_add,
                                      f.mlp_ar_in, f.mlp_ar_out));
+#if !QWEN35_MOE
+        if (m.calib.records(l)) {
+            /* The codes each int8 GEMM reads, in the domain its weight is stored in (i8_rot). */
+            const ActFP8& ao = lay.full ? m.a_attn : m.a_go;
+            const LinearFP8& li = lay.full ? lay.attn.qg : lay.gdn.in;
+            const LinearFP8& lo = lay.full ? lay.attn.o : lay.gdn.out;
+            if (!m.a_h.q8 || !ao.q8 || !m.a_ffn.q8 || !lay.mlp.gate_up.i8 || !lo.i8) {
+                fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk; layer %lld "
+                                "is not one\n", (long long)l);
+                return RAD_E_INVAL;
+            }
+            auto dom = [](const LinearFP8& w) { return w.i8_rot ? (uint32_t)RAD_FP8_BLOCK : 0u; };
+            const std::string L = "model.language_model.layers." + std::to_string(l);
+            const std::string mix = L + (lay.full ? ".self_attn" : ".linear_attn");
+            const std::string op = lay.full ? ".o_proj" : ".out_proj";
+            lay.cs_in = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site_i8(b, g, l, L + ".input", mix, m.a_h.q8, m.a_h.s8, g.n_embd,
+                                         dom(li)));
+            lay.cs_o = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site_i8(b, g, l, mix + op + ".input", mix + op, ao.q8, ao.s8, lo.K,
+                                         dom(lo)));
+            lay.cs_mlp = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site_i8(b, g, l, L + ".post_attention.input",
+                                         L + ".mlp.gate_proj," + L + ".mlp.up_proj", m.a_h.q8,
+                                         m.a_h.s8, g.n_embd, dom(lay.mlp.gate_up)));
+            lay.cs_down = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site_i8(b, g, l, L + ".mlp.down_proj.input", L + ".mlp.down_proj",
+                                         m.a_ffn.q8, m.a_ffn.s8, g.n_ff, dom(lay.mlp.down)));
+        }
+#endif
     }
 #if QWEN35_MOE
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
@@ -1243,12 +1335,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                      {m.a_h.x}, {m.b_hout});
 
-    m.op_logits = rw(b, RAD_OP(b, "logits_gemm",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                    RAD_INT("n_vocab", g.n_vocab),
-                                    RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
-                         RAD_WEIGHTS(m.w_lm_head)),
-                     {m.b_hout}, {m.b_logits});
+    m.op_logits = m.n_vcls
+        ? rw(b, RAD_OP(b, "logits_gemm_vocab",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                            RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off),
+                            RAD_INT("rows0", m.vcls_rows[0]), RAD_INT("rows1", m.vcls_rows[1]),
+                            RAD_INT("rows2", m.vcls_rows[2]), RAD_INT("rows3", m.vcls_rows[3])),
+                 RAD_WEIGHTS(m.w_vw[0], m.w_vs[0], m.w_vi[0], m.w_vw[1], m.w_vs[1], m.w_vi[1],
+                             m.w_vw[2], m.w_vs[2], m.w_vi[2], m.w_vw[3], m.w_vs[3], m.w_vi[3],
+                             m.w_vrow)),
+             {m.b_hout}, {m.b_logits})
+        : rw(b, RAD_OP(b, "logits_gemm",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                            RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
+                 RAD_WEIGHTS(m.w_lm_head)),
+             {m.b_hout}, {m.b_logits});
 
     /* ---- the multi-token-prediction head (rad_block_mtp_fp8.h).
      *
@@ -1258,7 +1360,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
-    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0) {
+    /* (A vocabulary-weighted head has no output.weight for the draft head to read.) */
+    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0 && !m.n_vcls) {
         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
          * history pass that fills the head's own K and V is one row per token over a whole prefill
          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */
@@ -1404,6 +1507,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * and a drafter's. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
     return RAD_OK;
+}
+
+/* The lm_head over the gathered rows: the one weight, or a vocabulary-weighted head's classes. */
+static void issue_logits(RadCtx* c, const Model& m, int n) {
+    if (!m.n_vcls) {
+        RAD_ISSUE_N(c, m.op_logits, n, brows(m.b_hout, n), RAD_W(m.w_lm_head),
+                    brows(m.b_logits, n));
+        return;
+    }
+    auto w = [](rad_weight h) { return h ? RAD_W(h) : RAD_NONE; };
+    RAD_ISSUE_N(c, m.op_logits, n, brows(m.b_hout, n), w(m.w_vw[0]), w(m.w_vs[0]), w(m.w_vi[0]),
+                w(m.w_vw[1]), w(m.w_vs[1]), w(m.w_vi[1]), w(m.w_vw[2]), w(m.w_vs[2]), w(m.w_vi[2]),
+                w(m.w_vw[3]), w(m.w_vs[3]), w(m.w_vi[3]), RAD_W(m.w_vrow), brows(m.b_logits, n));
 }
 
 #if !QWEN35_MOE
@@ -1632,9 +1748,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.a_h.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
                     brows(m.b_hout, batch->n_out));
-        RAD_ISSUE_N(c, m.op_logits, batch->n_out,
-                    brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
-                    brows(m.b_logits, batch->n_out));
+        issue_logits(c, m, batch->n_out);
     }
 }
 #endif
@@ -1713,9 +1827,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const Layer& l = m.layers[(size_t)li];
         if (l.full) l.attn.step(c, batch);
         else        l.gdn.step(c, batch);
+        /* The calibration taps read the codes the block's GEMMs just read, before the next block's
+         * norm rewrites the shared input planes. */
+        if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, batch->n_tok);
+        if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, batch->n_tok);
         prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
         dbg_resid(c, (int)li, "mix", m.g.n_embd, m.b_x, m.a_h.x);
         l.mlp.step(c, batch);
+        if (l.cs_mlp >= 0) m.calib.tap(c, (size_t)l.cs_mlp, batch->n_tok);
+        if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, batch->n_tok);
         prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
         dbg_resid(c, (int)li, "ffn", m.g.n_embd, m.b_x, m.a_h.x);
 
@@ -1727,6 +1847,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
                       bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, batch->n_tok));
         }
     }
+
+    m.calib.after_step(c, batch->n_tok);
 
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.a_h.x, batch->n_tok));
@@ -1740,9 +1862,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     brows(m.a_h.x, batch->n_tok),
                     praw(batch->out_ids, RAD_I32, batch->n_out),
                     brows(m.b_hout, batch->n_out));
-        RAD_ISSUE_N(c, m.op_logits, batch->n_out,
-                    brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
-                    brows(m.b_logits, batch->n_out));
+        issue_logits(c, m, batch->n_out);
     }
 }
 

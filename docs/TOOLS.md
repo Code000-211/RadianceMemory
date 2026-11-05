@@ -444,8 +444,8 @@ comparison with the recording runs either way. `--no-cache` runs it regardless.
 
 Against a container (`-m`), weight operands are read from it: each weight's canonical planes,
 which the kernel under test gets through its own `layout`/`relayout` hooks and the oracle gets
-decoded, and every expert of a weight table. This is the only test of the artifact and of the
-layout hooks.
+decoded, and every expert of a weight table, laid out expert by expert and stacked. This is the
+only test of the artifact and of the layout hooks.
 
 ```sh
 rad-kbench -m flashnext-w4.rad --home $RADIANCE_HOME --bench --report kbench.md

@@ -1,0 +1,14 @@
+# ling3-w4a8-rtn.recipe -- Ling-3.0-flash or a fine-tune of it (Ling-3.0-flash-Sante) from the bf16
+# checkpoint: the routed experts at four bits, an int4 code and a bf16 scale per 128 of K, rounded to
+# nearest; everything else as the checkpoint holds it (the KDA and MLA projections, the dense layers,
+# the shared expert, the router, the embedding and lm_head in bf16).
+#
+#   rad-convert <Ling-3.0-flash-Sante> --recipe data/recipes/ling3-w4a8-rtn.recipe -o ling3-w4a8-rtn.rad
+#
+# It is the container to calibrate in: served with RADIANCE_CALIB_DIR set, its experts' Grams feed
+# the GPTQ recipe.
+#
+# Measured on Ling-3.0-flash-Sante with the engine's KL mode against the bf16 model (wikitext-2,
+# 100 chunks of 512 tokens, the second half of each scored): mean KL 0.038, top-1 agreement 92.54%.
+
+blk.*.ffn_*_exps.*.weight  rtn  codes=i4 group=128 scale=bf16

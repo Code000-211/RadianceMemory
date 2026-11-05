@@ -58,9 +58,15 @@ const RadQuantOption kGptqOptions[] = {
     { "act_order", RAD_P_INT, "0",
       "1: quantise the columns by descending input energy, stored in that order with the "
       "permutation as the encoding's transform (a kernel permutes its activation to match)" },
+    { "tcq_order", RAD_P_INT, "0",
+      "a trellis's column order: 1 runs GPTQ over the columns by descending input energy, the codes "
+      "stored in column order (each column is its own trellis, so the reader is unchanged)" },
     { "cd", RAD_P_INT, "0",
       "sweeps of coordinate descent after the loop: every code re-chosen at its conditional "
       "optimum against the same damped Hessian, the other columns held (lq_gptq.h)" },
+    { "rescale", RAD_P_INT, "0",
+      "1: after the loop each row's scale is refitted to its codes, the least-squares factor under "
+      "the Hessian (one static f32 scale a row; lq_gptq.h gptq_rescale_rows)" },
     { "dyn", RAD_P_INT, "0",
       "1: each 128-column group's scale chosen when the loop reaches it, from the values earlier "
       "columns' error has moved it to (one scale level, groups of 128)" },
@@ -106,6 +112,9 @@ int gptq_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodi
     Grid g;
     const int st = grid_of(o, n_o, w, &g, true);
     if (st != RAD_OK) return st;
+    if (g.tcq_wide)
+        return refuse(w, "tcq_code=mad16's values are wider than int8, and no reader decodes them "
+                         "yet (the 16-bit path): quantise it with gptqsim");
     *out = grid_encoding(g);
     if (rad_param_geti(o, n_o, "act_order", 0)) {
         if (g.fwht) return refuse(w, "act_order=1 and transform= are two transforms, and an "
@@ -132,6 +141,8 @@ int gptq_decode(const RadEncoding* e, const RadQuantWeight* w, const void* const
     return grid_tcq_decode(e, w->rows, w->cols, planes, row0, rows, out);
 }
 
+/* `planes` null: quantise and leave the decoded values in `src` (the grid's domain, column order),
+ * storing nothing -- gptqsim's use. */
 int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
                   int64_t rows, void* const* planes) {
     Grid g;
@@ -144,17 +155,28 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     const char* dir = rad_param_gets(o, n_o, "calib", nullptr);
     const double damp = rad_param_getf(o, n_o, "damp", 0.01);
     const bool act = rad_param_geti(o, n_o, "act_order", 0) != 0;
+    /* A trellis's columns are independent codes, so GPTQ may take them in any order while they
+     * stay stored in column order: the order is the quantiser's alone. */
+    const bool tord = g.tcq_L && rad_param_geti(o, n_o, "tcq_order", 0) != 0;
     std::vector<int32_t> perm;
     std::vector<float> imp_p;
     const float* imp = w->importance;
-    if (act) {
-        perm = gptq_act_order(dir, w->name, K, g.fwht);
+    auto permute = [&](float* m, bool inverse) {
         std::vector<float> row((size_t)K);
         for (int64_t r = 0; r < N; ++r) {
-            float* wr = src + r * K;
-            for (int64_t j = 0; j < K; ++j) row[(size_t)j] = wr[perm[(size_t)j]];
+            float* wr = m + r * K;
+            for (int64_t j = 0; j < K; ++j) {
+                if (inverse) row[(size_t)perm[(size_t)j]] = wr[j];
+                else row[(size_t)j] = wr[perm[(size_t)j]];
+            }
             std::memcpy(wr, row.data(), (size_t)K * sizeof(float));
         }
+    };
+    Gram uf;
+    if (tord) uf = gptq_factor_ordered(dir, w->name, K, g.fwht, damp, &perm);
+    else if (act) perm = gptq_act_order(dir, w->name, K, g.fwht);
+    if (act || tord) {
+        permute(src, false);
         if (imp) {
             imp_p.resize((size_t)K);
             for (int64_t j = 0; j < K; ++j) imp_p[(size_t)j] = imp[perm[(size_t)j]];
@@ -165,19 +187,26 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     /* Scales come first, from the weight as it stands, and stay fixed through the loop -- or with
      * dyn=1 each group's is chosen again as the loop reaches it (gptq_quantise). */
     Scales sc = grid_scales(g, src, N, K, imp);
-    const Planes p = grid_planes(g, K, planes);
+    const Planes p = planes ? grid_planes(g, K, planes) : Planes{};
     const bool dyn = rad_param_geti(o, n_o, "dyn", 0) != 0;
     if (dyn && !gptq_dynamic_ok(g, sc))
         return refuse(w, "dyn=1 chooses a 128-column group's scale as GPTQ reaches it, which needs "
                          "one scale level per row and 128 columns");
+    if (tord && (dyn || sc.bc < K || g.lv2 || g.tcq_rb))
+        return refuse(w, "tcq_order=1 runs the columns out of order, so it takes one static scale a "
+                         "row (block=1x*, no dyn, scale2 or row blocks)");
 
-    const Gram uf = gptq_factor(dir, w->name, K, g.fwht, damp, act ? perm.data() : nullptr);
+    if (!tord) uf = gptq_factor(dir, w->name, K, g.fwht, damp, act ? perm.data() : nullptr);
     const float* u = uf ? uf->data() : nullptr;
 
     std::vector<int32_t> codes((size_t)(N * K));
     const int cd = (int)rad_param_geti(o, n_o, "cd", 0);
+    const bool rescale = rad_param_geti(o, n_o, "rescale", 0) != 0;
+    if (rescale && (dyn || sc.nc != 1 || sc.br != 1 || g.lv2 || g.tcq_rb || g.scale_dt != RAD_F32))
+        return refuse(w, "rescale=1 refits one static f32 scale a row (block=1x*, scale=f32, no dyn, "
+                         "scale2 or row blocks)");
     std::vector<float> x0;
-    if (cd > 0 && u) x0.assign(src, src + (size_t)(N * K));
+    if ((cd > 0 || rescale) && u) x0.assign(src, src + (size_t)(N * K));
     {
         std::string why;
         const int st = gptq_quantise(g, src, codes.data(), sc, N, K, u, dyn && u, &why);
@@ -186,11 +215,26 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
             return st;
         }
     }
-    grid_store_scales(g, sc, p);
-    if (!x0.empty()) {
+    if (tord) {
+        permute(src, true);
+        if (!x0.empty()) permute(x0.data(), true);
+        std::vector<int32_t> row((size_t)K);
+        for (int64_t r = 0; r < N; ++r) {
+            int32_t* cr = codes.data() + r * K;
+            for (int64_t j = 0; j < K; ++j) row[(size_t)perm[(size_t)j]] = cr[j];
+            std::memcpy(cr, row.data(), (size_t)K * sizeof(int32_t));
+        }
+    }
+    if (!x0.empty() && rescale) {
+        const Gram h = calib_gram(dir, w->name, K, g.fwht, "gptq rescale");
+        if (h) gptq_rescale_rows(x0.data(), src, sc, N, K, h->data());
+    }
+    if (planes) grid_store_scales(g, sc, p);
+    if (!x0.empty() && cd > 0) {
         const Gram h = calib_gram(dir, w->name, K, g.fwht, "gptq cd");
         if (h) gptq_refine(g, x0.data(), src, codes.data(), sc, N, K, h->data(), damp, cd);
     }
+    if (!planes) return RAD_OK;
     const int64_t V = g.vq.empty() ? 1 : g.vdim;            /* one code a vector */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (N * K > (1 << 20))
@@ -252,6 +296,47 @@ int cast_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ gptqsim */
+/* gptq on any grid, its decoded values stored as plain bf16 in the weight's own domain (the grid's
+ * rotation undone): what a reader that decodes the codes to 16 bits and runs a 16-bit GEMM over a
+ * 16-bit activation computes -- the W16A16 form a selected tensor can take -- measured before that
+ * reader exists. A plain bf16 linear runs gemm_nt over the bf16 activation, so the engine serves it
+ * as is. bf16 keeps 8 bits of mantissa, finer than a 7-bit code's error; tcq_code=mad16 is the code
+ * the 16-bit path can hold that int8 cannot. The container holds 16 bits a weight: a measurement
+ * sizes the tensor at its grid's bits. */
+int gptqsim_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncoding* out) {
+    if (declines(w)) return RAD_E_UNSUPPORTED;
+    Grid g;
+    const int st = grid_of(o, n_o, w, &g, true);
+    if (st != RAD_OK) return st;
+    if (rad_param_geti(o, n_o, "act_order", 0))
+        return refuse(w, "gptqsim stores the values in column order: tcq_order=1, not act_order=1");
+    *out = rad_enc_plain(RAD_BF16);
+    return RAD_OK;
+}
+
+int gptqsim_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
+                     int64_t rows, void* const* planes) {
+    Grid g;
+    int st = grid_of(o, n_o, w, &g, true);
+    if (st != RAD_OK) return st;
+    st = gptq_quantize(o, n_o, w, src, row0, rows, nullptr);
+    if (st != RAD_OK) return st;
+    const int64_t N = w->rows, K = w->cols;
+    /* The unnormalised Hadamard is its own inverse up to its width: F F = n I. */
+    if (g.fwht) {
+        grid_transform_rows(g, src, N, K);
+        const float inv = 1.0f / (float)g.fwht;
+        for (int64_t i = 0; i < N * K; ++i) src[i] *= inv;
+    }
+    uint16_t* out = (uint16_t*)planes[0];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (N * K > (1 << 20))
+#endif
+    for (int64_t i = 0; i < N * K; ++i) out[i] = f32_to_bf16(src[i]);
+    return RAD_OK;
+}
+
 const RadQuantizerInfo kQuantizers[] = {
     { "rtn",
       "round to nearest: every value to its nearest point on the grid, the scale of each block "
@@ -263,6 +348,11 @@ const RadQuantizerInfo kQuantizers[] = {
       "over the columns after it, on any grid, the scales fixed from the weight first",
       kGptqOptions, (int)(sizeof kGptqOptions / sizeof kGptqOptions[0]),
       gptq_encoding, whole_weight, gptq_quantize, gptq_decode },
+    { "gptqsim",
+      "gptq on any grid with the decoded values stored as plain bf16, the grid's rotation undone: "
+      "the W16A16 form of a tensor (a 16-bit decode and GEMM), measured before its reader exists",
+      kGptqOptions, (int)(sizeof kGptqOptions / sizeof kGptqOptions[0]),
+      gptqsim_encoding, whole_weight, gptqsim_quantize, nullptr },
     { "cast",
       "a float weight converted to another float dtype, to nearest even, with no scale",
       kCastOptions, (int)(sizeof kCastOptions / sizeof kCastOptions[0]),

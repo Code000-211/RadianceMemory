@@ -187,6 +187,12 @@ public:
     enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
                         ModelOpt };
     Import imports() const { return import_; }
+    /* The form `name` is read in: a drafter merged by add_draft ships its own quantisation (a
+     * ModelOpt NVFP4 drafter beside a bf16 target), so names under its prefix take that one. */
+    Import imports_at(const std::string& name) const {
+        return draft_import_ != Import::None && name.rfind(draft_prefix_, 0) == 0 ? draft_import_
+                                                                                  : import_;
+    }
     const std::string& import_refusal() const { return import_why_; }
 
     /* The pieces an imported `name` (a `.weight`) is read from, as views owned here: GPTQ-packed
@@ -209,6 +215,7 @@ private:
     int open_safetensors(const std::string& path);
     int open_diffusers();
     int open_sgm();
+    int open_hy3d(const std::string& weights);
     int add_companions();
     int add_torch_files();
     int open_gguf(const std::string& path);
@@ -230,6 +237,9 @@ private:
     int64_t fp8_br_ = 128, fp8_bc_ = 128;
     Import      import_ = Import::None;
     std::string import_why_;
+    /* add_draft's drafter, when it ships a quantisation of its own: the form and the prefix. */
+    Import      draft_import_ = Import::None;
+    std::string draft_prefix_;
     int64_t     ct_group_ = 0;   /* CtInt4: the group every weight's config states */
     bool        ct_asym_  = false;   /* CtInt4: the config states asymmetric weights */
     /* import_piece's answers by name, so a weight resolved twice reuses its views. */

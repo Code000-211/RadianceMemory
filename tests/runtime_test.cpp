@@ -11,6 +11,7 @@
  */
 #include "rad_test.h"
 #include "host_kargs_main.h"
+#include "rad_prefill_split.h"
 
 #include "device/device.h"
 #include "runtime/arena.h"
@@ -49,6 +50,7 @@ struct Rec {
     RadTensor   t[8]{};
     long long   M = -1;
     int         rank = 0, world = 0;
+    int32_t     kv_used_max_h = -1;
     void*       scratch = nullptr;
     int64_t     scratch_bytes = 0;
     void*       instance = nullptr;
@@ -66,6 +68,7 @@ static int record(const char* name, const RadArgs* a, RadStream s) {
     rad_args_geti(a, "M", &r.M);
     r.rank = a->rank;
     r.world = a->world_size;
+    r.kv_used_max_h = a->kv_used_max_h;
     r.scratch = a->scratch;
     r.scratch_bytes = a->scratch_bytes;
     r.instance = a->instance;
@@ -234,12 +237,14 @@ struct Fixture {
         return (rad_op)(P.ops.size() - 1);
     }
 
-    int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false) {
+    int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false,
+              uint64_t (*pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr) {
         CtxDesc d;
         d.program     = &P;
         d.rank        = 1;
         d.world_size  = 2;
         d.arch_step   = arch_step_trampoline;
+        d.arch_pass_key = pass_key;
         d.residency   = res;
         d.profile_ops = profile;
         d.kv          = kv;
@@ -739,6 +744,42 @@ TEST(route_report_is_asynchronous_and_drains_oldest_first) {
 
     /* A layer the model does not have is refused rather than corrupting a neighbour's bank. */
     CHECK_EQ(f.ctx.route_report(99, &r), RAD_E_INVAL);
+}
+
+/* The file stager reads a layer's counts through the address the layer's last report named, at
+ * the layer's next trigger. That holds for a buffer in the arena's fixed region or outside the
+ * arena. A transient buffer is at another offset at another arena level, and a later transient
+ * may share its bytes since no declared op reads the counts, so the source declines it and the
+ * stager reads that layer whole. */
+TEST(the_counts_source_declines_a_transient_buffer) {
+    Fixture f;
+    f.P.arena_fixed_bytes = 4096;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    CHECK_OK(f.start());
+    char* const base = (char*)f.ctx.arena_base();
+    REQUIRE(base != nullptr);
+    int64_t n = -1;
+    CHECK(f.ctx.route_counts_device(0, &n) == nullptr);      /* nothing reported yet */
+    CHECK_EQ(n, (int64_t)0);
+
+    RadRouting r{};
+    r.n_expert = 4;
+    r.top_k = 2;
+    r.expert_count = (const int32_t*)(base + 256);            /* the fixed region */
+    CHECK_OK(f.step(1, 0, [&](Ctx& c) { CHECK_OK(c.route_report(0, &r)); }));
+    CHECK(f.ctx.route_counts_device(0, &n) == r.expert_count);
+    CHECK_EQ(n, (int64_t)4);
+
+    r.expert_count = (const int32_t*)(base + 4096 + 512);     /* a transient */
+    CHECK_OK(f.step(1, 1, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    CHECK(f.ctx.route_counts_device(1, &n) == nullptr);
+    CHECK_EQ(n, (int64_t)0);
+
+    static const int32_t outside[4] = { 1, 2, 3, 4 };         /* not the arena's */
+    r.expert_count = outside;
+    CHECK_OK(f.step(1, 2, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    CHECK(f.ctx.route_counts_device(1, &n) == outside);
+    CHECK_OK(rad_stream_sync(f.ctx.stream()));
 }
 
 /* A step that drafts reports the same layer once per pass, all into the step's one bank. The drain
@@ -2175,12 +2216,14 @@ int k_copy(const RadArgs* a, RadStream s) {
 }
 
 /* A host row for every band of `op`, from a library that is not the reference. */
-void attach_host_row(Fixture& f, rad_op op, RadLaunchFn fn, const char* name) {
+void attach_host_row(Fixture& f, rad_op op, RadLaunchFn fn, const char* name,
+                     uint64_t capabilities = 0) {
     for (rad::Band& band : f.P.ops[op].bands) {
         f.infos.push_back(RadKernelInfo{});
         RadKernelInfo& ki = f.infos.back();
         ki.name = name; ki.op = "rope"; ki.family = "test"; ki.domain = RAD_DOMAIN_HOST;
         ki.launch = fn;
+        ki.capabilities = capabilities;
         f.rows.push_back(rad::KernelRow{});
         rad::KernelRow& kr = f.rows.back();
         kr.info = &ki;
@@ -2328,6 +2371,142 @@ TEST(a_program_with_a_calibration_tap_records_no_passes) {
  * and runtime state a pass's shape or arguments read, and must not change with the step number
  * alone. A field missing from the key replays stale arguments until the next audit. A pass that
  * cannot be recorded (encoder, generator, encoder rows) keys to 0. */
+static uint64_t test_prefill_geometry_key(RadCtx* c, const RadBatch* b, const int32_t* used) {
+    if (!c || !b || !used) return 0;
+    const int bq = 192, tile = 48, kv_heads = 4, threads = 768;
+    const int wgps = rad_ctx_wgp_count(c);
+    constexpr int declared_max_ctx = 65536;
+    const int splits = rad_prefill_splits_for_live(bq, tile, (int)b->max_q_len,
+                                                    (int)b->n_tok, (int)b->n_seq, kv_heads,
+                                                    declared_max_ctx, used[0], wgps);
+    return rad_prefill_grid_key((int)b->max_q_len, bq, splits, kv_heads, (int)b->n_seq, threads);
+}
+
+TEST(legacy_prefill_keying_only_fails_closed_for_dynamic_split_rows) {
+    {
+        Fixture f;
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        rad_op op = loose_op(f);
+        attach_host_row(f, op, k_host_read, "unaffected_prefill");
+        CHECK_OK(f.start());
+
+        RadBatch b{};
+        b.phase = RAD_PHASE_PREFILL;
+        b.n_tok = 128; b.n_seq = 1; b.max_q_len = 128;
+        CHECK(f.ctx.pass_key(&b) != 0);  // Unaffected legacy prefill retains reuse.
+    }
+    {
+        Fixture f;
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        rad_op op = loose_op(f);
+        attach_host_row(f, op, k_host_read, "live_split_prefill",
+                        RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT);
+        CHECK_OK(f.start());
+
+        RadBatch b{};
+        b.phase = RAD_PHASE_PREFILL;
+        b.n_tok = 128; b.n_seq = 1; b.max_q_len = 128;
+        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        b.phase = RAD_PHASE_MIXED;
+        CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+        /* Decode, verify and draft passes stay recordable: their launches read the keyed
+         * context bound, not the live maximum (issue_passes_only_proven_kv_host_summaries). */
+        b.phase = RAD_PHASE_DECODE; b.n_spec = 1;
+        CHECK(f.ctx.pass_key(&b) != 0);
+        b.n_spec = 0; b.draft_pass = -1;
+        CHECK(f.ctx.pass_key(&b) != 0);
+        b.draft_pass = 0;
+        CHECK(f.ctx.pass_key(&b) != 0);
+    }
+}
+
+TEST(issue_passes_only_proven_kv_host_summaries) {
+    Fixture f;
+    rad_op op = f.add_op("rope", "M", { 8192 }, { k_pre }, { "prefill" }, nullptr, {});
+    CHECK_OK(f.start());
+
+    int32_t used_device[2] = { 896, 1152 }, used_host[2] = { 896, 1152 };
+    int32_t positions_device[128]{}, positions_host[128]{};
+    for (int i = 0; i < 128; ++i) positions_host[i] = 2048 + i;
+    RadKVGroupBatch kv{};
+    kv.group = 1;
+    kv.seqused = used_device;
+    kv.seqused_h = used_host;
+    int32_t used_max[1] = { 1152 };
+    f.batch.n_kv_groups = 1;
+    f.batch.kv = &kv;
+    f.batch.kv_used_max_h = used_max;
+    f.batch.positions = positions_device;
+    f.batch.positions_h = positions_host;
+
+    auto issue = [&](const int32_t* ptr, int rows, int batch_seqs, int phase, int n_spec) -> int32_t {
+        f.batch.phase = phase;
+        f.batch.n_tok = 128;
+        f.batch.n_seq = batch_seqs;
+        f.batch.n_spec = n_spec;
+        g_rec.clear();
+        g_body = [&](Ctx& c) {
+            const RadOperand arg[1] = { RAD_P_T2(ptr, RAD_I32, rows, 1) };
+            (void)c.issue(op, arg, 1, RAD_N_BATCH);
+        };
+        const int status = f.ctx.run_step(&f.batch);
+        g_body = nullptr;
+        if (status < 0 || g_rec.size() != 1) return -999;
+        return g_rec[0].kv_used_max_h;
+    };
+
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 0), 1152); // full group maximum
+    CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_PREFILL, 0), 1152); // exact sequence slice
+    CHECK_EQ(issue(used_device, 1, 2, RAD_PHASE_PREFILL, 0), 896); // first sequence only
+    CHECK_EQ(issue(used_device, 3, 2, RAD_PHASE_PREFILL, 0), -1); // out-of-range span
+    CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_MIXED, 0), 1152); // mixed prefill slice
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 1), 1152); // exact speculative operand
+    CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_PREFILL, 0), positions_host[64]);
+    CHECK_EQ(issue(positions_device + 128, 1, 1, RAD_PHASE_PREFILL, 0), -1); // past step end
+    CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_MIXED, 0), -1);
+    CHECK_EQ(issue(positions_device + 64, 1, 1, RAD_PHASE_PREFILL, 1), -1);
+    /* A plugin with no pass-key callback records its decode passes, so a launch there reads the
+     * step's context bound plus its longest query, which the key holds, never the live maximum. */
+    f.batch.max_ctx_len = 2048;
+    f.batch.max_q_len = 2;
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_DECODE, 1), 2050);
+    CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_DECODE, 0), 2050);
+    CHECK_EQ(issue(used_device, 3, 2, RAD_PHASE_DECODE, 1), -1);   // still nothing to bound
+    CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 0), 1152); // prefill keeps the exact one
+}
+
+TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op op = loose_op(f);
+    attach_host_row(f, op, k_host_read, "host_read");
+    CHECK_OK(f.start(nullptr, false, false, test_prefill_geometry_key));
+
+    RadKVGroupBatch kv{};
+    kv.group = 3;
+    RadBatch b{};
+    b.phase = RAD_PHASE_PREFILL; b.n_tok = 128; b.n_seq = 1;
+    b.max_q_len = 128; b.max_ctx_len = 4096; b.n_kv_groups = 1; b.kv = &kv;
+    int32_t used[1] = {2304};
+    b.kv_used_max_h = used;
+    const int split6 = rad_prefill_splits_law(192, 48, 128, 128, 1, 4, used[0], 32);
+    const uint64_t k6 = f.ctx.pass_key(&b);
+    used[0] = 2305;
+    const int same_split = rad_prefill_splits_law(192, 48, 128, 128, 1, 4, used[0], 32);
+    CHECK_EQ(split6, 6);
+    CHECK_EQ(same_split, 6);
+    CHECK_EQ(f.ctx.pass_key(&b), k6);
+
+    used[0] = 3072;
+    const int split8 = rad_prefill_splits_law(192, 48, 128, 128, 1, 4, used[0], 32);
+    const uint64_t k8 = f.ctx.pass_key(&b);
+    CHECK_EQ(split8, 8);
+    CHECK(k8 != k6);
+    CHECK_EQ(((128 + 192 - 1) / 192) * split6 * 768, 4608);
+    CHECK_EQ(((128 + 192 - 1) / 192) * split8 * 768, 6144);
+    CHECK_EQ(rad_ctx_wgp_count((RadCtx*)&f.ctx), 32);
+}
+
 TEST(the_pass_key_changes_with_every_field_a_pass_depends_on) {
     Fixture f;
     f.add_buffer("x", RAD_BF16, 64, 4, 0);
@@ -2343,7 +2522,8 @@ TEST(the_pass_key_changes_with_every_field_a_pass_depends_on) {
         std::memset(&b, 0, sizeof b);
         std::memset(kv, 0, sizeof kv);
         b.phase = RAD_PHASE_DECODE; b.step = 5; b.n_tok = 4; b.n_seq = 2; b.n_out = 2;
-        b.max_q_len = 2; b.max_ctx_len = 1024; b.n_kv_groups = 2; b.kv = kv; b.n_spec = 1;
+        b.max_q_len = 2; b.max_ctx_len = 1024;
+        b.n_kv_groups = 2; b.kv = kv; b.n_spec = 1;
         b.n_seq_decode = 2; b.n_tok_decode = 4; b.max_q_len_decode = 2;
         int k = 0;
         b.token_ids = arr[k++]; b.positions = arr[k++]; b.cu_seqlens = arr[k++];

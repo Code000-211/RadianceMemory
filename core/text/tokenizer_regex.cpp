@@ -266,6 +266,12 @@ private:
     std::vector<size_t>    off_;       /* byte offset of each codepoint */
     size_t                 i_ = 0;
     size_t                 start_ = 0; /* where the construct being parsed began */
+    /* Groups open around the construct being parsed: a possessive quantifier is taken only at
+     * depth 0, where what follows its concatenation is the end of the match. */
+    int                    depth_ = 0;
+    /* Possessive repetitions parse_quant accepted, read as greedy; parse_concat checks that the
+     * rest of their concatenation cannot take back what they consumed. */
+    std::vector<int>       possessive_;
 
     bool decode_pattern() {
         const uint8_t* p = (const uint8_t*)pat_.data();
@@ -382,6 +388,7 @@ private:
             if (a < 0) return -1;
             items.push_back(a);
         }
+        if (!possessive_tails_ok(items)) return -1;
         if (items.empty()) return add(Node{});
         if (items.size() == 1) return items[0];
         Node n; n.kind = Node::CAT; n.kids = std::move(items);
@@ -448,11 +455,17 @@ private:
         else if (!interval_at(i_, &mn, &mx, &len)) return atom;
         const bool brace = c == '{';
         i_ += len;
-        bool greedy = true;
+        bool greedy = true, possessive = false;
         if (!at_end() && peek() == '?') { greedy = false; ++i_; }
         else if (!at_end() && peek() == '+') {
-            return failn(brace ? "a quantifier applied to a quantifier (Ruby reads '{n,m}+' as nested repetition)"
-                               : "a possessive quantifier");
+            if (brace)
+                return failn("a quantifier applied to a quantifier (Ruby reads '{n,m}+' as nested repetition)");
+            /* A possessive repetition of one class at the top level is read as greedy, which
+             * parse_concat proves gives the same matches; anything else has no DFA form. */
+            if (depth_ > 0 || nodes[atom].kind != Node::SET)
+                return failn("a possessive quantifier");
+            possessive = true;
+            ++i_;
         }
         if (is_quantifier_at(i_)) return failn("a quantifier applied to a quantifier");
         if (nodes[atom].kind == Node::ASSERT) return failn("a quantifier on an assertion");
@@ -461,7 +474,35 @@ private:
         if (mx < 0 && nullable(nodes, atom))
             return failn("unbounded repetition of an expression that can match empty");
         Node n; n.kind = Node::REP; n.min = mn; n.max = mx; n.greedy = greedy; n.kids = { atom };
-        return add(n);
+        const int r = add(n);
+        if (possessive) possessive_.push_back(r);
+        return r;
+    }
+
+    /* A possessive repetition of the class S never gives back, a greedy one gives back only when
+     * the rest of the match fails after its longest run. At the top level that rest is the tail of
+     * its concatenation and then the end of the match. When the tail is classes and repetitions of
+     * classes, none of which can take a codepoint of S, a shorter run leaves the tail facing a
+     * codepoint of S it cannot take, so no shorter run matches where the longest did not, and the
+     * greedy reading reports exactly the possessive matches (Ling-3.0's `[^\r\n\p{L}\p{N}]?+\p{L}+`
+     * and ` ?[^\s\p{L}\p{N}]++[\r\n]*`). Any other tail is refused. */
+    bool possessive_tails_ok(const std::vector<int>& items) {
+        for (size_t k = 0; k < items.size(); ++k) {
+            if (std::find(possessive_.begin(), possessive_.end(), items[k]) == possessive_.end())
+                continue;
+            const CpSet& own = sets[nodes[nodes[items[k]].kids[0]].set];
+            CpSet tail;
+            for (size_t j = k + 1; j < items.size(); ++j) {
+                const Node& n = nodes[items[j]];
+                const Node& m = n.kind == Node::REP ? nodes[n.kids[0]] : n;
+                if (m.kind != Node::SET)
+                    return fail("a possessive quantifier followed by something other than classes");
+                tail = set_union(tail, sets[m.set]);
+            }
+            if (!set_intersect(own, tail).empty())
+                return fail("a possessive quantifier whose class the rest of the match can take");
+        }
+        return true;
     }
 
     int literal(uint32_t c, const Flags& f) {
@@ -494,6 +535,7 @@ private:
 
     int parse_group(const Flags& outer) {
         /* `(` already consumed. */
+        struct Depth { int& d; explicit Depth(int& x) : d(x) { ++d; } ~Depth() { --d; } } depth(depth_);
         Flags f = outer;
         if (peek() != '?') {
             const int r = parse_alt(f);

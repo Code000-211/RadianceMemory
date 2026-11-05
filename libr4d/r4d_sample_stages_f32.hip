@@ -687,7 +687,7 @@ __global__ __launch_bounds__(kTopkThreads) void logprobs_kernel(
     __shared__ float red[kTopkWaves];
 
     const uint32_t m = blockIdx.x;
-    if (!(sp[m].flags & SP_LOGPROBS)) return;
+    if (sp && !(sp[m].flags & SP_LOGPROBS)) return;   /* no params: every row */
     const float* __restrict__ row = lg + (size_t)m * lg_ld;
     float* __restrict__ out = st + (size_t)m * st_ld;
     const uint32_t kk = k < n_vocab ? k : n_vocab;
@@ -1165,7 +1165,7 @@ static int r4d_sample_argmax_f32(long lg, long tok, int M, int n_vocab, int lg_l
 
 static int r4d_sample_logprobs_f32(long lg, long params, long stats, int M, int n_vocab, int k,
                                    int lg_ld, int st_ld, int vocab_off, long stream) {
-    if (!lg || !params || !stats) return R4D_NO(RAD_E_INVAL);
+    if (!lg || !stats) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n_vocab <= 0 || k <= 0) return R4D_NO(RAD_E_SHAPE);
     if ((uint32_t)k > kMaxLogprobs) return R4D_NO(RAD_E_SHAPE);
     if (!lg_ld) lg_ld = n_vocab;
@@ -1389,8 +1389,9 @@ extern "C" int r4d_rad_sample_logprobs(const RadArgs* a, RadStream s) {
     const RadTensor* lg;
     long long M = 0, nv = 0, ld = 0;
     R4D_NEED(logits_of(a, &lg, &M, &nv, &ld));
+    /* Absent params: every row (a drafter's candidate logprobs). */
     const RadTensor* pr = r4d_opt(a, V_PARAMS);
-    R4D_NEED(params_ok(pr, M));
+    if (pr) R4D_NEED(params_ok(pr, M));
     const RadTensor* st = r4d_opt(a, 2);
     if (!st) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_f32(st));

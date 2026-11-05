@@ -892,6 +892,14 @@ const PreEntry k_pre[] = {
 
 }  /* namespace */
 
+void vocab_textless(VocabBuild& out) {
+    out = VocabBuild{};
+    out.kind = RAD_TOK_BPE;
+    out.tokens = { "<|no-text|>" };
+    out.types = { RAD_TT_CONTROL };
+    out.source = "none: the model reads no text";
+}
+
 int vocab_from_gguf(const GgufFile& g, VocabBuild& out) {
     out = VocabBuild{};
     out.source = g.path();
@@ -1107,7 +1115,8 @@ int vocab_deserialize(const void* file_base, uint64_t file_bytes, const RadVocab
          * in, so the caller cannot pass a mismatched one. */
         if (file_bytes < sizeof(RadFileHeader)) return RAD_E_FORMAT;
         const RadFileHeader* fh = reinterpret_cast<const RadFileHeader*>(base);
-        if (fh->str_off + fh->str_bytes > file_bytes) return RAD_E_FORMAT;
+        if (fh->str_off > file_bytes || fh->str_bytes > file_bytes - fh->str_off)
+            return RAD_E_FORMAT;
         strs = reinterpret_cast<const char*>(base + fh->str_off);
         str_bytes = fh->str_bytes;
     }
@@ -1128,7 +1137,8 @@ int vocab_deserialize(const void* file_base, uint64_t file_bytes, const RadVocab
     out.ignore_merges = (h->flags & RAD_VOCAB_IGNORE_MERGES) != 0;
     out.chat_template = S(h->chat_template);
 
-    if (!in_file(h->tok_text_off, (uint64_t)h->n_tokens * sizeof(rad_stroff)))
+    if ((h->n_tokens && !h->tok_text_off) ||
+        !in_file(h->tok_text_off, (uint64_t)h->n_tokens * sizeof(rad_stroff)))
         return RAD_E_FORMAT;
     const rad_stroff* toff = reinterpret_cast<const rad_stroff*>(base + h->tok_text_off);
     out.tokens.resize(h->n_tokens);

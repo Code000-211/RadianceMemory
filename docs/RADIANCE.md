@@ -7,7 +7,8 @@ APIs, Anthropic's Messages API and llama-server's native one, so their clients a
 unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this
 tree are built and loaded the same way a third party's are ([`docs/PLUGIN.md`](PLUGIN.md)).
 
-The bundled device kernels (`libr4d`) target AMD RDNA4 (`gfx1200`, `gfx1201`). The serve flags
+The bundled device kernels target AMD RDNA4 (`libr4d`: `gfx1200`, `gfx1201`), RDNA3 (`libr3d`:
+`gfx11xx`) and Strix Halo (`libhalo`: `gfx1151`). The serve flags
 below are for two 32 GB cards (Radeon AI PRO R9700). The engine starts on any AMD GPU family;
 another card needs a kernel library for it. A machine with no GPU builds the host backend, whose
 AVX-512/AVX2 kernels (`libavx`) serve every model here: the small ones (EmbeddingGemma 2,
@@ -23,6 +24,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.8-Flash-Next: 4-bit experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-fp8-iq4r-moe.rad` (114 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe) | `flashnext.yaml` |
 | Qwen3.8-27B FP8, DFlash2 drafter, vision | `qwen3.8-27b-fp8.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-fp8) | `qwen3.8-27b-fp8.yaml` |
 | Qwen3.8-27B MXFP4 (AMD Quark AWQ), DFlash2 drafter, vision | `qwen3.8-27b-mxfp4.rad` (19 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-mxfp4) | `qwen3.8-27b-mxfp4.yaml` |
+| Qwen3.8-27B IQR-V4, 2.5 to 8 bits a weight ([docs/IQR.md](IQR.md)), DFlash2 drafter, vision | `qwen3.8-27b-iq2r-v4.rad` .. `qwen3.8-27b-iq8r-v4.rad` (10 to 28 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4) | `qwen3.8-27b-iqr-v4.yaml` |
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B w4a8: 4-bit experts (GPTQ), MTP, vision, fits one card | `ornith-1.5-35b-a3b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-w4a8) | `ornith-1.5-35b-a3b-w4a8.yaml` |
@@ -34,6 +36,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
+| Spark X2.6 4B bf16: thinking and tool calls, one to four cards | `spark-x2.6-4b-bf16.rad` (8.3 GiB) | [convert](#convert-a-checkpoint) | — |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
 | Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | `gemma4-31b-w5.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
@@ -43,9 +46,14 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
 | Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
 | Gemma 4 31B on four or two cards: int4 trunk, int8 activations and lm_head, a block-16 DFlash2 drafter (15 drafts a step, verified as a tree), vision | `gemma4-31b-dense-w4a8-df2b16-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2-b16) | `gemma4-31b-w4a8-df2b16-tp4.yaml`, `gemma4-31b-w4a8-df2b16-tp2.yaml` |
+| Gemma 4 12B bf16: MTP, vision, audio | `gemma4-12b-bf16.rad` (25 GiB) | [download](https://huggingface.co/keptn/gemma4-12b-bf16) | `gemma4-12b-bf16.yaml` |
+| Gemma 4 12B int8 (i8a8): MTP, vision, audio | `gemma4-12b-i8g.rad` (14 GiB) | [download](https://huggingface.co/keptn/gemma4-12b-i8g) | `gemma4-12b-i8g.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B bf16 (Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-bf16.rad` (17 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-bf16) | `nemotron-3.5-bolt-e4b-bf16.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B int8 (i8a8, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-i8g.rad` (13 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-i8g) | `nemotron-3.5-bolt-e4b-i8g.yaml` |
 | NVIDIA-Nemotron-3.5-Bolt-E4B 4-bit (int4 feed-forward, GPTQ, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, audio | `nemotron-3.5-bolt-e4b-a4.rad` (12 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-a4) | `nemotron-3.5-bolt-e4b-a4.yaml` |
+| Ling-3.0-flash-Sante w4a8: 4-bit experts (GPTQ), MTP, four or two cards | `ling-3.0-flash-sante-w4a8.rad` (66 GiB) | [download](https://huggingface.co/keptn/ling-3.0-flash-sante-w4a8) | `ling-3.0-flash-sante-w4a8.yaml`, `ling-3.0-flash-sante-w4a8-tp2.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-74B-A9B w4a8: 4-bit experts, FP8 trunk, NVIDIA's LiLiCorr drafter, vision, two cards | `nemotron-3.5-bolt-74b-w4a8.rad` (43 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-74b-w4a8) | `nemotron-3.5-bolt-74b-w4a8.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-74B-A9B FP8, NVIDIA's LiLiCorr drafter, vision, four cards | `nemotron-3.5-bolt-74b-fp8.rad` (73 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-74b-fp8) | `nemotron-3.5-bolt-74b-fp8.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
@@ -151,8 +159,8 @@ card works best with Resizable BAR on (Above 4G Decoding and Resizable BAR in th
 without it the engine keeps kernel arguments in pinned host memory, and every dispatch reads them
 over the link. The image
 is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its kernels
-built for `gfx1201`. Pull it, clone this repository for its compose files, then start a model from
-one of them:
+built for `gfx1201` (RDNA4), `gfx11-generic` (RDNA3) and `gfx1151` (Strix Halo). Pull it, clone
+this repository for its compose files, then start a model from one of them:
 
 ```sh
 docker pull stilldeadcode/radiance
@@ -281,6 +289,8 @@ budgets, long context, speculative decoding and operating a server.
 `data/recipes/` names. Download checkpoints with `scripts/hfget.sh <org/repo> <dir>`.
 
 ```sh
+# Spark X2.6 uses the checkpoint's BF16 weights, tokenizer and chat template; no recipe required.
+build/bin/rad-convert /srv/models/hf/XHToken-Spark-X2.6-4B -o spark-x2.6-4b-bf16.rad --max-ctx 4096
 build/bin/rad-convert /srv/models/hf/Qwen/Qwen3.8-27B -o qwen3.8-27b-bf16.rad \
     --recipe data/recipes/q38-27b-bf16.recipe
 build/bin/rad-convert /srv/models/hf/Qwen/Qwen3.8-Flash-Next -o qwen3.8-flash-next-bf16.rad --max-ctx 4096
@@ -318,6 +328,12 @@ W4A16 release, compressed-tensors' AWQ and GPTQ or AutoRound's, on the 4-bit GEM
 reads it: NVFP4 (compressed-tensors' and NVIDIA ModelOpt's) to the MXFP4 kernels, an AutoRound
 Flash-Next's int4 block projections to int8. [docs/GUIDE.md](GUIDE.md) names the recipes of record
 with their `rad-convert` commands.
+
+Spark X2.6 runs BF16 at `--tp 1`, `2`, `3` or `4` -- and `8`, the worlds libr4d has an exact
+all-reduce for -- without a drafter or quantisation recipe. Its checkpoint's chat template enables
+thinking by default; replies return reasoning in `reasoning_content`. Set
+`chat_template_kwargs.enable_thinking` to `false` for a non-thinking request. Tool calls use the
+checkpoint's tagged format and are returned as OpenAI `tool_calls`.
 
 ## Test
 

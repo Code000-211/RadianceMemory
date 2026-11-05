@@ -195,11 +195,12 @@ int ref_ple_gate(const RadArgs* a, RadStream) {
 struct ConvArgs {
     const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
     bool silu;
+    const RadTensor* b;   /* per-channel bias inside the activation (Mamba-2's conv1d), or null */
 };
 
 static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
-    const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y;
+    const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y, *b = o.b;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n    = p_int(a, "n", 0);
@@ -217,6 +218,7 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     if (N <= 0) return RAD_E_SHAPE;
     if (numel(x) < M * n || numel(y) < M * n || numel(w) < n * wid) return RAD_E_SHAPE;
     if (resid && numel(resid) < M * n) return RAD_E_SHAPE;
+    if (b && numel(b) != n) return RAD_E_SHAPE;
 
     const int64_t state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : hist_len;
     if (cs->data && state_len < hist_len) return RAD_E_SHAPE;
@@ -263,8 +265,9 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
         for (int64_t i = 0; i < hist_len; ++i)
             hist[i] = (warm && cs->data) ? ldt(cs, base + (off + i) * cs_t) : 0.0f;
 
+        const float bias = b ? ldt(b, c * laststride(b)) : 0.0f;
         for (int64_t t = 0; t < slen; ++t) {
-            float acc = 0.0f;
+            float acc = bias;
             for (int64_t j = 0; j < wid; ++j) {
                 const int64_t src = t - hist_len + j * dil;
                 const float v = src >= 0 ? ldt(x, (bos + src) * xrow + c * xcol)
@@ -298,6 +301,15 @@ int ref_ple_conv(const RadArgs* a, RadStream) {
     if (a->n_t < 9) return RAD_E_INVAL;
     return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), t_in(a, 4),
                                       t_in(a, 5), t_in(a, 6), t_in(a, 7), t_in(a, 8), true });
+}
+
+/* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`: Mamba-2's
+ * conv1d at dilation one. */
+int ref_ple_conv_bias(const RadArgs* a, RadStream) {
+    if (a->n_t < 10 || !t_in(a, 8)) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), t_in(a, 4),
+                                      t_in(a, 5), t_in(a, 6), t_in(a, 7), t_in(a, 9), true,
+                                      t_in(a, 8) });
 }
 
 /* ple_conv's operands without `resid`, at dilation one and with no activation. */

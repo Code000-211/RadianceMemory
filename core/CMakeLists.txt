@@ -23,6 +23,11 @@ list(APPEND RAD_CORE_SRC ${_top})
 add_library(rad_core STATIC ${RAD_CORE_SRC})
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_definitions(rad_core PUBLIC RAD_VERSION="${PROJECT_VERSION}")
+if(RAD_ENABLE_KV_ROLLBACK_TEST_HOOK)
+  # Scheduler is embedded in Engine and its test-only callback changes its class layout.
+  # Propagate the definition to every consumer to keep all translation units ABI-consistent.
+  target_compile_definitions(rad_core PUBLIC RAD_ENABLE_KV_ROLLBACK_TEST_HOOK=1)
+endif()
 target_include_directories(rad_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/abi

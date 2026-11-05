@@ -198,6 +198,9 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
               int64_t (*bytes)[2], int n) {
     /* A guided model's VCOND carries the negative prompt after the positive. */
     const int64_t prompts = d.guidance ? 2 : 1;
+    /* A schedule's steps: a request's, at most max_steps, plus the refinement rungs an upscaling
+     * request appends after them (video_schedule). */
+    const int64_t sched_cap = (int64_t)d.max_steps + std::max<int32_t>(d.n_refine_rungs, 0);
     const int64_t want[] = {
         prompts * d.max_text * 4,   /* R_TOK */
         prompts * d.max_text * 4,   /* R_POS */
@@ -205,8 +208,8 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
         3 * max_tok * 4,         /* R_ROPE: a step's positions, or the prompt's M-RoPE */
         RAD_VGEOM_N * 4,         /* R_GEOM */
         16 * 4,                  /* R_SCHED */
-        d.max_steps * 4,         /* R_TV */
-        d.max_steps * 4,         /* R_TA */
+        sched_cap * 4,           /* R_TV */
+        sched_cap * 4,           /* R_TA */
         4 * 4,                   /* R_SEED */
         4,                       /* R_LANE */
         4,                       /* R_FIRST */
@@ -1008,6 +1011,11 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
             px[i] = rad_f32_to_bf16(2.0f * ((float)img[i] / 255.0f) - 1.0f);
         reg_[R_IMG].used = (int64_t)img.size() * 2;
     }
+    if ((int64_t)j.sched.steps * 4 > reg_[R_TV].bytes) {
+        fail_locked(j, RAD_E_STATE, "the schedule's " + std::to_string(j.sched.steps) +
+                                        " steps are more than the timestep regions hold");
+        return nullptr;
+    }
     float* tv = hptr<float>(R_TV);
     float* ta = hptr<float>(R_TA);
     for (int32_t i = 0; i < j.sched.steps; ++i) {
@@ -1238,7 +1246,7 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     } else {
         const int64_t nf = m.enc_frames, area = (int64_t)eh * ew * 3;
         stage_frames = ng > 23 ? gd[23] : 0;
-        if (stage_frames < nf || stage_frames * area * 4 > reg_[R_ENCPX].bytes) {
+        if (nf < 1 || stage_frames < nf || stage_frames * area * 4 > reg_[R_ENCPX].bytes) {
             fail_locked(j, RAD_E_STATE, "'" + m.name + "' does not fit an encode pass");
             return nullptr;
         }

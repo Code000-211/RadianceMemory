@@ -141,8 +141,9 @@ inline int QuantFP8::declare(RadBuilder* b, const Geom& g, const ActFP8& act, in
     if (g.w_bf16) { op = 0; return a.x ? RAD_OK : RAD_E_INVAL; }
     if (!a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* `dtype` is the input's (bf16); the op name gives the output format. An input fed at int8
-     * codes is quantised by quant_act_i8g into its int8 pair. */
-    op = rw(b, RAD_OP(b, a.q8_fed ? "quant_act_i8g" : "quant_act_fp8",
+     * codes is quantised by quant_act_i8g into its int8 pair, or by had_quant_act_i8g where they
+     * are rotated (ActFP8::q8_rot). */
+    op = rw(b, RAD_OP(b, a.q8_fed ? (a.q8_rot ? "had_quant_act_i8g" : "quant_act_i8g") : "quant_act_fp8",
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
@@ -528,14 +529,20 @@ struct GateQuantFP8 {
      * not resolve: `silu_mul` into the bf16 plane (`op`), then `had_quant_act_fp8` over it into the
      * codes (`op_q`). */
     rad_op op_q = 0;
+    /* act "relu2" (Nemotron-H's ungated experts): `gate_up` is one part, n wide, and `op` is
+     * act_mul's relu over it twice, relu(x)^2 into the bf16 plane, which `op_q` quantises (rotated
+     * for a rotated weight). No fused form yet: the plane is written either way. */
+    bool   ungated = false;
 
     /* Set before declare: the product in bf16 alone, as for bf16 linears, for a consumer that
      * quantises its input itself (an int8 linear's op_q). */
     bool silu_only = false;
 
+    /* `step`: with `limit`, clip after the SiLU (`swiglu_step`, Ling-3.0) rather than before it
+     * (`swiglu_clamped`, GLM-5.3). It has no fused quantiser, so the pair runs. */
     int  declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act, int64_t n,
                  const char* act_name = "silu", int64_t max_rows = 0, bool bf16_out = true,
-                 bool rot = false, double limit = 0);
+                 bool rot = false, double limit = 0, bool step = false);
     void step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0 = 0, int64_t rows = 0) const;
 };
 
@@ -544,7 +551,7 @@ struct GateQuantFP8 {
  * bf16 output is unrotated either way. */
 inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act,
                                  int64_t n, const char* act_name, int64_t max_rows,
-                                 bool bf16_out, bool rot, double limit) {
+                                 bool bf16_out, bool rot, double limit, bool step) {
     a = act;
     want_x = bf16_out;
     op_quant = 0;
@@ -555,6 +562,28 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
     clipped = limit > 0;
     clamped_fused = false;
     if (!std::isfinite(limit) || limit < 0) return RAD_E_INVAL;
+    ungated = std::strcmp(act_name, "relu2") == 0;
+    if (ungated) {
+        if (!gate_up || !a.x || n <= 0 || clipped || (!bf16 && (!a.cq() || !a.cs())) ||
+            (rot && a.q8_fed))
+            return RAD_E_INVAL;
+        const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
+        want_x = true;
+        op = rw(b, RAD_OP(b, "act_mul",
+                   RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("act", "relu"),
+                              RAD_STR("dtype", g.dtype)),
+                   RAD_NOWEIGHTS),
+               { gate_up }, { a.x });
+        if (!op) return RAD_E_INVAL;
+        if (bf16) return RAD_OK;
+        const char* qn = rot ? "had_quant_act_fp8" : a.q8_fed ? "quant_act_i8g" : "quant_act_fp8";
+        op_q = rw(b, RAD_OP(b, qn,
+                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 { a.x }, { a.cq(), a.cs() });
+        return op_q ? RAD_OK : RAD_E_INVAL;
+    }
     if (clipped) {
         /* No rotated int8 form: its quantiser would be quant_act_i8g, unrotated; and no clamp
          * with `silu_only`. */
@@ -562,7 +591,7 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
             std::strcmp(act_name, "silu"))
             return RAD_E_INVAL;
         const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
-        if (fuse_clamped && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
+        if (fuse_clamped && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
             rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
             op =
                 RAD_OP(b, "swiglu_clamped_quant_fp8",
@@ -579,7 +608,7 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         }
         want_x = true;
         op = rw(b,
-                RAD_OP(b, "swiglu_clamped",
+                RAD_OP(b, step ? "swiglu_step" : "swiglu_clamped",
                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
                                   RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS),
@@ -649,6 +678,15 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
 inline void GateQuantFP8::step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0,
                                int64_t rows) const {
     if (rows <= 0) rows = T - r0;
+    if (ungated) {
+        RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, n), brow_slice(gate_up, r0, rows, n),
+                    brow_slice(a.x, r0, rows, n));
+        if (op_q)
+            RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, n),
+                        brow_slice(a.cq(), r0, rows, n),
+                        brow_slice(a.cs(), r0, rows, n / RAD_FP8_BLOCK));
+        return;
+    }
     if (clamped_fused) {
         RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, 2 * n),
                     brow_slice(a.cq(), r0, rows, n),
@@ -727,6 +765,13 @@ struct LinearFP8 {
      * writes E4M3. Read from the weight's encoding. */
     bool       i8 = false;
     rad_op     op_q = 0;
+    /* An int8 weight stored rotated (i8a8h, or a rotated four- or five-bit one): its activation
+     * codes are in the 128-wide Hadamard domain, whoever wrote them (had_quant_act_i8g or a
+     * rotating producer). */
+    bool       i8_rot = false;
+    /* With i8_rot: an IQR weight (libr4d's r4d_iqr.h), whose codes decode where they are read: a
+     * u6 code under a zero, a table, a grid or a trellis. Read from the weight's encoding. */
+    bool       iqr = false;
     /* OCP-MXFP4 weight read by `gemm_nt_q` at dtype mxfp4a8 against the usual E4M3 activation pair:
      * e2m1 codes with one E8M0 exponent per 32 of K (libquant `codes=fp4_e2m1 group=32
      * scale=e8m0`). libr4d folds each block's exponent into the e4m3 operand against a per-row
@@ -1252,6 +1297,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     const bool asym = known && linear_is_wnh(enc);
     const bool rot8 = known && (linear_is_w8h(enc) || asym);
     i8 = known && (linear_is_w8(enc) || rot8);
+    i8_rot = i8 && rot8;
     if (i8) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
@@ -1282,6 +1328,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         const char* sn = nm.f("%s.scale", base);
         /* A narrower i8a8h weight's codes view takes the plane that decodes it too. */
         const W8hForm form = linear_w8h_form(enc);
+        iqr = rot8 && !asym && (form == W8hForm::Zero || form == W8hForm::Table ||
+                                form == W8hForm::Grid || form == W8hForm::Trellis);
         const RadEncPlane* tpl = rad_enc_plane(&enc, "trellis");
         const bool trb = form == W8hForm::Trellis && tpl && tpl->block[1] > 1;
         const char* cv = form == W8hForm::Zero    ? "codes,zero"
@@ -1771,6 +1819,23 @@ struct DenseFP8 {
         RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
         return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
     }
+    /* This rank's rows [lo, hi) of a RAD_SHARD_ROW weight where the even shard is the wrong cut: a
+     * KV head replicated over ranks (Geom::kv_off), the same rows on every rank that shares it.
+     * Call after declare(), whose N is already hi - lo. The fp8 scale plane takes the span in its
+     * 128-row blocks; the MXFP4 and M2XFP4 planes are one row a weight row, as in LinearFP8. */
+    int span(RadBuilder* b, int64_t lo, int64_t hi) const {
+        RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
+        if (mx || m2x) {
+            RAD_ARCH_TRY(rad_weight_shard_span(b, s, lo, hi));
+            return rad_weight_shard_span(b, ref, lo, hi);
+        }
+        if (lo % RAD_FP8_BLOCK || hi % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: a row span [%lld, %lld) is not whole %d-row scale blocks\n",
+                    (long long)lo, (long long)hi, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
+    }
     /* `gemm_nt_q` over this weight, `fp8a8`, `mxfp4a8` or `m2xfp4` as it was declared, ranged
      * M 1..hi. `split_n`, when set, is the stored width a row slice takes its K split from
      * (docs/OPS.md). */
@@ -1908,6 +1973,27 @@ inline rad_op decl_gated_fold_mx(RadBuilder* b, int64_t rows, int64_t N, int64_t
         if (hi <= 8) break;
     }
     return 0;
+}
+
+/* The same fold over an IQR [2n, K] gate_up weight under the rotated int8 trunk (`gemm_nt_q_gated`
+ * at i8a8h: the codes and scale views gemm_nt_q reads, the input's and the output's int8 pairs, both
+ * in the Hadamard domain), declared for M up to min(rows, 16): libr4d's gemm_iqr_gated serves its
+ * GEMV and 16-token tile, each byte-identical to the GEMM row of its band followed by
+ * gated_had_quant_i8g. Optional like decl_gated_fold, and asked for only when a loaded library
+ * declares the op at that dtype: a CPU-only engine takes the pair. */
+inline rad_op decl_gated_fold_iqr(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
+                                  rad_weight ws, std::initializer_list<rad_buf> reads,
+                                  std::initializer_list<rad_buf> writes, int64_t* gated_rows) {
+    if (rows <= 0 || N % 256 || K % 256) return 0;
+    const int64_t hi = rows < 16 ? rows : 16;
+    const rad_op op = rw(b, RAD_OP(b, "gemm_nt_q_gated",
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                        RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8h"),
+                                        RAD_STR("act", "silu")),
+                             RAD_WEIGHTS(w, ws)),
+                         reads, writes);
+    if (op) *gated_rows = hi;
+    return op;
 }
 
 /* ================================================== a calibration tap */

@@ -19,6 +19,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "rad_yarn.h"
 #include <hip/hip_bf16.h>
@@ -67,7 +68,7 @@ enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4
  * writes that element and the head's v element into the cache at the token's slot, as E4M3 with
  * kv_store_fp8's arithmetic or as bf16 like kv_store_bf16 (see the store at the end). */
 template <int HD, int KV = QK_KV_NONE>
-__global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
+__device__ __forceinline__ void r4d_qk_norm_rope_gate_kernel_body(
     const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
     __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
     __hip_bfloat16* __restrict__ GO,
@@ -274,6 +275,32 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
   }
 }
 
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <int HD, int KV = QK_KV_NONE>
+__global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
+    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
+    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
+    __hip_bfloat16* __restrict__ GO,
+    const void* __restrict__ WQ, const void* __restrict__ WK,
+    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
+    int nq, int nkv, int rot, float eps, float wadd,
+    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
+    r4d_qk_norm_rope_gate_kernel_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot, eps, wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
+}
+template <int HD, int KV = QK_KV_NONE>
+__global__ __launch_bounds__(256) void r4dchain_qk_norm_rope_gate(
+    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
+    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
+    __hip_bfloat16* __restrict__ GO,
+    const void* __restrict__ WQ, const void* __restrict__ WK,
+    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
+    int nq, int nkv, int rot, float eps, float wadd,
+    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
+    r4d_chain_wait();
+    r4d_qk_norm_rope_gate_kernel_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot, eps, wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
+    r4d_chain_done();
+}
+
 // ============================================================ the cos/sin table
 //
 // The fused kernel reads a precomputed table instead of theta, and this fills it: one launch per
@@ -376,7 +403,10 @@ static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) 
   const int nh = (int)(nq + nkv);
   // One block per (token, head), 256 threads, one element per lane. The width is fixed at 256, not
   // fitted to the head count, so the sum of squares matches r4d_rmsnorm_bf16 (see the kernel).
-#define R4D_QKG_L(H) emit_rc = R4D_EMIT(stream, (r4d_qk_norm_rope_gate_kernel<H, KVF>), \
+  /* The chained form (r4d_chain.h) where the row resolved with `chain`. */
+  const bool ch = r4d_geti_or(args, "chain", 0) != 0 && r4d_chain_rows_ok(M);
+#define R4D_QKG_L(H) emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_qk_norm_rope_gate<H, KVF> \
+                                                    : &r4d_qk_norm_rope_gate_kernel<H, KVF>), \
     dim3((int)M, nh), dim3(256), 0, (const __hip_bfloat16*)r4d_p(qg), \
     (const __hip_bfloat16*)r4d_p(k), (__hip_bfloat16*)r4d_wp(qo), (__hip_bfloat16*)r4d_wp(ko), \
     (__hip_bfloat16*)r4d_wp(go), r4d_p(wq), r4d_p(wk), r4d_p(cs), r4d_p(po), (long)cs_rows, \

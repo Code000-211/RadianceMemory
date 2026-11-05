@@ -43,6 +43,7 @@ struct Deps {
     IImageGen*        images  = nullptr;   /* absent -> the images endpoints are 501 */
     IAudioGen*        audio   = nullptr;   /* absent -> /v1/audio/speech is 501 */
     IVideoGen*        videos  = nullptr;   /* absent -> /v1/videos is 501 */
+    IShapeGen*        shapes  = nullptr;   /* absent -> /generate is 501 */
     const SpeechFormat* speech = nullptr;  /* absent -> /v1/audio/transcriptions is 501 */
 
     /* Engine-side state the server cannot see (per-card VRAM, the expert plane), as a snapshot
@@ -88,6 +89,10 @@ struct ServerOptions {
      * many finished videos are kept at most (the oldest go first). */
     int64_t     video_ttl_s = 3600;
     int64_t     max_videos = 32;
+    /* A shape generator (rad_declare_shape_generator) generates no text either: the text
+     * endpoints answer 501 naming /generate. A shape made through /send is kept for /status for
+     * as long as a video, as many at most. */
+    bool        shape_model = false;
     /* The decision protocol from the container's `decision.type`: "d1" serves /v1/systemone
      * (systemone.h), "clef" serves it through the head on the card (clef.h), "laya" through the
      * Laya plugin's option logits (laya.h), "mica" through Mica's label logits (mica.h); empty
@@ -264,6 +269,7 @@ private:
     struct RealtimeSession;    /* realtime.cpp */
     struct SpeechSession;      /* speech_stream.cpp */
     struct VideoJob;           /* videos.cpp */
+    struct ShapeJob;           /* shapes.cpp */
     struct StreamState;
 
     static UsageOut usage_of(const OaiRequest& r, const std::vector<Generation>& gens);
@@ -366,6 +372,17 @@ private:
     /* What this deployment can do (chat, tools, reasoning, grammar, media, logprobs, reasoning
      * efforts), shared by /server_info's `capabilities` and the model entry so they agree. */
     json capabilities() const;
+    /* ------------------------------------------------------------------ shapes.cpp
+     * Hunyuan3D-2's own API: a shape from a picture, made at once (/generate) or in the
+     * background (/send) and collected (/status/{uid}). */
+    HttpResponse handle_shape_generate(const HttpRequest& req);
+    HttpResponse handle_shape_send(const HttpRequest& req);
+    HttpResponse handle_shape_status(const HttpRequest& req);
+    void shape_work(std::shared_ptr<ShapeJob> j);
+    void sweep_shapes_locked(int64_t now);
+    void stop_shapes();
+    static void shape_caps(json& caps, const IShapeGen* gen);
+
     /* A video model's capabilities (videos.cpp). */
     static void video_caps(json& caps, const IVideoGen* gen);
     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
@@ -453,6 +470,9 @@ private:
     std::mutex                              videos_m_;
     std::vector<std::shared_ptr<VideoJob>>  videos_;
     std::vector<std::shared_ptr<VideoJob>>  videos_gone_;
+    /* The background shapes (/send), oldest first, and their threads (shapes.cpp). */
+    std::mutex                              shapes_m_;
+    std::vector<std::shared_ptr<ShapeJob>>  shapes_;
 };
 
 }  /* namespace server */

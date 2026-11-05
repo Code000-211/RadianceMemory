@@ -72,7 +72,11 @@ using std::max;
 #ifndef G8_BLOCK_SIZE
 #define G8_BLOCK_SIZE 16
 #endif
-#define G8_MAX_DECODE_ROWS 64       // q_len * gqa a single decode workgroup can hold: q_len <= 8
+/* q_len * gqa a single decode workgroup can hold: q_len <= 8 here. An including unit may raise it
+ * to 128 (eight waves): gqa 16 then verifies 7 drafts in the decode kernel, as gqa 8 does. */
+#ifndef G8_MAX_DECODE_ROWS
+#define G8_MAX_DECODE_ROWS 64
+#endif
 
 #define G8_P_NWARPS 24
 #define G8_P_TILE   48
@@ -152,6 +156,11 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
                            dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
     else if (nw == 2) G8_LAUNCH(2);
     else if (nw == 3) G8_LAUNCH(3);
+#if G8_MAX_DECODE_ROWS > 64
+    /* Five to eight waves take eight; a wave past the last query row computes a copy of it and
+     * stores nothing. */
+    else if (nw > 4)  G8_LAUNCH(8);
+#endif
     else              G8_LAUNCH(4);
 #undef G8_LAUNCH
     if (emit_rc != RAD_OK) return -5;

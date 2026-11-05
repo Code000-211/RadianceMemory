@@ -1,5 +1,6 @@
 /* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h) and,
- * for E2B/E4B, its audio encoder (rad_block_gemma4_audio.h).
+ * for E2B/E4B, its audio encoder (rad_block_gemma4_audio.h); for the 12B ("unified"), its image and
+ * audio embedders in their place (rad_block_gemma4_unified.h).
  *
  * Two attention classes over one residual stream, alternating by layer. A "sliding" layer is
  * sliding-window attention over head_dim 256 with a v projection and standard RoPE; a "global"
@@ -17,6 +18,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_audio.h>
+#include <arch/rad_block_gemma4_unified.h>
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
@@ -454,6 +456,16 @@ struct Gemma4Attn {
      * no library serves it, which the model reads as "no trees". */
     bool   tree = false;
     rad_op op_attn_tree = 0, op_tree_lift = 0;
+    /* Pictures read both ways (Model::bidi, set before declare; sliding layers only): attention
+     * again over a run's keys without the causal bound (RadBatch::n_bidi), reading q in the row
+     * (op_bidi_row) where the step's attention does, else in its own rows (op_bidi); 0 where no
+     * kernel serves it. */
+    bool   want_bidi = false;
+    rad_op op_bidi = 0, op_bidi_row = 0;
+    /* The same where the window bounds the keys behind a row only: a run longer than the window
+     * (op_ahead_row where q is read in the row); 0 where no kernel serves it. */
+    rad_op op_ahead = 0, op_ahead_row = 0;
+    bool   bidi_ok() const { return op_bidi || op_bidi_row; }
     /* the feed-forward's gate_up read into the cache beside this block's all-reduce, or 0 (see
      * "Prefetch beside the reductions") */
     rad_op     op_pf = 0;
@@ -492,6 +504,9 @@ struct Gemma4Attn {
     bool slicable() const { return op_qnr_kv && (op_attn_row || op_attn); }
     void attend_rows(RadCtx* c, const RadBatch* batch, int64_t r0, int64_t n,
                      RadOperand used) const;
+    /* The rows of each run read both ways, attended again (see op_bidi); `q_dense`: the step's
+     * attention left q in its own rows. */
+    void attend_bidi(RadCtx* c, const RadBatch* batch, bool q_dense) const;
 };
 
 int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
@@ -644,11 +659,12 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     /* Gemma 4 scores Q.K without the 1/sqrt(head_dim) factor (HF Gemma4TextAttention and vLLM
      * use scaling = 1.0; the q/k norm gains absorb it). attn_paged defaults to 1/sqrt(head_dim),
      * so 1.0 is passed explicitly. */
-    auto attn = [&](const char* op, std::initializer_list<rad_buf> rd, int64_t q_hi = 0) {
+    auto attn = [&](const char* op, std::initializer_list<rad_buf> rd, int64_t q_hi = 0,
+                    int causal = 1) {
         return rw(b, RAD_OP(b, op,
                      RAD_PARAMS(RAD_RANGE("q_len", 1, q_hi > 0 ? q_hi : g.max_tok),
                                 RAD_INT("head_dim", cls.head_dim),
-                                RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1),
+                                RAD_INT("gqa", cls.gqa()), RAD_INT("causal", causal),
                                 RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
                                 RAD_INT("block_size", RAD_KV_BLOCK),
                                 RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
@@ -727,6 +743,15 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
         if (!op_attn_row) {
             op_lift_q = lift(qd, w.q);
             op_attn = attn("attn_paged", {w.q, w.qkv});
+        }
+    }
+    if (want_bidi) {
+        if (op_attn_row) {
+            op_bidi_row  = attn("attn_paged_qrow", {w.qkv}, 0, 0);
+            op_ahead_row = attn("attn_paged_qrow_ahead", {w.qkv}, 0, 0);
+        } else {
+            op_bidi  = attn("attn_paged", {w.q}, 0, 0);
+            op_ahead = attn("attn_paged_ahead", {w.q}, 0, 0);
         }
     }
 
@@ -855,6 +880,23 @@ int Gemma4Attn::declare_shared(RadBuilder* b, Names& nm, const char* pre) {
                                 RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
                   {w.q}, {w.attn});
+    if (want_bidi) {
+        auto bidi = [&](const char* op) {
+            return rw(b, RAD_OP(b, op,
+                          RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
+                                     RAD_INT("head_dim", cls.head_dim),
+                                     RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 0),
+                                     RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
+                                     RAD_INT("block_size", RAD_KV_BLOCK),
+                                     RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                     RAD_F64("scale", 1.0),
+                                     RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                          RAD_NOWEIGHTS),
+                       {w.q}, {w.attn});
+        };
+        op_bidi  = bidi("attn_paged");
+        op_ahead = bidi("attn_paged_ahead");
+    }
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                    RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -963,6 +1005,7 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
                     RAD_NONE, RAD_NONE,
                     praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
                     brows(w.attn, T));
+        attend_bidi(c, batch, true);
         return;
     }
     /* q, k and v where the prologue works on them: their own buffers, or on a fused layer with the
@@ -1001,6 +1044,7 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
      * which come first (spec §8). */
     const bool tree_step = op_attn_tree && batch->spec_parent && batch->draft_pass == 0 &&
                            batch->n_seq_decode > 0;
+    bool q_dense = true;
     if (!tree_step || batch->n_seq_decode < batch->n_seq) {
         /* attn_paged reads q dense: one row of the row's slice is, a taller step copies q out. */
         rad_op a_op = op_attn;
@@ -1011,8 +1055,9 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
         } else if (op_attn_dec && batch->max_q_len <= dec_hi) {
             a_op = op_attn_dec;
             a_q  = Q;
+            q_dense = false;
         } else if (row) {
-            if (T == 1) a_q = Q;
+            if (T == 1) { a_q = Q; q_dense = false; }
             else        RAD_ISSUE_N(c, op_lift_q, T, Q, brows(w.q, T));
         }
         RAD_ISSUE_N(c, a_op, batch->max_q_len,
@@ -1038,6 +1083,44 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
                     praw(batch->cu_seqlens, RAD_I32, Sd + 1),
                     brows(w.attn, Td),
                     praw(batch->spec_parent, RAD_I32, Td));
+    }
+    attend_bidi(c, batch, q_dense);
+}
+
+/* A run's rows (RadBatch::n_bidi) see every key of their run, later ones included: attention over
+ * their sequence's cache up to the run's end without the causal bound, written over what the
+ * causal pass left in their rows, on a sliding layer. Its window stays: (causal or the run) and
+ * the window, as transformers' mask has it. The window bounds the keys behind a row; within it a
+ * run's far end is in reach of every row up to the window's length, and a longer run is read with
+ * attn_paged_ahead, whose window bounds the keys behind only. The keys are all in the cache: the
+ * step stored its own, and a run's earlier rows are this step's or a prefix hit's. */
+void Gemma4Attn::attend_bidi(RadCtx* c, const RadBatch* batch, bool q_dense) const {
+    if (batch->n_bidi <= 0 || !bidi_ok()) return;
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* table = kvb ? kvb->block_table : nullptr;
+    const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
+    const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    const int64_t qkvd = qd + kvd + (cls.has_v ? kvd : 0);
+    for (int64_t i = 0; i < batch->n_bidi; ++i) {
+        const int64_t r0 = batch->bidi_row[i], n = batch->bidi_n[i], s = batch->bidi_seq[i];
+        const RadOperand tb = praw2(table ? table + s * pitch : nullptr, RAD_I32, 1, pitch);
+        const RadOperand used = praw(batch->bidi_used + i, RAD_I32, 1);
+        const RadOperand out = brow_slice(w.attn, r0, n, qd);
+        /* A run longer than the window has rows that miss its far end under a two-sided window;
+         * transformers' mask bounds only the keys behind. */
+        const bool ahead = n > cls.window;
+        const rad_op bidi_row = ahead && op_ahead_row ? op_ahead_row : op_bidi_row;
+        const rad_op bidi     = ahead && op_ahead ? op_ahead : op_bidi;
+        if (op_bidi_row) {
+            RAD_ISSUE_N(c, bidi_row, n, bcol_at(w.qkv, r0, qkvd, 0, qd, n),
+                        kv_cache(kv, kv_layer), tb, used, RAD_NONE, RAD_NONE, RAD_NONE, out);
+            continue;
+        }
+        if (!q_dense)
+            RAD_ISSUE_N(c, op_lift_q, n, bcol_at(w.qkv, r0, qkvd, 0, qd, n),
+                        brow_slice(w.q, r0, n, qd));
+        RAD_ISSUE_N(c, bidi, n, brow_slice(w.q, r0, n, qd), kv_cache(kv, kv_layer), tb, used,
+                    RAD_NONE, RAD_NONE, RAD_NONE, out);
     }
 }
 
@@ -1414,10 +1497,11 @@ struct Gemma4Head {
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
-/* Does the container carry an assistant head at all? */
+/* Does the container carry an assistant head at all? The 12B's is the same head under another
+ * name (Gemma4UnifiedAssistantForCausalLM). */
 static bool has_assistant(const RadModelMeta* m) {
     const char* a = rad_meta_gets(m, "draft.architectures", "");
-    return a && std::strstr(a, "Gemma4Assistant") != nullptr;
+    return a && (std::strstr(a, "Gemma4Assistant") || std::strstr(a, "Gemma4UnifiedAssistant"));
 }
 
 int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, const Geom& trunk,
@@ -1459,16 +1543,17 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
     }
     /* The head reads the trunk's cache, so everything the cache's shape depends on must agree:
      * the two head widths, the two kv head counts and the window. A head that disagrees was trained
-     * with another trunk. */
+     * with another trunk. The counts are the model's, not a rank's: a replicated kv head (fewer
+     * than ranks) is one head on every rank. */
     if (n_trunk != trunk.n_embd || vocab != trunk.n_vocab_all || head_s != cs.head_dim ||
-        head_g != cg.head_dim || n_kv != cs.n_head_kv * trunk.world ||
-        n_kv_g != cg.n_head_kv * trunk.world || win != cs.window) {
+        head_g != cg.head_dim || n_kv != cs.n_head_kv_all || n_kv_g != cg.n_head_kv_all ||
+        win != cs.window) {
         fprintf(stderr, "radiance: gemma4 assistant: this head was not made for this trunk -- it "
                         "states width %lld, vocabulary %lld, heads %lld/%lld x %lld/%lld kv over a "
                         "window of %lld; the trunk's cache is %lld/%lld kv heads of %lld/%lld over "
                         "%lld, at width %lld and vocabulary %lld\n",
                 (long long)n_trunk, vocab, n_kv, n_kv_g, head_s, head_g, win,
-                (long long)(cs.n_head_kv * trunk.world), (long long)(cg.n_head_kv * trunk.world),
+                (long long)cs.n_head_kv_all, (long long)cg.n_head_kv_all,
                 (long long)cs.head_dim, (long long)cg.head_dim, (long long)cs.window,
                 (long long)trunk.n_embd, (long long)trunk.n_vocab_all);
         return RAD_E_INVAL;
@@ -1888,7 +1973,13 @@ struct Model {
      * embeddings. */
     Gemma4Vision vis{};
     Gemma4Audio  aud{};
+    Gemma4UnifiedVision uvis{};   /* the 12B's embedders, in place of the tower and encoder */
+    Gemma4UnifiedAudio  uaud{};
     rad_op       op_mm = 0;
+    /* A picture's or video frame's placeholders attend to each other both ways
+     * (use_bidirectional_attention "vision"): every sliding layer attends a run's rows again
+     * (Gemma4Attn::op_bidi), and the encoder says so (RadEncoderDecl::bidirectional). */
+    bool         bidi = false;
 
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
     bool       fuse = false;
@@ -2404,8 +2495,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the lookup and before its all-reduce (RadBatch::mm_embd: rank 0 holds the rows, every other
      * rank zeros). The reference scales token embeddings by sqrt(n_embd) and scatters the media
      * features in unscaled. */
-    if ((Gemma4Vision::present(meta) && ctx->max_enc_patches > 0) ||
-        (Gemma4Audio::present(meta) && ctx->max_audio_frames > 0))
+    if (((Gemma4Vision::present(meta) || Gemma4UnifiedVision::present(meta)) &&
+         ctx->max_enc_patches > 0) ||
+        ((Gemma4Audio::present(meta) || Gemma4UnifiedAudio::present(meta)) &&
+         ctx->max_audio_frames > 0))
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                           RAD_STR("dtype", "bf16")),
@@ -2508,10 +2601,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            kv_shared == 0 && ctx->draft_tree != 0;
     bool tree_all = tree_want;
 
+    /* Pictures read both ways where the model was trained so, on the sliding layers alone: the
+     * global layers stay causal (transformers' create_masks_for_vision_model, "Gemma 4 explicitly
+     * disables bidirectional attention on global attention layers"; KerasHub's Gemma 4 decoder
+     * block and vLLM agree). */
+    const char* bidi_cfg = meta_text_gets(meta, "use_bidirectional_attention", "");
+    const bool want_bidi = bidi_cfg && !std::strcmp(bidi_cfg, "vision") && ctx->max_enc_patches > 0 &&
+                           (Gemma4Vision::present(meta) || Gemma4UnifiedVision::present(meta));
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.global = (is_global[(size_t)l] == 1);
+        lay.attn.want_bidi = want_bidi && !lay.global;
         const ClassGeom&        cgeo = lay.global ? m.cg : m.cs;
         const rad_kvgroup       kg   = lay.global ? m.kv_g : m.kv_s;
         const Gemma4Attn::Wire& aw   = lay.global ? gw : sw;
@@ -2818,11 +2919,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             std::snprintf(k, sizeof k, "%snum_hidden_layers", drafter_layer_prefix(meta));
             head_groups = rad_meta_geti(meta, k, 0);
         }
+        m.bidi = want_bidi;
+        for (const Layer& lay : m.layers) m.bidi = m.bidi && (lay.global || lay.attn.bidi_ok());
+        if (want_bidi && !m.bidi)
+            rad_note(b, "pictures are read causally: no kernel attends a run's rows without the "
+                        "causal bound");
+        m.vis.bidirectional = m.uvis.bidirectional = m.bidi;
         RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups),
                                    "model.", "gemma4_bf16"));
         RAD_ARCH_TRY(m.aud.declare(b, meta, ctx, nm, g.n_embd,
                                    (int)(m.n_main + head_groups) + (int)m.vis.L.size(), "model.",
                                    "gemma4_bf16"));
+        RAD_ARCH_TRY(m.uvis.declare(b, meta, ctx, nm, g.n_embd, "gemma4_bf16"));
+        RAD_ARCH_TRY(m.uaud.declare(b, meta, ctx, nm, g.n_embd, "gemma4_bf16"));
     }
 
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
@@ -2954,7 +3063,7 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
 
     m.j0.step(c, T);
     const size_t L = m.layers.size();
-    if (m.slice_attn && batch->n_seq == 1) {
+    if (m.slice_attn && batch->n_seq == 1 && batch->n_bidi == 0) {
         /* Attention per slice (see Model::slice_attn): slice A's context end first, then each
          * layer as A's attention block, B's beside A's attention-side reduction, A's feed-forward
          * beside B's, B's feed-forward beside A's, and the next layer's A block beside B's. Each
@@ -3050,8 +3159,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     /* An encoder pass runs only its encoder. */
     if (batch->enc) {
-        if (batch->enc == RAD_MM_AUDIO) m.aud.step(c, batch);
-        else                            m.vis.step(c, batch);
+        if (batch->enc == RAD_MM_AUDIO) {
+            if (m.uaud.on) m.uaud.step(c, batch);
+            else           m.aud.step(c, batch);
+        } else if (m.uvis.on) {
+            m.uvis.step(c, batch);
+        } else {
+            m.vis.step(c, batch);
+        }
         return;
     }
     /* A draft pass runs only the draft model. The trunk already left its final-normed hidden state
@@ -3192,12 +3307,15 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (k > 0) out->enc_merge = k * k;
     }
     if (Gemma4Audio::present(meta)) out->audio_frames = Gemma4Audio::frames_for(meta);
+    /* The 12B's embedders: a patch and an audio frame are a row each. */
+    if (Gemma4UnifiedVision::present(meta)) out->enc_merge = 1;
+    if (Gemma4UnifiedAudio::present(meta)) out->audio_frames = Gemma4UnifiedAudio::frames_for(meta);
     return RAD_OK;
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text, images and E2B/E4B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
+                "Gemma 4 dense (text, images, E2B/E4B/12B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "
                 "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
                 "logits; Google's assistant head, z-lab's DFlash drafter or a DFlash2 drafter")

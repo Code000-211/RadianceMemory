@@ -414,6 +414,152 @@ TEST(kda_prefill_commits_final_state_and_uses_absolute_cu_offsets) {
     CHECK_EQ(out.at(2), 0.0f);
 }
 
+/* dt = 0 with no bias gives softplus(0) = ln 2, so A_log 0 and ln 2 decay by exactly 1/2 and 1/4. */
+TEST(ssd_prefill_decays_per_head_and_adds_the_skip) {
+    const float l2 = std::log(2.0f);
+    T x(RAD_F32, {2, 2, 1}); x.f({1, 2, 3, 4});
+    T B(RAD_F32, {2, 1, 2}); B.f({1, 0, 0, 1});
+    T C(RAD_F32, {2, 1, 2}); C.f({1, 1, 1, 0});
+    T dt(RAD_F32, {2, 2}), dtb(RAD_F32, {2});
+    T alog(RAD_F32, {2}); alog.f({0, l2});
+    T D(RAD_F32, {2}); D.f({1, 0});
+    T state(RAD_F32, {1, 2, 1, 2}); state.f({9, 9, 9, 9});
+    T idx(RAD_I32, {1, 1}); idx.n({0});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T init(RAD_I32, {1}); init.n({0});
+    T out(RAD_F32, {2, 2, 1});
+    A a; a.t(x).t(B).t(C).t(dt).t(alog).t(dtb).t(D).t(state).t(idx).t(cu).tnull().t(init).t(out)
+        .i("M", 2).i("heads", 2).i("head_dim", 1).i("d_state", 2).i("groups", 1)
+        .s("mode", "prefill").s("dtype", "f32");
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    /* has_init 0 ignores the 9s; head 0 carries D = 1, head 1 none. */
+    CHECK_NEAR(out.at(0), l2 + 1, 3e-6);
+    CHECK_NEAR(out.at(1), 2 * l2, 3e-6);
+    CHECK_NEAR(out.at(2), l2 / 2 + 3, 3e-6);
+    CHECK_NEAR(out.at(3), l2 / 2, 3e-6);
+    CHECK_NEAR(state.at(0), l2 / 2, 3e-6);
+    CHECK_NEAR(state.at(1), 3 * l2, 3e-6);
+    CHECK_NEAR(state.at(2), l2 / 2, 3e-6);
+    CHECK_NEAR(state.at(3), 4 * l2, 3e-6);
+    /* Above softplus's threshold of 20 dt passes through: e^{-25} is zero to f32 at this scale. */
+    dt.f({25, 0, 0, 0});
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 25 + 1, 3e-5);
+    a.ps[4].ival = 3;
+    CHECK_EQ(run("ssd_update", a), RAD_E_SHAPE);
+}
+
+TEST(ssd_candidate_states_restore_the_accepted_prefix) {
+    const float l2 = std::log(2.0f);
+    T x(RAD_F32, {2, 1, 1}); x.f({2, 2});
+    T B(RAD_F32, {2, 1, 1}); B.f({1, 1});
+    T C(RAD_F32, {2, 1, 1}); C.f({1, 1});
+    T dt(RAD_F32, {2, 1}), alog(RAD_F32, {1}), dtb(RAD_F32, {1}), D(RAD_F32, {1});
+    T state(RAD_F32, {3, 1, 1, 1}); state.f({4, 0, 123});
+    T idx(RAD_I32, {1, 2}); idx.n({0, 1});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T accepted(RAD_I32, {1}); accepted.n({1});
+    T out(RAD_F32, {2, 1, 1});
+    A a; a.t(x).t(B).t(C).t(dt).t(alog).t(dtb).t(D).t(state).t(idx).t(cu).t(accepted).tnull().t(out)
+        .i("M", 2).i("heads", 1).i("head_dim", 1).i("d_state", 1).i("groups", 1)
+        .s("mode", "verify").s("dtype", "f32");
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 2 + 2 * l2, 3e-6);
+    CHECK_NEAR(out.at(1), 1 + 3 * l2, 3e-6);
+    CHECK_NEAR(state.at(0), 2 + 2 * l2, 3e-6);
+    CHECK_NEAR(state.at(1), 1 + 3 * l2, 3e-6);
+    CHECK_EQ(state.at(2), 123.0f);
+    /* The next step keeps only candidate 0 and reads its slot. */
+    cu.n({0, 1});
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1 + 3 * l2, 3e-6);
+    /* Keeping both instead starts from slot 1. */
+    state.f({4, 1 + 3 * l2, 123});
+    accepted.n({2});
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 0.5f * (1 + 3 * l2) + 2 * l2, 3e-6);
+    accepted.n({3});
+    CHECK_EQ(run("ssd_update", a), RAD_E_SHAPE);
+}
+
+/* The anchor form against the per-candidate one over two verify windows: the same outputs, and the
+ * committed state after a window is the candidate state its accepted prefix left, bit for bit. */
+TEST(ssd_anchor_replays_only_the_accepted_prefix_of_the_previous_window) {
+    constexpr int H = 2, P = 8, N = 16, W = 3;
+    for (int accepted : { 1, 2, 3 }) {
+        T x(RAD_F32, { W, H, P }), B(RAD_F32, { W, 1, N }), C(RAD_F32, { W, 1, N });
+        T dt(RAD_F32, { W, H }), al(RAD_F32, { H }), dtb(RAD_F32, { H }), D(RAD_F32, { H });
+        T anchor(RAD_F32, { 2, H, P, N }), candidate(RAD_F32, { W, H, P, N });
+        T ai(RAD_I32, { 1, 6 }), ci(RAD_I32, { 1, W }), cu(RAD_I32, { 2 }), na(RAD_I32, { 1 }),
+            init(RAD_I32, { 1 });
+        T ao(RAD_F32, { W, H, P }), co(RAD_F32, { W, H, P });
+        std::vector<float> v(W * H * P);
+        for (size_t j = 0; j < v.size(); ++j) v[j] = (float)((int)(j % 13) - 6) * 0.125f;
+        x.f(v);
+        std::vector<float> bc(W * N);
+        for (size_t j = 0; j < bc.size(); ++j) bc[j] = (float)((int)(j % 7) - 3) * 0.25f;
+        B.f(bc);
+        for (size_t j = 0; j < bc.size(); ++j) bc[j] = (float)((int)(j % 5) - 2) * 0.5f;
+        C.f(bc);
+        dt.f({ 0.5f, -1, 0, 1, -0.5f, 2 });
+        al.f({ 0, -0.5f });
+        dtb.f({ 0.25f, -0.25f });
+        D.f({ 1, 0.5f });
+        anchor.f(std::vector<float>(2 * H * P * N, 0));
+        candidate.f(std::vector<float>(W * H * P * N, 0));
+        ai.n({ 0, 0, 0, 1, 1, 1 });
+        ci.n({ 0, 1, 2 });
+        cu.n({ 0, W });
+        na.n({ 1 });
+        init.n({ 1 });
+        auto args = [&](T& state, T& idx, T& out, bool anc) {
+            A a;
+            a.t(x).t(B).t(C).t(dt).t(al).t(dtb).t(D).t(state).t(idx).t(cu).t(na).t(init).t(out)
+                .i("M", W).i("heads", H).i("head_dim", P).i("d_state", N).i("groups", 1)
+                .s("mode", "verify").s("dtype", "f32");
+            if (anc) a.s("state_form", "anchor");
+            return a;
+        };
+        A a = args(anchor, ai, ao, true), c = args(candidate, ci, co, false);
+        REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+        REQUIRE_EQ(run("ssd_update", c), RAD_OK);
+        for (int j = 0; j < W * H * P; ++j) CHECK_EQ(ao.at(j), co.at(j));
+        /* Nothing is committed before the next step says how much was accepted. */
+        for (int j = 0; j < H * P * N; ++j) CHECK_EQ(anchor.at(j), 0);
+        std::vector<float> committed(H * P * N);
+        for (int j = 0; j < H * P * N; ++j)
+            committed[j] = candidate.at((accepted - 1) * H * P * N + j);
+        na.n({ accepted });
+        REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+        REQUIRE_EQ(run("ssd_update", c), RAD_OK);
+        for (int j = 0; j < W * H * P; ++j) CHECK_EQ(ao.at(j), co.at(j));
+        for (int j = 0; j < H * P * N; ++j) CHECK_EQ(anchor.at(j), committed[j]);
+        const auto saved = anchor.mem;
+        na.n({ 4 });
+        CHECK_EQ(run("ssd_update", a), RAD_E_SHAPE);
+        CHECK(anchor.mem == saved);
+    }
+}
+
+/* Head h reads group h / (heads / groups): heads 0 and 1 share group 0, not heads 0 and 2. */
+TEST(ssd_heads_read_their_group_in_blocks) {
+    const float l2 = std::log(2.0f);
+    T x(RAD_F32, {1, 4, 1}); x.f({1, 1, 1, 1});
+    T B(RAD_F32, {1, 2, 2}); B.f({1, 0, 0, 1});
+    T C(RAD_F32, {1, 2, 2}); C.f({1, 0, 0, 2});
+    T dt(RAD_F32, {1, 4}), alog(RAD_F32, {4}), dtb(RAD_F32, {4}), D(RAD_F32, {4});
+    T state(RAD_F32, {1, 4, 1, 2});
+    T idx(RAD_I32, {1, 1}); idx.n({0});
+    T cu(RAD_I32, {2}); cu.n({0, 1});
+    T out(RAD_F32, {1, 4, 1});
+    A a; a.t(x).t(B).t(C).t(dt).t(alog).t(dtb).t(D).t(state).t(idx).t(cu).tnull().tnull().t(out)
+        .i("M", 1).i("heads", 4).i("head_dim", 1).i("d_state", 2).i("groups", 2)
+        .s("mode", "prefill").s("dtype", "f32");
+    REQUIRE_EQ(run("ssd_update", a), RAD_OK);
+    const float want[] = {l2, l2, 2 * l2, 2 * l2};
+    for (int h = 0; h < 4; ++h) CHECK_NEAR(out.at(h), want[h], 3e-6);
+}
+
 TEST(mla_attention_reads_one_latent_and_masks_the_last_selected_page) {
     T q(RAD_F32, { 1, 1, 2 }), kv(RAD_F32, { 2, 1, 2, 2 }), bt(RAD_I32, { 1, 2 });
     T len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, 2 });
@@ -452,6 +598,34 @@ TEST(mla_attention_reads_one_latent_and_masks_the_last_selected_page) {
     REQUIRE_EQ(run("mla_attn", a), RAD_OK);
     CHECK_EQ(out.at(0), 0);
     CHECK_EQ(out.at(1), 0);
+}
+
+/* An E4M3 cache (kv_dtype fp8_e4m3, kv_store_fp8 at descale 1) is read as the codes' values: the
+ * first case above with the latent as E4M3 codes and a bf16 query and output. */
+TEST(mla_attention_reads_an_e4m3_latent_cache_as_its_values) {
+    T q(RAD_BF16, { 1, 1, 2 }), kv(RAD_F8E4M3, { 2, 1, 2, 2 }), bt(RAD_I32, { 1, 2 });
+    T len(RAD_I32, { 1 }), out(RAD_BF16, { 1, 1, 2 });
+    q.f({ 0, 0 });
+    kv.f({ 3, 5, 448, -448, 1, 0, 0, 1 });
+    bt.n({ 1, 0 });
+    len.n({ 3 });
+    A a;
+    a.t(q)
+        .t(kv)
+        .t(bt)
+        .t(len)
+        .t(out)
+        .i("M", 7)
+        .i("latent_dim", 2)
+        .i("heads", 1)
+        .i("blocks", 2)
+        .i("block_size", 2)
+        .d("scale", 1)
+        .s("dtype", "bf16")
+        .s("kv_dtype", "fp8_e4m3");
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 4.0 / 3, 1e-2);
+    CHECK_EQ(out.at(1), 2);
 }
 
 TEST(dsa_score_relu_is_per_head_before_signed_weights_and_masks_invalid_history) {
@@ -835,6 +1009,88 @@ TEST(swiglu_clamping_is_asymmetric_and_precedes_the_activation) {
     CHECK_EQ(run("swiglu_clamped", bad), RAD_E_SHAPE);
 }
 
+TEST(swiglu_step_clips_the_activation_not_the_gate) {
+    T gu(RAD_F32, { 1, 8 }), y(RAD_F32, { 1, 4 });
+    gu.f({ -20, 2, 4.02f, 20, 9, 9, 9, -9 });
+    A a;
+    a.t(gu).t(y).i("M", 9).i("n", 4).d("limit", 4).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_step", a), RAD_OK);
+    auto silu = [](float g) { return g / (1 + std::exp(-g)); };
+    CHECK_NEAR(y.at(0), silu(-20) * 4, 1e-6);   // a negative activation is not clipped
+    CHECK_NEAR(y.at(1), silu(2) * 4, 1e-5);
+    CHECK_NEAR(y.at(2), silu(4.02f) * 4, 1e-5); // silu(4.02) is under 4: unclipped
+    CHECK_EQ(y.at(3), -16.0f);                  // silu(20) clips to exactly 4, up to -4
+    T gc(RAD_F32, { 1, 4 });
+    A c;
+    c.t(gu).t(gc).i("M", 9).i("n", 4).d("limit", 4).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_clamped", c), RAD_OK);
+    CHECK(gc.at(3) > y.at(3));                  // the gate-first form stops at silu(4) * -4
+}
+
+TEST(group_router_selects_only_inside_the_best_groups) {
+    T lg(RAD_F32, { 1, 8 }), bias(RAD_F32, { 8 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
+    auto logit = [](float p) { return std::log(p / (1 - p)); };
+    // Group sums of the top two: 1.0, 1.5, 0.86, 1.2 -> groups 1 and 3 are kept, so the single
+    // best experts (0 at 0.9, 4 at 0.85) are out and 2 and 3 are chosen.
+    lg.f({ logit(0.9f), logit(0.1f), logit(0.8f), logit(0.7f), logit(0.85f), logit(0.01f),
+           logit(0.6f), logit(0.6f) });
+    bias.f({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    A a;
+    a.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 8).i("top_k", 2).i("n_group", 4)
+        .i("topk_group", 2).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.at(0), 2);
+    CHECK_EQ(ids.at(1), 3);
+    CHECK_NEAR(w.at(0), 2.5 * 0.8 / 1.5, 1e-5);
+    CHECK_NEAR(w.at(1), 2.5 * 0.7 / 1.5, 1e-5);
+    // The bias ranks groups and experts and never weights them.
+    bias.f({ 0, 0, 0, 0, 0, 0, 1, 0 });
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.at(0), 6);
+    CHECK_EQ(ids.at(1), 2);
+    CHECK_NEAR(w.at(0), 2.5 * 0.6 / 1.4, 1e-5);
+    A bad;
+    bad.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 8).i("top_k", 2).i("n_group", 3)
+        .i("topk_group", 2).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    CHECK_EQ(run("router_sigmoid_group_topk", bad), RAD_E_SHAPE);
+}
+
+TEST(paged_latent_attention_is_causal_adds_the_rotary_part_and_gates_per_head) {
+    // One sequence of three tokens, the last two queried (positions 1 and 2). Token 0 and 1 sit
+    // in page 1, token 2 in page 0; a row is the latent (2) then the rotary part (2).
+    T q(RAD_F32, { 2, 1, 2 }), qr(RAD_F32, { 2, 1, 2 }), kv(RAD_F32, { 2, 1, 2, 4 });
+    T bt(RAD_I32, { 1, 2 }), su(RAD_I32, { 1 }), cu(RAD_I32, { 2 }), out(RAD_F32, { 2, 1, 2 });
+    q.f({ 0, 0, 0, 0 });
+    qr.f({ 0, 0, 0, 0 });
+    kv.f({ 5, 6, 0, 0, 77, 77, 77, 77, 1, 2, 1, 0, 3, 4, 0, 0 });
+    bt.n({ 1, 0 });
+    su.n({ 3 });
+    cu.n({ 0, 2 });
+    A a;
+    a.t(q).t(qr).t(kv).t(bt).t(su).t(cu).tnull().t(out).i("M", 9).i("heads", 1)
+        .i("latent_dim", 2).i("rope_dim", 2).i("block_size", 2).d("scale", 1).s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn_paged", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 2, 1e-6);   // position 1 sees tokens 0 and 1
+    CHECK_NEAR(out.at(1), 3, 1e-6);
+    CHECK_NEAR(out.at(2), 3, 1e-6);   // position 2 sees all three
+    CHECK_NEAR(out.at(3), 4, 1e-6);
+    // The rotary part alone scores token 0 at ln 3 and token 1 at 0: weights 3/4 and 1/4.
+    qr.f({ std::log(3.0f), 0, 0, 0 });
+    REQUIRE_EQ(run("mla_attn_paged", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1.5, 1e-6);
+    CHECK_NEAR(out.at(1), 2.5, 1e-6);
+    // A gate logit of 0 halves the head.
+    T gate(RAD_F32, { 2, 1 });
+    gate.f({ 0, 0 });
+    A g;
+    g.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(gate).t(out).i("M", 9).i("heads", 1)
+        .i("latent_dim", 2).i("rope_dim", 2).i("block_size", 2).d("scale", 1).s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn_paged", g), RAD_OK);
+    CHECK_NEAR(out.at(0), 0.75, 1e-6);
+    CHECK_NEAR(out.at(1), 1.25, 1e-6);
+    CHECK_NEAR(out.at(2), 1.5, 1e-6);
+}
+
 TEST(sigmoid_router_uses_correction_only_for_selection_and_stable_ties) {
     T lg(RAD_F32, { 1, 4 }), bias(RAD_F32, { 4 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
     lg.f({ -std::log(3.0f), std::log(3.0f), 0, 0 });
@@ -969,15 +1225,19 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
-        "kda_update",
+        "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
+        "kda_update", "ssd_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
         "seg_mean_bf16_sum",
-        "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
+        "pool_rows", "pool_cols", "point_fourier", "relu", "clamp", "conv2d", "conv2d_unfold",
+        "conv1d_dw",
         "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
         "fill",
         "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
+        /* Mamba-2's conv1d (Nemotron-3.5-Bolt): ple_conv with a bias inside the silu. */
+        "ple_conv_bias",
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
@@ -987,16 +1247,18 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        "dflash_markov_greedy", "dflash_markov_greedy_f32",
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
-        "dflash_tree", "attn_paged_tree",
+        "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
-        "dequant",
+        "dequant", "dequant_w4",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
-        "grid_embed_aa",
+        "grid_embed_aa", "grid_embed_cpe",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
+        "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
         /* libr4d's row-form names, served by the base op's row. */
         "rmsnorm_rows", "rope_rows", "gemm_nt_q_short", "gemm_nt_q_gated_wide",
@@ -1073,6 +1335,8 @@ TEST(op_vocabulary) {
         /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
         "sub_i32",
         "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
+        /* LiLiCorr's candidate correlator (Nemotron-3.5-Bolt's drafter). */
+        "lili_cand", "lili_attn", "lili_factor", "lili_walk",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -1081,16 +1345,18 @@ TEST(op_vocabulary) {
     CHECK_EQ(api().kernel_count(), (int)(sizeof(kOps) / sizeof(kOps[0])));
 
     /* The structural constraint on the paged block, and only that; everything else must match
-     * anything. attn_paged_tree is attn_paged's row with the tree operand, the same constraint. */
+     * anything. attn_paged_tree, attn_paged_anchor_window and attn_paged_sink take attn_paged's. */
     CHECK_EQ(kern("attn_paged")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged")->constraints[0].key, "block_size") == 0);
     CHECK_EQ(kern("attn_paged_tree")->n_constraints, 1);
+    CHECK_EQ(kern("attn_paged_sink")->n_constraints, 1);
+    CHECK(std::strcmp(kern("attn_paged_sink")->constraints[0].key, "block_size") == 0);
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
     CHECK_EQ(kern("gemm_nt")->n_constraints, 0);
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 3);
+    CHECK_EQ(constrained, 5);
 }
 
 /* ================================================================== the numerics
@@ -1645,6 +1911,34 @@ TEST(op_ple_gate) {
  * accumulate to 100a + 10b + c and any misread tap changes a digit. silu is applied after, so
  * the expectation is silu of that number.
  */
+/* Mamba-2's conv1d: ple_conv_bias at dilation one and with no residual. The bias
+ * must sit inside the activation, so silu(b + conv) and not b + silu(conv). */
+TEST(op_ple_conv_bias_is_inside_the_silu) {
+    auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
+    T x(RAD_F32, {3, 2}); x.f({ 1, 10, 2, 20, 3, 30 });
+    T w(RAD_F32, {2, 2}); w.f({ 1, 1, 0.5f, -1 });
+    T cs(RAD_F32, {1, 2, 1}); cs.f({ 4, 8 });
+    T cu(RAD_I32, {2}); cu.n({ 0, 3 });
+    T ci(RAD_I32, {1}); ci.n({ 0 });
+    T hi(RAD_I32, {1}); hi.n({ 1 });
+    T y(RAD_F32, {3, 2});
+    T b(RAD_F32, {2}); b.f({ -2, 3 });
+    A a; a.t(x).t(w).t(cs).t(cu).tnull().t(ci).t(hi).tnull().t(b).t(y)
+         .i("M", 3).i("n", 2).i("width", 2).i("dilation", 1).s("dtype", "f32");
+    CHECK_OK(run("ple_conv_bias", a));
+    /* channel 0: taps (prev, cur) * (1, 1) - 2; channel 1: (prev, cur) * (0.5, -1) + 3 */
+    CHECK_NEAR(y.at(0), silu(4 + 1 - 2.0f), 1e-5);
+    CHECK_NEAR(y.at(1), silu(0.5f * 8 - 10 + 3.0f), 1e-5);
+    CHECK_NEAR(y.at(2), silu(1 + 2 - 2.0f), 1e-5);
+    CHECK_NEAR(y.at(5), silu(0.5f * 20 - 30 + 3.0f), 1e-5);
+    /* the window keeps the inputs, not the biased sums */
+    CHECK_EQ(cs.at(0), 3.0f);
+    CHECK_EQ(cs.at(1), 30.0f);
+    T bad(RAD_F32, {3});
+    a.ts[8] = bad.t;
+    CHECK_EQ(run("ple_conv_bias", a), RAD_E_SHAPE);
+}
+
 TEST(op_ple_conv) {
     auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
     const int n = 1, wid = 3, dil = 2, hist = (wid - 1) * dil;   /* 4 */
@@ -1765,6 +2059,54 @@ TEST(op_grid_embed_aa_is_torchs_antialiased_bilinear) {
         CHECK_OK(run("grid_embed_aa", a));
         for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 2e-5);
     }
+}
+
+/* RADIO's cropped position embedding, against torch's F.interpolate(bilinear, align_corners=False)
+ * onto a d x d square cropped to the grid (values from torch 2.11). A 3 x 5 grid upsamples the
+ * 4 x 4 table to 5 x 5 and keeps three rows; a 2 x 2 grid downsamples it, which antialias would
+ * change, so the two cases tell this op from grid_embed_aa. */
+TEST(op_grid_embed_cpe_is_torchs_bilinear_on_a_square_cropped) {
+    const int side = 4, n = 2;
+    T tab(RAD_F32, {side * side, n});
+    tab.f({ -5.0f, -1.75f, 2.0f, 5.25f, -2.0f, 1.25f, 5.0f, -2.75f, 1.0f, 4.25f, -3.0f, 0.25f,
+            4.0f, -3.75f, 0.0f, 3.25f, -4.0f, -0.75f, 3.0f, -4.75f, -1.0f, 2.25f, -5.0f, -1.75f,
+            2.0f, 5.25f, -2.0f, 1.25f, 5.0f, -2.75f, 1.0f, 4.25f });
+    struct G { int h, w; std::vector<float> want; };
+    const G cases[] = {
+        { 3, 5, { -5.0f, -1.75f, -0.1f, 3.15f, 0.0f, 3.25f, 0.1f, 0.05f, 5.0f, -2.75f, -0.8f,
+                  2.45f, -1.29f, 1.96f, 0.35f, -0.25f, 1.99f, -1.14f, 1.5f, 1.45f, -1.5f, 1.75f,
+                  -0.45f, -1.05f, 0.75f, -1.5f, 0.3f, -0.3f, -2.5f, 0.75f } },
+        { 2, 2, { -1.25f, 2.0f, 1.75f, -0.5f, -0.25f, 0.25f, 0.0f, 0.5f } },
+    };
+    for (const G& g : cases) {
+        const int M = g.h * g.w;
+        T x(RAD_F32, {M, n});
+        std::vector<float> zero((size_t)(M * n), 0.0f);
+        x.f(zero);
+        T crd(RAD_I32, {4, M});
+        std::vector<int64_t> c((size_t)(4 * M));
+        for (int r = 0; r < M; ++r) {
+            c[(size_t)r] = r / g.w;
+            c[(size_t)(M + r)] = r % g.w;
+            c[(size_t)(2 * M + r)] = g.h;
+            c[(size_t)(3 * M + r)] = g.w;
+        }
+        crd.n(c);
+        A a; a.t(x).t(tab).t(crd).i("M", M).i("n", n).i("side", side).s("dtype", "f32");
+        CHECK_OK(run("grid_embed_cpe", a));
+        for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 2e-5);
+    }
+    /* The rows ahead of a segment's patches: row coordinate -1, the column naming the prefix row.
+     * Two of them, then the 2 x 2 grid's (1, 0), which still takes the resampled table. */
+    T pre(RAD_F32, {2, n}); pre.f({ 10.0f, 11.0f, 20.0f, 21.0f });
+    T x(RAD_F32, {3, n}); x.f({ 0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f });
+    T crd(RAD_I32, {4, 3}); crd.n({ -1, -1, 1,   1, 0, 0,   2, 2, 2,   2, 2, 2 });
+    A a; a.t(x).t(tab).t(crd).t(pre).i("M", 3).i("n", n).i("side", side).i("n_prefix", 2)
+            .s("dtype", "f32");
+    CHECK_OK(run("grid_embed_cpe", a));
+    CHECK_NEAR(x.at(0), 20.5f, 1e-6); CHECK_NEAR(x.at(1), 21.5f, 1e-6);   /* 0.5 + prefix row 1 */
+    CHECK_NEAR(x.at(2), 10.0f, 1e-6); CHECK_NEAR(x.at(3), 11.0f, 1e-6);   /* prefix row 0 */
+    CHECK_NEAR(x.at(4), -0.25f, 2e-5); CHECK_NEAR(x.at(5), 0.25f, 2e-5);  /* torch's (1, 0) */
 }
 
 /* LFM2's short convolution: ple_conv's window at dilation one, with no activation. */
@@ -3120,6 +3462,47 @@ TEST(op_attn_paged) {
     CHECK_NEAR(out2.at(5), 1.0f, 1e-6);
 }
 
+TEST(op_attn_paged_sink) {
+    /* op_attn_paged's cache and queries, non-causal, with a sink logit a head: token 0 now sees both
+     * keys too, and each sink adds exp(sink) to the denominator only. Head 0, token 0, q = [1,0]:
+     * scores 1/sqrt(2) and 0, so weights 1, exp(-1/sqrt(2)) and exp(sink0 - 1/sqrt(2)). */
+    const float sc = 1.0f / 1.41421356f;
+    T q(RAD_F32, {2, 2, 2});
+    q.f({ 1, 0,   0, 1,
+          0, 1,   1, 0 });
+    T kv(RAD_F32, {1, 1, 2, 4});
+    kv.f({ 1, 0, 1, 0,
+           0, 1, 0, 1 });
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T su(RAD_I32, {1});    su.n({2});
+    T sk(RAD_F32, {2});    sk.f({ 0.5f, 3.0f });     /* head 1's sink lies above every score */
+    T out(RAD_F32, {2, 2, 2});
+    A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(sk).t(out)
+          .i("q_len", 2).i("head_dim", 2).i("gqa", 2).i("block_size", 2)
+          .i("causal", 0).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged_sink", a));
+    const float w = std::exp(-sc);
+    const float d0 = 1.0f + w + std::exp(0.5f - sc);          /* head 0, either token */
+    CHECK_NEAR(out.at(0), 1.0f / d0, 1e-6); CHECK_NEAR(out.at(1), w / d0, 1e-6);
+    CHECK_NEAR(out.at(4), w / d0, 1e-6);    CHECK_NEAR(out.at(5), 1.0f / d0, 1e-6);
+    const float d1 = 1.0f + w + std::exp(3.0f - sc);          /* head 1 */
+    CHECK_NEAR(out.at(2), w / d1, 1e-6);    CHECK_NEAR(out.at(3), 1.0f / d1, 1e-6);
+    CHECK_NEAR(out.at(6), 1.0f / d1, 1e-6); CHECK_NEAR(out.at(7), w / d1, 1e-6);
+
+    /* A sink far below every score changes nothing: attn_paged's values, causal. */
+    T sk2(RAD_F32, {2}); sk2.f({ -1e30f, -1e30f });
+    T o1(RAD_F32, {2, 2, 2}), o2(RAD_F32, {2, 2, 2});
+    A b; b.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(o1)
+          .i("q_len", 2).i("head_dim", 2).i("gqa", 2).i("block_size", 2)
+          .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", b));
+    A c; c.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(sk2).t(o2)
+          .i("q_len", 2).i("head_dim", 2).i("gqa", 2).i("block_size", 2)
+          .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged_sink", c));
+    for (int i = 0; i < 8; ++i) CHECK_NEAR(o2.at(i), o1.at(i), 1e-7);
+}
+
 TEST(op_attn_paged_ragged) {
     /* A ragged batch, as a serving step really looks: sequence 0 prefills two tokens while
      * sequence 1 decodes one. total_q is 3 and n_seq is 2, so without cu_seqlens this batch cannot
@@ -3162,6 +3545,43 @@ TEST(op_attn_paged_ragged) {
  * right after a one-token prompt is (core/sched/advance_impl.h ADV_HIST ends the context at the
  * last committed position). Rows sit at seqused - q_len + j = -2, -1, 0, 1: the first two see no
  * key and are zero, not NaN, and the last two are as if the run were two rows. */
+TEST(op_attn_paged_anchor_window_is_exact_at_512_history_and_shared_across_rows) {
+    constexpr int qlen = 7, ctx = 520, bs = 16, seqs = 2, window = 513;
+    const int blocks = (ctx + bs - 1) / bs;
+    T q(RAD_F32, {seqs * qlen, 1, 1});
+    T kv(RAD_F32, {seqs * blocks, 1, bs, 2});
+    for (int s = 0; s < seqs; ++s) {
+        const int slot_base = s * blocks * bs;
+        const float before = s == 0 ? 500.0f : 700.0f;  /* anchor - 513: masked */
+        const float edge = s == 0 ? 10.0f : 20.0f;       /* anchor - 512: visible */
+        const float future = s == 0 ? 1000.0f : 2000.0f;
+        st_dt(RAD_F32, kv.t.data, (int64_t)(slot_base + 0) * 2 + 1, before);
+        st_dt(RAD_F32, kv.t.data, (int64_t)(slot_base + 1) * 2 + 1, edge);
+        st_dt(RAD_F32, kv.t.data, (int64_t)(slot_base + ctx - 1) * 2 + 1, future);
+    }
+    T bt(RAD_I32, {seqs, blocks});
+    std::vector<int64_t> block_ids(seqs * blocks);
+    for (int s = 0; s < seqs; ++s)
+        for (int b = 0; b < blocks; ++b) block_ids[s * blocks + b] = s * blocks + b;
+    bt.n(block_ids);
+    T su(RAD_I32, {seqs}); su.n({ctx, ctx});
+    T cu(RAD_I32, {seqs + 1}); cu.n({0, qlen, 2 * qlen});
+    T out(RAD_F32, {seqs * qlen, 1, 1});
+    for (int causal : {0, 1}) {
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().t(cu).t(out)
+              .i("q_len", qlen).i("head_dim", 1).i("gqa", 1).i("block_size", bs)
+              .i("causal", causal).i("window", window).s("q_dtype", "f32").s("kv_dtype", "f32");
+        CHECK_OK(run("attn_paged_anchor_window", a));
+        const float denom = causal ? 513.0f : 519.0f;
+        const float expected0 = causal ? 10.0f / denom : 1010.0f / denom;
+        const float expected1 = causal ? 20.0f / denom : 2020.0f / denom;
+        for (int i = 0; i < qlen; ++i) {
+            CHECK_NEAR(out.at(i), expected0, 1e-6);
+            CHECK_NEAR(out.at(qlen + i), expected1, 1e-6);
+        }
+    }
+}
+
 TEST(op_attn_paged_rows_before_the_context) {
     const float sc = 1.0f / 1.41421356f;
     T q(RAD_F32, {4, 1, 2});
@@ -4749,8 +5169,20 @@ TEST(op_act_mul) {
     CHECK_NEAR(y.at(1), gt(-2) * 4, 1e-5);
     CHECK_NEAR(y.at(2), gt(0.5f) * -1, 1e-5);
     CHECK_NEAR(y.at(3), 0.0f, 1e-6);
-    A bad; bad.t(g).t(u).t(y).i("M", 2).i("n", 2).s("act", "relu").s("dtype", "f32");
+    A bad; bad.t(g).t(u).t(y).i("M", 2).i("n", 2).s("act", "tanh").s("dtype", "f32");
     CHECK(run("act_mul", bad) < 0);
+}
+
+/* act_mul's relu over one tensor in both operands: relu(x)^2, zero below. */
+TEST(op_act_mul_relu_of_one_tensor_squares_it) {
+    T x(RAD_F32, {1, 4}); x.f({ 3, -2, 0.5f, 0 });
+    T y(RAD_F32, {1, 4});
+    A a; a.t(x).t(x).t(y).i("M", 1).i("n", 4).s("act", "relu").s("dtype", "f32");
+    CHECK_OK(run("act_mul", a));
+    CHECK_NEAR(y.at(0), 9.0f, 1e-6);
+    CHECK_NEAR(y.at(1), 0.0f, 1e-6);
+    CHECK_NEAR(y.at(2), 0.25f, 1e-6);
+    CHECK_NEAR(y.at(3), 0.0f, 1e-6);
 }
 
 /* seg_mean: one row per segment, an empty segment a zero row. */
@@ -5002,6 +5434,30 @@ TEST(op_pool_cols) {
     CHECK_NEAR(y.at(2), 11.0f, 1e-6); CHECK_NEAR(y.at(3), 16.0f, 1e-6);
     A bad; bad.t(x).t(y).i("M", 2).i("n", 4).i("k", 3).s("dtype", "f32");
     CHECK(run("pool_cols", bad) < 0);
+}
+
+/* point_fourier: [x | sin(x 2^j) | cos(x 2^j)], sines and cosines each value-major then octave;
+ * with `pi`, the octaves times pi. */
+TEST(op_point_fourier) {
+    T x(RAD_F32, {2, 2}); x.f({ 0.5f, -0.25f,  1.0f, 0.0f });
+    T y(RAD_F32, {2, 10});
+    A a; a.t(x).t(y).i("M", 2).i("n", 2).i("freqs", 2).s("dtype", "f32");
+    CHECK_OK(run("point_fourier", a));
+    const float v[2][2] = { { 0.5f, -0.25f }, { 1.0f, 0.0f } };
+    for (int r = 0; r < 2; ++r)
+        for (int i = 0; i < 2; ++i) {
+            CHECK_EQ(y.at(r * 10 + i), v[r][i]);
+            for (int j = 0; j < 2; ++j) {
+                const float t = v[r][i] * (float)(1 << j);
+                CHECK_NEAR(y.at(r * 10 + 2 + i * 2 + j), std::sin(t), 1e-6);
+                CHECK_NEAR(y.at(r * 10 + 6 + i * 2 + j), std::cos(t), 1e-6);
+            }
+        }
+    A b; b.t(x).t(y).i("M", 2).i("n", 2).i("freqs", 2).i("pi", 1).s("dtype", "f32");
+    CHECK_OK(run("point_fourier", b));
+    CHECK_NEAR(y.at(3), std::sin(0.5f * 2.0f * 3.14159265f), 1e-6);
+    A bad; bad.t(x).t(y).i("M", 2).i("n", 2).i("freqs", 3).s("dtype", "f32");
+    CHECK(run("point_fourier", bad) < 0);
 }
 
 /* rmsnorm with no gain: a unit gain. */
@@ -11524,6 +11980,225 @@ TEST(dflash_select_walks_from_its_own_previous_pick) {
     CHECK_EQ(tok.iat(1), 0LL);
 }
 
+/* The DSpark reference scores all vocabulary entries after applying the Markov bias. Both
+ * sequences choose tokens outside their base-logit top 16; step 1 conditions on the prior greedy
+ * choice, and the step-0 tie across tile boundaries resolves to the lower token id. */
+TEST(dflash_markov_greedy_scans_full_vocab_and_keeps_sequences_independent) {
+    constexpr int V = 130, R = 32, M = 2, steps = 2, tiles = 3;
+    std::vector<float> logits_values(M * steps * V, 0.0f);
+    for (int r = 0; r < M * steps; r += 2)
+        for (int v = 0; v < 16; ++v) logits_values[r * V + v] = 100 - v;
+    T logits(RAD_BF16, {M * steps, V}); logits.f(logits_values);
+    T anchor(RAD_I32, {M, 2}); anchor.n({1, -1, 2, -1});
+    std::vector<float> pred_values(V * R, 0.0f), succ_values(V * R, 0.0f);
+    pred_values[1 * R + 0] = 1;       /* sequence 0, step 0 predecessor */
+    succ_values[127 * R + 0] = 200;   /* outside the base top 16 */
+    succ_values[129 * R + 0] = 200;   /* equal biased score in a later tile */
+    pred_values[127 * R + 1] = 1;     /* sequence 0 step 1 depends on token 127 */
+    succ_values[100 * R + 1] = 100;
+    pred_values[2 * R + 2] = 1;       /* sequence 1 has a separate anchor/codebook walk */
+    succ_values[80 * R + 2] = 200;
+    pred_values[80 * R + 3] = 1;
+    succ_values[101 * R + 3] = 90;
+    T pred(RAD_BF16, {V, R}); pred.f(pred_values);
+    T succ(RAD_BF16, {V, R}); succ.f(succ_values);
+    T tile_scores(RAD_F32, {M, tiles});
+    T tile_tokens(RAD_I32, {M, tiles});
+    T out(RAD_I32, {M, steps});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(tile_scores).t(tile_tokens).t(out)
+          .i("M", M).i("steps", steps).i("rank", R).i("n_vocab", V)
+          .i("anchor_stride", 2).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 127LL);
+    CHECK_EQ(out.iat(1), 100LL);
+    CHECK_EQ(out.iat(2), 80LL);
+    CHECK_EQ(out.iat(3), 101LL);
+    CHECK_EQ(tile_tokens.iat(0), 0LL);
+    CHECK_EQ(tile_tokens.iat(1), 100LL);
+    CHECK_EQ(tile_tokens.iat(2), 128LL);
+    CHECK_EQ(tile_scores.at(0), 0.0f);
+    CHECK_EQ(tile_scores.at(1), 100.0f);
+    CHECK_EQ(tile_scores.at(2), 0.0f);
+}
+
+TEST(dflash_markov_f32_preserves_a_near_tie_and_refuses_bf16) {
+    T logits(RAD_F32, {1, 2}); logits.f({1.001f, 1.002f});
+    T anchor(RAD_I32, {1}); anchor.n({0});
+    T pred(RAD_BF16, {2, 32}), succ(RAD_BF16, {2, 32});
+    T score(RAD_F32, {1, 1}), token(RAD_I32, {1, 1}), out(RAD_I32, {1, 1});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(score).t(token).t(out)
+        .i("M", 1).i("steps", 1).i("rank", 32).i("n_vocab", 2).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy_f32", a));
+    CHECK_EQ(out.iat(0), 1);
+    T bad_anchor(RAD_F32, {1}); bad_anchor.f({0});
+    a.ts[1] = bad_anchor.t;
+    CHECK_EQ(run("dflash_markov_greedy_f32", a), RAD_E_SHAPE);
+    a.ts[1] = anchor.t;
+    CHECK(run("dflash_markov_greedy", a) != RAD_OK);
+    T bf_logits(RAD_BF16, {1, 2}); bf_logits.f({1.001f, 1.002f});
+    a.ts[0] = bf_logits.t;
+    CHECK(run("dflash_markov_greedy_f32", a) != RAD_OK);
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 0);
+}
+
+/* Independent pitches in the two scratch arrays are part of the tensor contract. Guard cells
+ * distinguish correct row addressing from treating both outputs as tightly packed. */
+TEST(dflash_markov_greedy_padded_scratch_rows) {
+    constexpr int V=130, R=32, M=2, tiles=3;
+    T logits(RAD_BF16, {M, V}), anchor(RAD_I32, {M}); anchor.n({1, 2});
+    T pred(RAD_BF16, {V, R}), succ(RAD_BF16, {V, R});
+    st_dt(RAD_BF16, pred.t.data, R, 1); st_dt(RAD_BF16, pred.t.data, 2*R+1, 1);
+    st_dt(RAD_BF16, succ.t.data, 129*R, 4); st_dt(RAD_BF16, succ.t.data, 80*R+1, 8);
+    T scores(RAD_F32, {M, 5}); scores.f(std::vector<float>(10, -777));
+    T tokens(RAD_I32, {M, 7}); tokens.n(std::vector<int64_t>(14, -777));
+    scores.t.shape[1]=tiles; tokens.t.shape[1]=tiles;
+    T out(RAD_I32, {M, 1});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(scores).t(tokens).t(out)
+        .i("M", M).i("steps", 1).i("rank", R).i("n_vocab", V).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 129); CHECK_EQ(out.iat(1), 80);
+    CHECK_EQ(tokens.iat(2), 129); CHECK_EQ(tokens.iat(7+1), 80);
+    CHECK_EQ(scores.at(2), 4); CHECK_EQ(scores.at(5+1), 8);
+    for (int i : {3,4,8,9}) CHECK_EQ(scores.at(i), -777);
+    for (int i : {3,4,5,6,10,11,12,13}) CHECK_EQ(tokens.iat(i), -777);
+}
+
+/* A one-row, one-layer DSpark oracle assembled from libref's ordinary ops. The literals check the
+ * architecture-specific chain rather than only each primitive: each tap has its own RMS gain,
+ * the normalized taps feed fc/h_norm then context K/V projections, context and draft K/V land in
+ * the paged cache, and a gated attention residual plus the exact-GELU MLP gives the layer output. */
+TEST(dspark_taps_context_kv_and_layer_output_match_hand_oracle) {
+    T tap0_src(RAD_F32, {1, 2}); tap0_src.f({1, 1});
+    T tap0_gain(RAD_BF16, {2}); tap0_gain.f({1, 2});
+    T tap0(RAD_BF16, {1, 2});
+    A tap0a; tap0a.t(tap0_src).t(tap0_gain).t(tap0)
+                 .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", tap0a));
+    CHECK_EQ(tap0.at(0), 1.0f); CHECK_EQ(tap0.at(1), 2.0f);
+
+    T tap1_src(RAD_F32, {1, 2}); tap1_src.f({2, 2});
+    T tap1_gain(RAD_BF16, {2}); tap1_gain.f({2, 1});
+    T tap1(RAD_BF16, {1, 2});
+    A tap1a; tap1a.t(tap1_src).t(tap1_gain).t(tap1)
+                 .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", tap1a));
+    CHECK_EQ(tap1.at(0), 2.0f); CHECK_EQ(tap1.at(1), 1.0f);
+
+    T taps(RAD_BF16, {1, 4}); taps.f({tap0.at(0), tap0.at(1), tap1.at(0), tap1.at(1)});
+    T fc_w(RAD_BF16, {2, 4}); fc_w.f({1, 0, 0, 0,  0, 0, 0, 1});
+    T context(RAD_BF16, {1, 2});
+    A fca; fca.t(taps).t(fc_w).t(context).i("M", 1).i("N", 2).i("K", 4).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", fca));
+    CHECK_EQ(context.at(0), 1.0f); CHECK_EQ(context.at(1), 1.0f);
+
+    T context_gain(RAD_BF16, {2}); context_gain.f({1, 1});
+    T context_norm(RAD_BF16, {1, 2});
+    A cna; cna.t(context).t(context_gain).t(context_norm)
+            .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", cna));
+    CHECK_EQ(context_norm.at(0), 1.0f); CHECK_EQ(context_norm.at(1), 1.0f);
+
+    T wq(RAD_BF16, {2, 2}); wq.f({0, 0, 0, 0});
+    T wk(RAD_BF16, {2, 2}); wk.f({0, 0, 0, 0});
+    T wv(RAD_BF16, {2, 2}); wv.f({0, 0, 1, 1});
+    T q_proj(RAD_BF16, {1, 2}), k_ctx(RAD_BF16, {1, 2}), v_ctx(RAD_BF16, {1, 2});
+    A qa; qa.t(context_norm).t(wq).t(q_proj).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    A ka; ka.t(context_norm).t(wk).t(k_ctx).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    A va; va.t(context_norm).t(wv).t(v_ctx).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", qa)); CHECK_OK(run("gemm_nt", ka)); CHECK_OK(run("gemm_nt", va));
+    CHECK_EQ(k_ctx.at(0), 0.0f); CHECK_EQ(k_ctx.at(1), 0.0f);
+    CHECK_EQ(v_ctx.at(0), 0.0f); CHECK_EQ(v_ctx.at(1), 2.0f);
+
+    /* The query projection is from the draft row, but has the same simple normalized input. */
+    T query_src(RAD_F32, {1, 2}); query_src.f({1, 1});
+    T query_norm(RAD_BF16, {1, 2});
+    A qna; qna.t(query_src).t(context_gain).t(query_norm)
+            .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", qna));
+    T k_query(RAD_BF16, {1, 2}), v_query(RAD_BF16, {1, 2});
+    A kqa; kqa.t(query_norm).t(wk).t(k_query).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    A vqa; vqa.t(query_norm).t(wv).t(v_query).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", kqa)); CHECK_OK(run("gemm_nt", vqa));
+
+    T keys(RAD_BF16, {2, 1, 2}); keys.f({k_ctx.at(0), k_ctx.at(1), k_query.at(0), k_query.at(1)});
+    T values(RAD_BF16, {2, 1, 2}); values.f({v_ctx.at(0), v_ctx.at(1), v_query.at(0), v_query.at(1)});
+    T slots(RAD_I32, {2}); slots.n({0, 1});
+    T cache(RAD_BF16, {1, 1, 2, 4});
+    A store; store.t(keys).t(values).t(slots).t(cache)
+              .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2).s("kv_dtype", "bf16");
+    CHECK_OK(run("kv_store", store));
+    for (int slot = 0; slot < 2; ++slot) {
+        CHECK_EQ(cache.at(slot * 4 + 0), 0.0f); CHECK_EQ(cache.at(slot * 4 + 1), 0.0f);
+        CHECK_EQ(cache.at(slot * 4 + 2), 0.0f); CHECK_EQ(cache.at(slot * 4 + 3), 2.0f);
+    }
+
+    T q(RAD_BF16, {1, 1, 2}); q.f({q_proj.at(0), q_proj.at(1)});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T used(RAD_I32, {1}); used.n({2});
+    T attended(RAD_BF16, {1, 1, 2});
+    A attn; attn.t(q).t(cache).t(bt).t(used).tnull().tnull().tnull().t(attended)
+               .i("q_len", 1).i("head_dim", 2).i("gqa", 1).i("block_size", 2)
+               .i("causal", 0).i("window", 513).i("n_head", 1)
+               .s("q_dtype", "bf16").s("kv_dtype", "bf16");
+    CHECK_OK(run("attn_paged_anchor_window", attn));
+    CHECK_EQ(attended.at(0), 0.0f); CHECK_EQ(attended.at(1), 2.0f);
+
+    T gate_w(RAD_BF16, {1, 2}); gate_w.f({0, 0});
+    T gate_logit(RAD_BF16, {1, 1}), gate(RAD_BF16, {1, 1});
+    A ga; ga.t(query_norm).t(gate_w).t(gate_logit)
+           .i("M", 1).i("N", 1).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", ga));
+    A sig; sig.t(gate_logit).t(gate).i("M", 1).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("sigmoid", sig));
+    CHECK_EQ(gate.at(0), 0.5f);
+    T gated(RAD_BF16, {1, 2});
+    A scale; scale.t(attended).t(gate).tnull().t(gated)
+              .i("M", 1).i("n", 2).s("act", "none").s("dtype", "bf16");
+    CHECK_OK(run("scale_rows", scale));
+    CHECK_EQ(gated.at(0), 0.0f); CHECK_EQ(gated.at(1), 1.0f);
+
+    T wo(RAD_BF16, {2, 2}); wo.f({1, 0, 0, 1});
+    T delta(RAD_BF16, {1, 2});
+    A oa; oa.t(gated).t(wo).t(delta).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", oa));
+    CHECK_EQ(delta.at(0), 0.0f); CHECK_EQ(delta.at(1), 1.0f);
+    T residual(RAD_F32, {1, 2}); residual.f({1, 1});
+    T after_attn(RAD_F32, {1, 2});
+    A adda; adda.t(residual).t(delta).t(after_attn).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("add", adda));
+    CHECK_EQ(after_attn.at(0), 1.0f); CHECK_EQ(after_attn.at(1), 2.0f);
+
+    T ff_norm(RAD_BF16, {1, 2});
+    A fna; fna.t(after_attn).t(context_gain).t(ff_norm)
+            .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", fna));
+    T ff_w(RAD_BF16, {2, 2}); ff_w.f({1, 0, 1, 0});
+    T gate_up(RAD_BF16, {1, 2});
+    A fua; fua.t(ff_norm).t(ff_w).t(gate_up)
+             .i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", fua));
+    T ff(RAD_BF16, {1, 1});
+    A act; act.t(gate_up).t(gate_up).t(ff)
+             .i("M", 1).i("n", 1).s("act", "gelu").s("dtype", "bf16");
+    CHECK_OK(run("act_mul", act));
+    T down_w(RAD_BF16, {2, 1}); down_w.f({1, 0});
+    T down(RAD_BF16, {1, 2});
+    A da; da.t(ff).t(down_w).t(down).i("M", 1).i("N", 2).i("K", 1).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", da));
+    const float normalized = bf16_to_f32((uint16_t)f32_to_bf16(1.0f / std::sqrt(2.5f)));
+    const float gelu = 0.5f * normalized * (1.0f + std::erf(normalized / std::sqrt(2.0f)));
+    const float rounded_gelu = bf16_to_f32((uint16_t)f32_to_bf16(gelu));
+    const float expected_ff = bf16_to_f32((uint16_t)f32_to_bf16(rounded_gelu * normalized));
+    CHECK_NEAR(ff.at(0), expected_ff, 1e-6);
+    CHECK_EQ(down.at(0), expected_ff); CHECK_EQ(down.at(1), 0.0f);
+    T layer_out(RAD_F32, {1, 2});
+    A outa; outa.t(after_attn).t(down).t(layer_out).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("add", outa));
+    CHECK_NEAR(layer_out.at(0), 1.0f + expected_ff, 1e-6);
+    CHECK_EQ(layer_out.at(1), 2.0f);
+}
+
 TEST(gemm_nt_q_bias_adds_a_bias_per_column) {
     T a_(RAD_I8, {1, 2}); a_.n({1, 2});
     T as(RAD_F32, {1}); as.f({0.5f});
@@ -11876,6 +12551,14 @@ std::vector<Geo> geometries() {
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("grid_embed_cpe", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("lili_cand", "M", 3, a.i("M", R).i("k", 4).i("world", 1).i("steps", 3).i("n", 8)
+                                .s("dtype", "f32")),
+        G("lili_attn", "M", 8, a.i("M", R).i("steps", 2).i("k", 2).i("n_head", 2).i("head_dim", 4)
+                                .s("dtype", "f32")),
+        G("lili_factor", "M", 8, a.i("M", R).i("L", 4).i("n", 8).s("dtype", "f32")),
+        G("lili_walk", "M", 2, a.i("M", R).i("steps", 3).i("k", 2).i("n", 8).s("dtype", "f32")
+                                .d("eps", 1e-4).d("scale", 8.0)),
         G("layernorm", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("add", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("mul", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
@@ -11886,6 +12569,7 @@ std::vector<Geo> geometries() {
         G("seg_mean_bf16_sum", "M", 6, a.i("M", R).i("n", 8).s("dtype", "bf16").i("n_seq", 2)),
         G("pool_rows", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("pool_cols", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
+        G("point_fourier", "M", 3, a.i("M", R).i("n", 3).i("freqs", 2).s("dtype", "f32")),
         G("relu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("clamp", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("conv2d", "M", 8, a.i("M", R).i("width", 4).i("cin", 2).i("cout", 3).i("kh", 3).i("kw", 3)
@@ -11910,6 +12594,8 @@ std::vector<Geo> geometries() {
         G("scatter_rows", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("ple_gate", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("ple_conv", "M", 6, a.i("M", R).i("n", 8).i("width", 3).i("dilation", 2).s("dtype", "f32")),
+        G("ple_conv_bias", "M", 6, a.i("M", R).i("n", 8).i("width", 4).i("dilation", 1)
+                                    .s("dtype", "f32")),
         G("causal_conv1d", "M", 6, a.i("M", R).i("n", 8).i("width", 4).s("dtype", "f32")),
         G("ngram_ids", "M", 4, a.i("M", R).i("heads", 2).i("ngram", 3).i("eos", 1)),
         G("cast", "M", 3, a.i("M", R).i("n", 8).s("from", "f32").s("to", "bf16")),
@@ -11930,6 +12616,10 @@ std::vector<Geo> geometries() {
         G("givens_rotate", "M", 3, a.i("M", R).i("n", 8).i("group", 8).s("dtype", "f32")
                                    .i("stages", 2).i("parts", 1)),
         G("dequant", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("dequant_w4", "N", 16, a.i("N", R).i("K", 64).i("group", 64).i("twos", 1)
+                                   .s("dtype", "w4a8")),
+        G("dequant_w4", "N", 16, a.i("N", R).i("K", 128).i("group", 128).i("twos", 0)
+                                   .s("dtype", "w4a8")),
         G("rmsnorm_quant_fp8", "M", 3, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
                                        .s("dtype", "bf16")),
         G("gated_quant_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "bf16")
@@ -11940,6 +12630,12 @@ std::vector<Geo> geometries() {
                                      .s("dtype", "fp8a8").s("act", "silu")),
         G("dflash_select", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                    .i("n_vocab", 30).s("dtype", "bf16")),
+        G("dflash_markov_greedy", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
+                                             .i("n_vocab", 130).i("anchor_stride", 1)
+                                             .s("dtype", "bf16")),
+        G("dflash_markov_greedy_f32", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
+                                                 .i("n_vocab", 130).i("anchor_stride", 1)
+                                                 .s("dtype", "bf16")),
         G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                  .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
@@ -11954,8 +12650,15 @@ std::vector<Geo> geometries() {
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
+        G("attn_paged_anchor_window", "q_len", 3,
+          a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4).i("causal", 1)
+           .i("window", 4).s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
         G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                          .i("block_size", 4).i("causal", 1).i("window", 0)
+                                         .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
+                                         .i("ctx", 9)),
+        G("attn_paged_sink", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                         .i("block_size", 4).i("causal", 0).i("window", 0)
                                          .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
                                          .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
@@ -12013,6 +12716,14 @@ std::vector<Geo> geometries() {
                               .s("a_order", "token").s("dtype", "f32")),
         G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
                                 .i("group", 128).s("a_order", "token").s("dtype", "fp8a8")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "token").s("dtype", "w4a8")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "sorted").s("dtype", "w4a8")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "token").s("dtype", "w4a4")),
+        G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
+                                .i("group", 128).s("a_order", "sorted").s("dtype", "w4a4")),
         G("moe_gemm_q_mod4", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 5)
                                      .i("top_k", 2).i("group", 128).s("a_order", "sorted")
                                      .s("dtype", "fp8a8")),
@@ -12105,16 +12816,25 @@ std::vector<Geo> geometries() {
         G("kda_update", "M", 3, a.i("M", R).i("heads", 2).i("head_k", 8).i("head_v", 8)
                                 .d("lower_bound", -5.0).d("scale", 0.35).d("l2_eps", 1e-6)
                                 .s("mode", "prefill").s("dtype", "f32")),
+        G("ssd_update", "M", 3, a.i("M", R).i("heads", 4).i("head_dim", 4).i("d_state", 8)
+                                .i("groups", 2).s("mode", "prefill").s("dtype", "f32")),
         G("mla_attn", "M", 3, a.i("M", R).i("latent_dim", 8).i("heads", 2).i("blocks", 2)
                               .i("block_size", 4).d("scale", 0.125).s("dtype", "f32")),
         G("mla_project", "M", 3, a.i("M", R).i("heads", 2).i("head_dim", 4).i("latent_dim", 6)
                                  .s("mode", "absorb").s("dtype", "bf16")),
+        G("mla_attn_paged", "M", 3, a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4)
+                                    .i("block_size", 4).d("scale", 0.25).i("ctx", 6)
+                                    .s("dtype", "f32")),
         G("dsa_score", "M", 4, a.i("M", R).i("n", 8).i("heads", 2).i("blocks", 3).i("seqs", 2)
                                .s("dtype", "fp8_e4m3")),
         G("dsa_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).s("dtype", "bf16")),
         G("dsa_query", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gemm_nt_f32", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")),
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("swiglu_step", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("router_sigmoid_group_topk", "M", 3, a.i("M", R).i("n_expert", 8).i("top_k", 2)
+                                               .i("n_group", 4).i("topk_group", 2).i("norm", 1)
+                                               .d("route_scale", 2.5).s("dtype", "f32")),
         G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                          .d("route_scale", 2.5).s("dtype", "f32")),
         G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)
@@ -12230,7 +12950,9 @@ bool undrawable(const char* op) {
     // Complete raster grids need the hand-built cases in nemotron35_test, not random indices.
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
            !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
-           !std::strcmp(op, "pixtral_merge");
+           !std::strcmp(op, "pixtral_merge") ||
+           /* sample_logprobs rows (sorted pairs, positive sums): avx_check_hand.cpp builds them */
+           !std::strcmp(op, "lili_cand");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }
