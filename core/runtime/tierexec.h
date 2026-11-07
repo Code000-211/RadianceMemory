@@ -170,10 +170,18 @@ public:
      * while an earlier one is still in flight). */
     struct MoveStats { int64_t out_blocks = 0, in_blocks = 0, out_bytes = 0, in_bytes = 0, idx_syncs = 0; };
     const MoveStats& move_stats() const { return mv_; }
-    /* Whether every move issued so far has landed: a poll of one event, no host sync. True when
-     * nothing was issued. A failed query counts as landed, so a broken card cannot hold pool
-     * blocks and store slots for ever (the failure itself was reported by the move). */
-    bool moves_landed() const;
+    /* Whether every move issued so far has landed: a poll of one event, no host sync. 1 when
+     * landed (or nothing was issued), 0 while in flight, < 0 when the transfer failed. A failure
+     * is never landed: the caller's tables name the slots and blocks those copies were to fill,
+     * and reporting them landed would free a demoted block (its slot never written) or keep a
+     * promoted block whose bytes never arrived -- either way a later step reads what another
+     * sequence left there as its own history. */
+    int  moves_state() const;
+    bool moves_landed() const { return moves_state() == 1; }
+    /* Waits on the host for everything queued on the transfer stream: after a failed
+     * issue_moves(), before the caller puts the tables back and hands the blocks to someone else,
+     * so no copy a failed batch had already queued can still write them. */
+    int  moves_drain();
     /* Only the leader's manager holds the move records (rank 0 hands out slot ids and blocks); a
      * follower carries out the same list into its own shard and has nothing to check it against. */
 

@@ -1542,7 +1542,9 @@ int KVManager::res_store_check(int32_t g, const HostArena* store, int64_t rank_o
     const HostArena* cur = gi < res_arena_.size() ? res_arena_[gi] : nullptr;
     int64_t moving = 0;
     for (const Demoting& d : res_demoting_) moving += d.group == g;
-    for (const auto& pr : res_pending_) moving += pr.first == g;
+    for (const Promoting& pr : res_pending_) moving += pr.group == g;
+    for (const Demoting& d : res_quarantine_demote_) moving += d.group == g;
+    for (const Promoting& pr : res_quarantine_promote_) moving += pr.group == g;
     const int64_t held = gi < res_slots_.size() ? res_slots_[gi] : 0;
     if (store != cur && cur && (held > 0 || moving > 0)) {
         RAD_ERR("KV residency: group '%s's store was replaced with %lld slots held and %lld "
@@ -1596,6 +1598,8 @@ void KVManager::release_residency() {
     res_emul_.assign(plans_.size(), {});
     res_pending_.clear();
     res_demoting_.clear();
+    res_quarantine_demote_.clear();
+    res_quarantine_promote_.clear();
     res_idle_.assign(plans_.size(), {});
     res_cold_ = 0;
 }
@@ -1711,13 +1715,13 @@ bool KVManager::residency_move_pending(const BlockMove& m, bool to_host) const {
             if (d.group == m.group && d.block == m.block && d.slot == m.host_slot) return true;
         return false;
     }
-    for (const auto& [g, slot] : res_pending_)
-        if (g == m.group && slot == m.host_slot) return true;
+    for (const Promoting& pr : res_pending_)
+        if (pr.group == m.group && pr.slot == m.host_slot && pr.block == m.block) return true;
     return false;
 }
 
 void KVManager::residency_complete() {
-    for (const auto& [g, slot] : res_pending_) slot_drop(g, slot);
+    for (const Promoting& pr : res_pending_) slot_drop(pr.group, pr.slot);
     res_pending_.clear();
 }
 
@@ -1729,6 +1733,143 @@ void KVManager::residency_demote_landed() {
         if (d.seq != kCacheSeq) seq_res(d.seq).freed_bytes += plans_[(size_t)d.group].bytes_per_block;
     }
     res_demoting_.clear();
+}
+
+/* Exact only because nothing ran between the naming and the failed issue: the scheduler names a
+ * batch and hands it to the mover in one call (Scheduler::res_sweep, the promotion before a build),
+ * so every entry a move re-pointed still holds what the move wrote there. A record that does not
+ * match is a caller that broke that order; it is quarantined, not repaired by guesswork. */
+int64_t KVManager::residency_abort(const std::vector<BlockMove>& moves, bool to_host,
+                                   std::vector<uint64_t>* seqs) {
+    int64_t undone = 0;
+    auto note_seq = [&](uint64_t id) {
+        if (seqs && std::find(seqs->begin(), seqs->end(), id) == seqs->end()) seqs->push_back(id);
+    };
+    for (const BlockMove& m : moves) {
+        const int32_t g = m.group;
+        if (g < 0 || (size_t)g >= plans_.size()) continue;
+        if (to_host) {
+            /* The emulation's round trip in place: the entry never changed. Forgetting the mark
+             * lets the next sweep try the block again. */
+            if (m.host_slot == -1) {
+                if ((size_t)g < res_emul_.size() && res_emul_[(size_t)g].erase(m.block)) ++undone;
+                continue;
+            }
+            auto it = std::find_if(res_demoting_.begin(), res_demoting_.end(), [&](const Demoting& d) {
+                return d.group == g && d.block == m.block && d.slot == m.host_slot;
+            });
+            if (it == res_demoting_.end()) {
+                RAD_ERR("KV residency: abort of a demotion of block %d (group %d, slot %d) that "
+                        "is not in flight", m.block, g, m.host_slot);
+                continue;
+            }
+            const Demoting d = *it;
+            res_demoting_.erase(it);
+            const int32_t cold = rad_kv_cold_entry(d.slot);
+            if (d.seq != kCacheSeq) {
+                Seq* s = find(d.seq);
+                auto* tbl = s ? &s->blocks[(size_t)g] : nullptr;
+                if (!tbl || d.idx < 0 || d.idx >= (int64_t)tbl->size() || (*tbl)[(size_t)d.idx] != cold) {
+                    RAD_ERR("KV residency: request %llu's entry %lld no longer names slot %d; the "
+                            "failed demotion of block %d is quarantined",
+                            (unsigned long long)d.seq, (long long)d.idx, d.slot, d.block);
+                    res_quarantine_demote_.push_back(d);
+                    ++res_stats_.quarantined;
+                    continue;
+                }
+                /* The block still holds this table's bytes: the gather only read it. Its one
+                 * reference, the landing's, becomes the table's again. */
+                (*tbl)[(size_t)d.idx] = d.block;
+                table_changed(s, (size_t)g, d.idx);
+                slot_drop(g, d.slot);                        /* the table's slot reference */
+                --res_cold_;
+                note_seq(d.seq);
+            }
+            if (d.cache) {
+                /* The cache's entry followed into the slot with a reference of its own: it names
+                 * the block again, with a block reference again. */
+                if (res_cache_restore_ && res_cache_restore_(g, cold, d.block)) {
+                    slot_drop(g, d.slot);
+                    if (d.seq != kCacheSeq) {
+                        add_ref((size_t)g, d.block);         /* 1 -> 2: table and cache */
+                        cached_[(size_t)g][(size_t)d.block] = 1;
+                    } else {
+                        cache_reserved_block(g, d.block);    /* the landing's 1 is the cache's */
+                    }
+                } else {
+                    /* No entry names the slot: whoever holds it reads bytes never written. Keep
+                     * the slot held (it is not ours to drop) and say so; nothing should get here. */
+                    RAD_ERR("KV residency: the prefix cache no longer names slot %d of group %d "
+                            "after a failed demotion", d.slot, g);
+                    if (d.seq == kCacheSeq) drop_block(g, d.block);
+                }
+            }
+            ++undone;
+        } else {
+            auto it = std::find_if(res_pending_.begin(), res_pending_.end(), [&](const Promoting& p) {
+                return p.group == g && p.block == m.block && p.slot == m.host_slot;
+            });
+            if (it == res_pending_.end()) {
+                RAD_ERR("KV residency: abort of a promotion into block %d (group %d, slot %d) "
+                        "that is not in flight", m.block, g, m.host_slot);
+                continue;
+            }
+            const Promoting pr = *it;
+            res_pending_.erase(it);
+            Seq* s = find(pr.seq);
+            auto* tbl = s ? &s->blocks[(size_t)g] : nullptr;
+            if (!tbl || pr.idx < 0 || pr.idx >= (int64_t)tbl->size() ||
+                (*tbl)[(size_t)pr.idx] != pr.block) {
+                RAD_ERR("KV residency: request %llu's entry %lld no longer names block %d; the "
+                        "failed promotion from slot %d is quarantined",
+                        (unsigned long long)pr.seq, (long long)pr.idx, pr.block, pr.slot);
+                res_quarantine_promote_.push_back(pr);
+                ++res_stats_.quarantined;
+                continue;
+            }
+            /* Cold again on the slot, whose reference the pending record held for the table. The
+             * fresh block was never filled: back to the pool (an origin reference goes with it,
+             * forget_origin). */
+            (*tbl)[(size_t)pr.idx] = rad_kv_cold_entry(pr.slot);
+            table_changed(s, (size_t)g, pr.idx);
+            ++res_cold_;
+            drop_block(g, pr.block);
+            note_seq(pr.seq);
+            ++undone;
+        }
+    }
+    res_stats_.aborted += undone;
+    return undone;
+}
+
+int64_t KVManager::residency_fail_inflight(std::vector<uint64_t>* seqs) {
+    /* What the failed transfers wrote: a demotion's slot (the copy out), a promotion's block (the
+     * copy in). Any table naming one reads bytes nobody can vouch for. */
+    std::vector<std::pair<int32_t, int32_t>> bad;
+    for (const Demoting& d : res_demoting_) bad.push_back({ d.group, rad_kv_cold_entry(d.slot) });
+    for (const Promoting& p : res_pending_) bad.push_back({ p.group, p.block });
+    if (seqs && !bad.empty()) {
+        for (const auto& [id, s] : seqs_) {
+            bool hit = false;
+            for (const auto& [g, e] : bad) {
+                if ((size_t)g >= s.blocks.size()) continue;
+                const auto& tbl = s.blocks[(size_t)g];
+                if (std::find(tbl.begin(), tbl.end(), e) != tbl.end()) { hit = true; break; }
+            }
+            if (hit && std::find(seqs->begin(), seqs->end(), id) == seqs->end()) seqs->push_back(id);
+        }
+    }
+    /* Held for ever: a demotion's block keeps the landing's reference, a promotion's slot keeps
+     * the pending record's, and the promoted block gains one so the failed sequence's release
+     * cannot hand it to the pool while a broken stream may still write it. */
+    for (const Promoting& p : res_pending_) add_ref((size_t)p.group, p.block);
+    const int64_t n = (int64_t)(res_demoting_.size() + res_pending_.size());
+    res_quarantine_demote_.insert(res_quarantine_demote_.end(), res_demoting_.begin(), res_demoting_.end());
+    res_quarantine_promote_.insert(res_quarantine_promote_.end(), res_pending_.begin(), res_pending_.end());
+    res_demoting_.clear();
+    res_pending_.clear();
+    res_stats_.quarantined += n;
+    return n;
 }
 
 KVManager::SeqResidency& KVManager::seq_res(uint64_t id) {
@@ -1884,7 +2025,7 @@ int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64
         /* The entry is cold from here; the block keeps its one reference until the copy lands. */
         tbl[(size_t)i] = rad_kv_cold_entry(slot);
         s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
-        res_demoting_.push_back({ g, b, slot, id });
+        res_demoting_.push_back({ g, b, slot, id, i, with_cache });
         ++res_cold_;
         out->push_back(BlockMove{g, b, slot});
         --left;
@@ -1962,7 +2103,7 @@ int64_t KVManager::residency_demote_cached(std::vector<BlockMove>* out, int64_t 
             }
             /* The cache's block reference becomes the landing's, as a table's does. */
             uncache(g, b);
-            res_demoting_.push_back({ (int32_t)g, b, slot, kCacheSeq });
+            res_demoting_.push_back({ (int32_t)g, b, slot, kCacheSeq, -1, true });
             out->push_back(BlockMove{(int32_t)g, b, slot});
             ++n;
             ++res_stats_.demoted;
@@ -2002,13 +2143,14 @@ int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64
         tbl[(size_t)i] = fresh;
         table_changed(s, (size_t)g, i);
         --res_cold_;
-        res_pending_.push_back({ g, slot });
         /* A tiered block keeps its slot too: its pool bytes are the slot's expanded, and a
          * second requantisation from them would round the block twice (KVGroupPlan::tiered). */
-        if ((shared || p->tiered()) && (size_t)g < res_origin_.size()) {
+        const bool origin = (shared || p->tiered()) && (size_t)g < res_origin_.size();
+        if (origin) {
             slot_ref(g, slot);
             res_origin_[(size_t)g][fresh] = slot;
         }
+        res_pending_.push_back({ g, slot, fresh, id, i, origin });
         out->push_back(BlockMove{g, fresh, slot});
         ++res_stats_.promoted;
         ++res_stats_.promoted_misses;

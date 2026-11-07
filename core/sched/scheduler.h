@@ -509,7 +509,10 @@ public:
      * rows page as a decode step's do. */
     struct ResidencyMover {
         std::function<int(const std::vector<BlockMove>&, bool to_host)> move;
-        std::function<bool()> landed;
+        /* 1: every move issued so far has landed; 0: some are still in flight; < 0: a transfer
+         * failed. A failure is never landed: the blocks and slots of what was in flight are
+         * quarantined and every sequence naming what the moves wrote fails (res_reap). */
+        std::function<int()> landed;
         /* RADIANCE_DEBUG_KV_TIER (sync or emulate): a step that would poll for the last sweep's
          * landing waits for it instead, so a sweep follows every decode step and which step first
          * reads a block demoted does not depend on the transfer's timing -- what a tiered
@@ -564,9 +567,19 @@ private:
     ResidencyMover res_mover_;
     int64_t        res_sweep_blocks_ = 0;
     bool           res_inflight_ = false;
+    /* A move failed: no more demotions (whatever is resident stays so). Promotions still run, so a
+     * conversation already cold can still be made dense, or fail on its own if that fails too. */
+    bool           res_sweep_off_ = false;
     std::vector<BlockMove> res_moves_;
-    /* Runs res_moves_ through the mover one group at a time, then clears it. */
-    int res_issue(bool to_host);
+    /* Sequences a failed promotion left cold: they cannot run a dense step, and fail at the start
+     * of the next step (the abandoned step still names them). */
+    std::vector<uint64_t> res_lost_;
+    /* Runs res_moves_ through the mover one group at a time, then clears it. A failure puts back
+     * every entry res_moves_ re-pointed (IKVManager::residency_abort) and appends the sequences
+     * put back to `undone`; RAD_OK means every move was queued and is now in flight. */
+    int res_issue(bool to_host, std::vector<uint64_t>* undone = nullptr);
+    /* Fails the live requests among `ids` as kv_residency_move_failed, unpublished. */
+    void res_fail(const std::vector<uint64_t>& ids, int status, const char* why);
     /* Gives back the blocks and slots of moves that have landed. */
     void res_reap();
     /* After a committed step: demote what falls outside sink + tail, within the bound. */

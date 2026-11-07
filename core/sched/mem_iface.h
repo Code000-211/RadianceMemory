@@ -107,6 +107,20 @@ struct IKVManager {
     /* The issued copies have landed: demoted pool blocks go free, promoted slots are given back. */
     virtual void residency_demote_landed() {}
     virtual void residency_complete() {}
+    /* The mover could not run `moves` (KVManager::residency_abort): every entry they re-pointed is
+     * put back, so no table names a slot or block the copy never filled. The sequences put back
+     * are appended to `seqs`. Returns how many moves were undone. */
+    virtual int64_t residency_abort(const std::vector<BlockMove>& moves, bool to_host,
+                                    std::vector<uint64_t>* seqs) {
+        (void)moves; (void)to_host; (void)seqs;
+        return 0;
+    }
+    /* The issued moves' landing failed (KVManager::residency_fail_inflight): appends every sequence
+     * whose table names what they wrote, and holds their blocks and slots for ever. */
+    virtual int64_t residency_fail_inflight(std::vector<uint64_t>* seqs) {
+        (void)seqs;
+        return 0;
+    }
     /* Every cold entry of `seq` back in a pool block (RAD_E_FULL, nothing changed, when the pool
      * cannot take them all). */
     virtual int  residency_promote_all(uint64_t seq, std::vector<BlockMove>* out) {
@@ -431,6 +445,13 @@ struct KVBinding final : IKVManager {
     }
     void residency_demote_landed() override { m->residency_demote_landed(); }
     void residency_complete() override { m->residency_complete(); }
+    int64_t residency_abort(const std::vector<BlockMove>& mv, bool to_host,
+                            std::vector<uint64_t>* seqs) override {
+        return m->residency_abort(mv, to_host, seqs);
+    }
+    int64_t residency_fail_inflight(std::vector<uint64_t>* seqs) override {
+        return m->residency_fail_inflight(seqs);
+    }
     int  residency_promote_all(uint64_t s, std::vector<BlockMove>* out) override {
         return m->residency_promote_all(s, out);
     }

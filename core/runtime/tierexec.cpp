@@ -718,9 +718,16 @@ int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute
     return RAD_OK;
 }
 
-bool TierExec::moves_landed() const {
-    if (!moved_ || !ev_move_) return true;
-    return rad_event_query(ev_move_) != 0;
+int TierExec::moves_state() const {
+    if (!moved_ || !ev_move_) return 1;
+    const int q = rad_event_query(ev_move_);
+    return q < 0 ? q : q != 0 ? 1 : 0;
+}
+
+int TierExec::moves_drain() {
+    if (!stream_) return RAD_OK;
+    TIER_TRY(rad_stream_sync(stream_), "draining the residency transfers of a failed batch");
+    return RAD_OK;
 }
 
 int64_t* TierExec::paged_counter() {

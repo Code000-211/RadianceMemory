@@ -5307,6 +5307,9 @@ struct Rig {
     /* Polls of `landed`; with `land_after` > 0 the copies land at that poll, as a transfer that
      * takes a while does. */
     int64_t polls = 0, land_after = 0;
+    /* A mover that fails: `fail_demote` / `fail_promote` is what a call in that direction returns
+     * (the call is still recorded); `land_error` < 0 is what a poll of the landing returns. */
+    int fail_demote = RAD_OK, fail_promote = RAD_OK, land_error = 0;
     int64_t moved(bool to_host) const {
         int64_t n = 0;
         for (const auto& r : runs) if (r.first == to_host) n += (int64_t)r.second.size();
@@ -5321,9 +5324,13 @@ struct Rig {
         Scheduler::ResidencyMover m;
         m.move = [this](const std::vector<BlockMove>& mv, bool to_host) {
             runs.push_back({ to_host, mv });
-            return RAD_OK;
+            return to_host ? fail_demote : fail_promote;
         };
-        m.landed = [this] { ++polls; return landed || (land_after > 0 && polls >= land_after); };
+        m.landed = [this]() -> int {
+            ++polls;
+            if (land_error < 0) return land_error;
+            return landed || (land_after > 0 && polls >= land_after) ? 1 : 0;
+        };
         m.sync = sync;
         m.every_step = every_step;
         f.sch.set_residency_mover(std::move(m), sweep);
@@ -5660,6 +5667,127 @@ TEST(the_sweep_gives_what_running_sequences_leave_of_its_budget_to_blocks_only_t
     for (int32_t e : f.kv.block_table(a, 0)) cold += e <= -2;
     CHECK_EQ(rig.moved(true), cold + 12);
     CHECK(f.kv.free_blocks(0) + 2 >= free0 + 12 + cold - 21);
+}
+
+/* ---- a mover that fails ----
+ * The manager re-points the table when it names a move. A failed demotion used to stay "in
+ * flight" anyway: the sweep waited on it, the landing poll said yes, and the pool took the block
+ * back while the table named a slot nothing had written -- the next step paged another
+ * conversation's old KV in as this one's history. */
+
+TEST(a_demotion_the_mover_failed_is_put_back_and_its_blocks_are_never_given_to_the_pool) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/5, /*window=*/64, /*sink=*/32);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);
+    run_to_decode(f);
+    const std::vector<int32_t> before = f.kv.block_table(a, 0);
+    const int64_t free_before = f.kv.free_blocks(0);
+
+    rig.fail_demote = RAD_E_DEVICE;
+    f.commit_plain();                            /* the sweep: named, issued, failed */
+    REQUIRE_EQ(rig.runs.size(), (size_t)1);
+    const int64_t named = rig.moved(true);
+    CHECK(named > 0);
+    CHECK_EQ(f.kv.res_aborted, named);
+    for (int32_t e : f.kv.block_table(a, 0)) CHECK(e >= 0);   /* nothing names a slot */
+    CHECK_EQ(f.kv.res_cold, (int64_t)0);
+    CHECK(f.kv.res_held.empty());
+
+    /* The landing says yes now; there is nothing to reap, and no block of the table goes free. */
+    rig.landed = true;
+    for (int step = 0; step < 4; ++step) {
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        const RadKVGroupBatch& g = b->kv[0];
+        for (int64_t k = 0; k < (int64_t)before.size(); ++k)
+            CHECK_EQ(g.block_table[k], before[(size_t)k]);
+        f.commit_plain();
+    }
+    CHECK(f.kv.free_blocks(0) <= free_before);
+    /* Demotion stays off: the next sweep would fail the same way, every step. */
+    CHECK_EQ(rig.runs.size(), (size_t)1);
+    CHECK((int)f.sch.find(a)->state == (int)ReqState::Running);
+}
+
+/* A promotion that failed put the entries back cold, so the dense step that needed them cannot
+ * run: the request fails at the next step instead of reading blocks nothing filled, and instead
+ * of replanning a promotion that fails the same way forever. */
+TEST(a_promotion_the_mover_failed_fails_its_request_instead_of_reading_an_unfilled_block) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/64, /*window=*/64, /*sink=*/0);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(70, 64);
+    run_to_decode(f);
+    f.commit_plain();
+    rig.landed = true;
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                            /* reaps */
+    const std::vector<int32_t> cold_tbl = f.kv.block_table(a, 0);
+    int64_t cold = 0;
+    for (int32_t e : cold_tbl) cold += e <= -2;
+    REQUIRE(cold > 0);
+    const int64_t free_before = f.kv.free_blocks(0);
+
+    rig.fail_promote = RAD_E_DEVICE;
+    const uint64_t c = f.submit(8, 4);           /* mixed and dense: a must be promoted */
+    CHECK(f.sch.step() == nullptr);              /* the step is abandoned, nothing built */
+    CHECK_EQ(rig.moved(false), cold);
+    CHECK(f.kv.block_table(a, 0) == cold_tbl);   /* cold again, on the same slots */
+    /* The unfilled blocks went back; only c's admission holds one. */
+    CHECK_EQ(f.kv.free_blocks(0), free_before - (int64_t)f.kv.block_table(c, 0).size());
+    CHECK_EQ(f.kv.res_aborted, cold);
+
+    const RadBatch* b = f.sch.step();            /* a fails here; c runs */
+    CHECK((int)f.sch.find(a)->state == (int)ReqState::Failed);
+    CHECK_EQ(f.sch.find(a)->finish_reason, std::string("kv_residency_move_failed"));
+    REQUIRE(b != nullptr);
+    for (const StepEntry& e : f.sch.plan().e) CHECK(e.seq != a);
+    CHECK(f.sch.find(c)->state != ReqState::Failed);
+    CHECK_EQ(rig.moved(false), cold);            /* not asked again */
+}
+
+/* A transfer that failed after it was queued is never landed: steps have read its bytes since,
+ * so the requests naming them fail, the blocks and slots in flight are held for good, and
+ * demotion stops. */
+TEST(a_landing_that_failed_fails_the_requests_it_moved_and_gives_back_nothing) {
+    Fixture f;
+    f.build();
+    Rig rig;
+    rig.arm(f, /*sweep=*/5, /*window=*/64, /*sink=*/32);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(320, 64);
+    const uint64_t b = f.submit(16, 64);         /* too short to sweep: untouched */
+    run_to_decode(f);
+    f.commit_plain();                            /* a's sweep, in flight */
+    const int64_t named = rig.moved(true);
+    REQUIRE(named > 0);
+    const int64_t free_before = f.kv.free_blocks(0);
+
+    rig.land_error = RAD_E_DEVICE;
+    const RadBatch* st = f.sch.step();           /* the poll fails */
+    CHECK((int)f.sch.find(a)->state == (int)ReqState::Failed);
+    CHECK_EQ(f.sch.find(a)->finish_reason, std::string("kv_residency_move_failed"));
+    CHECK(f.sch.find(b)->state != ReqState::Failed);
+    CHECK_EQ(f.kv.res_quarantined, named);
+    CHECK_EQ((int64_t)f.kv.res_stuck.size(), named);
+    if (st) {
+        for (const StepEntry& e : f.sch.plan().e) CHECK(e.seq != a);
+        f.commit_plain();
+    }
+    /* a's resident blocks went back; the demoted ones did not. */
+    CHECK(f.kv.free_blocks(0) >= free_before);
+    for (const auto& [g, blk] : f.kv.res_stuck) CHECK(f.kv.refcnt[(size_t)g][(size_t)blk] > 0);
+    rig.land_error = 0;
+    rig.landed = true;
+    for (int step = 0; step < 4; ++step) {
+        if (f.sch.step()) f.commit_plain();
+    }
+    CHECK_EQ(rig.moved(true), named);            /* no sweep since */
 }
 
 /* --kv-residency-mib 0 gives the scheduler no mover, and then nothing moves even when the manager

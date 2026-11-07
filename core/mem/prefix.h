@@ -511,6 +511,9 @@ private:
     /* KVManager's re-point hook: the entry holding `block` of `group` now names `cold`. Its host
      * tier copy, if any, goes: the idle tiers never hold an entry with a cold component. */
     bool repoint_cold(int32_t group, int32_t block, int32_t cold);
+    /* Its reverse, for a demotion that failed before its copy was queued
+     * (KVManager::residency_abort): the entry naming `cold` names resident `block` again. */
+    bool restore_resident(int32_t group, int32_t cold, int32_t block);
     /* Takes the cache's reference on the blocks of entry `b` of a sequence's tables `bt` (one per
      * cached group) into `out`, entry_groups_ order; on a refusal releases exactly what it took
      * and returns false. */

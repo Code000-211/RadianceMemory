@@ -1709,26 +1709,63 @@ void Scheduler::set_residency_mover(ResidencyMover m, int64_t sweep_blocks) {
 }
 
 /* The mover takes one group per call (TierExec::issue_moves), so the list is cut at group changes.
- * A failed batch is an error to report, not a state to repair: the manager already encoded the
- * entries, so the moves it named must still be accounted as in flight. */
-int Scheduler::res_issue(bool to_host) {
+ *
+ * A failed batch is not in flight. The manager encoded every entry when it named the moves -- a
+ * demotion's entry already names the slot, a promotion's the fresh block -- so marking the batch
+ * in flight and reaping it later would hand the pool a block a table still needs (or free a slot
+ * whose bytes never arrived), and the next step would read whatever another sequence left in that
+ * slot or block as this one's history. Every entry is put back instead, the failed group's and
+ * the ones queued before it alike: the mover drained what it queued before reporting, and the
+ * manager's records are all-or-nothing per batch. Nothing ran on the tables in between, since the
+ * batch is named and issued in one call. */
+int Scheduler::res_issue(bool to_host, std::vector<uint64_t>* undone) {
     int rc = RAD_OK;
-    for (size_t a = 0; a < res_moves_.size(); ) {
+    for (size_t a = 0; a < res_moves_.size() && rc == RAD_OK; ) {
         size_t z = a;
         while (z < res_moves_.size() && res_moves_[z].group == res_moves_[a].group) ++z;
         const std::vector<BlockMove> part(res_moves_.begin() + (std::ptrdiff_t)a,
                                           res_moves_.begin() + (std::ptrdiff_t)z);
         const int st = res_mover_.move(part, to_host);
         if (st < 0) {
-            RAD_ERR("kv residency: %s of %zu block(s) failed: %s", to_host ? "demote" : "promote",
-                    part.size(), rad_strerror(st));
-            if (rc == RAD_OK) rc = st;
+            RAD_ERR("kv residency: %s of %zu block(s) failed: %s; the batch of %zu is put back",
+                    to_host ? "demote" : "promote", part.size(), rad_strerror(st),
+                    res_moves_.size());
+            rc = st;
         }
         a = z;
     }
-    if (!res_moves_.empty()) res_inflight_ = true;
+    if (rc < 0) {
+        const int64_t n = kv_->residency_abort(res_moves_, to_host, undone);
+        if (n != (int64_t)res_moves_.size())
+            RAD_ERR("kv residency: %lld of %zu failed moves could not be put back and are "
+                    "quarantined", (long long)((int64_t)res_moves_.size() - n), res_moves_.size());
+        /* An issue failure is a state or device error, not a full pool: the next sweep would fail
+         * the same way, every step. Whatever is resident stays resident. */
+        if (to_host && !res_sweep_off_) {
+            res_sweep_off_ = true;
+            RAD_ERR("kv residency: demotion is off for the rest of this server's life");
+        }
+    } else if (!res_moves_.empty()) {
+        res_inflight_ = true;
+    }
     res_moves_.clear();
     return rc;
+}
+
+void Scheduler::res_fail(const std::vector<uint64_t>& ids, int status, const char* why) {
+    for (uint64_t id : ids) {
+        auto it = by_id_.find(id);
+        if (it == by_id_.end()) continue;
+        SchedReq& s = *reqs_[(size_t)it->second];
+        if (!s.req || (s.req->state != ReqState::Running && s.req->state != ReqState::Preempted &&
+                       s.req->state != ReqState::Waiting))
+            continue;
+        /* A step issued ahead or a drafter may still name its blocks, as for cancel(). Never
+         * published: the prefix cache must not hand these bytes to the next turn. */
+        const bool in_flight = in_step(s) || block_holds(s.req->id);
+        close_request(s, ReqState::Failed, "kv_residency_move_failed", in_flight,
+                      /*publish=*/false, status, why);
+    }
 }
 
 /* Whether a step may read its decode rows' tables densely. A QSA consumer (arch/common/rad_qsa.h,
@@ -1750,18 +1787,45 @@ bool Scheduler::res_dense_rows(const StepPlan& p) const {
 }
 
 void Scheduler::res_reap() {
+    /* A promotion that failed to issue left its sequences cold, and the step that needed them
+     * dense was abandoned: they fail here, before anything plans them again. */
+    if (!res_lost_.empty()) {
+        const std::vector<uint64_t> lost = std::move(res_lost_);
+        res_lost_.clear();
+        res_fail(lost, RAD_E_DEVICE, "kv residency: a promotion of this conversation's history "
+                                     "back into VRAM failed");
+    }
     if (!res_inflight_ || !res_mover_.landed) return;
+    int st = res_mover_.landed();
     if (res_mover_.sync)
-        while (!res_mover_.landed()) std::this_thread::sleep_for(std::chrono::microseconds(20));
-    else if (!res_mover_.landed())
-        return;
-    kv_->residency_demote_landed();
-    kv_->residency_complete();
+        while (st == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+            st = res_mover_.landed();
+        }
+    if (st == 0) return;
     res_inflight_ = false;
+    if (st > 0) {
+        kv_->residency_demote_landed();
+        kv_->residency_complete();
+        return;
+    }
+    /* A transfer failed after it was queued. Its bytes cannot be trusted and steps have read them
+     * since (the step after a sweep pages the demoted slots; the step after a promotion reads the
+     * block), so nothing is put back: every sequence whose table names what the moves wrote --
+     * forks and cache adopters included -- fails, the blocks and slots in flight are held for
+     * good, and the prefix cache is emptied, since its entries may name the same slots. */
+    std::vector<uint64_t> bad;
+    const int64_t n = kv_->residency_fail_inflight(&bad);
+    RAD_ERR("kv residency: a transfer failed after it was queued (%s); %lld move(s) quarantined, "
+            "%zu request(s) failed, the prefix cache emptied and demotion off",
+            rad_strerror(st), (long long)n, bad.size());
+    res_fail(bad, st, "kv residency: a transfer of this conversation's history failed");
+    if (pc_) (void)pc_->reset();
+    res_sweep_off_ = true;
 }
 
 void Scheduler::res_sweep() {
-    if (!res_mover_.move || res_sweep_blocks_ <= 0) return;
+    if (!res_mover_.move || res_sweep_blocks_ <= 0 || res_sweep_off_) return;
     /* One sweep in flight at a time. Landing is a poll of the newest transfer, so a sweep issued
      * every step would keep that transfer always pending and the blocks of every earlier one held:
      * on the card the store filled while not one byte of VRAM came back. Waiting for the last batch
@@ -2456,7 +2520,9 @@ const RadBatch* Scheduler::step() {
                 promote_failed = true;
             }
         }
-        if (res_issue(/*to_host=*/false) < 0) promote_failed = true;
+        /* A failed issue put every entry back cold: those sequences cannot run this step, and
+         * fail at the next (res_reap) rather than replan a promotion that fails the same way. */
+        if (res_issue(/*to_host=*/false, &res_lost_) < 0) promote_failed = true;
         /* Still full: the sequence that could not be promoted gives its blocks up, by recompute.
          * Without this a pool that stays full replans the same dense step forever -- the sweep
          * that would free room runs only after a committed step, and an abandoned one commits

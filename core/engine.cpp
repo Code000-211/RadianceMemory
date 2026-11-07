@@ -2332,22 +2332,36 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         m.move = [this](const std::vector<BlockMove>& mv, bool to_host) {
             int rc = RAD_OK;
             for (auto& r : ranks_) {
-                if (rad_dev_set(r->device) != RAD_OK) { rc = rc ? rc : RAD_E_DEVICE; continue; }
+                if (rc < 0) break;                   /* the batch is put back whole anyway */
+                if (rad_dev_set(r->device) != RAD_OK) { rc = RAD_E_DEVICE; break; }
                 for (size_t a = 0; a < mv.size(); a += TierExec::kMoveBatch) {
                     const std::vector<BlockMove> part(
                         mv.begin() + (std::ptrdiff_t)a,
                         mv.begin() + (std::ptrdiff_t)std::min(mv.size(), a + TierExec::kMoveBatch));
                     const int st = r->resx.issue_moves(part, r->ctx.stream(), to_host);
-                    if (st < 0 && rc == RAD_OK) rc = st;
+                    if (st < 0) { if (rc == RAD_OK) rc = st; break; }
                 }
             }
+            /* A failed batch is put back by the scheduler (KVManager::residency_abort), which
+             * frees its slots and blocks: every rank's queued part must have finished first, the
+             * ranks that succeeded included, or a copy still queued writes a block or slot its
+             * next owner already holds. A host wait, but only on failure. */
+            if (rc < 0)
+                for (auto& r : ranks_)
+                    if (rad_dev_set(r->device) == RAD_OK) (void)r->resx.moves_drain();
             (void)rad_dev_set(ranks_[0]->device);
             return rc;
         };
-        /* A poll of one event a rank: the step path never waits on the host for a transfer. */
-        m.landed = [this] {
-            for (auto& r : ranks_) if (!r->resx.moves_landed()) return false;
-            return true;
+        /* A poll of one event a rank: the step path never waits on the host for a transfer. A
+         * failure on any rank is the batch's failure: never reported landed. */
+        m.landed = [this]() -> int {
+            int st = 1;
+            for (auto& r : ranks_) {
+                const int q = r->resx.moves_state();
+                if (q < 0) return q;
+                if (q == 0) st = 0;
+            }
+            return st;
         };
         /* RADIANCE_DEBUG_KV_TIER: `sync` waits for each sweep to land before the next step plans,
          * so the step at which a demoted block is first read does not depend on the transfer's

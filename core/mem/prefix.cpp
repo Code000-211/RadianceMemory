@@ -180,6 +180,7 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
 
     if (!kv) return RAD_E_INVAL;
     kv->set_residency_cache(nullptr);
+    kv->set_residency_cache_restore(nullptr);
     if (!cfg.prefix_cache) {
         report_ = "prefix cache: disabled by --no-prefix-cache\n";
         return RAD_OK;
@@ -260,6 +261,8 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     /* Window residency demotes what the cache holds too: an idle conversation keeps no block of
      * its chain in VRAM, and a block a live sequence shares with the cache follows it. */
     kv->set_residency_cache([this](int32_t g, int32_t b, int32_t cold) { return repoint_cold(g, b, cold); });
+    kv->set_residency_cache_restore(
+        [this](int32_t g, int32_t cold, int32_t b) { return restore_resident(g, cold, b); });
     report_ = fmt("prefix cache: %zu paged group(s) in %lld-token entries; checkpoints "
                   "every %lld tokens (%lld slots of %s a rank, pinned host memory), retention "
                   "'%s'\n",
@@ -688,6 +691,21 @@ bool PrefixCache::repoint_cold(int32_t g, int32_t b, int32_t cold) {
          * longer its, and its bytes are in the residency store already. */
         if (tiers_) tiers_->forget_copy(h);
         return true;
+    }
+    return false;
+}
+
+/* A scan, not an index: cold ids are not kept by block (by_block_ is resident blocks only), and
+ * this runs only when a demotion's copy could not be issued. */
+bool PrefixCache::restore_resident(int32_t g, int32_t cold, int32_t b) {
+    for (auto& [h, e] : map_) {
+        if (!e.in_lru) continue;
+        for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k) {
+            if (entry_groups_[k] != g || e.blocks[k] != cold) continue;
+            e.blocks[k] = b;
+            by_block_[block_key(g, b)] = h;
+            return true;
+        }
     }
     return false;
 }

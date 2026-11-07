@@ -169,6 +169,7 @@ struct FakeKV : IKVManager {
             res_held.push_back({ g, b });
             ++res_cold; ++res_slots_out; --max;
             out->push_back(BlockMove{ g, b, slot });
+            res_dem.push_back(out->back());
         }
         return RAD_OK;
     }
@@ -185,12 +186,14 @@ struct FakeKV : IKVManager {
             res_held.push_back({ g, b });
             ++res_slots_out;
             out->push_back(BlockMove{ g, b, res_next_slot++ });
+            res_dem.push_back(out->back());
         }
         return n;
     }
     void residency_demote_landed() override {
         for (auto& [g, b] : res_held) release(g, b);
         res_held.clear();
+        res_dem.clear();
     }
     int residency_promote_all(uint64_t id, std::vector<BlockMove>* out) override {
         auto it = seqs.find(id);
@@ -208,10 +211,74 @@ struct FakeKV : IKVManager {
                 std::min<int64_t>(it->second.dirty[(size_t)res_group], (int64_t)i);
             --res_cold;
             out->push_back(BlockMove{ res_group, b, slot });
+            res_pro.push_back(out->back());
         }
         return RAD_OK;
     }
-    void residency_complete() override { res_slots_out = res_cold; }
+    void residency_complete() override { res_slots_out = res_cold; res_pro.clear(); }
+    /* Moves named and not yet landed, as KVManager's records; what was put back or held. */
+    std::vector<BlockMove> res_dem, res_pro;
+    int64_t res_aborted = 0, res_quarantined = 0;
+    std::vector<std::pair<int32_t, int32_t>> res_stuck;   /* blocks held for good */
+    int64_t residency_abort(const std::vector<BlockMove>& mv, bool to_host,
+                            std::vector<uint64_t>* out) override {
+        int64_t n = 0;
+        auto note = [&](uint64_t id) {
+            if (out && std::find(out->begin(), out->end(), id) == out->end()) out->push_back(id);
+        };
+        auto same = [](const BlockMove& a, const BlockMove& b) {
+            return a.group == b.group && a.block == b.block && a.host_slot == b.host_slot;
+        };
+        for (const BlockMove& m : mv) {
+            auto& rec = to_host ? res_dem : res_pro;
+            auto r = std::find_if(rec.begin(), rec.end(), [&](const BlockMove& x) { return same(x, m); });
+            if (r == rec.end()) continue;
+            rec.erase(r);
+            const int32_t want = to_host ? -2 - m.host_slot : m.block;
+            bool in_table = false;
+            for (auto& [id, q] : seqs) {
+                auto& tbl = q.blocks[(size_t)m.group];
+                for (size_t i = 0; i < tbl.size(); ++i) {
+                    if (tbl[i] != want) continue;
+                    tbl[i] = to_host ? m.block : -2 - m.host_slot;
+                    q.dirty[(size_t)m.group] = std::min<int64_t>(q.dirty[(size_t)m.group], (int64_t)i);
+                    in_table = true;
+                    note(id);
+                }
+            }
+            if (to_host) {
+                auto h = std::find(res_held.begin(), res_held.end(), std::make_pair(m.group, m.block));
+                if (h != res_held.end()) res_held.erase(h);
+                --res_slots_out;
+                if (in_table) --res_cold;
+                else res_idle.push_back({ m.group, m.block });   /* the cache's again */
+            } else {
+                release(m.group, m.block);
+                ++res_cold;
+            }
+            ++n;
+        }
+        res_aborted += n;
+        return n;
+    }
+    int64_t residency_fail_inflight(std::vector<uint64_t>* out) override {
+        for (auto& [id, q] : seqs) {
+            bool hit = false;
+            for (const BlockMove& m : res_dem)
+                for (int32_t e : q.blocks[(size_t)m.group]) hit |= e == -2 - m.host_slot;
+            for (const BlockMove& m : res_pro)
+                for (int32_t e : q.blocks[(size_t)m.group]) hit |= e == m.block;
+            if (hit && out) out->push_back(id);
+        }
+        for (const BlockMove& m : res_pro) { retain(m.group, m.block); res_stuck.push_back({ m.group, m.block }); }
+        res_stuck.insert(res_stuck.end(), res_held.begin(), res_held.end());
+        const int64_t n = (int64_t)(res_dem.size() + res_pro.size());
+        res_held.clear();
+        res_dem.clear();
+        res_pro.clear();
+        res_quarantined += n;
+        return n;
+    }
 
     int64_t rows_for(int gi, int64_t n) const {
         const KVGeom::G& e = geom.g[(size_t)gi];

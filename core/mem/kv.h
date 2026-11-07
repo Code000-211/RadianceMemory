@@ -413,6 +413,10 @@ public:
      * configure installs it; without it a block the cache holds is never demoted. */
     using ResidencyCacheRepoint = std::function<bool(int32_t group, int32_t block, int32_t cold)>;
     void set_residency_cache(ResidencyCacheRepoint f) { res_cache_ = std::move(f); }
+    /* The reverse, for a demotion whose copy failed (residency_abort): the entry naming `cold` of
+     * `group` names `block` again. False when no entry names `cold`. */
+    using ResidencyCacheRestore = std::function<bool(int32_t group, int32_t cold, int32_t block)>;
+    void set_residency_cache_restore(ResidencyCacheRestore f) { res_cache_restore_ = std::move(f); }
     /* Demote blocks ONLY the prefix cache holds (an idle conversation waiting for its next turn,
      * or a prefix whose readers all finished), oldest first, at most `max_blocks` copies. The
      * cache's reference becomes the slot's: the entry reads cold, a lookup still hits it and the
@@ -464,6 +468,25 @@ public:
      * call gives it back, so a slot is never freed while its bytes are still being read. Called
      * once per batch, after the transfer landed. (Demotions have their own landing call.) */
     void    residency_complete();
+    /* The caller could not run `moves` (the mover failed before they were all queued, and has
+     * drained what it did queue): every table and cache entry those moves re-pointed is put back
+     * as it was before residency_demote*() / residency_promote() named them, so nothing reads a
+     * slot or a block the copy never filled -- bytes another sequence left there. A demotion's
+     * entry names its pool block again (its bytes were never touched: the gather only reads) and
+     * the slot is freed; a promotion's entry is cold again on its slot and the fresh block goes
+     * back to the pool. Valid only for moves not yet reported landed and with nothing run on the
+     * tables since they were named; anything else is refused and counted, never guessed at.
+     * Appends the sequences whose entries were put back to `seqs` (deduplicated; never the
+     * cache's). Returns how many moves were undone. */
+    int64_t residency_abort(const std::vector<BlockMove>& moves, bool to_host,
+                            std::vector<uint64_t>* seqs = nullptr);
+    /* Moves issued earlier whose landing the transfer reported as failed: their bytes cannot be
+     * trusted, and steps have run since, so nothing is put back. Appends every sequence whose
+     * table names an entry those moves wrote (a demotion's slot, a promotion's block; forks and
+     * adopters included) to `seqs`, and quarantines the moves: their
+     * held pool blocks and slot references are never given back, since a transfer still queued
+     * on a broken stream may write them. Returns how many moves were quarantined. */
+    int64_t residency_fail_inflight(std::vector<uint64_t>* seqs);
     /* Entries of `group` in `seq`'s table that are cold, as table indices. A caller that hands a
      * table to a kernel asserts this is empty for the part the step reads. */
     std::vector<int64_t> residency_cold_entries(uint64_t seq, int32_t group) const;
@@ -475,6 +498,8 @@ public:
         int64_t freed_blocks = 0, freed_bytes = 0; /* pool blocks given back by landed demotions: VRAM freed */
         int64_t promoted_misses = 0;               /* a promotion a step needed: the link traffic */
         int64_t repointed = 0;                     /* demotions that moved no bytes: the entry went back to its origin slot */
+        int64_t aborted = 0;                       /* moves the mover failed to queue, put back (residency_abort) */
+        int64_t quarantined = 0;                   /* moves whose landing failed: never given back */
     };
     const ResidencyStats& residency_stats() const { return res_stats_; }
     /* The same counters per sequence (= per session: the scheduler keys both by request id). A
@@ -1005,9 +1030,12 @@ private:
     int64_t    res_cold_ = 0;                         /* cold entries held across all tables */
     /* Blocks a demotion encoded cold whose copy has not been reported landed: still referenced
      * (refcount 1, in no table) so the pool cannot reuse them under the gather. */
-    struct Demoting { int32_t group, block, slot; uint64_t seq; };
+    /* `idx` is the table entry the demotion made cold (-1 for the cache's); `cache` says the
+     * prefix cache's entry followed it into the slot (cache_follows), so an abort re-points both. */
+    struct Demoting { int32_t group, block, slot; uint64_t seq; int64_t idx = -1; bool cache = false; };
     static constexpr uint64_t kCacheSeq = UINT64_MAX;   /* Demoting::seq of a cache-only block */
     ResidencyCacheRepoint res_cache_;
+    ResidencyCacheRestore res_cache_restore_;
     /* Per group: blocks that became cache-only (marked, refcount one), oldest first, for
      * residency_demote_cached(). Lazy: an entry is checked when it is taken, so a block that was
      * adopted or released since is skipped there. Filled only while a cache and a store are set. */
@@ -1048,7 +1076,17 @@ private:
     void release_residency();
     /* Slots a promotion released from a block and no transfer has finished reading yet, as
      * (group, slot). residency_complete() frees them. */
-    std::vector<std::pair<int32_t, int32_t>> res_pending_;
+    struct Promoting {
+        int32_t group, slot;
+        int32_t block;        /* the fresh pool block the entry names until the copy lands */
+        uint64_t seq;
+        int64_t idx;          /* the table entry promoted */
+        bool origin;          /* res_origin_ took a slot reference of its own for `block` */
+    };
+    std::vector<Promoting> res_pending_;
+    /* Moves whose landing failed (residency_fail_inflight): held for ever, never reused. */
+    std::vector<Demoting>  res_quarantine_demote_;
+    std::vector<Promoting> res_quarantine_promote_;
     ResidencyStats res_stats_;
     /* Bumped when a block stops being shared (drop_block leaves it one holder and no cache
      * mark): an entry the sweep kept because it was shared may now move, so every resume point
