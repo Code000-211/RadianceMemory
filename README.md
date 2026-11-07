@@ -11,6 +11,10 @@ about 48 MiB of it. The rest is VRAM nothing touches.
 This document covers only the KV memory system. The engine it runs in is radiance, documented in
 [`docs/RADIANCE.md`](docs/RADIANCE.md) and the rest of `docs/`.
 
+**Paper:** [*Infinite KV Cache: Sparse-Attention-Aware Window Residency and Measured Per-Layer
+Quantisation for a Hybrid MoE Model on AMD RDNA4*](docs/paper/Infinite_KV_Cache.pdf) (PDF, 23 pages)
+covers window residency, the KV layouts, `rad-autoquant`, the noise floor and all measurements.
+
 ---
 
 ## Contents
