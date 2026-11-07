@@ -823,6 +823,10 @@ static const RadParamSpec pGemmNtQ[] = {
     /* The width whose K split a row slice of a wider linear takes (docs/OPS.md); only the narrow
      * fp8a8 / i8a8 rows split K by N, and they read it. */
     { "split_n", RAD_P_INT, RAD_OPTIONAL },
+    /* The weight rows one scale covers (docs/OPS.md). Accepted and ignored: an int8 weight's
+     * per-row scale plane holds each block's value in every row, and the trellis forms that need
+     * the count are IQR dtypes, which no row here serves. */
+    { "w_rb",  RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libhalo's six
  * quantised GEMMs need a seventh operand. RadLayout can declare aux streams beside a weight, but
@@ -1212,6 +1216,9 @@ static const RadParamSpec pGramAccum[] = {
     { "n",     RAD_P_INT, RAD_REQUIRED },
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+    /* 1: only k2 >= k1 need be accumulated (H is symmetric). Accepted and ignored: the whole
+     * matrix is added, and the entries below the diagonal are then outside the contract. */
+    { "upper", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oGramAccum[] = {
     { "a",       RAD_OPD_IN,    0 },
@@ -1903,6 +1910,10 @@ static const RadParamSpec pQkNormRope[] = {
 /* `M` is the input row count, a multiple of `k`. */
 static const RadParamSpec pPoolRows[] = {
     P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"), P_STR("dtype"),
+};
+/* `n` is the point's values; y has n (2 freqs + 1) columns. */
+static const RadParamSpec pPointFourier[] = {
+    P_INT("M"), P_INT("n"), P_INT("freqs"), P_INTO("pi"), P_STR("dtype"),
 };
 /* `positions` may be absent at `rotary_dim` 0 (the norm alone), and an absent gain is a unit
  * gain. */
@@ -2929,6 +2940,10 @@ static const RadOpSchema kSchemas[] = {
            "Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and "
            "rounded, then times `mult` and rounded again. n, the input width, is a multiple of k; "
            "y has n / k columns."),
+    SCHEMA("point_fourier", pPointFourier, oUnary,
+           "A point's Fourier features: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)], f_j = 2^j "
+           "for j < freqs (times pi with `pi` 1), sines then cosines each i-major then j; y is "
+           "[M, n (2 freqs + 1)]."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
     SCHEMA("relu", pMnDtype, oUnary, "y = max(x, 0)."),
     SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
@@ -5729,6 +5744,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, halo_rad_pool_cols },
+
+{ "point_fourier_f32", "point_fourier", "elem",
+  "a point's Fourier features: x, then its sines and cosines at octaves (a shape decoder's query "
+  "embedding)",
+  "any n and freqs up to 30; a thread an output column",
+  "f32 in and out, the device's sinf and cosf",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, halo_rad_point_fourier },
 
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",
@@ -9738,19 +9762,21 @@ extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
  * out entirely, so another RDNA3 card gets libr3d alone.
  *
  * The test reads the KFD topology (gfx_target_version 110501 is gfx1151) rather than asking a
- * runtime, which open must not initialise. Where the topology cannot be read (no KFD, a sandbox
- * without /sys) the library stays: the code-object check is the backstop. */
+ * runtime, which open must not initialise. KFD lists only the cards the process may open, so a
+ * container without /dev/kfd sees the CPU node alone. With no gfx1151 listed, or no topology at
+ * all, the library declines: rad-convert and the other tools resolve kernels without the
+ * engine's code-object check, and a library for an absent card would choose the stored form of
+ * every weight it has a row for. */
 extern "C" int rad_plugin_open(void) {
     const char* root = "/sys/class/kfd/kfd/topology/nodes";
     DIR* d = opendir(root);
-    if (!d) return RAD_OK;
-    bool readable = false, halo = false;
+    if (!d) return RAD_E_UNSUPPORTED;
+    bool halo = false;
     while (const dirent* e = readdir(d)) {
         if (e->d_name[0] == '.') continue;
         const std::string path = std::string(root) + "/" + e->d_name + "/properties";
         FILE* f = std::fopen(path.c_str(), "r");
         if (!f) continue;
-        readable = true;
         char key[64];
         unsigned long long v = 0;
         while (std::fscanf(f, "%63s %llu", key, &v) == 2)
@@ -9758,7 +9784,7 @@ extern "C" int rad_plugin_open(void) {
         std::fclose(f);
     }
     closedir(d);
-    return (!readable || halo) ? RAD_OK : RAD_E_UNSUPPORTED;
+    return halo ? RAD_OK : RAD_E_UNSUPPORTED;
 }
 
 extern "C" int rad_kernel_schema_count(void) {

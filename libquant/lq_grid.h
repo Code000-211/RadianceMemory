@@ -126,6 +126,10 @@ struct Grid {
      * table is still stored, A and B beside it ("trellis.mad"). */
     bool     tcq_mad = false;
     uint32_t tcq_a = 0, tcq_b = 0;
+    /* tcq_code=mad16: the same hash with every byte whole, bytesum(h) - 510 (sigma ~148, where mad's
+     * is ~37): values a 16-bit reader takes exactly (f16 holds integers to 2048), so the code is not
+     * held to the int8 grid's ~42 dB floor. No int8 encoding can carry it; gptqsim measures it. */
+    bool     tcq_wide = false;
 
     /* The planes of the encoding, by index; -1 when the grid has none. */
     int plane_zero() const { return asym ? 2 : -1; }
@@ -180,8 +184,9 @@ int   grid_code(const Grid& g, const BlockScale& b, float v);
 int   grid_vq_code(const Grid& g, const BlockScale& b, const float* v);
 float grid_decode(const Grid& g, const BlockScale& b, int code);
 
-/* tcq_code=mad's value of every one of the 2^L states (Grid::tcq_mad). */
-std::vector<float> tcq_lut_mad(int L, uint32_t a, uint32_t b);
+/* tcq_code=mad's value of every one of the 2^L states (Grid::tcq_mad); with `wide`, mad16's
+ * (Grid::tcq_wide). */
+std::vector<float> tcq_lut_mad(int L, uint32_t a, uint32_t b, bool wide = false);
 
 /* A trellis grid's search state for one run, reused across runs. */
 struct TcqWork {

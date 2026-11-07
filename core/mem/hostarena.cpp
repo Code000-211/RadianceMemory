@@ -8,12 +8,34 @@ namespace rad {
 HostArena::~HostArena() { close(); }
 
 int HostArena::open(int64_t slot_bytes, int64_t cap_bytes) {
+    close();   /* frees under the old kind */
+    kind_ = RAD_MEM_HOST_PINNED;
+    return open_kind(slot_bytes, cap_bytes);
+}
+
+int HostArena::open_mapped(int64_t slot_bytes, int64_t cap_bytes, void* (*dev_view)(void*)) {
+    close();
+    kind_ = RAD_MEM_HOST_MAPPED;
+    const int rc = open_kind(slot_bytes, cap_bytes);
+    if (rc != RAD_OK) return rc;
+    dev_base_ = (dev_view ? dev_view : rad_dev_device_ptr)(base_);
+    if (!dev_base_) {
+        RAD_ERR("kv residency: --kv-residency-mib needs host-mapped (SVM) memory the card can read "
+                "directly, and this host maps none: the pager copies cold blocks from the store "
+                "on the card. Drop --kv-residency-mib or run on a host with SVM");
+        close();
+        return RAD_E_UNSUPPORTED;
+    }
+    return RAD_OK;
+}
+
+int HostArena::open_kind(int64_t slot_bytes, int64_t cap_bytes) {
     close();
     if (slot_bytes <= 0 || cap_bytes < slot_bytes) return RAD_E_INVAL;
     const int64_t n = cap_bytes / slot_bytes;
     /* Pinned or nothing: an async copy to pageable memory serialises against the stream, so a
      * pageable fallback would run the store at a fraction of its budgeted rate. */
-    base_ = rad_dev_alloc(n * slot_bytes, RAD_MEM_HOST_PINNED);
+    base_ = rad_dev_alloc(n * slot_bytes, kind_);
     if (!base_) return RAD_E_NOMEM;
     slot_bytes_ = slot_bytes;
     used_ = 0;
@@ -24,8 +46,9 @@ int HostArena::open(int64_t slot_bytes, int64_t cap_bytes) {
 }
 
 void HostArena::close() {
-    if (base_) rad_dev_free(base_, RAD_MEM_HOST_PINNED);
+    if (base_) rad_dev_free(base_, kind_);
     base_ = nullptr;
+    dev_base_ = nullptr;
     slot_bytes_ = 0;
     used_ = 0;
     cap_slots_ = 0;

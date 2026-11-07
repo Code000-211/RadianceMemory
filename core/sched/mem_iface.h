@@ -15,6 +15,7 @@
 #include "mem/prefix.h"
 #include "rad_core.h"
 #include "mm/processor.h"
+#include "sched/metrics.h"
 
 #include <vector>
 
@@ -66,6 +67,90 @@ struct IKVManager {
      * defaults mean no hit on a windowed trunk is ever resumed. */
     virtual bool has_window_snapshot() const { return false; }
     virtual int  seed_window(uint64_t seq, int64_t pos) { (void)seq; (void)pos; return -1; }
+
+    /* Window residency (spec §7.3): the blocks a sparse consumer's window does not cover, moved to
+     * host memory and back, and the store they live in. All zero on a manager with no store, which
+     * is every server that does not pass --kv-residency-mib. */
+    struct Residency {
+        int64_t demoted = 0, promoted = 0, skipped = 0, misses = 0;
+        int64_t host_bytes = 0, cap_bytes = 0;
+        int64_t freed_bytes = 0;     /* VRAM given back by landed demotions */
+        int64_t link_bytes = 0;      /* bytes over the link, both directions */
+        int64_t scratch_bytes = 0;   /* VRAM the pager's scratch pages hold (reserved, not traffic) */
+        int64_t paged_in = 0;        /* cold entries the pager rewrote, from the card's counter */
+        int64_t paged_hits = 0;      /* of them, served by the page cache without a copy */
+    };
+    virtual Residency residency() const { return Residency{}; }
+    /* The same per request id, which is the session id; an overlapping view (see SessionStat). */
+    using SeqResidency = rad::SeqResidency;
+    virtual std::vector<SeqResidency> residency_seqs() const { return {}; }
+
+    /* What the scheduler's sweep and dense-step promotion ask of the manager (KVManager's
+     * residency block). Window tokens of a group the sweep may demote in: 0 for every group
+     * without a window and for every manager whose store is closed, which is what makes
+     * --kv-residency-mib 0 inert here. */
+    virtual int32_t n_groups() const { return 0; }
+    virtual int64_t residency_window(int32_t group) const { (void)group; return 0; }
+    /* Demote at most `max_blocks` of `seq`'s blocks in `group` outside the first `keep_head` and
+     * last `keep_tail` table entries; the moves are appended for the caller to run. */
+    virtual int  residency_demote(uint64_t seq, int32_t group, int64_t keep_head, int64_t keep_tail,
+                                  int64_t max_blocks, std::vector<BlockMove>* out) {
+        (void)seq; (void)group; (void)keep_head; (void)keep_tail; (void)max_blocks; (void)out;
+        return RAD_E_INVAL;
+    }
+    /* Demote at most `max_blocks` blocks only the prefix cache holds (idle conversations); the
+     * moves are appended like residency_demote()'s. Returns how many were appended. */
+    virtual int64_t residency_demote_cached(int64_t max_blocks, std::vector<BlockMove>* out) {
+        (void)max_blocks; (void)out;
+        return 0;
+    }
+    /* The issued copies have landed: demoted pool blocks go free, promoted slots are given back. */
+    virtual void residency_demote_landed() {}
+    virtual void residency_complete() {}
+    /* The mover could not run `moves` (KVManager::residency_abort): every entry they re-pointed is
+     * put back, so no table names a slot or block the copy never filled. The sequences put back
+     * are appended to `seqs`. Returns how many moves were undone. */
+    virtual int64_t residency_abort(const std::vector<BlockMove>& moves, bool to_host,
+                                    std::vector<uint64_t>* seqs) {
+        (void)moves; (void)to_host; (void)seqs;
+        return 0;
+    }
+    /* The issued moves' landing failed (KVManager::residency_fail_inflight): appends every sequence
+     * whose table names what they wrote, and holds their blocks and slots for ever. */
+    virtual int64_t residency_fail_inflight(std::vector<uint64_t>* seqs) {
+        (void)seqs;
+        return 0;
+    }
+    /* Every cold entry of `seq` back in a pool block (RAD_E_FULL, nothing changed, when the pool
+     * cannot take them all). */
+    virtual int  residency_promote_all(uint64_t seq, std::vector<BlockMove>* out) {
+        (void)seq; (void)out;
+        return RAD_OK;
+    }
+
+    /* What the batch hands the pager (RadKVGroupBatch::residency_*) for a group on a rank: the
+     * store as the card addresses it, its slot size, the per-layer fragment offsets (host array,
+     * stable for the engine's life) and the scratch-page table, [scratch_rows, pitch] pool ids.
+     * All zero for a group with no window or a closed store -- and then the batch fields are too.
+     * scratch_pitch() is asked at init to size the batch's staging, before the store is known to
+     * be open, so it is the reservation's, not the store's. */
+    struct Pager {
+        void*          store = nullptr;
+        int64_t        slot_bytes = 0;
+        int64_t        slots = 0;
+        const int64_t* layer_off = nullptr;
+        const int32_t* scratch = nullptr;
+        int64_t*       paged = nullptr;   /* the pager's counter on this rank's card, or null */
+        /* The page cache (RadKVGroupBatch::residency_tags): this rank's planes of the group, their
+         * rows and bytes, its hit counter, and the leader's residency_epoch(). */
+        int32_t*       tags = nullptr;
+        int64_t        tags_rows = 0;
+        int64_t        tags_bytes = 0;
+        int64_t*       hits = nullptr;
+        int64_t        epoch = 0;
+    };
+    virtual Pager   pager(int32_t group, int rank) const { (void)group; (void)rank; return {}; }
+    virtual int64_t scratch_pitch(int32_t group) const { (void)group; return 0; }
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a multiple of the group's block
      * size; a shared partial block would be corrupted by the next token written into it. */
@@ -278,6 +363,9 @@ struct KVGeom {
         /* Columns in this group's state_index row. The manager decides it, so KVGeom::of leaves
          * it at 1 and the scheduler fills it in from the configured pool. */
         int64_t sidx_width = 1;
+        /* Columns of the pager's scratch-page table (IKVManager::scratch_pitch); 0 when the group
+         * reserves none. Filled in by the scheduler beside sidx_width. */
+        int64_t scratch_pitch = 0;
     };
     std::vector<G> g;
 
@@ -343,6 +431,80 @@ struct KVBinding final : IKVManager {
     bool has_runtime_window(uint64_t s) const override { return m->has_runtime_window(s); }
     bool has_window_snapshot() const override { return m->has_window_snapshot(); }
     int  seed_window(uint64_t s, int64_t p) override { return m->seed_window(s, p); }
+    int32_t n_groups() const override { return (int32_t)m->plans().size(); }
+    int64_t residency_window(int32_t g) const override {
+        const KVGroupPlan* p = m->plan(g);
+        return p && p->residency() && m->residency_enabled() ? p->residency_window : 0;
+    }
+    int residency_demote(uint64_t s, int32_t g, int64_t h, int64_t t, int64_t n,
+                         std::vector<BlockMove>* out) override {
+        return m->residency_demote(s, g, h, t, out, n);
+    }
+    int64_t residency_demote_cached(int64_t n, std::vector<BlockMove>* out) override {
+        return m->residency_demote_cached(out, n);
+    }
+    void residency_demote_landed() override { m->residency_demote_landed(); }
+    void residency_complete() override { m->residency_complete(); }
+    int64_t residency_abort(const std::vector<BlockMove>& mv, bool to_host,
+                            std::vector<uint64_t>* seqs) override {
+        return m->residency_abort(mv, to_host, seqs);
+    }
+    int64_t residency_fail_inflight(std::vector<uint64_t>* seqs) override {
+        return m->residency_fail_inflight(seqs);
+    }
+    int  residency_promote_all(uint64_t s, std::vector<BlockMove>* out) override {
+        return m->residency_promote_all(s, out);
+    }
+    Residency residency() const override {
+        const auto& st = m->residency_stats();
+        Residency r;
+        r.demoted    = st.demoted;
+        r.promoted   = st.promoted;
+        r.skipped    = st.demote_skipped;
+        r.misses     = st.promoted_misses;
+        r.freed_bytes = st.freed_bytes;
+        r.host_bytes = m->residency_host_bytes();
+        r.cap_bytes  = m->residency_host_cap_bytes();
+        r.link_bytes = st.demoted_bytes + st.promoted_bytes;
+        r.scratch_bytes = m->residency_scratch_bytes();
+        if (paged_read) r.paged_in = paged_read();
+        if (hits_read) r.paged_hits = hits_read();
+        return r;
+    }
+    std::vector<SeqResidency> residency_seqs() const override {
+        std::vector<SeqResidency> v;
+        for (const auto& [id, s] : m->residency_by_seq())
+            v.push_back({ id, s.demoted, s.promoted, s.skipped, s.link_bytes, s.freed_bytes });
+        return v;
+    }
+    /* Ranks past 0, whose managers hold their own shard offsets; the engine fills it in. */
+    std::vector<KV*> peers;
+    /* Reads the pager's counter back from the card (TierExec::paged_in); set by the engine when
+     * the pager is live. Called per statistics poll, never per step. */
+    std::function<int64_t()> paged_read;
+    std::function<int64_t()> hits_read;   /* the page cache's hits (TierExec::hits_in), the same way */
+    Pager pager(int32_t g, int rank) const override {
+        const KV* k = rank > 0 && (size_t)rank <= peers.size() ? peers[(size_t)rank - 1] : m;
+        Pager p;
+        const KVGroupPlan* pl = k->plan(g);
+        if (!pl || pl->scratch_blocks <= 0 || !k->residency_device_base(g)) return p;
+        p.store      = k->residency_device_base(g);   /* the group's own store */
+        p.slot_bytes = k->residency_slot_bytes(g);
+        p.slots      = k->residency_slots(g);
+        p.layer_off  = k->residency_layer_off(g).data();
+        p.scratch    = k->scratch_table(g).data();
+        p.paged      = k->residency_paged();
+        p.tags       = k->residency_tags(g);
+        p.tags_rows  = p.tags ? k->scratch_rows() : 0;
+        p.tags_bytes = p.tags ? k->residency_tags_bytes(g) : 0;
+        p.hits       = k->residency_hits();
+        p.epoch      = m->residency_epoch();
+        return p;
+    }
+    int64_t scratch_pitch(int32_t g) const override {
+        const KVGroupPlan* pl = m->plan(g);
+        return pl ? pl->scratch_pitch : 0;
+    }
     int  adopt(uint64_t s, int32_t g, const std::vector<int32_t>& b, int64_t n) override {
         return m->adopt(s, g, b, n);
     }

@@ -15,9 +15,9 @@
  *     run structure (the block walks the runs in its 16 rows, so a block spanning several experts
  *     is correct).
  *
- *   * Phase 3: the even/odd expert split (expert e's weight is in `w` for even e, `w_odd` for odd
- *     e, at index e/2) and the dtype-selected scale grid (`grid_rows` = 1 for w4a8's per-row scale,
- *     128 for fp8a8's per-128x128 tile).
+ *   * Phase 3: the even/odd expert split (expert e's weight is entry e/2 of `w` for even e and of
+ *     `w_odd` for odd e, each a weight table: r3d_moe_tab.h) and fp8a8f32's scale grid, one f32
+ *     per 128x128 tile of the weight.
  *
  * Verified against a CPU reference for runs of 1, 2, 4 and 16 rows, the even/odd split, and both
  * scale grids (maxrel ~1e-4, the f16 rounding floor). A row: `moe_gemm_q_e4m3` in r3d_rows.cpp, a
@@ -29,7 +29,9 @@
 #include "r3d_args.h"
 #include "r3d_common.h"
 #include "r3d_launch.h"
+#include "r3d_codecs.h"
 #include "r3d_fp8_dequant.h"
+#include "r3d_moe_tab.h"
 
 namespace {
 
@@ -45,11 +47,9 @@ __device__ __forceinline__ _Float16 h16(uint32_t w) { return __builtin_bit_cast(
 template <int ALU>
 __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void moe_q_kernel(
     const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    const uint8_t* __restrict__ w, const float* __restrict__ w_scale,
-    const uint8_t* __restrict__ w_odd, const float* __restrict__ w_odd_scale,
-    float* __restrict__ y, int T, int N, int K, int a_ld, int w_ld_b, int y_ld,
-    int n_expert, int top_k, int grid_rows)
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
+    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,
+    int n_expert, int top_k, int a_sorted)
 {
     __shared__ __align__(16) uint32_t s_a[16 * kPitch];
     __shared__ __align__(16) uint32_t s_w[kNBlock * kPitch];
@@ -69,11 +69,12 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void moe_q_kernel(
     const uint32_t n0 = (uint32_t)blockIdx.x * kNBlock;
     const uint32_t r1 = (r0 + 16 < (uint32_t)T) ? r0 + 16 : (uint32_t)T;
 
-    // The block's rows' source tokens (the gather). -1 marks a dropped slot.
+    // The block's rows' source rows of `a` (the gather, or the row itself under a_order
+    // "sorted"). -1 marks a dropped slot.
     if (tid < 16) {
         const uint32_t i = r0 + tid;
         const int32_t f = (i < (uint32_t)T) ? sorted[i] : -1;
-        s_tok[tid] = (f < 0) ? -1 : (f / top_k);
+        s_tok[tid] = (f < 0) ? -1 : (a_sorted ? (int32_t)i : f / top_k);
     }
     // The runs in [r0, r1): each a contiguous set of rows for one expert. The block walks them.
     if (tid == 0) {
@@ -95,16 +96,16 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void moe_q_kernel(
 
     // One GEMM per run: the run's rows read the gathered activation and expert e's weight. Rows the
     // run does not own are padding (reading the run's first row) and their output is dropped. Expert
-    // e's weight is in `w` (even e) or `w_odd` (odd e) at index e/2.
+    // e's weight is entry e/2 of class e%2's tables.
     for (int run = 0; run < nruns; ++run) {
         const int rs = s_rs[run], re = s_re[run], e = s_e[run];
         v8float acc = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
         if (e >= 0) {
-        const int e2 = e >> 1;
-        const uint8_t* wbase = (e & 1) ? w_odd + (size_t)e2 * (size_t)N * w_ld_b
-                                       : w + (size_t)e2 * (size_t)N * w_ld_b;
-        const float* wsb = (e & 1) ? w_odd_scale + (size_t)e2 * (size_t)(N / grid_rows) * (K / kGroup)
-                                   : w_scale + (size_t)e2 * (size_t)(N / grid_rows) * (K / kGroup);
+        const int cls = e & 1, e2 = e >> 1;
+        const uint8_t* wbase = r3d_tab_at(tw.w[cls], e2);
+        const int w_ld_b = tw.w[cls].ld;
+        const float* wsb = (const float*)r3d_tab_at(tw.s[cls], e2);
+        const int ws_ld = tw.s[cls].ld;
 
         for (int b = 0; b < K / kGroup; ++b) {
             const int kt = b * kGroup;
@@ -148,14 +149,14 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void moe_q_kernel(
             group_barrier();
 
             // Fold the g-block's scales. acc[g] is at row g*2 + lane/16 (varies with g), column r.
-            // The weight scale is per (grid_rows columns, 128 of K).
-            const float sw = wsb[(size_t)(n_real / grid_rows) * (K / kGroup) + b];
+            // The weight scale is per 128x128 tile.
+            const float sw = wsb[(size_t)(n_real / kGroup) * ws_ld + b];
 #pragma unroll
             for (int g = 0; g < 8; ++g) {
                 const int row = (int)(g * 2 + (lane >> 4));
                 const int src = (rs <= (int)(r0 + row) && (int)(r0 + row) < re) ? s_tok[row]
                                                                                  : s_tok[rs - (int)r0];
-                const float sa = a_scale[(size_t)(src < 0 ? 0 : src) * (K / kGroup) + b];
+                const float sa = a_scale[(size_t)(src < 0 ? 0 : src) * as_ld + b];
                 acc[g] += blk[g] * sa * sw;
             }
         }
@@ -166,7 +167,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void moe_q_kernel(
         for (int g = 0; g < 8; ++g) {
             const int row = (int)(g * 2 + (lane >> 4));
             const int m = (int)(r0 + row);
-            if (rs <= m && m < re && nc < (uint32_t)N) y[(size_t)m * y_ld + nc] = acc[g];
+            if (rs <= m && m < re && nc < (uint32_t)N) y[(size_t)m * y_ld + nc] = f32_to_bf16(acc[g]);
         }
     }
 }
@@ -177,50 +178,49 @@ extern "C" {
 
 static int r3d_moe_gemm_q_dispatch(const RadArgs* a, RadStream s, int alu)
 {
-    if (!a || a->n_t < 9) return R3D_NO(RAD_E_INVAL);
-    const RadTensor* at = r3d_opt(a, 0), *asc = r3d_opt(a, 1), *st = r3d_opt(a, 2),
-                    *ot = r3d_opt(a, 3), *wt = r3d_opt(a, 4), *wsc = r3d_opt(a, 5),
-                    *wot = r3d_opt(a, 6), *wosc = r3d_opt(a, 7), *yt = r3d_opt(a, 8);
-    if (!r3d_p(at) || !r3d_p(asc) || !r3d_p(st) || !r3d_p(ot) || !r3d_p(wt) || !r3d_p(wsc) ||
-        !r3d_wp(yt))
-        return R3D_NO(RAD_E_INVAL);
-    long long M = 0, K = 0;
-    if (r3d_rows_of(at, &M, &K) != 0) return R3D_NO(RAD_E_INVAL);
-    const long long T = (st->rank >= 1) ? st->shape[0] : 0;
-    const long long N = (wt->rank >= 3) ? wt->shape[1] : 0;
-    if (M <= 0 || T <= 0 || N <= 0 || K <= 0 || K % 128) return R3D_NO(RAD_E_SHAPE);   // N tail clamps
-    const int n_expert = (int)r3d_geti_or(a, "n_expert", 1);
-    const int top_k = (int)r3d_geti_or(a, "top_k", 1);
-    const int grid_rows = (int)r3d_geti_or(a, "grid_rows", 1);  // 1 (w4a8) or 128 (fp8a8)
-    const int a_ld = (int)at->stride[0];
-    const int w_ld_b = (int)wt->shape[2];            // the weight's K in bytes
-    const int y_ld = (int)yt->stride[0];
+    R3dMoeCall c;
+    int rc = r3d_moe_call(a, true, &c);
+    if (rc != RAD_OK) return rc;
+    if (!c.a_scale) return R3D_NO(RAD_E_INVAL);
+    if (c.a->dtype != RAD_F8E4M3 || c.a_scale->dtype != RAD_F32 || c.y->dtype != RAD_BF16)
+        return R3D_NO(RAD_E_DTYPE);
+    if (c.K % kGroup) return R3D_NO(RAD_E_SHAPE);   // the N tail clamps
+    R3dMoeTabs tw;
+    rc = r3d_moe_q_tabs(c, RAD_F8E4M3, 8, RAD_F32, 32, (c.N + kGroup - 1) / kGroup, c.K / kGroup,
+                        &tw);
+    if (rc != RAD_OK) return rc;
+    const int a_ld = (int)c.a->stride[0], as_ld = (int)c.a_scale->stride[0];
+    const int y_ld = (int)c.y->stride[0];
 
-    dim3 grid((unsigned)((N + kNBlock - 1) / kNBlock), (unsigned)((T + 15) / 16)), blk(kThreads);
-    const uint8_t* pa = (const uint8_t*)r3d_p(at);
-    const float* psa = (const float*)r3d_p(asc);
-    const int32_t* ps = (const int32_t*)r3d_p(st);
-    const int32_t* po = (const int32_t*)r3d_p(ot);
-    const uint8_t* pw = (const uint8_t*)r3d_p(wt);
-    const float* pws = (const float*)r3d_p(wsc);
-    const uint8_t* pwo = (const uint8_t*)r3d_p(wot);
-    const float* pwos = (const float*)r3d_p(wosc);
-    float* py = (float*)r3d_wp(yt);
+    dim3 grid((unsigned)((c.N + kNBlock - 1) / kNBlock), (unsigned)((c.T + 15) / 16)), blk(kThreads);
+    const uint8_t* pa = (const uint8_t*)r3d_p(c.a);
+    const float* psa = (const float*)r3d_p(c.a_scale);
+    const int32_t* ps = (const int32_t*)r3d_p(c.sorted);
+    const int32_t* po = (const int32_t*)r3d_p(c.off);
+    uint16_t* py = (uint16_t*)r3d_wp(c.y);
     if (alu)
-        moe_q_kernel<1><<<grid, blk, 0, (hipStream_t)s>>>(pa, psa, ps, po, pw, pws, pwo, pwos, py,
-                                                          (int)T, (int)N, (int)K, a_ld, w_ld_b, y_ld,
-                                                          n_expert, top_k, grid_rows);
+        moe_q_kernel<1><<<grid, blk, 0, (hipStream_t)s>>>(pa, psa, ps, po, tw, py, (int)c.T, (int)c.N,
+                                                          (int)c.K, a_ld, as_ld, y_ld,
+                                                          (int)c.n_expert, (int)c.top_k,
+                                                          c.a_sorted);
     else
-        moe_q_kernel<0><<<grid, blk, 0, (hipStream_t)s>>>(pa, psa, ps, po, pw, pws, pwo, pwos, py,
-                                                          (int)T, (int)N, (int)K, a_ld, w_ld_b, y_ld,
-                                                          n_expert, top_k, grid_rows);
+        moe_q_kernel<0><<<grid, blk, 0, (hipStream_t)s>>>(pa, psa, ps, po, tw, py, (int)c.T, (int)c.N,
+                                                          (int)c.K, a_ld, as_ld, y_ld,
+                                                          (int)c.n_expert, (int)c.top_k,
+                                                          c.a_sorted);
     return (int)hipGetLastError();
 }
 
-/* The two rows share the dispatch: the table decode (ALU=0) and the ALU decode (ALU=1). The tune
- * picks the faster per geometry. */
+/* The row's entry: the tune's `impl` arm picks the kernel -- 0 the table decode, 1 the ALU decode,
+ * 2 the 16x128 block (r3d_moe_gemm_fp8_f32scale.hip) at the tune's register budget and
+ * accumulator. */
 extern "C" int r3d_rad_moe_gemm_q(const RadArgs* a, RadStream s)
-{ return r3d_moe_gemm_q_dispatch(a, s, 0); }
+{
+    R3dMoeQCfg cfg;
+    r3d_cfg_moe_q(a, &cfg);
+    if (cfg.impl == 2) return r3d_moe_gemm_fp8_f32scale_run(a, s, cfg.vgpr, cfg.acc);
+    return r3d_moe_gemm_q_dispatch(a, s, cfg.impl == 1);
+}
 extern "C" int r3d_rad_moe_gemm_q_alu(const RadArgs* a, RadStream s)
 { return r3d_moe_gemm_q_dispatch(a, s, 1); }
 

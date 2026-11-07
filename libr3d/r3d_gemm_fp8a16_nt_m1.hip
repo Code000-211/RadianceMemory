@@ -125,6 +125,7 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
     const uint8_t* __restrict__ A, const float* __restrict__ AScale,
     const uint8_t* __restrict__ B, const void* __restrict__ BScale, int bs16,
     uint16_t* __restrict__ Y, float* __restrict__ Part,
+    const uint16_t* __restrict__ Bias,
     int M, int N, int K, int group, int pb1, int a_ld, int y_ld, int kslab, int nkb)
 {
     __shared__ uint32_t s_a[kMTMax * kAPitch];
@@ -258,7 +259,8 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
     if constexpr (SPLIT) {
         Part[((size_t)blockIdx.y * M + m) * N + n0] = acc;
     } else {
-        Y[(size_t)m * y_ld + n0] = f32_to_bf16(acc);
+        const float bv = Bias ? bf16_to_f32(Bias[n0]) : 0.0f;
+        Y[(size_t)m * y_ld + n0] = f32_to_bf16(acc + bv);
     }
 }
 
@@ -294,7 +296,8 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_reduce(
  * 0, -1 a null pointer, -2 an unsupported shape, -3 an unreadable pitch, -4 HIP failed. */
 extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, long y, int M,
                                     int N, int K, int group, int pb1, int pb2, int a_ld, int y_ld,
-                                    int sk, int nt, long scratch, int bs_dt, long stream)
+                                    int sk, int nt, long scratch, int bs_dt, long stream,
+                                    long bias)
 {
     if (!a || !b || !b_scale || !y) return -1;
     if (M < 1 || N < 1 || K < 1) return -2;
@@ -318,6 +321,7 @@ extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, 
     if (sk > 1 && !scratch) return -1;
 
     const int bs16 = (bs_dt == RAD_BF16);      /* anything else, 0 included, reads the plane as f32 */
+    const uint16_t* bias_p = bias ? (const uint16_t*)(uintptr_t)bias : nullptr;
     const int mt = M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : M <= 8 ? 8 : kMTMax;
     const int kslab = K / sk;
     const int nrowb = (N + pb1 - 1) / pb1;
@@ -331,7 +335,8 @@ extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, 
             R3D_KLAUNCH(R3D_KNAME((gemm_q_kernel<MTV, A8V, NTV, true>)), grid, dim3_blk,         \
                         (hipStream_t)stream, (const uint8_t*)a, (const float*)a_scale,           \
                         (const uint8_t*)b, (const void*)b_scale, bs16, (uint16_t*)y,        \
-                        (float*)scratch, M, N, K, group, pb1, a_ld, y_ld, kslab, nkb);           \
+                        (float*)scratch, (const uint16_t*)nullptr,                               \
+                        M, N, K, group, pb1, a_ld, y_ld, kslab, nkb);           \
             const int mn = M * N;                                                                \
             const int nb = std::min((mn + kBlockThreads - 1) / kBlockThreads, 4096);             \
             R3D_KLAUNCH(gemm_q_reduce, dim3(nb), dim3(kBlockThreads), (hipStream_t)stream,       \
@@ -340,7 +345,8 @@ extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, 
             R3D_KLAUNCH(R3D_KNAME((gemm_q_kernel<MTV, A8V, NTV, false>)), grid, dim3_blk,        \
                         (hipStream_t)stream, (const uint8_t*)a, (const float*)a_scale,           \
                         (const uint8_t*)b, (const void*)b_scale, bs16, (uint16_t*)y,        \
-                        (float*)nullptr, M, N, K, group, pb1, a_ld, y_ld, kslab, nkb);           \
+                        (float*)nullptr, (const uint16_t*)bias_p,                                  \
+                        M, N, K, group, pb1, a_ld, y_ld, kslab, nkb);           \
         }                                                                                        \
     } while (0)
 #define R3D_Q_A8(MTV, A8V) do { if (nt) R3D_Q_NT(MTV, A8V, true); else R3D_Q_NT(MTV, A8V, false); } while (0)
@@ -482,7 +488,7 @@ extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
                                     (int)pb2, (int)a_ld, (int)y_ld, sk, c.nt,
                                     (long)(uintptr_t)(sk > 1 ? a->scratch : nullptr),
                                     (int)BS->dtype,        /* bf16 weight_scale_inv or f32 */
-                                    (long)(uintptr_t)s);
+                                    (long)(uintptr_t)s, 0);
     if (e == 0) return RAD_OK;
     return R3D_NO(e == -1 ? RAD_E_INVAL : e == -2 ? RAD_E_SHAPE
                         : e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);

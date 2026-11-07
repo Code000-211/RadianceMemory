@@ -735,6 +735,7 @@ int halo_rad_cast_f16        (const RadArgs*, RadStream);
 int halo_rad_cast_bf16       (const RadArgs*, RadStream);
 int halo_rad_pool_rows       (const RadArgs*, RadStream);
 int halo_rad_pool_cols       (const RadArgs*, RadStream);
+int halo_rad_point_fourier   (const RadArgs*, RadStream);
 int halo_rad_relu            (const RadArgs*, RadStream);
 int halo_rad_silu            (const RadArgs*, RadStream);
 int halo_rad_gelu            (const RadArgs*, RadStream);

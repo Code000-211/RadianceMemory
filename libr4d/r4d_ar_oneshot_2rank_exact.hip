@@ -18,6 +18,7 @@
 //  * Fine-grained memory (hipDeviceMallocFinegrained) is uncached and posted straight to the
 //    fabric, so system-scope release/acquire skip the L2 writeback. The drain/acq fences are
 //    selectable (default drain=1/acq=0 on fine-grained).
+#include "r4d_chain.h"
 #include "r4d.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
@@ -147,7 +148,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
 //
 // n is a multiple of eight, so a word never straddles a row and the block that reduces it owns
 // every stream element behind it.
-__global__ void r4d_ar_hc_write_kernel(
+__device__ __forceinline__ void r4d_ar_hc_write_kernel_body(
     int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
@@ -209,6 +210,26 @@ __global__ void r4d_ar_hc_write_kernel(
   }
 }
 
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+__global__ void r4d_ar_hc_write_kernel(
+    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
+    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
+    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
+    int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
+    unsigned int* gate_ctr, long stage) {
+    r4d_ar_hc_write_kernel_body(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, gate, gate_ctr, stage);
+}
+__global__ void r4dchain_ar_hc_write(
+    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
+    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
+    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
+    int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
+    unsigned int* gate_ctr, long stage) {
+    r4d_chain_wait();
+    r4d_ar_hc_write_kernel_body(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, gate, gate_ctr, stage);
+    r4d_chain_done();
+}
+
 // The same write with the MoE gather as its prologue. The routed experts' rows go back to token
 // order, y[t][i] = sum over t's slots, ascending, of w[t][j] * y_expert[slot][i] rounded to bf16,
 // with the shared arm folded in as moe_gather does; the word is pushed to the peer and kept as this
@@ -238,7 +259,7 @@ __global__ void r4d_ar_gather_inv_kernel(int* __restrict__ inv, const int* __res
 }
 
 template <bool INV>
-__global__ void r4d_ar_gather_hc_write_kernel(
+__device__ __forceinline__ void r4d_ar_gather_hc_write_kernel_body(
     int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
@@ -324,6 +345,28 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
                          reinterpret_cast<const unsigned short*>(&r));
   }
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <bool INV>
+__global__ void r4d_ar_gather_hc_write_kernel(
+    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
+    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
+    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
+    int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
+    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, long stage) {
+    r4d_ar_gather_hc_write_kernel_body<INV>(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, G, inv, gate, gate_ctr, stage);
+}
+template <bool INV>
+__global__ void r4dchain_ar_gather_hc_write(
+    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
+    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
+    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
+    int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
+    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, long stage) {
+    r4d_chain_wait();
+    r4d_ar_gather_hc_write_kernel_body<INV>(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, G, inv, gate, gate_ctr, stage);
+    r4d_chain_done();
 }
 
 // The IPC handle goes into a caller-owned buffer of R4D_AR_HANDLE_BYTES so this stays a C ABI.
@@ -420,7 +463,7 @@ int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, lon
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream_i, long nblocks, long nthreads,
-                     long drain, long acq, long gate, long gate_ctr, long stage) {
+                     long drain, long acq, long gate, long gate_ctr, long stage, long chain) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8) throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
   if (hc < 1 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
@@ -436,7 +479,7 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
   nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
-  r4d_ar_hc_write_kernel<<<nb, nt, 0, st>>>(
+  (chain ? r4dchain_ar_hc_write : r4d_ar_hc_write_kernel)<<<nb, nt, 0, st>>>(
       (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
       (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
       n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw,
@@ -448,7 +491,8 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
                            long n, long hc, long irow, long hrow, long ye, long ew, long sorted,
                            long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                            long top_k, long sig, long stream_i, long nblocks, long nthreads,
-                           long drain, long acq, long inv, long gate, long gate_ctr, long stage) {
+                           long drain, long acq, long inv, long gate, long gate_ctr, long stage,
+                           long chain) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
@@ -488,13 +532,13 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
   if (by_inv) {
     r4d_ar_gather_inv_kernel<<<1, 1024, 0, st>>>((int*)inv, (const int*)sorted, G.T);
-    r4d_ar_gather_hc_write_kernel<true><<<nb, nt, 0, st>>>(
+    (chain ? r4dchain_ar_gather_hc_write<true> : r4d_ar_gather_hc_write_kernel<true>)<<<nb, nt, 0, st>>>(
         (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
         (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr, stage);
   } else {
-    r4d_ar_gather_hc_write_kernel<false><<<nb, nt, 0, st>>>(
+    (chain ? r4dchain_ar_gather_hc_write<false> : r4d_ar_gather_hc_write_kernel<false>)<<<nb, nt, 0, st>>>(
         (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,

@@ -19,13 +19,24 @@ Written by Deadcode, with contributions from:
   Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files, Gemma 4's E2B/E4B form (KV-shared
   layers, per-layer embeddings, clipped vision linears) with NVIDIA-Nemotron-3.5-Bolt-E4B, its audio
   encoder, its i8a8 linears and its KV heads replicated over ranks, 4-bit weights at decode heights
-  through w4a16_asym, and the Ornith-1.5-122B compose files
+  through w4a16_asym, the Ornith-1.5-122B compose files, the Gemma 4 31B's asymmetric int5
+  linears (w5a8i8 and w5a16), the junctions at quant_act_i8g's grid (rmsnorm_quant_i8g,
+  gelu_mul_quant_i8g and ar_rmsnorm_quant_i8g) with the prefill overlap on the i8a8, a4 and w5
+  grids, the 31B's i8g, heretic-ara-i8g and w5 compose files, and Ling-3.0-flash (bailing_hybrid:
+  KDA, dense latent attention, group-limited sigmoid routing, the clipped SwiGLU and its MTP layer as
+  a serial drafter) with mla_attn_paged, its w4a8 recipes and compose files, possessive quantifiers
+  in the tokenizer's patterns, the Grafana dashboard's first screen, and Gemma 4 12B (its picture
+  and audio embedders, a picture's placeholders read both ways on the sliding layers, the windowed
+  attention at head_dim 512, suppress_tokens) with its compose files
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
   coupling with its cooperative verify (--draft-coupling), the W4A8 prefill's tail scale read, the
   ISA instruments' VGPR granule, back-edge count and fail-closed parse, scored steps
   (rad_declare_scores, RadBatch::score_only), the gated prefill fold, the short-prompt split row and
-  the rows forms of rmsnorm and rope, and LFM2's 8-bit trunk with the d1-3B recipe
+  the rows forms of rmsnorm and rope, LFM2's 8-bit trunk with the d1-3B recipe, the file tier's
+  routed reads with their own router's counts and its deposit wait, the stop-string hold-back, and
+  the sampler's planes by the step's token bound, its n-gram ban beside a drafter and no candidate
+  cut over a top-1 row
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
@@ -85,7 +96,8 @@ Written by Deadcode, with contributions from:
   split by depth, the delta net's out-projection read beside its decode recurrent update, the MXFP4
   feed-forward's gated fold up to 16 rows, the three-wave verify floor bounded by the batch's
   workgroups, the split-KV row sum read with fetch-inactive, KLATE again for the head-256 gqa6
-  paged prefill, and the preempted-prefill gate past a KV group that holds no blocks
+  paged prefill, the preempted-prefill gate past a KV group that holds no blocks, and the norms'
+  lane sum issuing its reads eight at a time
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
   linears' operands directly
@@ -106,7 +118,8 @@ Written by Deadcode, with contributions from:
   one-sequence KV floor over the live plan, and prefill staging paid by expert residency
 - Memoria: the dashboard's decode floor and recent window, the sparklines' percentile range, and
   the bringup time in /stats, the acceptance tiles' live figures and statsdump's size-capped
-  rotation
+  rotation, the dashboard's history line, session extremes, card-count changes and Requests-header
+  JSON export, with the page's JavaScript driven by tests/js
 - C_Tamas: control vectors, loaded when the deployment asks and applied as a per-layer residual
   projection, KV streaming for a context bigger than VRAM (--kv-resident), and the dashboard's
   request history, KV streaming traffic and one-unit KV meter
@@ -118,7 +131,11 @@ Written by Deadcode, with contributions from:
 - farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix
 - gostar: snapshot-backed prefix KV kept across recomputes, and Tencent's Hy-Memory (HYV3) -- its
   BF16, FP8 and GGUF adapters, its KV scales, its native sectioned tool calls, and its W4 decode
-  (the per-128 I4 expert packing, the one-row W4/W5 epilogue and the fused prologue and folds)
+  (the per-128 I4 expert packing, the one-row W4/W5 epilogue and the fused prologue and folds),
+  and the head-256 prefill softmax rescaled by row rather than by wave, Spark 2.5 (spark25: bf16 and
+  rotated-int8 IQ8R checkpoints, tensor parallelism with exact collectives, reasoning and tagged
+  tool calls) with its DSpark drafter (exact attention and Markov walk ops), the prefill split keyed
+  by live KV bounds, and --gpu-memory-mib
 - launch80_assets: tuning collectives as the exchange they serve at the served configuration, the
   per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch
 - hugypufy: M2XFP4 -- its quantiser, its GEMMs and its linears in the Qwen3.8 trunk and the DFlash2
@@ -134,7 +151,9 @@ Written by Deadcode, with contributions from:
 - Dad_Vibes: hc_read's decode kernels as one grid, its tiled up-mix pipelined and its one-grid
   wait trapping past its deadline, and gemm_fp8a8's narrow form with its scales staged through LDS
   and its gated three-tile form at 8 waves
-- RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library
+- RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library, and its wave-matrix rewrite: the GEMMs
+  retiled to 16x128 blocks, the grouped MoE GEMMs, the norms and quantisers, and the QSA and MoE
+  router rows
 - fl0l0u: every request entry point bounded, gated and sanitised (JSON parses bounded in depth,
   errors safe on invalid UTF-8, control bytes kept off the log, the dashboard's CSP, cross-origin
   browsers refused on the loopback-only routes, method-scoped API-key exemptions), prompt ids that
@@ -150,6 +169,8 @@ Written by Deadcode, with contributions from:
   hot VRAM cache with its deposits and copyless relabels, and GLM-5.3-Flash's experts read
   file-direct under expert parallelism -- the stall watch counting drive reads as progress, and
   the DMA lane's lists fenced so a stalled read pointer no longer fills its ring
+- pokesjw: the n-gram reader refilling its reads as they land, and a decode gather waiting on the
+  other rank's read of a row instead of reading it again
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

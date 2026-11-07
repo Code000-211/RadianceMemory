@@ -595,6 +595,46 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_mx(const RadParam* p, int n_p, uint64_t 
 }
 
 /* ==========================================================================================
+ * gemm_nt_q_gated at i8a8h -- the same fold over an IQR gate_up weight (r4d_iqr.h) under the
+ * rotated int8 trunk. (row: gemm_iqr_gated, M <= 16; kernel: libr4d/r4d_gemm_iqr.hip, the gated
+ * forms of its GEMV and 16-token tile, each byte-identical to the GEMM row gemm_iqr_nt_m64 serves
+ * at that M followed by gated_had_quant_i8g.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] q  [5] scale  [6] out_bf16
+ *
+ * As gemm_nt_q_gated's chain, with `dtype` i8a8h on the GEMM and the rotated int8 quantiser.
+ */
+extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t present, int step,
+                                            RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    const char* dt = r4d_pgets(p, n_p, "dtype");
+    if (M <= 0 || N <= 0 || K <= 0 || N % 2) return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (!dt || std::strcmp(dt, "i8a8h")) return RAD_E_UNSUPPORTED;
+    if (!act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_q");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
+        return s.wire({ 0, 1, 2, 3, RAD_FUSE_TMP(0), RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    case 1: {
+        Step s(out, "gated_had_quant_i8g");
+        s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).mirror(p, n_p, "group")
+         .pstr("dtype", "bf16").mirror(p, n_p, "act");
+        return s.wire({ RAD_FUSE_TMP(0), 4, 5, 6 });   /* gate_up, q, scale, out_bf16 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * gdn_conv_recurrent_update -- the decode convolution folded into the recurrent update's prologue.
  * (row: gdn_conv_recurrent_update_k128_v128_bf16; kernel: libr4d/
  * r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip, r4d_gdn_recurrent_update_kernel under CV)

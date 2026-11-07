@@ -295,7 +295,13 @@ int SafeTensorsFile::open(const std::string& path) {
             return RAD_E_FORMAT;
         }
 
-        index_.emplace(t.name, tensors_.size());
+        /* A JSON object's keys are unique; a header naming one tensor twice has two answers to
+         * find() and is refused rather than resolved to the first. */
+        if (!index_.emplace(t.name, tensors_.size()).second) {
+            RAD_ERR("%s: the header names '%s' twice", path.c_str(), name.c_str());
+            close();
+            return RAD_E_FORMAT;
+        }
         tensors_.push_back(std::move(t));
 
         if (!sc.eat(',')) break;

@@ -1,0 +1,16 @@
+# Gemma 4 12B-it at bf16 on two cards: every weight as Google released it, Google's assistant head
+# merged in as the MTP drafter (depth 3). Pictures and audio go in through the 12B's own embedders (no
+# vision tower, no audio encoder). bf16 KV: fp8 KV costs the 12B more than it saves. Thinking is off,
+# as in Google's template; switch it per request (chat_template_kwargs). Sampling as the checkpoint's
+# generation_config states it (temperature 1.0, top_p 0.95, top_k 64).
+name: radiance-gemma4-12b-bf16
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-gemma4-12b-bf16
+    command: >
+      --model /models/gemma4-12b-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
+      --tp 2 --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype bf16
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048 --mm-max-patches 1120
+      --temp 1.0 --top-p 0.95 --top-k 64 --chat-template-kwargs '{"enable_thinking":false}'

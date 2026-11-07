@@ -136,6 +136,150 @@ struct FakeKV : IKVManager {
         return b;
     }
 
+    /* ---- window residency, as KVManager's block: a cold entry is -2 - slot and owns no pool
+     * block; a demoted block stays held until the copy is reported landed. `res_group` is the one
+     * group with a window; `res_open` is the store being open. */
+    int32_t res_group = -1;
+    int64_t res_window = 0;
+    bool    res_open = false;
+    int32_t res_next_slot = 0;
+    int64_t res_cold = 0;                               /* cold entries now in tables */
+    std::vector<std::pair<int32_t, int32_t>> res_held;  /* (group, block) demoted, not yet landed */
+    int64_t res_slots_out = 0;                          /* slots handed out and not freed */
+    void drop_entry(int32_t g, int32_t b) {
+        if (b >= 0) release(g, b);
+        else if (b <= -2) { --res_cold; --res_slots_out; }
+    }
+    int32_t n_groups() const override { return (int32_t)gs.size(); }
+    int64_t residency_window(int32_t g) const override { return res_open && g == res_group ? res_window : 0; }
+    int residency_demote(uint64_t id, int32_t g, int64_t head, int64_t tail, int64_t max,
+                         std::vector<BlockMove>* out) override {
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return RAD_E_NOTFOUND;
+        if (!res_open || g != res_group) return RAD_E_INVAL;
+        auto& tbl = it->second.blocks[(size_t)g];
+        const int64_t end = (int64_t)tbl.size();
+        int64_t last = std::min<int64_t>(end - tail, end - 1);
+        for (int64_t i = head; i < last && max > 0; ++i) {
+            const int32_t b = tbl[(size_t)i];
+            if (b < 0 || refcnt[(size_t)g][(size_t)b] > 1) continue;
+            const int32_t slot = res_next_slot++;
+            tbl[(size_t)i] = -2 - slot;
+            it->second.dirty[(size_t)g] = std::min<int64_t>(it->second.dirty[(size_t)g], i);
+            res_held.push_back({ g, b });
+            ++res_cold; ++res_slots_out; --max;
+            out->push_back(BlockMove{ g, b, slot });
+            res_dem.push_back(out->back());
+        }
+        return RAD_OK;
+    }
+    /* Blocks only the prefix cache holds, (group, block), oldest first, and the budget each call
+     * of residency_demote_cached was given. */
+    std::vector<std::pair<int32_t, int32_t>> res_idle;
+    std::vector<int64_t> res_idle_asks;
+    int64_t residency_demote_cached(int64_t max, std::vector<BlockMove>* out) override {
+        res_idle_asks.push_back(max);
+        int64_t n = 0;
+        for (; n < max && !res_idle.empty(); ++n) {
+            const auto [g, b] = res_idle.front();
+            res_idle.erase(res_idle.begin());
+            res_held.push_back({ g, b });
+            ++res_slots_out;
+            out->push_back(BlockMove{ g, b, res_next_slot++ });
+            res_dem.push_back(out->back());
+        }
+        return n;
+    }
+    void residency_demote_landed() override {
+        for (auto& [g, b] : res_held) release(g, b);
+        res_held.clear();
+        res_dem.clear();
+    }
+    int residency_promote_all(uint64_t id, std::vector<BlockMove>* out) override {
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return RAD_E_NOTFOUND;
+        if (!res_open) return RAD_OK;
+        auto& tbl = it->second.blocks[(size_t)res_group];
+        int64_t cold = 0;
+        for (int32_t e : tbl) cold += e <= -2;
+        if (cold > (int64_t)freelist[(size_t)res_group].size()) return RAD_E_FULL;
+        for (size_t i = 0; i < tbl.size(); ++i) {
+            if (tbl[i] > -2) continue;
+            const int32_t slot = -2 - tbl[i], b = grab(res_group);
+            tbl[i] = b;
+            it->second.dirty[(size_t)res_group] =
+                std::min<int64_t>(it->second.dirty[(size_t)res_group], (int64_t)i);
+            --res_cold;
+            out->push_back(BlockMove{ res_group, b, slot });
+            res_pro.push_back(out->back());
+        }
+        return RAD_OK;
+    }
+    void residency_complete() override { res_slots_out = res_cold; res_pro.clear(); }
+    /* Moves named and not yet landed, as KVManager's records; what was put back or held. */
+    std::vector<BlockMove> res_dem, res_pro;
+    int64_t res_aborted = 0, res_quarantined = 0;
+    std::vector<std::pair<int32_t, int32_t>> res_stuck;   /* blocks held for good */
+    int64_t residency_abort(const std::vector<BlockMove>& mv, bool to_host,
+                            std::vector<uint64_t>* out) override {
+        int64_t n = 0;
+        auto note = [&](uint64_t id) {
+            if (out && std::find(out->begin(), out->end(), id) == out->end()) out->push_back(id);
+        };
+        auto same = [](const BlockMove& a, const BlockMove& b) {
+            return a.group == b.group && a.block == b.block && a.host_slot == b.host_slot;
+        };
+        for (const BlockMove& m : mv) {
+            auto& rec = to_host ? res_dem : res_pro;
+            auto r = std::find_if(rec.begin(), rec.end(), [&](const BlockMove& x) { return same(x, m); });
+            if (r == rec.end()) continue;
+            rec.erase(r);
+            const int32_t want = to_host ? -2 - m.host_slot : m.block;
+            bool in_table = false;
+            for (auto& [id, q] : seqs) {
+                auto& tbl = q.blocks[(size_t)m.group];
+                for (size_t i = 0; i < tbl.size(); ++i) {
+                    if (tbl[i] != want) continue;
+                    tbl[i] = to_host ? m.block : -2 - m.host_slot;
+                    q.dirty[(size_t)m.group] = std::min<int64_t>(q.dirty[(size_t)m.group], (int64_t)i);
+                    in_table = true;
+                    note(id);
+                }
+            }
+            if (to_host) {
+                auto h = std::find(res_held.begin(), res_held.end(), std::make_pair(m.group, m.block));
+                if (h != res_held.end()) res_held.erase(h);
+                --res_slots_out;
+                if (in_table) --res_cold;
+                else res_idle.push_back({ m.group, m.block });   /* the cache's again */
+            } else {
+                release(m.group, m.block);
+                ++res_cold;
+            }
+            ++n;
+        }
+        res_aborted += n;
+        return n;
+    }
+    int64_t residency_fail_inflight(std::vector<uint64_t>* out) override {
+        for (auto& [id, q] : seqs) {
+            bool hit = false;
+            for (const BlockMove& m : res_dem)
+                for (int32_t e : q.blocks[(size_t)m.group]) hit |= e == -2 - m.host_slot;
+            for (const BlockMove& m : res_pro)
+                for (int32_t e : q.blocks[(size_t)m.group]) hit |= e == m.block;
+            if (hit && out) out->push_back(id);
+        }
+        for (const BlockMove& m : res_pro) { retain(m.group, m.block); res_stuck.push_back({ m.group, m.block }); }
+        res_stuck.insert(res_stuck.end(), res_held.begin(), res_held.end());
+        const int64_t n = (int64_t)(res_dem.size() + res_pro.size());
+        res_held.clear();
+        res_dem.clear();
+        res_pro.clear();
+        res_quarantined += n;
+        return n;
+    }
+
     int64_t rows_for(int gi, int64_t n) const {
         const KVGeom::G& e = geom.g[(size_t)gi];
         return e.paged ? (n + e.block_size - 1) / e.block_size : 1;
@@ -173,7 +317,7 @@ struct FakeKV : IKVManager {
         if (it == seqs.end()) return;
         for (size_t i = 0; i < gs.size(); ++i) {
             if (geom.g[i].paged)
-                for (int32_t b : it->second.blocks[i]) release((int32_t)i, b);
+                for (int32_t b : it->second.blocks[i]) drop_entry((int32_t)i, b);
             it->second.blocks[i].clear();
             if (it->second.state[i] >= 0) {
                 state_free[i].push_back(it->second.state[i]);
@@ -222,7 +366,11 @@ struct FakeKV : IKVManager {
         Seq& q = it->second;
         q.blocks[(size_t)g] = blocks;
         q.dirty[(size_t)g] = 0;
-        for (int32_t b : blocks) retain(g, b);
+        /* A cold entry (the cache indexes them) is adopted as it is: one more table holds its slot. */
+        for (int32_t b : blocks) {
+            if (b >= 0) retain(g, b);
+            else { ++res_cold; ++res_slots_out; }
+        }
         if (n > q.n) q.n = n;
         return RAD_OK;
     }
@@ -232,7 +380,7 @@ struct FakeKV : IKVManager {
         if (it == seqs.end()) return RAD_E_NOTFOUND;
         for (size_t i = 0; i < gs.size(); ++i) {
             if (geom.g[i].paged)
-                for (int32_t b : it->second.blocks[i]) release((int32_t)i, b);
+                for (int32_t b : it->second.blocks[i]) drop_entry((int32_t)i, b);
             it->second.blocks[i].clear();
             it->second.dirty[i] = 0;
             if (it->second.state[i] >= 0) {
@@ -332,6 +480,14 @@ struct FakeKV : IKVManager {
         return n;
     }
     int64_t first_block_pos(uint64_t, int32_t) const override { return 0; }
+
+    /* The pager's operands for one group (spec §7.3), as a manager with an open store hands them
+     * out; the default is a group with no window. `pager_scratch` is rows x pitch pool ids. */
+    int32_t pager_group = -1;
+    int64_t pager_pitch = 0;
+    Pager   pager_view;
+    int64_t scratch_pitch(int32_t g) const override { return g == pager_group ? pager_pitch : 0; }
+    Pager pager(int32_t g, int) const override { return g == pager_group ? pager_view : Pager{}; }
     int64_t take_table_changes(uint64_t id, int32_t g) const override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return 0;
@@ -428,6 +584,17 @@ struct FakePC : IPrefixCache {
             int32_t g = groups[i];
             int64_t nb = n_tokens / kv->geom.g[(size_t)g].block_size;
             for (int64_t b = 0; b < nb; ++b) seeded[i].push_back(kv->grab(g));
+        }
+    }
+
+    /* seed(), then turn `n` entries of group `groups[0]` from `first` on cold: the cache indexes a
+     * paged-out conversation's middle, so the pool blocks go back and the entries name store slots
+     * (-2 - slot), as KVManager::residency_demote leaves a published chain. */
+    void seed_cold(int32_t n_tokens, int64_t first, int64_t n) {
+        seed(n_tokens);
+        for (int64_t k = first; k < first + n; ++k) {
+            kv->release(groups[0], seeded[0][(size_t)k]);
+            seeded[0][(size_t)k] = -2 - (int32_t)(1000 + k);
         }
     }
 

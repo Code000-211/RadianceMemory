@@ -171,6 +171,7 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     per_.clear();
     entry_groups_.clear();
     map_.clear(); lru_.clear();
+    by_block_.clear();
     ck_by_prefix_.clear(); ck_by_session_.clear();
     /* set_policy() may override this afterwards. */
     policy_ = make_checkpoint_policy(cfg.checkpoint_policy, checkpoint_interval);
@@ -178,6 +179,8 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     report_.clear();
 
     if (!kv) return RAD_E_INVAL;
+    kv->set_residency_cache(nullptr);
+    kv->set_residency_cache_restore(nullptr);
     if (!cfg.prefix_cache) {
         report_ = "prefix cache: disabled by --no-prefix-cache\n";
         return RAD_OK;
@@ -255,6 +258,11 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     }
 
     enabled_ = true;
+    /* Window residency demotes what the cache holds too: an idle conversation keeps no block of
+     * its chain in VRAM, and a block a live sequence shares with the cache follows it. */
+    kv->set_residency_cache([this](int32_t g, int32_t b, int32_t cold) { return repoint_cold(g, b, cold); });
+    kv->set_residency_cache_restore(
+        [this](int32_t g, int32_t cold, int32_t b) { return restore_resident(g, cold, b); });
     report_ = fmt("prefix cache: %zu paged group(s) in %lld-token entries; checkpoints "
                   "every %lld tokens (%lld slots of %s a rank, pinned host memory), retention "
                   "'%s'\n",
@@ -420,10 +428,12 @@ bool PrefixCache::retain_entry(const std::vector<std::vector<int32_t>>& bt, int6
     for (size_t g = 0; g < groups_.size(); ++g)
         for (int32_t j = 0; j < per_[g]; ++j, ++k) {
             const int32_t blk = bt[g][(size_t)(b * per_[g] + j)];
-            if (kv_->retain_block(groups_[g], blk) >= 0) { (*out)[k] = blk; continue; }
+            /* An entry, not a block: a cold id (KVManager window residency) is retained on its
+             * store slot, so the cache indexes it and a hit adopts it cold. */
+            if (kv_->retain_entry(groups_[g], blk) >= 0) { (*out)[k] = blk; continue; }
             /* Unwind exactly what was retained: anything else leaks a block or frees one under a
              * live sequence. */
-            for (size_t i = 0; i < k; ++i) kv_->release_block(entry_groups_[i], (*out)[i]);
+            for (size_t i = 0; i < k; ++i) kv_->release_entry(entry_groups_[i], (*out)[i]);
             out->clear();
             return false;
         }
@@ -439,11 +449,14 @@ int PrefixCache::insert(uint64_t session,
     if (blocks.size() != groups_.size()) return RAD_E_INVAL;
     if (n_tokens > (int64_t)tokens.size()) return RAD_E_INVAL;
 
-    const int64_t n_full = n_tokens / block_size_;
+    int64_t n_full = n_tokens / block_size_;
     if (n_full <= 0) return RAD_OK;
     for (size_t g = 0; g < blocks.size(); ++g)
         if ((int64_t)blocks[g].size() < n_full * per_[g]) return RAD_E_INVAL;
 
+    /* A cold entry (< 0: KVManager window residency) is indexed like a pool id: the cache holds a
+     * reference on its store slot (retain_entry), and a hit adopts it cold. Only the idle tiers
+     * cannot take one (see cold_entry). */
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
     const uint64_t now = rad_mono_ns();
     for (int64_t b = 0; b < n_full; ++b) {
@@ -460,10 +473,17 @@ int PrefixCache::insert(uint64_t session,
              * tier copy goes (IdleTiers::rebound). An entry with a promotion in flight is left
              * alone. */
             if (!tiers_ || !tiers_->resident_off_device(h)) continue;
+            /* The tiers gather pool blocks; a cold id cannot be one. The entry stays off-device
+             * and the next turn recomputes it. */
+            bool cold = false;
+            for (const auto& bt : blocks) for (int32_t j = 0; j < per_[(size_t)(&bt - &blocks[0])]; ++j)
+                cold = cold || bt[(size_t)(b * per_[(size_t)(&bt - &blocks[0])] + j)] < 0;
+            if (cold) continue;
             std::vector<int32_t> mine;
             if (!retain_entry(blocks, b, &mine)) return RAD_E_STATE;
             Entry& e = it->second;
             e.blocks = std::move(mine);
+            index_blocks(h, e);
             e.used_ns = now;
             lru_.push_back(h);
             e.lru = std::prev(lru_.end());
@@ -480,7 +500,7 @@ int PrefixCache::insert(uint64_t session,
         lru_.push_back(h);
         e.lru = std::prev(lru_.end());
         e.in_lru = true;
-        map_.emplace(h, std::move(e));
+        index_blocks(h, map_.emplace(h, std::move(e)).first->second);
         if (b > 0) {
             auto p = map_.find(hs[(size_t)b - 1]);
             if (p != map_.end() && p->second.n_children < 255) ++p->second.n_children;
@@ -498,7 +518,7 @@ int PrefixCache::insert(uint64_t session,
     if (tiers_ && demotable_) {
         for (int64_t b = 0; b < n_full; ++b) {
             auto it = map_.find(hs[(size_t)b]);
-            if (it == map_.end()) continue;
+            if (it == map_.end() || cold_entry(it->second)) continue;
             tiers_->note_used(hs[(size_t)b], it->second.blocks, now, b);
         }
     }
@@ -596,7 +616,7 @@ void PrefixCache::drop_offdevice(const BlockHash& key) {
     auto it = map_.find(key);
     if (it == map_.end()) return;
     /* No release_block: the ids name blocks the pool has reassigned (see the declaration). */
-    if (it->second.in_lru) lru_.erase(it->second.lru);
+    if (it->second.in_lru) { lru_.erase(it->second.lru); unindex_blocks(it->second); }
     map_.erase(it);
     ++stats_.evictions;
     /* A snapshot under the same key stays: no lookup reaches it past the missing block, and
@@ -613,7 +633,9 @@ int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks
      * refcount one with no sequence attached, and the cache's release path frees it from now on.
      * No extra retain. */
     Entry& e = it->second;
+    if (e.in_lru) unindex_blocks(e);
     e.blocks = blocks;
+    index_blocks(key, e);
     for (size_t k = 0; k < entry_groups_.size(); ++k)
         kv_->cache_reserved_block(entry_groups_[k], blocks[k]);
     if (!e.in_lru) {
@@ -628,7 +650,12 @@ int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks
 
 bool PrefixCache::shared_with_live(const Entry& e) const {
     for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k)
-        if (kv_->block_refcount(entry_groups_[k], e.blocks[k]) > 1) return true;
+        if (kv_->entry_refs(entry_groups_[k], e.blocks[k]) > 1) return true;
+    return false;
+}
+
+bool PrefixCache::cold_entry(const Entry& e) const {
+    for (int32_t b : e.blocks) if (b < 0) return true;
     return false;
 }
 
@@ -639,9 +666,54 @@ bool PrefixCache::same_tokens(const Entry& e, const int32_t* src) const {
            std::memcmp(e.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) == 0;
 }
 
-void PrefixCache::release_blocks(const Entry& e) {
+void PrefixCache::index_blocks(const BlockHash& h, const Entry& e) {
     for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k)
-        kv_->release_block(entry_groups_[k], e.blocks[k]);
+        if (e.blocks[k] >= 0) by_block_[block_key(entry_groups_[k], e.blocks[k])] = h;
+}
+
+void PrefixCache::unindex_blocks(const Entry& e) {
+    for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k)
+        if (e.blocks[k] >= 0) by_block_.erase(block_key(entry_groups_[k], e.blocks[k]));
+}
+
+bool PrefixCache::repoint_cold(int32_t g, int32_t b, int32_t cold) {
+    auto ix = by_block_.find(block_key(g, b));
+    if (ix == by_block_.end()) return false;
+    const BlockHash h = ix->second;
+    by_block_.erase(ix);
+    auto it = map_.find(h);
+    if (it == map_.end() || !it->second.in_lru) return false;
+    Entry& e = it->second;
+    for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k) {
+        if (entry_groups_[k] != g || e.blocks[k] != b) continue;
+        e.blocks[k] = cold;
+        /* The tiers gather pool blocks: a copy of this entry would now name a block that is no
+         * longer its, and its bytes are in the residency store already. */
+        if (tiers_) tiers_->forget_copy(h);
+        return true;
+    }
+    return false;
+}
+
+/* A scan, not an index: cold ids are not kept by block (by_block_ is resident blocks only), and
+ * this runs only when a demotion's copy could not be issued. */
+bool PrefixCache::restore_resident(int32_t g, int32_t cold, int32_t b) {
+    for (auto& [h, e] : map_) {
+        if (!e.in_lru) continue;
+        for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k) {
+            if (entry_groups_[k] != g || e.blocks[k] != cold) continue;
+            e.blocks[k] = b;
+            by_block_[block_key(g, b)] = h;
+            return true;
+        }
+    }
+    return false;
+}
+
+void PrefixCache::release_blocks(const Entry& e) {
+    unindex_blocks(e);
+    for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k)
+        kv_->release_entry(entry_groups_[k], e.blocks[k]);
 }
 
 int64_t PrefixCache::evict_lru(int64_t n) {
@@ -704,6 +776,10 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
             it = next;
             continue;
         }
+        /* Nothing in the pool to give back: an entry of cold ids frees store slots, not blocks. */
+        bool pooled = false;
+        for (int32_t b : e.blocks) pooled = pooled || b >= 0;
+        if (!pooled) { ++it; continue; }
         /* Skip an entry whose copy is still in flight; one the tier cannot hold never gets a copy. */
         if (keep && demotable_ && !tiers_->droppable(h)) { ++it; continue; }
         it = lru_.erase(it);
@@ -775,6 +851,7 @@ void PrefixCache::clear() {
     }
     map_.clear();
     lru_.clear();
+    by_block_.clear();
     drop_wait_.clear();
 }
 

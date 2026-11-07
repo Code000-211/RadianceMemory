@@ -416,13 +416,20 @@ void wait_windows(GbnfGrammar& g, const Vocab& vb, int n) {
 /* Waiting costs the same at any length. A lazy grammar sees every token of the reply until its
  * word appears, and each speculative window copies its state twice; the last tokens of a long
  * reply must cost what the first did. Counted in work, 20,000 windows at the start and again after
- * 200,000 more. */
+ * 200,000 more, each the least of three runs: under the CPU-time fallback (a container build, tests
+ * beside it) one run alone came out 1.65x the other. */
 TEST(lazy_grammar_waiting_work_does_not_grow_with_the_reply) {
     Vocab vb;
     auto g = make(vb, true, { "<tool_call>\n" }, {});
-    const uint64_t first = radtest::work().of([&] { wait_windows(*g, vb, 20000); });
+    auto least = [&] {
+        uint64_t m = UINT64_MAX;
+        for (int k = 0; k < 3; ++k)
+            m = std::min(m, radtest::work().of([&] { wait_windows(*g, vb, 20000); }));
+        return m;
+    };
+    const uint64_t first = least();
     wait_windows(*g, vb, 200000);
-    const uint64_t last = radtest::work().of([&] { wait_windows(*g, vb, 20000); });
+    const uint64_t last = least();
     CHECK(g->awaiting_trigger());
     std::printf("  lazy wait: %llu then %llu %s per 20k windows\n", (unsigned long long)first,
                 (unsigned long long)last, radtest::work().unit());

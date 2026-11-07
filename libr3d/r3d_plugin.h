@@ -163,14 +163,13 @@ int r3d_relayout_gemm_nt_q_w5a16(const RadParam* p, int n_p, int operand, const 
                                  int64_t dst_bytes);
 int r3d_rad_gemm_nt_q_fp8    (const RadArgs* a, RadStream s);
 
-/* --- r3d_gdn_kkt_solve_c64.hip: the gated-delta-net chunk preamble, the gram and the blocked
- * inverse of I + the strictly lower decayed gram, one 64-chunk a workgroup. --- */
-int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s);
+/* --- r3dh_gdn_kkt_solve.hip (libhalo's): the gated-delta-net chunk preamble, the gram and the
+ * blocked inverse of I + the strictly lower decayed gram, one 64-chunk a workgroup. --- */
+extern "C" int r3dh_rad_gdn_kkt_solve(const RadArgs* a, RadStream s);
 
-
-/* --- r3d_gdn_chunk_scan_k128_v128_c64.hip: the gated-delta-net chunked scan, the chunk's
- * output and its closing state, the recurrent state in wave-matrix accumulators. --- */
-int r3d_rad_gdn_chunk_scan(const RadArgs* a, RadStream s);
+/* --- r3dh_gdn_chunk_scan.hip (libhalo's): the gated-delta-net chunked scan, the chunk's output
+ * and its closing state, the recurrent state in wave-matrix accumulators. --- */
+extern "C" int r3dh_rad_gdn_chunk_scan(const RadArgs* a, RadStream s);
 
 /* --- r3d_gdn_gated_rmsnorm_h128.hip: the gated RMS norm a gated-delta-net layer applies to its
  * own output, one wave per (token, head) row. */
@@ -185,9 +184,10 @@ int r3d_rad_gdn_gated_norm_hq_i8(const RadArgs* a, RadStream s);
 int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s);
 int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s);
 
-/* --- r3d_gdn_recurrent_update_k128_v128.hip: the gated-delta-net recurrent state update at
- * decode, the per-token state step against a paged fp32 state cache. */
-int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s);
+/* --- r3dh_gdn_recurrent_update.hip (libhalo's): the gated-delta-net recurrent state update at
+ * decode against the paged state cache, in either state form (per_candidate or anchor). */
+extern "C" int r3dh_rad_gdn_recurrent_update(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s);
 
 /* --- r3d_expert_scale_bf16.hip: each routing weight times its expert's own scale, in place. */
 int r3d_rad_expert_scale_bf16(const RadArgs* a, RadStream s);
@@ -198,6 +198,7 @@ int r3d_rad_moe_router_topk_bf16(const RadArgs* a, RadStream s);
 /* --- r3d_moe_scatter.hip: the routed slots' stable counting sort (small form). */
 int r3d_rad_moe_scatter(const RadArgs* a, RadStream s);
 int r3d_rad_moe_scatter_inv(const RadArgs* a, RadStream s);
+int64_t r3d_rad_moe_scatter_scratch(const RadArgs* a);
 
 /* --- r3d_moe_gather.hip: fold the expert outputs back to the token. */
 int r3d_rad_moe_gather(const RadArgs* a, RadStream s);
@@ -214,6 +215,15 @@ int r3d_rad_moe_gemm_mxfp4a8(const RadArgs* a, RadStream s);
 
 /* --- r3d_moe_gemm_w4a8.hip: the grouped GEMM with int4-weights / int8-activation experts. */
 int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s);
+
+/* --- r3d_moe_gemm_w4a4.hip: the grouped GEMM with int4-weights / int4-activation experts. */
+int r3d_rad_moe_gemm_w4a4(const RadArgs* a, RadStream s);
+int r3d_rad_dequant_w4(const RadArgs* a, RadStream s);
+int r3d_rad_row_topk_merge(const RadArgs* a, RadStream s);
+int r3d_rad_ngram_ids(const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_bias_fp8(const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_short_fp8(const RadArgs* a, RadStream s);
+int r3d_rad_moe_gemm_q_mod4(const RadArgs* a, RadStream s);
 
 /* --- r3d_had_quant_act_i8.hip: a block Hadamard along K, then per-row symmetric int8. */
 int r3d_rad_had_quant_act_i8(const RadArgs* a, RadStream s);

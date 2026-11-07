@@ -22,7 +22,8 @@
 struct RadModelMeta;
 
 namespace rad {
-namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket; }
+namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket;
+                struct ShapeRequest; struct ShapeGenInfo; }
 namespace mm { struct Frame; struct Item; }
 namespace server {
 
@@ -86,6 +87,20 @@ struct SchedMetrics {
     /* Removed by --prefix-cache-ttl, cumulative. Not evictions: nothing wanted the memory. */
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;
     int64_t prefix_released = 0, prefix_ckpt_released = 0;
+    /* Window residency (spec §7.3): blocks a sparse consumer's window does not cover, moved to the
+     * pinned store and back. `res_misses` is the link traffic a step paid because its selection
+     * named a cold block.
+     *
+     * `res_paged_in` is the pager's own count: cold entries it rewrote to scratch pages, summed
+     * over QSA layers and decode rows, read from a counter on the card (rank 0). It is the proof
+     * that paging happened, and is not per session. All zero with --kv-residency-mib 0. */
+    int64_t res_demoted = 0, res_promoted = 0, res_skipped = 0, res_misses = 0;
+    int64_t res_host_bytes = 0, res_cap_bytes = 0;
+    int64_t res_freed_bytes = 0;     /* VRAM the demotions gave back to the pool */
+    int64_t res_link_bytes = 0;      /* bytes over the link, both directions */
+    int64_t res_scratch_bytes = 0;   /* VRAM the pager's scratch pages hold */
+    int64_t res_paged_in = 0;        /* cold entries the pager rewrote (card counter, rank 0) */
+    int64_t res_paged_hits = 0;      /* of them, served by the page cache without a copy */
     /* Decoupled prefix caching (spec §7.3). `prefix_hit_rate` is the attention hit rate, as in
      * vLLM. The linear side hits at a different granularity (whole checkpoints, not blocks), so
      * it is reported separately, with token counts and checkpoints written. */
@@ -173,6 +188,13 @@ struct SessionStat {
     int64_t     snap_bytes = 0;
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
+    /* Window-residency counters for the session's sequence (spec §7.3), over its life. These
+     * overlap between sessions that share blocks: a block moved while one session's sequence
+     * held it is counted for that sequence only, though other sessions' prefixes may name it, so
+     * the sum over sessions is not the server's kv_residency (which counts each move once, and
+     * also moves of sequences whose session is gone). Zero with residency off. */
+    int64_t     res_demoted = 0, res_promoted = 0, res_skipped = 0;
+    int64_t     res_link_bytes = 0, res_freed_bytes = 0;
     bool        moving = false;   /* a transfer is outstanding */
 };
 
@@ -212,6 +234,7 @@ struct RequestStat {
     int32_t     slot = -1;
     double      age_s = 0;
     double      ttft_s = -1;       /* negative until the first token */
+    double      prefill_s = -1;    /* first token minus admission; negative until both */
     double      decode_tps = 0;
 };
 
@@ -812,6 +835,20 @@ public:
     virtual const VideoGenInfo& info() const = 0;
     /* Queue a request; refused at once, with `why`, when it can never run. */
     virtual int submit(std::unique_ptr<gen::VideoRequest> r, std::string* why) = 0;
+    virtual int64_t queued() const = 0;
+    virtual int64_t running() const = 0;
+};
+
+/* The shape generator (core/gen/shape_driver.h), for a model that makes a 3-D shape from a
+ * picture: its declared picture, sampler and grid (gen::ShapeGenInfo) and its request queue. The
+ * server prepares the picture (gen::shape_picture), queues the request, and meshes the field the
+ * ticket hands back. */
+class IShapeGen {
+public:
+    virtual ~IShapeGen() = default;
+    virtual const gen::ShapeGenInfo& info() const = 0;
+    /* Queue a request; refused at once, with `why`, when it can never run. */
+    virtual int submit(std::unique_ptr<gen::ShapeRequest> r, std::string* why) = 0;
     virtual int64_t queued() const = 0;
     virtual int64_t running() const = 0;
 };

@@ -68,6 +68,8 @@ set(R4D_UNITS
   # Two queries per KV head at head_dim 128 only (Qwen3-1.7B's 16 over 8, Qwen3-ASR's decoder):
   # the gqa8 body with the ratio set.
   "r4d_attn_paged_h128_gqa2|"
+  # Sixteen queries per KV head at head_dim 128 (Nemotron-H's 32 over 2 at one or two ranks).
+  "r4d_attn_paged_h128_gqa16|"
   "r4d_attn_vit_h72_bf16|"
   # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
@@ -116,6 +118,8 @@ set(R4D_UNITS
   "r4d_dsa|"
   "r4d_mla|"
   "r4d_kda|"
+  # Mamba-2's selective state update (Nemotron-H), the KDA kernel's register layout.
+  "r4d_ssd|"
   "r4d_moe_mxfp4|"
   "r4d_fp8_f32scale|"
   "r4d_ngram_ids|"
@@ -160,12 +164,16 @@ set(R4D_UNITS
   "r4d_gemm_fp8a8|"
   "r4d_gemm_iqr|"
   "r4d_iqr_embed|"
+  "r4d_logits_vocab|"
   "r4d_quant_act_fp8|"
+  # The normalised Hadamard rotation alone, in place (had_rotate: a rotated layer's q, k, v, output).
+  "r4d_had_rotate|"
   "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
   "r4d_gram_accum_fp8|"
   "r4d_qsa_block_key_bf16|"
   "r4d_qsa_score_bf16|"
+  "r4d_qsa_page_u8|"
   "r4d_qsa_select_bf16|"
   "r4d_kv_resolve|"
   "r4d_qsa_tail_store_bf16|"
@@ -193,6 +201,8 @@ set(R4D_UNITS
   "r4d_rowtopk_bf16|"
   # The vocab-sharded draft head's cross-rank top-1, one id a row.
   "r4d_pair_argmax_f32|"
+  # LiLiCorr's correlator: candidates, lattice attention, factor input, walk.
+  "r4d_lili|"
   # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
@@ -201,6 +211,7 @@ set(R4D_UNITS
   "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
+  "r4d_dflash_markov_bf16|"
   "r4d_dflash_tree_bf16|"
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.

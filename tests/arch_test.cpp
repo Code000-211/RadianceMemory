@@ -13,6 +13,9 @@
 #include "arch_fakes.h"
 
 #include <array>
+#include <cstring>
+#include <map>
+#include <random>
 #include <dlfcn.h>
 #include <sstream>
 #include <thread>
@@ -1881,6 +1884,109 @@ RadModelMeta qwen4exp_meta() {
     return m;
 }
 }  /* namespace */
+
+TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx build = build_ctx(0, 1);
+    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 0; build.max_ctx = 65536;
+    RadBuilder graph;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&graph, &meta, &build), RAD_OK);
+    rad_kvgroup kv_full = 0;
+    for (size_t i = 0; i < graph.kv_groups.size(); ++i)
+        if (graph.kv_groups[i].name.find("kv_attn") != std::string::npos) {
+            kv_full = (rad_kvgroup)(i + 1);
+            break;
+        }
+    REQUIRE(kv_full != 0);
+
+    RadCtx ctx{};
+    RadKVGroupBatch group{};
+    group.group = kv_full;
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_PREFILL;
+    batch.n_tok = 64; batch.n_seq = 1; batch.max_q_len = 64;
+    /* The split law uses the declared launch context, not this rounded live-batch bound. */
+    batch.max_ctx_len = 1024; batch.n_kv_groups = 1; batch.kv = &group;
+    int32_t used[1] = {2304};
+    const uint64_t key6 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    CHECK(key6 != 0);
+    used[0] = 2305;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), key6);
+    used[0] = 3072;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != key6);
+
+    /* Same rounded live bound, different exact grids under the launcher's model context. */
+    used[0] = 896;
+    const uint64_t key_896 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    used[0] = 1152;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != key_896);
+
+    /* A shorter one-sequence chunk still proves q_len = n_tok; do not require the model max_tok. */
+    used[0] = 2304;
+    batch.n_tok = 32; batch.max_q_len = 32;
+    const uint64_t key_chunk = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    CHECK(key_chunk != 0);
+    CHECK(key_chunk != key6);
+    batch.n_tok = 64; batch.max_q_len = 64;
+
+    batch.phase = RAD_PHASE_MIXED;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    batch.phase = RAD_PHASE_PREFILL; batch.draft_pass = 0; batch.n_seq = 2;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    batch.n_seq = 1; used[0] = 0;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+}
+
+/* Decode, verify and draft passes are recorded, keyed by the cap their live KV length puts on a
+ * split launcher (eight 48-key tiles a split, binding below 64 splits): one key within a level, another
+ * across it, the same past the last level, and none without a host summary or in a mixed pass. A pass
+ * left unkeyed (0) is issued op by op on every step (issue #402). */
+TEST(qwen4exp_pass_key_keys_decode_verify_and_draft_by_the_split_cap) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx build = build_ctx(0, 1);
+    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 5; build.max_ctx = 65536;
+    RadBuilder graph;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&graph, &meta, &build), RAD_OK);
+    rad_kvgroup kv_full = 0;
+    for (size_t i = 0; i < graph.kv_groups.size(); ++i)
+        if (graph.kv_groups[i].name.find("kv_attn") != std::string::npos) {
+            kv_full = (rad_kvgroup)(i + 1);
+            break;
+        }
+    REQUIRE(kv_full != 0);
+
+    RadCtx ctx{};
+    RadKVGroupBatch group{};
+    group.group = kv_full;
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_DECODE; batch.n_spec = 5;
+    batch.n_tok = 6; batch.n_seq = 1; batch.max_q_len = 6;
+    batch.max_ctx_len = 1024; batch.n_kv_groups = 1; batch.kv = &group;
+    int32_t used[1] = {400};                      /* 9 tiles: level 1 (337-720 keys) */
+    const uint64_t verify1 = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    CHECK(verify1 != 0);
+    used[0] = 720;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), verify1);
+    used[0] = 721;                                /* 16 tiles: level 2 */
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != verify1);
+    used[0] = 300;                                /* 7 tiles: level 0 */
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != verify1);
+    used[0] = 30000;                              /* past 64 splits' 24,576 keys: one key */
+    const uint64_t verify_long = qwen4exp_fp8::pass_key(&ctx, &batch, used);
+    used[0] = 60000;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), verify_long);
+
+    used[0] = 400;
+    batch.n_spec = 0; batch.n_tok = 1; batch.max_q_len = 1;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != 0);   /* plain decode */
+    batch.draft_pass = -1;
+    CHECK(qwen4exp_fp8::pass_key(&ctx, &batch, used) != 0);   /* the MTP head's draft pass */
+
+    used[0] = 0;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+    used[0] = 400; batch.draft_pass = 0; batch.phase = RAD_PHASE_MIXED;
+    CHECK_EQ(qwen4exp_fp8::pass_key(&ctx, &batch, used), (uint64_t)0);
+}
 
 TEST(qwen4exp_yarn_reaches_attention_indexer_and_compressed_keys) {
     RadModelMeta meta = qwen4exp_meta();
@@ -4950,6 +5056,130 @@ TEST(the_gemma4_31b_form_reads_asymmetric_int4_and_int5_linears) {
     }
 }
 
+/* Gemma 4 12B (`gemma4_unified`, served here through the arch id's alias) on the same twelve
+ * layers: width 3840, 16 query heads over 8 sliding KV heads and ONE global KV head, its layer
+ * schedule from layer_types. */
+const char* k_gem12_keys[] = {
+    "model_type", "sliding_window", "global_head_dim", "num_global_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor", "num_kv_shared_layers",
+    "final_logit_softcapping", "attention_k_eq_v", "hidden_size_per_layer_input", "layer_types",
+};
+const char* k_gem12_vals[] = {
+    "gemma4_unified", "1024", "512", "1", "10000", "1000000", "0.25", "0", "30", "1", "0",
+    "sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention "
+    "full_attention sliding_attention sliding_attention sliding_attention sliding_attention "
+    "sliding_attention full_attention",
+};
+
+RadModelMeta gemma4_12b_meta() {
+    RadModelMeta m = gemma4_meta();
+    m.name      = "test-gemma4-12b-form";
+    m.n_embd    = 3840;
+    m.n_head    = 16;
+    m.n_head_kv = 8;
+    m.n_ff      = 15360;
+    m.n_kv      = (int)(sizeof(k_gem12_keys) / sizeof(k_gem12_keys[0]));
+    m.kv_key    = k_gem12_keys;
+    m.kv_val    = k_gem12_vals;
+    return m;
+}
+
+/* At one rank the global class is 16 q heads over one KV head (gqa 16). At two and four the
+ * sliding heads split (4 and 2 a rank, gqa 2) and the global head is replicated: each rank keeps
+ * a share of the q heads (gqa 8 and 4) and the whole k row (rows 0..511), as one span or as the k
+ * part of a fused q|k. Each layer's attention reads its own cache in its class's group, and a
+ * step reduces the lookup and two a layer. */
+TEST(the_gemma4_12b_form_declares_and_steps_at_one_two_and_four_ranks) {
+    const int64_t L = 12, hs = 256, hg = 512;
+    for (bool fused : { false, true }) {
+        for (int world : { 1, 2, 4 }) {
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuilder b;
+                if (fused) {
+                    const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+                    b.encs = { { "attn_qkv.", e }, { "attn_o.", e }, { "ffn_gate_up.", e },
+                               { "ffn_down.", e } };
+                }
+                RadModelMeta meta = gemma4_12b_meta();
+                RadBuildCtx  ctx  = build_ctx(rank, world);
+                CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+                CHECK_EQ(gemma4_bf16::g_model[rank].fuse, fused);
+                REQUIRE_EQ((int)b.kv_groups.size(), 2);
+                CHECK_EQ(b.kv_groups[0].d.n_head_kv, 8 / world);
+                CHECK_EQ(b.kv_groups[0].d.head_dim, hs);
+                CHECK_EQ(b.kv_groups[1].d.n_head_kv, 1);
+                CHECK_EQ(b.kv_groups[1].d.head_dim, hg);
+                const int64_t nq = 16 / world;
+                if (!fused) {
+                    const RecOp* as = find_op(b, "attn_paged", 0);
+                    const RecOp* ag = find_op(b, "attn_paged", 5);
+                    REQUIRE(as != nullptr && ag != nullptr);
+                    CHECK_EQ(pint(as, "head_dim"), hs);
+                    CHECK_EQ(pint(as, "n_head"), nq);
+                    CHECK_EQ(pint(as, "gqa"), 2);
+                    CHECK_EQ(pint(as, "window"), 1024);
+                    CHECK_EQ(pint(ag, "head_dim"), hg);
+                    CHECK_EQ(pint(ag, "n_head"), nq);
+                    CHECK_EQ(pint(ag, "gqa"), 16 / world);
+                    CHECK_EQ(pint(ag, "window"), 0);
+                    const RecWeight* q0 = find_w(b, "blk.0.attn_q.weight");
+                    const RecWeight* k0 = find_w(b, "blk.0.attn_k.weight");
+                    const RecWeight* q5 = find_w(b, "blk.5.attn_q.weight");
+                    const RecWeight* k5 = find_w(b, "blk.5.attn_k.weight");
+                    REQUIRE(q0 && k0 && q5 && k5);
+                    CHECK_EQ(q0->d.shape[0], nq * hs); CHECK_EQ(q0->d.shape[1], 3840);
+                    CHECK_EQ(k0->d.shape[0], (8 / world) * hs);
+                    CHECK_EQ(q5->d.shape[0], nq * hg);
+                    CHECK_EQ(k5->d.shape[0], hg);
+                    CHECK(find_w(b, "blk.5.attn_v.weight") == nullptr);   /* k == v */
+                    CHECK(!k0->span_set);                                 /* an even share */
+                    CHECK_EQ(k5->span_set, world > 1);
+                    if (world > 1) { CHECK_EQ(k5->span_lo, 0); CHECK_EQ(k5->span_hi, hg); }
+                } else {
+                    const RecWeight* s0 = find_w(b, "blk.0.attn_qkv.weight");
+                    REQUIRE(s0 != nullptr);
+                    CHECK_EQ(s0->n_part_spans, 0);                        /* even shares */
+                    for (const char* v : { "weight", "scale" }) {
+                        const RecWeight* w = find_w(b, std::string("blk.5.attn_qkv.") + v);
+                        REQUIRE(w != nullptr);
+                        if (world == 1) { CHECK_EQ(w->n_part_spans, 0); continue; }
+                        REQUIRE_EQ(w->n_part_spans, 2);                   /* q and k, no v */
+                        CHECK_EQ(w->part_lo[0], rank * nq * hg);
+                        CHECK_EQ(w->part_hi[0], (rank + 1) * nq * hg);
+                        CHECK_EQ(w->part_total[0], 16 * hg);
+                        CHECK_EQ(w->part_lo[1], 0);
+                        CHECK_EQ(w->part_hi[1], hg);
+                        CHECK_EQ(w->part_total[1], hg);
+                    }
+                }
+
+                RadBatch batch = decode_batch();
+                RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+                gemma4_bf16::step(&c, &batch);
+                CHECK_LINT(b, &c);
+                CHECK(c.step_fail.empty());
+                std::vector<std::pair<int, int64_t>> kv;
+                for (const auto& i : c.issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o || (o->op != "attn_paged" && o->op != "attn_paged_qrow")) continue;
+                    REQUIRE(i.opd.size() > 1);
+                    CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_KV);
+                    kv.push_back({ (int)i.opd[1].handle, (int64_t)i.opd[1].offset });
+                }
+                REQUIRE_EQ((int)kv.size(), (int)L);
+                for (int l = 0; l < (int)L; ++l) {
+                    CHECK_EQ(kv[(size_t)l].first, (l % 6 == 5) ? 2 : 1);
+                    CHECK_EQ(kv[(size_t)l].second, (int64_t)l);
+                }
+                const std::vector<std::string> ops = issued_ops(b, c);
+                CHECK_EQ(count_issued(ops, "all_reduce") + count_issued(ops, "ar_rmsnorm_quant_i8"),
+                         world > 1 ? (int)(1 + 2 * L) : 0);
+            }
+        }
+    }
+}
+
 TEST(gemma4_attention_shapes_for_both_classes) {
     RadBuilder b;
     RadModelMeta meta = gemma4_meta();
@@ -5484,6 +5714,104 @@ TEST(gemma4_probe_names_the_heads_operating_depth) {
     RadModelMeta without = gemma4_meta();
     CHECK_OK(gemma4_bf16::probe(&without, &q));
     CHECK_EQ(q.draft_depth, 0);
+}
+
+/* The 12B's assistant: the same head under the name Gemma4UnifiedAssistantForCausalLM, width
+ * 1024 over a 3840 trunk, 16 q heads over the trunk's 8 sliding and one global KV head. */
+const char* k_gem12d_keys[] = {
+    "model_type", "sliding_window", "global_head_dim", "num_global_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor", "num_kv_shared_layers",
+    "final_logit_softcapping", "attention_k_eq_v", "hidden_size_per_layer_input", "layer_types",
+    "draft.architectures", "draft.backbone_hidden_size", "draft.use_ordered_embeddings",
+    "draft.text_config.hidden_size", "draft.text_config.num_hidden_layers",
+    "draft.text_config.layer_types", "draft.text_config.num_attention_heads",
+    "draft.text_config.num_key_value_heads", "draft.text_config.num_global_key_value_heads",
+    "draft.text_config.head_dim", "draft.text_config.global_head_dim",
+    "draft.text_config.intermediate_size", "draft.text_config.sliding_window",
+    "draft.text_config.vocab_size", "draft.text_config.rms_norm_eps",
+    "draft.text_config.rope_parameters.sliding_attention.rope_theta",
+    "draft.text_config.rope_parameters.full_attention.rope_theta",
+    "draft.text_config.rope_parameters.full_attention.partial_rotary_factor",
+};
+std::vector<const char*> gem12d_vals() {
+    std::vector<const char*> v(std::begin(k_gem12_vals), std::end(k_gem12_vals));
+    for (const char* s : { "Gemma4UnifiedAssistantForCausalLM", "3840", "0", "1024", "4",
+                           "sliding_attention sliding_attention sliding_attention full_attention",
+                           "16", "8", "1", "256", "512", "8192", "1024", "262144", "1e-06", "10000",
+                           "1000000", "0.25" })
+        v.push_back(s);
+    return v;
+}
+
+/* Declared at one, two and four ranks: the head's full layer is gqa 16, 8 and 4 over the trunk's
+ * one (replicated) global KV head, its sliding layers gqa 2. A pass reads layers 10 and 11. A head
+ * stating another global KV count than the trunk's is still refused. */
+TEST(the_gemma4_12b_assistant_is_declared_at_one_two_and_four_ranks) {
+    const std::vector<const char*> vals = gem12d_vals();
+    REQUIRE_EQ(vals.size(), sizeof(k_gem12d_keys) / sizeof(k_gem12d_keys[0]));
+    for (int world : { 1, 2, 4 }) {
+        for (int rank : { 0, world - 1 }) {
+            RadBuilder b;
+            RadModelMeta meta = gemma4_12b_meta();
+            meta.n_kv = (int)vals.size(); meta.kv_key = k_gem12d_keys; meta.kv_val = vals.data();
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_spec = 3;
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+            CHECK_EQ(b.drafter.depth, 3);
+            CHECK_EQ(count_op(b, "attn_paged"), 16);
+            const int64_t nq = 16 / world;
+            for (int l = 0; l < 4; ++l) {
+                const RecOp* at = find_op(b, "attn_paged", 12 + l);
+                REQUIRE(at != nullptr);
+                CHECK_EQ(pint(at, "n_head"), nq);
+                CHECK_EQ(pint(at, "head_dim"), l == 3 ? 512 : 256);
+                CHECK_EQ(pint(at, "gqa"), l == 3 ? nq : 2);
+            }
+            const RecWeight* wq3 = find_w(b, "mtp.blk.3.attn_q.weight");
+            const RecWeight* pre = find_w(b, "mtp.pre_proj.weight");
+            const RecWeight* post = find_w(b, "mtp.post_proj.weight");
+            REQUIRE(wq3 && pre && post);
+            CHECK_EQ(wq3->d.shape[0], nq * 512); CHECK_EQ(wq3->d.shape[1], 1024);
+            CHECK_EQ(pre->d.shape[0], 1024);     CHECK_EQ(pre->d.shape[1], 2 * 3840);
+            CHECK_EQ(post->d.shape[0], 3840);    CHECK_EQ(post->d.shape[1], 1024);
+            const RecMap* mpre = find_map(b, "mtp.pre_proj.weight");
+            REQUIRE(mpre != nullptr);
+            CHECK_EQ(mpre->src[0], std::string("draft.pre_projection.weight"));
+
+            RadBatch batch = head_batch(-1);
+            RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK(c.step_fail.empty());
+            int seen = 0;
+            for (const auto& i : c.issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o || o->op != "attn_paged") continue;
+                REQUIRE(i.opd.size() > 1);
+                CHECK_EQ((int)i.opd[1].handle, seen < 3 ? 1 : 2);
+                CHECK_EQ((long long)i.opd[1].offset, seen < 3 ? 10LL : 11LL);
+                ++seen;
+            }
+            CHECK_EQ(seen, 4);
+        }
+    }
+    std::vector<const char*> two = gem12d_vals();
+    two[20] = "2";   /* draft.text_config.num_global_key_value_heads */
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        RadModelMeta meta = gemma4_12b_meta();
+        meta.n_kv = (int)two.size(); meta.kv_key = k_gem12d_keys; meta.kv_val = two.data();
+        RadBuildCtx ctx = build_ctx(0, world);
+        ctx.max_spec = 3;
+        CHECK_EQ(stderr_of_rc([&] { return gemma4_bf16::declare(&b, &meta, &ctx); }),
+                 (int)RAD_E_INVAL);
+    }
+    RadArchProbe p{};
+    RadModelMeta with = gemma4_12b_meta();
+    with.n_kv = (int)vals.size(); with.kv_key = k_gem12d_keys; with.kv_val = vals.data();
+    CHECK_OK(gemma4_bf16::probe(&with, &p));
+    CHECK_EQ(p.draft_depth, gemma4_bf16::kHeadDepth);
 }
 
 /* ===================== gemma4: the 26B-A4B, a dense and a routed arm side by side ===================== */
@@ -7734,7 +8062,11 @@ TEST(gemma4_31b_dflash2_fc_splits_by_rows_without_changing_a_bit) {
             }
             if (o.op == "all_gather" && pint(&o, "row") == cs.share) {
                 ++fc_gathers;
-                CHECK_EQ(pint(&o, "numel"), (long long)(2048 * E));   /* the trunk's instance */
+                /* The trunk's instance, and a range: a sizing declare may not change it. */
+                const RecParam* ne = param(&o, "numel");
+                REQUIRE(ne != nullptr);
+                CHECK_EQ(ne->kind, (int)RAD_P_RANGE);
+                CHECK_EQ(ne->ihi, (long long)(2048 * E));
                 CHECK_EQ(pint(&o, "world_size"), (long long)cs.world);
             }
         }
@@ -9134,6 +9466,329 @@ TEST(qwen35_fp8_quantised_kv_is_refused_outside_h256_gqa6) {
     }
 }
 
+namespace {
+
+/* --kv-recipe, as the engine hands it over (RadBuildCtx::kv_recipe): indexed by layer, a
+ * RAD_KVQ_* or -1. The fixture's attention layers are 3 and 7 (eight layers, interval 4), and its
+ * MTP head is bound at 8. */
+std::vector<int32_t> q35_recipe(int at3, int at7) {
+    std::vector<int32_t> r(8, -1);
+    r[3] = at3;
+    r[7] = at7;
+    return r;
+}
+
+RadBuildCtx with_recipe(RadBuildCtx c, const std::vector<int32_t>& r) {
+    c.kv_dtype    = RAD_F8E4M3;
+    c.kv_recipe   = r.data();
+    c.n_kv_recipe = (int32_t)r.size();
+    return c;
+}
+
+/* The first difference between two recorded programs, or "" when there is none: every op with
+ * its parameters, weights and declared uses, every buffer, weight and KV group declaration byte
+ * for byte, the layer bindings and the notes. */
+std::string program_diff(const RadBuilder& a, const RadBuilder& b) {
+    if (a.ops.size() != b.ops.size()) return "op count";
+    for (size_t i = 0; i < a.ops.size(); ++i) {
+        const RecOp& x = a.ops[i];
+        const RecOp& y = b.ops[i];
+        const std::string at = "op " + std::to_string(i) + " (" + x.op + ")";
+        if (x.op != y.op || x.w != y.w || x.reads != y.reads || x.writes != y.writes ||
+            x.resolved != y.resolved || x.p.size() != y.p.size())
+            return at;
+        for (size_t j = 0; j < x.p.size(); ++j) {
+            const RecParam& p = x.p[j];
+            const RecParam& q = y.p[j];
+            if (p.key != q.key || p.kind != q.kind || p.ival != q.ival || p.ihi != q.ihi ||
+                p.dval != q.dval || p.sval != q.sval)
+                return at + ", parameter " + p.key;
+        }
+    }
+    if (a.bufs.size() != b.bufs.size()) return "buffer count";
+    for (size_t i = 0; i < a.bufs.size(); ++i) {
+        const RadBufDecl& x = a.bufs[i].d;
+        const RadBufDecl& y = b.bufs[i].d;
+        if (a.bufs[i].name != b.bufs[i].name || x.dtype != y.dtype || x.rank != y.rank ||
+            std::memcmp(x.shape, y.shape, sizeof x.shape) || x.kind != y.kind ||
+            x.domain != y.domain || x.kv != y.kv)
+            return "buffer " + a.bufs[i].name;
+    }
+    if (a.weights.size() != b.weights.size()) return "weight count";
+    for (size_t i = 0; i < a.weights.size(); ++i)
+        if (a.weights[i].name != b.weights[i].name) return "weight " + a.weights[i].name;
+    if (a.kv_groups.size() != b.kv_groups.size()) return "KV group count";
+    for (size_t i = 0; i < a.kv_groups.size(); ++i) {
+        const RecKV& x = a.kv_groups[i];
+        const RecKV& y = b.kv_groups[i];
+        if (x.name != y.name || std::memcmp(&x.d, &y.d, sizeof x.d) || x.zero != y.zero ||
+            x.replicated != y.replicated || x.dense != y.dense)
+            return "KV group " + x.name;
+    }
+    if (a.binds != b.binds) return "layer bindings";
+    if (a.notes != b.notes) return "notes";
+    return "";
+}
+
+}  /* namespace */
+
+/* A recipe giving every attention layer one layout is that layout's --kv-cache-dtype: the same
+ * ops with the same parameters, the same buffers, one group under the same name at the same
+ * declared row, so the same bytes a token and the same pages. fp8 included (kv_quant 0), and the
+ * MTP head bound into that group as before. */
+TEST(a_uniform_kv_recipe_is_the_matching_kv_cache_dtype_byte_for_byte) {
+    MetaKV mk = q35fp8_meta();
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+        RadBuildCtx flag = spec_ctx(0, 1, 3);
+        flag.kv_dtype = RAD_F8E4M3;
+        flag.kv_quant = q;
+        RadBuilder a;
+        REQUIRE_EQ(qwen35_fp8::declare(&a, mk.meta(), &flag), RAD_OK);
+
+        const std::vector<int32_t> r = q35_recipe(q, q);
+        const RadBuildCtx rc = with_recipe(spec_ctx(0, 1, 3), r);
+        RadBuilder b;
+        REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &rc), RAD_OK);
+        CHECK_EQ(program_diff(a, b), std::string());
+        CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+        CHECK_EQ(rad_kv_layer_bytes(&b, 1), rad_kv_layer_bytes(&a, 1));
+        const auto dec = kit(b, { 1, 1 }, {});
+        const auto v = run_passes(b, qwen35_fp8::step, { dec.get() });
+        CHECK_PASSES(b, v);
+    }
+}
+
+/* A recipe mixing layouts: a group per layout, named by it and declared at that layout's row
+ * (256 E4M3 columns for fp8, 176 for k6_v4), each attention layer bound to its own and its ops
+ * banding on its own kv_dtype. The MTP head is no recipe layer; it shares the last attention
+ * layer's group. A step's cache operands name the layer's own group. */
+TEST(a_mixed_kv_recipe_declares_each_layers_cache_in_its_own_layout) {
+    MetaKV mk = q35fp8_meta();
+    const std::vector<int32_t> r = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_K6V4);
+    const RadBuildCtx ctx = with_recipe(spec_ctx(0, 1, 3), r);
+    RadBuilder b;
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    REQUIRE(b.kv_groups.size() >= 2);
+    CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_fp8"));
+    CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k6_v4"));
+    for (int i : { 0, 1 }) {
+        CHECK_EQ(b.kv_groups[(size_t)i].d.kind, RAD_KV_FULL);
+        CHECK_EQ(b.kv_groups[(size_t)i].d.dtype, (uint32_t)RAD_F8E4M3);
+        CHECK_EQ(b.kv_groups[(size_t)i].d.n_head_kv, 4);
+    }
+    CHECK_EQ(b.kv_groups[0].d.head_dim, 256);
+    CHECK_EQ(b.kv_groups[1].d.head_dim, 176);
+    /* A page of one layer: block x 4 heads x the declared row, K and V. */
+    CHECK_EQ(rad_kv_layer_bytes(&b, 1), b.kv_block * 4 * 256 * 2);
+    CHECK_EQ(rad_kv_layer_bytes(&b, 2), b.kv_block * 4 * 176 * 2);
+    CHECK(noted(b, "kv cache k6_v4"));
+
+    std::map<int, rad_kvgroup> bound;
+    for (const auto& [layer, g] : b.binds)
+        if (g == 1 || g == 2) bound[layer] = g;
+    CHECK_EQ(bound.size(), (size_t)3);
+    CHECK_EQ(bound[3], (rad_kvgroup)1);
+    CHECK_EQ(bound[7], (rad_kvgroup)2);
+    CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+
+    const auto dec = kit(b, { 1, 1 }, {});
+    const auto pre = kit(b, {}, { 6 }, 20);
+    for (const Kit* k : { dec.get(), pre.get() }) {
+        const auto v = run_passes(b, qwen35_fp8::step, { k });
+        CHECK_PASSES(b, v);
+        int fp8 = 0, k6 = 0;
+        for (const auto& i : v[0]->issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            for (const RadOperand& d : i.opd) {
+                if (d.kind != RAD_OPK_KV || (d.handle != 1 && d.handle != 2)) continue;
+                const std::string kd = pstr(o, "kv_dtype");
+                if (d.handle == 1) {
+                    CHECK_EQ(d.offset, (int64_t)3);
+                    CHECK_EQ(kd, std::string("fp8_e4m3"));
+                    ++fp8;
+                } else {
+                    CHECK_EQ(d.offset, (int64_t)7);
+                    CHECK_EQ(kd, std::string("k6_v4"));
+                    ++k6;
+                }
+            }
+        }
+        CHECK(fp8 > 0);
+        CHECK_EQ(fp8, k6);   /* the same ops on either layer, each on its own cache */
+    }
+}
+
+/* What the engine checks before declare is the plugin's say (RadArchProbe): qwen35_fp8 and
+ * qwen4exp_fp8 read a recipe (a plugin that does not is refused --kv-recipe by name). What only the
+ * plugin knows is checked at declare, and each refusal names the layer: an entry for a delta-net
+ * layer or one past the trunk, an attention layer the recipe leaves out, and a narrow layout on a
+ * geometry libr4d has no rows for. */
+TEST(a_kv_recipe_the_model_cannot_serve_is_refused_naming_the_layer) {
+    MetaKV mk = q35fp8_meta();
+    RadArchProbe p{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
+    CHECK_EQ(p.kv_recipe_ok, 1);
+    RadModelMeta m4 = qwen4exp_meta();
+    RadArchProbe p4{};
+    CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
+    CHECK_EQ(p4.kv_recipe_ok, 1);
+
+    auto refusal = [&](MetaKV& meta, const std::vector<int32_t>& r) {
+        const RadBuildCtx ctx = with_recipe(build_ctx(), r);
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, meta.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    std::vector<int32_t> gdn = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    gdn[2] = RAD_KVQ_V4;
+    CHECK(has(refusal(mk, gdn), "layer 2 keeps no attention cache"));
+    std::vector<int32_t> past = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    past.resize(10, -1);
+    past[9] = RAD_KVQ_NONE;
+    CHECK(has(refusal(mk, past), "layer 9 keeps no attention cache"));
+    CHECK(has(refusal(mk, q35_recipe(RAD_KVQ_V4, -1)), "attention layer 7 has no entry"));
+    CHECK(has(refusal(mk, { -1, -1, -1, RAD_KVQ_NONE }), "attention layer 7 has no entry"));
+
+    MetaKV gqa12 = q35fp8_meta();
+    gqa12.m.n_head_kv = 2;
+    CHECK(has(refusal(gqa12, q35_recipe(RAD_KVQ_NONE, RAD_KVQ_K6V4)), "layer 7 asks for k6_v4"));
+    /* fp8 throughout needs no narrow rows, so that recipe serves the same geometry. */
+    const std::vector<int32_t> f8 = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    const RadBuildCtx ok = with_recipe(build_ctx(), f8);
+    RadBuilder b;
+    CHECK_EQ(qwen35_fp8::declare(&b, gqa12.meta(), &ok), RAD_OK);
+}
+
+namespace {
+
+/* What a pass does around one layer's cache, in issue order: each had_rotate named by the buffer
+ * it rotates (rot:q, rot:k, rot:v, rot:out), whichever layer issued it (the buffers are every
+ * layer's), and each op that reads or writes `layer`'s cache by its op name. */
+std::vector<std::string> around_layer(const RadBuilder& b, const RadCtx& c, int layer) {
+    std::vector<std::string> seq;
+    auto ends = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_rotate") {
+            const RadOperand& d = i.opd.at(0);
+            const std::string nm = d.handle >= 1 && d.handle <= b.bufs.size()
+                                       ? b.bufs[d.handle - 1].name : std::string("?");
+            seq.push_back(ends(nm, "attn_q") ? "rot:q" : ends(nm, "attn_k") ? "rot:k"
+                        : ends(nm, "attn_v") ? "rot:v" : ends(nm, "attn_out") ? "rot:out"
+                        : "rot:" + nm);
+            continue;
+        }
+        for (const RadOperand& d : i.opd)
+            if (d.kind == RAD_OPK_KV && d.offset == layer) { seq.push_back(o->op); break; }
+    }
+    return seq;
+}
+
+/* Two programs' ops, in order, leaving out the rotation and the folds a rotated layer does not
+ * declare: what remains must be the same ops with the same parameters. */
+std::string ops_but_rotation_diff(const RadBuilder& a, const RadBuilder& b) {
+    auto keep = [](const RecOp& o) {
+        return o.op != "had_rotate" && o.op != "qk_norm_rope_gate_kv_store" &&
+               o.op != "qk_norm_rope_gate_kv_store_streamed" && o.op != "attn_paged_gate_quant";
+    };
+    std::vector<const RecOp*> x, y;
+    for (const auto& o : a.ops) if (keep(o)) x.push_back(&o);
+    for (const auto& o : b.ops) if (keep(o)) y.push_back(&o);
+    if (x.size() != y.size()) return "op count";
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i]->op != y[i]->op || x[i]->p.size() != y[i]->p.size()) return "op " + x[i]->op;
+        for (size_t j = 0; j < x[i]->p.size(); ++j) {
+            const RecParam& p = x[i]->p[j];
+            const RecParam& q = y[i]->p[j];
+            if (p.key != q.key || p.ival != q.ival || p.ihi != q.ihi || p.dval != q.dval ||
+                p.sval != q.sval)
+                return "op " + x[i]->op + ", parameter " + p.key;
+        }
+    }
+    return "";
+}
+
+}  /* namespace */
+
+/* A recipe line ending in `rotated` (RAD_KVQ_ROTATED) runs that layer through had_rotate, and
+ * nothing else changes: in every pass the layer rotates its q, k and v after the prologue and
+ * before its store, and its attention output after the attention, over head_dim (256) at bf16;
+ * the unrotated layer issues no rotation. The cache is the layout's own -- the same groups and
+ * pages as the unrotated recipe -- and every op the two programs share has the same parameters, so
+ * the packed k6_v4 store and attention are the rows they were. Only the folds a rotation would
+ * have to sit inside are left out on the rotated layer (the prologue with the store in it). */
+TEST(a_rotated_kv_recipe_layer_rotates_q_k_v_and_its_output_around_an_unchanged_cache) {
+    MetaKV mk = q35fp8_meta();
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_K6V4 }) {
+        const std::vector<int32_t> plain = q35_recipe(q, q);
+        const std::vector<int32_t> rot = q35_recipe(q | RAD_KVQ_ROTATED, q);
+        const RadBuildCtx pc = with_recipe(spec_ctx(0, 1, 3), plain);
+        const RadBuildCtx rc = with_recipe(spec_ctx(0, 1, 3), rot);
+        RadBuilder a, b;
+        REQUIRE_EQ(qwen35_fp8::declare(&a, mk.meta(), &pc), RAD_OK);
+        REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &rc), RAD_OK);
+        CHECK_EQ(ops_but_rotation_diff(a, b), std::string());
+        REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+        for (size_t i = 0; i < a.kv_groups.size(); ++i) {
+            CHECK_EQ(a.kv_groups[i].name, b.kv_groups[i].name);
+            CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d, sizeof a.kv_groups[i].d));
+        }
+        CHECK(a.binds == b.binds);
+
+        int rot_ops = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "had_rotate") {
+                ++rot_ops;
+                CHECK_EQ(pint(&o, "n"), 256LL);
+                CHECK_EQ(pint(&o, "group"), 256LL);
+                CHECK_EQ(pstr(&o, "dtype"), std::string("bf16"));
+            }
+        CHECK_EQ(rot_ops, 1);
+        for (const auto& o : a.ops) CHECK(o.op != "had_rotate");
+
+        const auto dec = kit(b, { 1, 1 }, {});
+        const auto pre = kit(b, {}, { 6 }, 20);
+        for (const Kit* k : { dec.get(), pre.get() }) {
+            const auto v = run_passes(b, qwen35_fp8::step, { k });
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> want = { "rot:q", "rot:k", "rot:v", "kv_store",
+                                                    "attn_paged", "rot:out" };
+            CHECK(around_layer(b, *v[0], 3) == want);
+            /* Those four are the pass's only rotations: layer 7 and the MTP head issue none. */
+            int rots = 0;
+            for (const auto& i : v[0]->issues) rots += b.op_of(i.op)->op == "had_rotate";
+            CHECK_EQ(rots, 4);
+        }
+    }
+}
+
+/* What `rotated` marks is checked as the layout is: an entry with a bit the ABI does not define is
+ * a layout the plugin does not know, and a rotated layer still needs an attention cache. */
+TEST(a_rotated_kv_recipe_entry_is_refused_where_its_layer_or_layout_would_be) {
+    MetaKV mk = q35fp8_meta();
+    auto refusal = [&](const std::vector<int32_t>& r) {
+        const RadBuildCtx ctx = with_recipe(build_ctx(), r);
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    std::vector<int32_t> gdn = q35_recipe(RAD_KVQ_NONE, RAD_KVQ_NONE);
+    gdn[2] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED;
+    CHECK(has(refusal(gdn), "layer 2 keeps no attention cache"));
+    /* 0x800: past RAD_KVQ_VPRED (0x400, ABI 49), the first bit the ABI does not define. */
+    CHECK(has(refusal(q35_recipe(RAD_KVQ_NONE, RAD_KVQ_ROTATED | 0x800)),
+              "layer 7 asks for layout 2048"));
+}
+
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob
  * defaults on in this family; without it the weights sum to about 0.4), fp8a8 grouped GEMMs over
  * the expert planes, and the shared expert folded into the gather behind a sigmoid gate. */
@@ -9421,9 +10076,11 @@ int w8a8_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx
 
 }  /* namespace */
 
-/* The `_had_quant_i8g` producers, which libr4d serves and libref does not. */
+/* The `_had_quant_i8g` producers and the ops that write those codes in their epilogue (the
+ * attention gate's, the delta net's decode conv fold's), which libr4d serves and libref does not. */
 const char* const kW8a8Fused[] = { "rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g",
-                                   "gated_had_quant_i8g" };
+                                   "gated_had_quant_i8g", "gate_had_quant_i8g",
+                                   "gdn_conv_recurrent_update_had" };
 
 /* Where the `_had_quant_i8g` producers are not served, every trunk linear of a rotated int8
  * container is an i8a8h GEMM right behind its own had_quant_act_i8g, at one rank and two: 2
@@ -9458,11 +10115,13 @@ TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
     }
 }
 
-/* Where they are served, the norms and the gated product write had_quant_act_i8g's codes into the
- * int8 pair, and the projections reading them declare no quantiser: had_quant_act_i8g is left only
- * before the attention and delta-net output projections (2 + 6), every norm is the rotated twin (at
- * two ranks with its fused all-reduce form beside it), and every feed-forward's product is
- * gated_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are unchanged. */
+/* Where they are served, the norms, the gated product, the attention gate and the delta net's
+ * decode conv fold write had_quant_act_i8g's codes into the int8 pair, and the projections reading
+ * them declare no quantiser: had_quant_act_i8g is left only as the delta net's quantiser of the
+ * rows its decode fold does not serve (6), every norm is the rotated twin (at two ranks with its
+ * fused all-reduce form beside it), every feed-forward's product is gated_had_quant_i8g and every
+ * attention gate gate_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are
+ * unchanged. */
 TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_them) {
     MetaKV mk = q35w8a8_meta();
     for (int world : { 1, 2 }) {
@@ -9473,9 +10132,11 @@ TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_
         int rot = 0;
         for (const RecOp& o : b.ops) rot += o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
         CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
-        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 2 + 6);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 6);
         CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), 8 + 8);
         CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 8);
+        CHECK_EQ(count_op(b, "gate_had_quant_i8g"), 2);
+        CHECK_EQ(count_op(b, "gdn_conv_recurrent_update_had"), 6);
         for (const char* op : { "rmsnorm_quant_fp8", "ar_rmsnorm_quant_fp8", "gated_quant_fp8",
                                 "quant_act_i8g" })
             CHECK_EQ(count_op(b, op), 0);
@@ -9805,6 +10466,1875 @@ TEST(flashnext_steps_lint_clean_at_one_two_and_four_ranks) {
         }
 }
 
+/* Flash-Next takes a recipe as qwen35_fp8 does. One layout on both attention layers is that
+ * layout's --kv-cache-dtype at one, two and four ranks: the same ops and parameters, one `kv_attn`
+ * group at the flag's row, the MTP head behind it, and with the residency store asked for the same
+ * pager fragment. The indexer's block keys and tail are no recipe's (spec, out of scope), so they
+ * are the flag's too. */
+TEST(a_uniform_kv_recipe_on_flashnext_is_the_matching_kv_cache_dtype_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    for (int q : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuildCtx flag = q4_ctx(rank, world);
+                flag.kv_dtype     = RAD_F8E4M3;
+                flag.kv_quant     = q;
+                flag.kv_residency = 1;
+                RadBuilder a;
+                a.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &flag), RAD_OK);
+
+                r[3] = r[7] = q;
+                RadBuildCtx rc = with_recipe(q4_ctx(rank, world), r);
+                rc.kv_residency = 1;
+                RadBuilder b;
+                b.encs = a.encs;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &rc), RAD_OK);
+                CHECK_EQ(program_diff(a, b), std::string());
+                CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            }
+}
+
+/* --state-cache-dtype f16 on Flash-Next, as on qwen35_fp8: the probe says the plugin serves it,
+ * the default declares the delta-net state f32 and RadBuildCtx::state_dtype f16 declares it f16
+ * with the note startup prints. Nothing else moves: with that one group's dtype put back, the f16
+ * declare is the default's graph fingerprint, and the steps (decode, a prefill after history, a
+ * mixed step, a verify with the MTP head's passes) issue the same launches, since the kernels take
+ * the state's width off the cache. At one, two and four ranks. The default's own bytes are pinned
+ * by the fingerprint table (a_4096_budget_without_a_span_is_the_pinned_graph_and_steps). */
+TEST(flashnext_gdn_state_is_f32_unless_the_deployment_asks_f16_and_nothing_else_changes) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.state_f16_ok, 1);
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; rank += world > 1 ? world - 1 : 1) {
+            RadBuilder b[2];
+            uint64_t graph[2] = {};
+            for (int f16 = 0; f16 < 2; ++f16) {
+                b[f16].encs = { { "draft_head", u2_head() } };
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.max_tok = 4096;   /* pinned_steps' prefill */
+                ctx.state_dtype = f16 ? (uint32_t)RAD_F16 : 0;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b[f16], &meta, &ctx), RAD_OK);
+                int n = 0;
+                for (const RecKV& g : b[f16].kv_groups)
+                    if (g.name == "kv_gdn_state") {
+                        ++n;
+                        CHECK_EQ(g.d.dtype, f16 ? (uint32_t)RAD_F16 : (uint32_t)RAD_F32);
+                    }
+                CHECK_EQ(n, 1);
+                CHECK_EQ(noted(b[f16], "GDN state cache f16"), f16 == 1);
+                /* Hashed before the next declare: a recorded weight's `source` points into the
+                 * plugin's own strings, which the next declare rewrites. The f16 declare is
+                 * hashed with the state group put back at f32. */
+                RadBuilder back = b[f16];
+                for (RecKV& g : back.kv_groups)
+                    if (g.name == "kv_gdn_state") g.d.dtype = RAD_F32;
+                graph[f16] = graph_hash(back);
+            }
+            CHECK_EQ(graph[1], graph[0]);
+            /* And program_diff's view, the f16 note aside. */
+            std::erase_if(b[1].notes, [](const std::string& x) {
+                return x.find("GDN state cache f16") != std::string::npos; });
+            for (RecKV& g : b[1].kv_groups)
+                if (g.name == "kv_gdn_state") g.d.dtype = RAD_F32;
+            CHECK_EQ(program_diff(b[1], b[0]), std::string());
+            for (RecKV& g : b[1].kv_groups)
+                if (g.name == "kv_gdn_state") g.d.dtype = RAD_F16;
+            CHECK_EQ(pinned_steps(b[1], qwen4exp_fp8::step, rank, world),
+                     pinned_steps(b[0], qwen4exp_fp8::step, rank, world));
+        }
+}
+
+/* A mixed recipe on Flash-Next: fp8_v4 at layer 3 and k6_v4 at layer 7 are two groups, declared at
+ * 200 and 176 E4M3 columns, each layer bound to its own and the MTP head (layer 8) to layer 7's.
+ * Each layer's indexer pages its own group's fragment (K and V of a four-token page at its row),
+ * and the steps lint clean at one, two and four ranks with every cache operand naming the layer's
+ * own group and every attention banding on that group's kv_dtype. */
+TEST(a_mixed_kv_recipe_on_flashnext_declares_each_layers_cache_in_its_own_layout) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = RAD_KVQ_V4;
+    r[7] = RAD_KVQ_K6V4;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_fp8_v4"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k6_v4"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 200);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 176);
+            CHECK_EQ(b.kv_groups[0].zero, b.kv_groups[1].zero);
+            /* Each layout's group carries the indexer's residency window, the same one, so both
+             * page out and the store's slot follows the widest layout's block. */
+            CHECK(b.kv_groups[0].d.residency_window > 0);
+            CHECK_EQ(b.kv_groups[0].d.residency_window, b.kv_groups[1].d.residency_window);
+            const bool has_cache = !b.kv_groups[0].zero;
+
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound.size(), (size_t)3);
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+
+            /* The pagers in declaration order: layer 3's, layer 7's, the head's. */
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 200));
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 176));
+                CHECK_EQ(page[2], page[1]);
+            } else {
+                CHECK(page.empty());
+            }
+
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on[3] = {};
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd) {
+                        if (d.kind != RAD_OPK_KV || (d.handle != 1 && d.handle != 2)) continue;
+                        CHECK_EQ(d.offset, (int64_t)(d.handle == 1 ? 3 : 7));
+                        const std::string kd = pstr(o, "kv_dtype");
+                        if (!kd.empty())
+                            CHECK_EQ(kd, std::string(d.handle == 1 ? "fp8_v4" : "k6_v4"));
+                        ++on[d.handle];
+                    }
+                }
+                if (has_cache) CHECK(on[1] > 0 && on[1] == on[2]);
+            }
+        }
+}
+
+/* Flash-Next with layer 3 rotated over fp8_v4 and layer 7 plain k6_v4, at one, two and four ranks:
+ * a rank with an attention cache rotates layer 3's q, k and v before its store and its output after
+ * its attention, on the dense prefill and on the sparse decode, whose gate is then the separate
+ * gate op and not folded into the attention's merge (the merge would gate the rotated output).
+ * Layer 7 keeps that fold and issues no rotation; an attention-zero rank declares no rotation at
+ * all. The groups, pagers and every shared op's parameters are the unrotated recipe's. */
+TEST(a_rotated_kv_recipe_layer_on_flashnext_rotates_around_its_dense_and_sparse_attention) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> plain(8, -1), rot(8, -1);
+    plain[3] = RAD_KVQ_V4;
+    plain[7] = rot[7] = RAD_KVQ_K6V4;
+    rot[3] = (int)RAD_KVQ_V4 | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx pc = with_recipe(q4_ctx(rank, world), plain);
+            RadBuildCtx rc = with_recipe(q4_ctx(rank, world), rot);
+            pc.kv_residency = rc.kv_residency = 1;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &rc), RAD_OK);
+            CHECK_EQ(ops_but_rotation_diff(a, b), std::string());
+            REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+            for (size_t i = 0; i < a.kv_groups.size(); ++i)
+                CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d,
+                                   sizeof a.kv_groups[i].d));
+            const bool has_cache = !b.kv_groups[0].zero;
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            CHECK_EQ(rot_ops, has_cache ? 1 : 0);
+
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                if (!has_cache) continue;
+                /* The store, the attention launches (one per chunk of rows on the sparse path)
+                 * and the rotations; the pager and the resolve sit around them unchanged. */
+                std::vector<std::string> seq;
+                for (const std::string& e : around_layer(b, *v[0], 3))
+                    if (e.rfind("rot:", 0) == 0 || e == "kv_store" || e.rfind("attn_paged", 0) == 0)
+                        seq.push_back(e);
+                const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "kv_store" };
+                REQUIRE(seq.size() >= head.size() + 2);
+                CHECK(std::vector<std::string>(seq.begin(), seq.begin() + 4) == head);
+                CHECK_EQ(seq.back(), std::string("rot:out"));
+                for (size_t j = 4; j + 1 < seq.size(); ++j) CHECK_EQ(seq[j], std::string("attn_paged"));
+                /* Layer 3's four are the pass's only rotations. */
+                int rots = 0;
+                for (const auto& i : v[0]->issues) rots += b.op_of(i.op)->op == "had_rotate";
+                CHECK_EQ(rots, 4);
+                bool merged7 = false;
+                for (const std::string& e : around_layer(b, *v[0], 7))
+                    merged7 = merged7 || e == "attn_paged_gate_quant";
+                /* The decode kit takes the sparse path, where layer 7 still gates in its merge. */
+                if (k->b.n_seq == 4) CHECK(merged7);
+            }
+        }
+}
+
+/* A recipe Flash-Next cannot serve is refused naming the layer: an entry for a delta-net layer, an
+ * attention layer left out, and a narrow layout at a geometry libr4d has no rows for (gqa 8). */
+TEST(a_kv_recipe_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const std::vector<int32_t>& r) {
+        const RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, { -1, -1, RAD_KVQ_NONE, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_NONE }),
+              "layer 2 keeps no attention cache"));
+    CHECK(has(refusal(mk, { -1, -1, -1, RAD_KVQ_V4 }), "attention layer 7 has no entry"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    CHECK(has(refusal(gqa8, { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_K6V4 }),
+              "layer 7 asks for k6_v4"));
+}
+
+/* k4h_v4 on Flash-Next (RAD_KVQ_K4H: rotated int4 K, int4 V, 288 bytes a token and head, declared
+ * as 144 E4M3 columns), the layer libr4d's gqa12 and four-rank gqa6 rows serve, at one, two and
+ * four ranks: the probe offers it beside fp8_v4 and k6_v4; layer 3 in k4h_v4 and layer 7 in k6_v4
+ * are two groups in RAD_KVQ_* order, layer 3 paging its own 144-column fragment; a rank with a
+ * cache rotates layer 3's q, k and v before its k4h_v4 store and its output after its attention,
+ * every op on its group bands on kv_dtype k4h_v4, and the steps lint clean. */
+TEST(a_k4h_v4_recipe_layer_on_flashnext_is_a_rotated_288_byte_cache_on_its_own_rows) {
+    RadModelMeta m4 = qwen4exp_meta();
+    RadArchProbe p4{};
+    CHECK_OK(qwen4exp_fp8::probe(&m4, &p4));
+    CHECK_EQ(p4.kv_quant_ok, (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4) | (1 << RAD_KVQ_K4H) |
+                             (1 << RAD_KVQ_K4HV2H) | (1 << RAD_KVQ_I8H) | (1 << RAD_KVQ_BF16) |
+                             (1 << RAD_KVQ_K5V4));
+
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED;
+    r[7] = RAD_KVQ_K6V4;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_k6_v4"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k4h_v4"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 176);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 144);
+            CHECK(noted(b, "kv cache k4h_v4: rotated int4 K, int4 V"));
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)2);
+            CHECK_EQ(bound[7], (rad_kvgroup)1);
+            CHECK_EQ(bound[8], (rad_kvgroup)1);   /* the MTP head, behind layer 7 */
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 144));
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 176));
+                CHECK_EQ(rot_ops, 1);   /* layer 3's; the head, behind k6_v4, is unrotated */
+            }
+
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd)
+                        if (d.kind == RAD_OPK_KV && d.handle == 2) {
+                            const std::string kd = pstr(o, "kv_dtype");
+                            if (!kd.empty()) CHECK_EQ(kd, std::string("k4h_v4"));
+                            ++on;
+                            break;
+                        }
+                }
+                if (!has_cache) continue;
+                CHECK(on > 0);
+                std::vector<std::string> seq;
+                for (const std::string& e : around_layer(b, *v[0], 3))
+                    if (e.rfind("rot:", 0) == 0 || e == "kv_store" || e.rfind("attn_paged", 0) == 0)
+                        seq.push_back(e);
+                const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "kv_store" };
+                REQUIRE(seq.size() >= head.size() + 2);
+                CHECK(std::vector<std::string>(seq.begin(), seq.begin() + 4) == head);
+                CHECK_EQ(seq.back(), std::string("rot:out"));
+            }
+        }
+}
+
+/* A k4h_v4 group holds rotated K and V only, so when the last attention layer is k4h_v4 the MTP
+ * head that shares its group rotates too: the declaration has the head's rotation beside layer
+ * 7's, the verify, the head's history pass and its rounds lint clean, and the head's pass issues
+ * its four rotations. The same recipe with layer 7 rotated over k6_v4 keeps the head unrotated. */
+TEST(the_mtp_head_behind_a_k4h_v4_layer_on_flashnext_rotates_with_it) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int q : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K6V4 })
+        for (int world : { 1, 2 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> r(8, -1);
+                r[3] = RAD_KVQ_NONE;
+                r[7] = q | RAD_KVQ_ROTATED;
+                const RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                REQUIRE_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+                const bool has_cache = !b.kv_groups[0].zero;
+                int rot_ops = 0;
+                for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+                if (has_cache) CHECK_EQ(rot_ops, q == RAD_KVQ_K4H ? 2 : 1);
+                const auto ver = kit(b, std::vector<int>(4, 4), {});
+                const auto his = history_pass(b, *ver);
+                const auto r2 = round_pass(b, 4, 2);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get(), r2.get() },
+                                          rank, world);
+                CHECK_PASSES(b, v);
+                int head_rots = 0;
+                for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+                if (has_cache) CHECK_EQ(head_rots, q == RAD_KVQ_K4H ? 4 : 0);
+            }
+}
+
+/* What Flash-Next cannot serve in k4h_v4 is refused naming the layer: the layout without its
+ * rotation (a hand-built context; the recipe parser never makes one), the layout as every layer's
+ * --kv-cache-dtype (only a recipe asks for a rotated layout), and a geometry libr4d has no k4h_v4
+ * rows for (gqa 8), where the probe does not offer it either. */
+TEST(a_k4h_v4_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, RAD_KVQ_K4H, -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for k4h_v4 unrotated"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_K4H;
+    CHECK(has(refusal(mk, flag), "KV cache layout 3 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_K4H), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                          (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED })),
+              "layer 7 asks for k4h_v4"));
+}
+
+/* k4h_v2h on Flash-Next (RAD_KVQ_K4HV2H: rotated int4 K, KVarN-normalised int2 V, 224 bytes a
+ * token and head, declared as 112 E4M3 columns) beside k4h_v4, at one, two and four ranks: the two
+ * are groups of their own in RAD_KVQ_* order, k4h_v2h's pager fragment its own; layer 7, the last
+ * attention layer, in k4h_v2h rotates and so does the MTP head behind it (its pass issues its four
+ * rotations); every op on k4h_v2h's group bands on kv_dtype k4h_v2h; and the steps lint clean. */
+TEST(a_k4h_v2h_recipe_layer_on_flashnext_is_a_rotated_224_byte_cache_and_its_head_rotates) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED;
+    r[7] = (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_k4h_v4"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k4h_v2h"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 144);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 112);
+            CHECK(noted(b, "kv cache k4h_v2h: rotated int4 K, variance-normalised int2 V"));
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 144));
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 112));
+                CHECK_EQ(rot_ops, 3);   /* layers 3 and 7, and the head */
+            }
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd)
+                        if (d.kind == RAD_OPK_KV && d.handle == 2) {
+                            const std::string kd = pstr(o, "kv_dtype");
+                            if (!kd.empty()) CHECK_EQ(kd, std::string("k4h_v2h"));
+                            ++on;
+                            break;
+                        }
+                }
+                if (has_cache) CHECK(on > 0);
+            }
+            /* The head's history pass after an MTP verify (one and two ranks, as for k4h_v4). */
+            if (world == 4) continue;
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            int head_rots = 0;
+            for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+            if (has_cache) CHECK_EQ(head_rots, 4);
+        }
+}
+
+/* k4h_v2h's refusals are k4h_v4's: without its rotation (a hand-built context), as every layer's
+ * --kv-cache-dtype, and where libr4d has no rows for it (gqa 8, which the probe does not offer). */
+TEST(a_k4h_v2h_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, RAD_KVQ_K4HV2H, -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for k4h_v2h unrotated"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_K4HV2H;
+    CHECK(has(refusal(mk, flag), "KV cache layout 4 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_K4HV2H), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                          (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED })),
+              "layer 7 asks for k4h_v2h"));
+}
+
+/* A uniform i8h recipe on Flash-Next (RAD_KVQ_I8H: rotated int8 K and V, one f16 scale a token and
+ * head each, 516 bytes a token and head, declared as 258 E4M3 columns), at one, two and four
+ * ranks: one layout throughout is the single `kv_attn` group, as a uniform recipe always is; its
+ * pager fragment is 4 tokens of 516 bytes a head; both attention layers and the MTP head behind
+ * layer 7 rotate (three rotations declared, four issued by the head's history pass); every op on
+ * the group bands on kv_dtype i8h; and the steps lint clean. */
+TEST(a_uniform_i8h_recipe_on_flashnext_is_one_rotated_516_byte_cache_and_its_head_rotates) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(!b.kv_groups.empty());
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 258);
+            CHECK(noted(b, "kv cache i8h: rotated int8 K and V, one f16 scale a token and head"));
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE(!page.empty());
+                for (long long pb : page) CHECK_EQ(pb, (long long)(2 * 4 * nkv * 258));
+                CHECK_EQ(rot_ops, 3);   /* layers 3 and 7, and the head */
+            }
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd)
+                        if (d.kind == RAD_OPK_KV && d.handle == 1) {
+                            const std::string kd = pstr(o, "kv_dtype");
+                            if (!kd.empty()) CHECK_EQ(kd, std::string("i8h"));
+                            ++on;
+                            break;
+                        }
+                }
+                if (has_cache) CHECK(on > 0);
+            }
+            if (world == 4) continue;
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            int head_rots = 0;
+            for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+            if (has_cache) CHECK_EQ(head_rots, 4);
+        }
+}
+
+/* A tiered recipe on Flash-Next (RAD_KVQ_DEMOTE), at one, two and four ranks. Uniform `i8h demote
+ * k4h_v2h` is the uniform i8h program but for the pager: the one `kv_attn` group at 258 columns,
+ * every pager (the two trunk layers' and the head's) expanding `store_layout` k4h_v2h into
+ * `pool_layout` i8h at head_dim 256 over the same i8h block_bytes, and the steps lint clean. Mixed,
+ * a layer with a demote layout and one without are two groups (a store slot holds one width), each
+ * pager its own: layer 3's expands, layer 7's and the head's copy bytes. A rotated fp8 layer may
+ * be tiered and its head behind it rotates, since its demoted blocks are rotated int4. */
+TEST(a_tiered_recipe_on_flashnext_keys_its_groups_by_the_pair_and_its_pagers_expand) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int d2 = (int)RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT, d4 = (int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            std::vector<int32_t> r(8, -1);
+            r[3] = r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | d2;
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 258);
+            CHECK(noted(b, "kv cache i8h: demoted blocks stored as k4h_v2h under window residency"));
+            const bool has_cache = !b.kv_groups[0].zero;
+            int pages = 0;
+            for (const auto& o : b.ops) {
+                if (o.op != "qsa_page") continue;
+                ++pages;
+                CHECK_EQ(pstr(&o, "store_layout"), std::string("k4h_v2h"));
+                CHECK_EQ(pstr(&o, "pool_layout"), std::string("i8h"));
+                CHECK_EQ(pint(&o, "head_dim"), 256ll);
+                CHECK_EQ(pint(&o, "block_bytes"), (long long)(2 * 4 * b.kv_groups[0].d.n_head_kv * 258));
+            }
+            CHECK_EQ(pages, has_cache ? 3 : 0);
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+
+            r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+            RadBuildCtx cm = with_recipe(q4_ctx(rank, world), r);
+            cm.kv_residency = 1;
+            RadBuilder m;
+            m.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&m, &meta, &cm), RAD_OK);
+            std::vector<std::string> names;
+            for (const auto& g : m.kv_groups) names.push_back(g.name);
+            CHECK(std::find(names.begin(), names.end(), "kv_attn_i8h") != names.end());
+            CHECK(std::find(names.begin(), names.end(), "kv_attn_i8h_demote_k4h_v2h") != names.end());
+            int expanding = 0, copying = 0;
+            for (const auto& o : m.ops)
+                if (o.op == "qsa_page") (pstr(&o, "store_layout") == "<absent>" ? copying : expanding)++;
+            CHECK_EQ(expanding, has_cache ? 1 : 0);
+            CHECK_EQ(copying, has_cache ? 2 : 0);
+
+            r[3] = r[7] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED | d4;
+            RadBuildCtx cf = with_recipe(q4_ctx(rank, world), r);
+            cf.kv_residency = 1;
+            RadBuilder f;
+            f.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&f, &meta, &cf), RAD_OK);
+            int rot_ops = 0;
+            for (const auto& o : f.ops) {
+                rot_ops += o.op == "had_rotate";
+                if (o.op == "qsa_page") CHECK_EQ(pstr(&o, "pool_layout"), std::string("fp8"));
+            }
+            if (!f.kv_groups[0].zero) CHECK_EQ(rot_ops, 3);   /* layers 3 and 7, and the head */
+        }
+}
+
+/* A demote layout the plugin does not serve is refused naming the layer: fp8_v4 as a demote layout
+ * (a hand-built entry; the recipe parser refuses it first), a k6_v4 resident layout, and an fp8
+ * layer without its rotation. */
+TEST(a_demote_layout_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int e : { (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED | ((int)RAD_KVQ_V4 << RAD_KVQ_DEMOTE_SHIFT),
+                   (int)RAD_KVQ_K6V4 | ((int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT),
+                   (int)RAD_KVQ_NONE | ((int)RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT) }) {
+        std::vector<int32_t> r(8, -1);
+        r[3] = e;
+        r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, &meta, &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        CHECK(has(err, "KV recipe: layer 3 asks for demote layout"));
+    }
+}
+
+/* i8h's refusals are the k4h layouts': without its rotation (a hand-built context), as every
+ * layer's --kv-cache-dtype, and where libr4d has no rows for it (gqa 8, which the probe does not
+ * offer). */
+TEST(an_i8h_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    CHECK(has(refusal(mk, with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, RAD_KVQ_I8H, -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for i8h unrotated"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_I8H;
+    CHECK(has(refusal(mk, flag), "KV cache layout 5 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_I8H), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                          (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED })),
+              "layer 7 asks for i8h"));
+}
+
+/* bf16 as a recipe layout (RAD_KVQ_BF16) on Flash-Next: a recipe of bf16 alone is
+ * --kv-cache-dtype bf16's attention cache byte for byte at one, two and four ranks -- the same
+ * declarations (one `kv_attn` group at RAD_BF16 and head_dim 256, the same pager fragment with the
+ * residency store asked for, the MTP head behind it), and the same launches on decode, prefill,
+ * a mixed step and the verify with the head's passes -- although the recipe arrives under the fp8
+ * flag's RadBuildCtx::kv_dtype. The probe offers bf16 at every geometry, gqa 8 included. */
+TEST(a_uniform_bf16_recipe_on_flashnext_is_the_bf16_kv_cache_dtype_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = r[7] = RAD_KVQ_BF16;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx flag = q4_ctx(rank, world);
+            flag.max_tok      = 4096;   /* pinned_steps' prefill */
+            flag.kv_dtype     = RAD_BF16;
+            flag.kv_residency = 1;
+            RadBuilder a;
+            a.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &flag), RAD_OK);
+            /* Stepped before the next declare, which replaces the plugin's model. */
+            const uint64_t flag_steps = pinned_steps(a, qwen4exp_fp8::step, rank, world);
+
+            RadBuildCtx rc = q4_ctx(rank, world);
+            rc.max_tok = 4096;
+            rc = with_recipe(rc, r);
+            rc.kv_residency = 1;
+            RadBuilder b;
+            b.encs = a.encs;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &rc), RAD_OK);
+            CHECK_EQ(program_diff(a, b), std::string());
+            REQUIRE(!b.kv_groups.empty());
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+            CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 256);
+            CHECK_EQ(pinned_steps(b, qwen4exp_fp8::step, rank, world), flag_steps);
+        }
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok, 1 << RAD_KVQ_BF16);
+}
+
+/* A mixed recipe with a bf16 layer on Flash-Next, at one, two and four ranks: layer 3 in bf16 and
+ * layer 7 in i8h are two groups in RAD_KVQ_* order, `kv_attn_i8h` (258 E4M3 columns) and
+ * `kv_attn_bf16` (RAD_BF16 at head_dim 256), and the MTP head (layer 8) follows layer 7 into i8h,
+ * rotated. Each layer's pager moves its own fragment, layer 3's at bf16's width (K and V of a
+ * four-token page, two bytes an element). Layer 3 runs exactly the bf16 flag's path: the ops that
+ * touch its cache, in order, are the flag build's on decode and prefill (the prologue's store fold
+ * and the sparse decode's gate-in-merge included, nothing turned off), every one banding on
+ * kv_dtype bf16, and no rotation is issued for it. */
+TEST(a_bf16_layer_beside_i8h_on_flashnext_keeps_the_bf16_flags_cache_and_path) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = RAD_KVQ_BF16;
+    r[7] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_i8h"));
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_bf16"));
+            CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_F8E4M3);
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 258);
+            CHECK_EQ(b.kv_groups[1].d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 256);
+            CHECK_EQ(b.kv_groups[0].d.residency_window, b.kv_groups[1].d.residency_window);
+            CHECK(b.kv_groups[1].d.residency_window > 0);
+            CHECK(!noted(b, "kv cache bf16"));
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound.size(), (size_t)3);
+            CHECK_EQ(bound[3], (rad_kvgroup)2);
+            CHECK_EQ(bound[7], (rad_kvgroup)1);
+            CHECK_EQ(bound[8], (rad_kvgroup)1);   /* the MTP head, behind layer 7 */
+
+            const bool has_cache = !b.kv_groups[0].zero;
+            std::vector<long long> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            if (has_cache) {
+                const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                REQUIRE_EQ(page.size(), (size_t)3);
+                CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 256 * 2));   /* layer 3, bf16 */
+                CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 258));       /* layer 7, i8h */
+                CHECK_EQ(page[2], page[1]);                              /* the head */
+                CHECK_EQ(rot_ops, 2);   /* layer 7's and the head's */
+            }
+
+            /* Layer 3's ops on decode and prefill, the rotations of layer 7 and the head left out. */
+            std::vector<std::string> mine[2];
+            int pass = 0;
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                for (const std::string& e : around_layer(b, *v[0], 3))
+                    if (e.rfind("rot:", 0) != 0) mine[pass].push_back(e);
+                ++pass;
+                if (!has_cache) continue;
+                CHECK(!mine[pass - 1].empty());
+                int on = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    for (const RadOperand& d : i.opd) {
+                        if (d.kind != RAD_OPK_KV || (d.handle != 1 && d.handle != 2)) continue;
+                        CHECK_EQ(d.offset, (int64_t)(d.handle == 2 ? 3 : 7));
+                        const std::string kd = pstr(o, "kv_dtype");
+                        if (!kd.empty())
+                            CHECK_EQ(kd, std::string(d.handle == 2 ? "bf16" : "i8h"));
+                        on += d.handle == 2;
+                    }
+                }
+                CHECK(on > 0);
+            }
+            /* The flag's build after the recipe's passes: a declare replaces the plugin's model. */
+            RadBuildCtx flag = q4_ctx(rank, world);
+            flag.kv_dtype = RAD_BF16;
+            flag.kv_residency = 1;
+            RadBuilder f;
+            f.encs = b.encs;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&f, &meta, &flag), RAD_OK);
+            pass = 0;
+            for (const auto& k : { kit(f, { 1, 1, 1, 1 }, {}), kit(f, {}, { 64, 64 }, 9000) }) {
+                const auto w = run_passes(f, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(f, w);
+                CHECK(mine[pass++] == around_layer(f, *w[0], 3));
+            }
+        }
+}
+
+/* The MTP head follows the last attention layer into bf16: with layer 7 in bf16 and layer 3 in
+ * i8h, the head is bound to the bf16 group and unrotated (a verify's history pass issues no
+ * rotation beside layer 3's four). At one and two ranks. */
+TEST(the_mtp_head_behind_a_bf16_layer_on_flashnext_shares_its_cache_unrotated) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED;
+    r[7] = RAD_KVQ_BF16;
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            const RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);
+            int rot_ops = 0;
+            for (const auto& o : b.ops) rot_ops += o.op == "had_rotate";
+            const bool has_cache = !b.kv_groups[0].zero;
+            CHECK_EQ(rot_ops, has_cache ? 1 : 0);   /* layer 3's only */
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            int head_rots = 0;
+            for (const auto& i : v[1]->issues) head_rots += b.op_of(i.op)->op == "had_rotate";
+            CHECK_EQ(head_rots, 0);
+        }
+}
+
+/* bf16's refusals: rotated or centred (a hand-built context; the recipe parser refuses both
+ * words), and as every layer's kv_quant, which --kv-cache-dtype bf16 spells as kv_dtype. */
+TEST(a_bf16_recipe_entry_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](const RadBuildCtx& ctx) {
+        MetaKV mk = q4_small();
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    CHECK(has(refusal(with_recipe(q4_ctx(0, 1), { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1,
+                                                  (int)RAD_KVQ_BF16 | RAD_KVQ_ROTATED })),
+              "layer 7 asks for bf16 rotated"));
+    CHECK(has(refusal(with_recipe(q4_ctx(0, 1), { -1, -1, -1, (int)RAD_KVQ_BF16 | RAD_KVQ_VMEAN,
+                                                  -1, -1, -1, RAD_KVQ_NONE })),
+              "layer 3 asks for bf16 with a V mean"));
+    /* Nor tiered: a demote layout on a bf16 entry (hand-built; the parser refuses it first). */
+    for (int dq : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H })
+        CHECK(has(refusal(with_recipe(q4_ctx(0, 1),
+                                      { -1, -1, -1, (int)RAD_KVQ_BF16 | (dq << RAD_KVQ_DEMOTE_SHIFT),
+                                        -1, -1, -1, RAD_KVQ_NONE })),
+                  "layer 3 asks for bf16 demoted to layout"));
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_BF16;
+    CHECK(has(refusal(flag), "KV cache layout 6 is not one this plugin knows"));
+}
+
+/* A bf16 layer beside a tiered rotated fp8 layer keeps its own group: the group keys stride by
+ * the layout count, so `fp8 rotated demote k4h_v4` is not bf16's key. Layer 3 bf16 (RAD_BF16 at
+ * head_dim 256, its pager copying 2-byte elements), layer 7 tiered fp8 (256 E4M3 columns, its
+ * pager and the head's expanding k4h_v4 into fp8), at one, two and four ranks. */
+TEST(a_bf16_layer_beside_a_tiered_fp8_layer_on_flashnext_keeps_its_own_group) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<int32_t> r(8, -1);
+    r[3] = RAD_KVQ_BF16;
+    r[7] = (int)RAD_KVQ_NONE | RAD_KVQ_ROTATED | ((int)RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT);
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_residency = 1;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.kv_groups.size() >= 2);
+            CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_bf16"));
+            CHECK_EQ(b.kv_groups[0].d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(b.kv_groups[0].d.head_dim, 256);
+            CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_fp8_demote_k4h_v4"));
+            CHECK_EQ(b.kv_groups[1].d.dtype, (uint32_t)RAD_F8E4M3);
+            CHECK_EQ(b.kv_groups[1].d.head_dim, 256);
+            std::map<int, rad_kvgroup> bound;
+            for (const auto& [layer, g] : b.binds)
+                if (g == 1 || g == 2) bound[layer] = g;
+            CHECK_EQ(bound[3], (rad_kvgroup)1);
+            CHECK_EQ(bound[7], (rad_kvgroup)2);
+            CHECK_EQ(bound[8], (rad_kvgroup)2);   /* the MTP head, behind layer 7 */
+            if (b.kv_groups[0].zero) continue;
+            const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+            std::vector<const RecOp*> page;
+            for (const auto& o : b.ops)
+                if (o.op == "qsa_page") page.push_back(&o);
+            REQUIRE_EQ(page.size(), (size_t)3);
+            CHECK_EQ(pint(page[0], "block_bytes"), (long long)(2 * 4 * nkv * 256 * 2));
+            CHECK_EQ(pstr(page[0], "store_layout"), std::string("<absent>"));
+            for (int i : { 1, 2 }) {
+                CHECK_EQ(pint(page[i], "block_bytes"), (long long)(2 * 4 * nkv * 256));
+                CHECK_EQ(pstr(page[i], "store_layout"), std::string("k4h_v4"));
+                CHECK_EQ(pstr(page[i], "pool_layout"), std::string("fp8"));
+            }
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+        }
+}
+
+/* k5_v4 on Flash-Next (RAD_KVQ_K5V4: int5 K, int4 V, 320 bytes a token and head, declared as 160
+ * E4M3 columns) at one, two and four ranks. Layer 3 in k5_v4 and layer 7 in k6_v4 are two groups in
+ * RAD_KVQ_* order (k6_v4's first), layer 3 paging its own 160-column fragment. Unlike the k4h
+ * layouts it is rotated only where the recipe says: unrotated, nothing rotates; with `rotated`,
+ * layer 3's q, k and v before its store and its output after. Every op on its group bands on
+ * kv_dtype k5_v4, and none of them is a fused form k5_v4 has no row for (the prologue's store fold,
+ * the gate in the decode merge), while the k6_v4 layer keeps both; the steps lint clean. */
+TEST(a_k5_v4_recipe_layer_on_flashnext_is_a_320_byte_cache_rotated_only_when_asked) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (const bool rotated : { false, true })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> r(8, -1);
+                r[3] = (int)RAD_KVQ_K5V4 | (rotated ? (int)RAD_KVQ_ROTATED : 0);
+                r[7] = RAD_KVQ_K6V4;
+                RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+                ctx.kv_residency = 1;
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                REQUIRE(b.kv_groups.size() >= 2);
+                CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn_k6_v4"));
+                CHECK_EQ(b.kv_groups[1].name, std::string("kv_attn_k5_v4"));
+                CHECK_EQ(b.kv_groups[0].d.head_dim, 176);
+                CHECK_EQ(b.kv_groups[1].d.head_dim, 160);
+                CHECK(noted(b, "kv cache k5_v4: int5 K, int4 V, in groups of 32 with f16 scales, "
+                               "320 bytes a token and head instead of 512"));
+                std::map<int, rad_kvgroup> bound;
+                for (const auto& [layer, g] : b.binds)
+                    if (g == 1 || g == 2) bound[layer] = g;
+                CHECK_EQ(bound[3], (rad_kvgroup)2);
+                CHECK_EQ(bound[7], (rad_kvgroup)1);
+                const bool has_cache = !b.kv_groups[0].zero;
+                std::vector<long long> page;
+                for (const auto& o : b.ops)
+                    if (o.op == "qsa_page") page.push_back(pint(&o, "block_bytes"));
+                int rot_ops = 0, fused_k5 = 0, fused_k6 = 0;
+                for (const auto& o : b.ops) {
+                    rot_ops += o.op == "had_rotate";
+                    if (o.op != "qk_norm_rope_gate_kv_store" && o.op != "attn_paged_gate_quant")
+                        continue;
+                    fused_k5 += pstr(&o, "kv_dtype") == "k5_v4";
+                    fused_k6 += pstr(&o, "kv_dtype") == "k6_v4";
+                }
+                CHECK_EQ(fused_k5, 0);
+                if (has_cache) {
+                    const int64_t nkv = b.kv_groups[0].d.n_head_kv;
+                    REQUIRE_EQ(page.size(), (size_t)3);
+                    CHECK_EQ(page[0], (long long)(2 * 4 * nkv * 160));
+                    CHECK_EQ(page[1], (long long)(2 * 4 * nkv * 176));
+                    CHECK_EQ(rot_ops, rotated ? 1 : 0);   /* the head, behind k6_v4, is unrotated */
+                    CHECK(fused_k6 > 0);
+                }
+
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    int on = 0;
+                    for (const auto& i : v[0]->issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o) continue;
+                        for (const RadOperand& d : i.opd)
+                            if (d.kind == RAD_OPK_KV && d.handle == 2) {
+                                const std::string kd = pstr(o, "kv_dtype");
+                                if (!kd.empty()) CHECK_EQ(kd, std::string("k5_v4"));
+                                ++on;
+                                break;
+                            }
+                    }
+                    if (!has_cache) continue;
+                    CHECK(on > 0);
+                    if (!rotated) continue;
+                    std::vector<std::string> seq;
+                    for (const std::string& e : around_layer(b, *v[0], 3))
+                        if (e.rfind("rot:", 0) == 0 || e == "kv_store" || e.rfind("attn_paged", 0) == 0)
+                            seq.push_back(e);
+                    const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "kv_store" };
+                    REQUIRE(seq.size() >= head.size() + 2);
+                    CHECK(std::vector<std::string>(seq.begin(), seq.begin() + 4) == head);
+                    CHECK_EQ(seq.back(), std::string("rot:out"));
+                }
+            }
+}
+
+/* k5_v4's refusals: as every layer's --kv-cache-dtype (a recipe word only), and where libr4d has no
+ * rows for it (gqa 8, which the probe does not offer). */
+TEST(a_k5_v4_layer_flashnext_cannot_serve_is_refused_naming_the_layer) {
+    auto refusal = [&](MetaKV& mk, const RadBuildCtx& ctx) {
+        RadBuilder b;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    MetaKV mk = q4_small();
+    RadBuildCtx flag = q4_ctx(0, 1);
+    flag.kv_dtype = RAD_F8E4M3;
+    flag.kv_quant = RAD_KVQ_K5V4;
+    CHECK(has(refusal(mk, flag), "KV cache layout 7 is not one this plugin knows"));
+    MetaKV gqa8 = q4_small();
+    gqa8.m.n_head_kv = 3;
+    RadArchProbe p{};
+    CHECK_OK(qwen4exp_fp8::probe(gqa8.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok & (1 << RAD_KVQ_K5V4), 0);
+    CHECK(has(refusal(gqa8, with_recipe(q4_ctx(0, 1),
+                                        { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_K5V4 })),
+              "layer 7 asks for k5_v4"));
+}
+
+/* The fp8-rounding experiment (RADIANCE_DEBUG_KV_E4M3R, rad_block_attn_gated_fp8.h) on Flash-Next
+ * at one and two ranks: with a bf16 cache every kv_store bands on kv_dtype bf16_e4m3r while the
+ * attention stays bf16, and the prologue's store fold is not declared (it has no rounding row);
+ * otherwise the program is the plain bf16 one's. With an fp8 cache the switch changes nothing,
+ * byte for byte. */
+TEST(the_e4m3_rounding_switch_rounds_a_bf16_flashnext_store_and_leaves_fp8_alone) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank)
+            for (const uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F8E4M3 }) {
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.kv_dtype = dt;
+                RadBuilder a, b;
+                a.encs = b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &ctx), RAD_OK);
+                ::setenv("RADIANCE_DEBUG_KV_E4M3R", "1", 1);
+                int rc = RAD_OK;
+                (void)stderr_of([&] { rc = qwen4exp_fp8::declare(&b, &meta, &ctx); });
+                ::unsetenv("RADIANCE_DEBUG_KV_E4M3R");
+                REQUIRE_EQ(rc, RAD_OK);
+                if (dt == RAD_F8E4M3) { CHECK_EQ(program_diff(a, b), std::string()); continue; }
+                int stores = 0, folds_a = 0, folds_b = 0;
+                for (const auto& o : a.ops) folds_a += o.op == "qk_norm_rope_gate_kv_store";
+                for (const auto& o : b.ops) {
+                    folds_b += o.op == "qk_norm_rope_gate_kv_store";
+                    if (o.op == "kv_store") {
+                        CHECK_EQ(pstr(&o, "kv_dtype"), std::string("bf16_e4m3r"));
+                        ++stores;
+                    }
+                    if (o.op.rfind("attn_paged", 0) == 0 && !pstr(&o, "kv_dtype").empty())
+                        CHECK_EQ(pstr(&o, "kv_dtype"), std::string("bf16"));
+                }
+                CHECK(stores > 0);
+                CHECK(folds_a > 0);
+                CHECK_EQ(folds_b, 0);
+                for (const auto& o : a.ops)
+                    if (o.op == "kv_store") CHECK_EQ(pstr(&o, "kv_dtype"), std::string("bf16"));
+                const auto k = kit(b, {}, { 64, 64 }, 9000);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+}
+
+namespace {
+
+/* A V mean table as the engine hands it over (RadKvVMean, abi/rad_builder.h), here on the host:
+ * the plugin records the pointers and never reads them. Flash-Next's fixture is 8 layers of 24
+ * query heads over 2 KV heads of 256, so an entry is (2 + 24) * 256 bf16 and a layer has two, the
+ * plain basis and the rotated one. */
+struct VMeanFix {
+    static constexpr int64_t kE = (2 + 24) * 256;
+    std::vector<uint16_t> t;
+    RadKvVMean v{};
+    VMeanFix() : t((size_t)(8 * 2 * kE), 0) {
+        v.table = t.data();
+        v.n_layers = 8;
+        v.n_head_kv = 2;
+        v.n_head = 24;
+        v.head_dim = 256;
+    }
+    /* Where layer l's entry in basis r starts, in elements. */
+    static int64_t entry(int l, int r) { return (l * 2 + r) * kE; }
+    /* This rank's first KV head and first query head, in elements: the KV heads split over two
+     * ranks and are replicated over a pair at four; the query heads split evenly. */
+    static int64_t kv0(int rank, int world) { return (world == 4 ? rank / 2 : world == 2 ? rank : 0) * 256; }
+    static int64_t q0(int rank, int world) { return rank * (24 / world) * 256; }
+};
+
+/* What a pass does around `layer`'s cache, as around_layer says it (the rotations by buffer, the
+ * store and the attention), with the adds whose broadcast row lies in `fx`'s table named by the
+ * buffer they change, `sub:v` and `add:out`; each such row's element offset into the table goes to
+ * `offs`. */
+std::vector<std::string> around_centred(const RadBuilder& b, const RadCtx& c, int layer,
+                                        const VMeanFix& fx, std::vector<int64_t>* offs) {
+    std::vector<std::string> seq;
+    const char* lo = reinterpret_cast<const char*>(fx.t.data());
+    const char* hi = lo + fx.t.size() * 2;
+    auto ends = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    auto name_of = [&](const RadOperand& d) {
+        return d.handle >= 1 && d.handle <= b.bufs.size() ? b.bufs[d.handle - 1].name
+                                                           : std::string("?");
+    };
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_rotate") {
+            const std::string nm = name_of(i.opd.at(0));
+            seq.push_back(ends(nm, "attn_q") ? "rot:q" : ends(nm, "attn_k") ? "rot:k"
+                        : ends(nm, "attn_v") ? "rot:v" : ends(nm, "attn_out") ? "rot:out"
+                        : "rot:" + nm);
+            continue;
+        }
+        if (o->op == "add" && i.opd.size() >= 3 && i.opd[1].kind == RAD_OPK_RAW) {
+            const char* r = static_cast<const char*>(i.opd[1].raw);
+            if (r < lo || r >= hi) continue;
+            const std::string nm = name_of(i.opd.at(0));
+            seq.push_back(ends(nm, "attn_v") ? "sub:v" : ends(nm, "attn_out") ? "add:out"
+                                                                                : "add:" + nm);
+            offs->push_back((int64_t)(r - lo) / 2);
+            continue;
+        }
+        if (o->op != "kv_store" && o->op.rfind("attn_paged", 0) != 0) continue;
+        for (const RadOperand& d : i.opd)
+            if (d.kind == RAD_OPK_KV && d.offset == layer) { seq.push_back(o->op); break; }
+    }
+    return seq;
+}
+
+/* Two programs' ops, in order, leaving out a centred layer's two adds (an `add` over a buffer
+ * named attn_v or attn_out alone) and the folds a centred layer does not declare (the prologue with
+ * the store in it, the gate in the sparse attention's merge): what remains must be the same ops
+ * with the same parameters. */
+std::string ops_but_centring_diff(const RadBuilder& a, const RadBuilder& b) {
+    auto keep = [](const RadBuilder& rb, const RecOp& o) {
+        if (o.op == "attn_paged_gate_quant" || o.op == "qk_norm_rope_gate_kv_store" ||
+            o.op == "qk_norm_rope_gate_kv_store_streamed")
+            return false;
+        if (o.op != "add" || o.reads.size() != 1) return true;
+        const rad_buf h = o.reads[0];
+        const std::string nm = h >= 1 && h <= rb.bufs.size() ? rb.bufs[h - 1].name : "";
+        const bool centring = (nm.size() >= 6 && nm.compare(nm.size() - 6, 6, "attn_v") == 0) ||
+                              (nm.size() >= 8 && nm.compare(nm.size() - 8, 8, "attn_out") == 0);
+        return !centring;
+    };
+    std::vector<const RecOp*> x, y;
+    for (const auto& o : a.ops) if (keep(a, o)) x.push_back(&o);
+    for (const auto& o : b.ops) if (keep(b, o)) y.push_back(&o);
+    if (x.size() != y.size()) return "op count";
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i]->op != y[i]->op || x[i]->p.size() != y[i]->p.size()) return "op " + x[i]->op;
+        for (size_t j = 0; j < x[i]->p.size(); ++j) {
+            const RecParam& p = x[i]->p[j];
+            const RecParam& q = y[i]->p[j];
+            if (p.key != q.key || p.ival != q.ival || p.ihi != q.ihi || p.dval != q.dval ||
+                p.sval != q.sval)
+                return "op " + x[i]->op + ", parameter " + p.key;
+        }
+    }
+    return "";
+}
+
+}  /* namespace */
+
+/* A `vmean` recipe layer on Flash-Next (RAD_KVQ_VMEAN), layer 3 in fp8_v4 plain, in k4h_v4 and in
+ * i8h (both rotated), layer 7 k6_v4 as it was, at one, two and four ranks: the layer declares two bf16 adds,
+ * over V's rows (kv_dim wide) and over the output's (q_dim), and every other op is the uncentred
+ * recipe's, with the same groups. In a pass the add takes -mu off V after the rotations and before
+ * the store, and puts mu back on the output after the attention and before the rotation back; the
+ * rows it broadcasts are this rank's slices of layer 3's entry in the layer's own basis (its KV
+ * heads at the rank's KV offset, replicated at four ranks, and its query heads). On the sparse
+ * decode the gate is the separate op, not the merge's, and layer 7 keeps its fold. */
+TEST(a_vmean_kv_recipe_layer_on_flashnext_centres_v_before_its_store_and_the_output_after) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VMeanFix fx;
+    for (int q : { (int)RAD_KVQ_V4, (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED,
+                   (int)RAD_KVQ_I8H | RAD_KVQ_ROTATED })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                const bool rot = (q & RAD_KVQ_ROTATED) != 0;
+                std::vector<int32_t> plain(8, -1), cen(8, -1);
+                plain[3] = q;
+                cen[3] = q | RAD_KVQ_VMEAN;
+                plain[7] = cen[7] = RAD_KVQ_K6V4;
+                RadBuildCtx pc = with_recipe(q4_ctx(rank, world), plain);
+                RadBuildCtx cc = with_recipe(q4_ctx(rank, world), cen);
+                pc.kv_residency = cc.kv_residency = 1;
+                cc.kv_vmean = &fx.v;
+                RadBuilder a, b;
+                a.encs = b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &cc), RAD_OK);
+                CHECK_EQ(ops_but_centring_diff(a, b), std::string());
+                REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+                for (size_t i = 0; i < a.kv_groups.size(); ++i)
+                    CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d,
+                                       sizeof a.kv_groups[i].d));
+                CHECK(a.binds == b.binds);
+                const int64_t kv_dim = (world == 4 ? 1 : 2 / world) * 256;
+                const int64_t q_dim = 24 / world * 256;
+                std::vector<long long> widths;
+                for (const auto& o : b.ops)
+                    if (o.op == "add" && o.reads.size() == 1) widths.push_back(pint(&o, "n"));
+                CHECK(std::count(widths.begin(), widths.end(), (long long)kv_dim) == 1);
+                CHECK(std::count(widths.begin(), widths.end(), (long long)q_dim) == 1);
+
+                const int64_t base = VMeanFix::entry(3, rot ? 1 : 0);
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    std::vector<int64_t> offs;
+                    const std::vector<std::string> seq = around_centred(b, *v[0], 3, fx, &offs);
+                    std::vector<std::string> head = { "sub:v", "kv_store" };
+                    if (rot) head.insert(head.begin(), { "rot:q", "rot:k", "rot:v" });
+                    REQUIRE(seq.size() >= head.size() + 2);
+                    CHECK(std::vector<std::string>(seq.begin(), seq.begin() + head.size()) == head);
+                    for (size_t j = head.size(); j + 1 + rot < seq.size(); ++j)
+                        CHECK_EQ(seq[j], std::string("attn_paged"));
+                    CHECK_EQ(seq[seq.size() - 1 - rot], std::string("add:out"));
+                    if (rot) CHECK_EQ(seq.back(), std::string("rot:out"));
+                    REQUIRE_EQ(offs.size(), (size_t)2);
+                    CHECK_EQ(offs[0], base + VMeanFix::kv0(rank, world));
+                    CHECK_EQ(offs[1], base + 2 * 256 + VMeanFix::q0(rank, world));
+                    /* The decode kit takes the sparse path, where layer 7 still gates in its
+                     * merge and layer 3 does not. */
+                    if (k->b.n_seq == 4) {
+                        bool merged7 = false;
+                        std::vector<int64_t> o7;
+                        for (const std::string& e : around_centred(b, *v[0], 7, fx, &o7))
+                            merged7 = merged7 || e == "attn_paged_gate_quant";
+                        CHECK(merged7);
+                    }
+                }
+            }
+}
+
+/* The MTP head shares the last attention layer's cache, so behind a `vmean` layer 7 it centres V
+ * on layer 7's mean, in its own basis: rotated behind k4h_v4 (whose group holds rotated K and V
+ * only), plain behind a rotated k6_v4 layer (the head is unrotated there). Its history pass after a
+ * verify issues the two adds with layer 7's slices, and the steps lint clean. */
+TEST(the_mtp_head_behind_a_vmean_layer_on_flashnext_takes_that_layers_mean) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VMeanFix fx;
+    for (int q : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K6V4 })
+        for (int world : { 1, 2 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> r(8, -1);
+                r[3] = RAD_KVQ_NONE;
+                r[7] = q | RAD_KVQ_ROTATED | RAD_KVQ_VMEAN;
+                RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+                ctx.kv_vmean = &fx.v;
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                const auto ver = kit(b, std::vector<int>(4, 4), {});
+                const auto his = history_pass(b, *ver);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank,
+                                          world);
+                CHECK_PASSES(b, v);
+                const bool head_rot = q == RAD_KVQ_K4H;
+                std::vector<int64_t> offs;
+                const std::vector<std::string> seq = around_centred(b, *v[1], 8, fx, &offs);
+                REQUIRE(!offs.empty());
+                CHECK_EQ(offs[0], VMeanFix::entry(7, head_rot ? 1 : 0) + VMeanFix::kv0(rank, world));
+                CHECK(std::find(seq.begin(), seq.end(), "sub:v") < std::find(seq.begin(), seq.end(),
+                                                                               "kv_store"));
+                /* The trunk's layer 7 in the verify, rotated in both cases. */
+                std::vector<int64_t> o7;
+                (void)around_centred(b, *v[0], 7, fx, &o7);
+                REQUIRE(!o7.empty());
+                CHECK_EQ(o7[0], VMeanFix::entry(7, 1) + VMeanFix::kv0(rank, world));
+            }
+}
+
+/* Without a `vmean` layer nothing of the mean reaches the program: the same recipe declares the
+ * same program byte for byte with the engine's table handed over or not, at one, two and four
+ * ranks, so a recipe that does not ask for it is what it was. */
+TEST(without_a_vmean_layer_the_flashnext_program_is_unchanged_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VMeanFix fx;
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED;
+    r[7] = RAD_KVQ_V4;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx pc = with_recipe(q4_ctx(rank, world), r);
+            RadBuildCtx tc = pc;
+            tc.kv_vmean = &fx.v;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &tc), RAD_OK);
+            CHECK_EQ(program_diff(a, b), std::string());
+        }
+}
+
+/* What cannot be centred is refused naming the layer: a mean on fp8 (no integer V; a hand-built
+ * entry, the recipe parser never makes one), a `vmean` layer without the engine's table, a table
+ * of another geometry, and the mean on qwen35_fp8, which does not serve it. */
+TEST(a_vmean_layer_that_cannot_be_centred_is_refused_naming_the_layer) {
+    MetaKV mk = q4_small();
+    VMeanFix fx;
+    auto refusal = [&](const std::vector<int32_t>& r, const RadKvVMean* t) {
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        ctx.kv_vmean = t;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    const int32_t vm = RAD_KVQ_VMEAN;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_NONE | vm, -1, -1, -1, RAD_KVQ_V4 }, &fx.v),
+              "layer 3 subtracts a V mean, which only a layout with integer V takes"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_V4 | vm, -1, -1, -1, RAD_KVQ_V4 }, nullptr),
+              "layer 3 subtracts a V mean, which the engine did not hand over"));
+    VMeanFix narrow;
+    narrow.v.head_dim = 128;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_V4, -1, -1, -1, RAD_KVQ_V4 | vm }, &narrow.v),
+              "layer 7 subtracts a V mean and the engine's table does not fit this model"));
+
+    MetaKV q35 = q35fp8_meta();
+    const std::vector<int32_t> r35 = q35_recipe(RAD_KVQ_V4 | vm, RAD_KVQ_V4);
+    const RadBuildCtx ctx = with_recipe(build_ctx(), r35);
+    RadBuilder b;
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, q35.meta(), &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(has(err, "layer 3 subtracts a V mean, which this plugin does not serve"));
+}
+
+/* ================================================================== V predicted from K */
+namespace {
+
+/* The maps as the engine hands them over (RadKvVPred, abi/rad_builder.h), on the host: the plugin
+ * records the pointer and never reads it. Flash-Next's fixture: 8 layers, 2 KV heads of 256, an
+ * entry per vpred layer of 2 * 257 * 256 f32. Entries for layers 3 and 7, in that order. */
+struct VPredFix {
+    static constexpr int64_t kPer = 257 * 256, kE = 2 * kPer;
+    std::vector<float> t;
+    std::vector<int32_t> en;
+    RadKvVPred v{};
+    VPredFix() : t((size_t)(2 * kE), 0.0f), en(8, -1) {
+        en[3] = 0;
+        en[7] = 1;
+        v.table = t.data();
+        v.entry = en.data();
+        v.n_layers = 8;
+        v.n_head_kv = 2;
+        v.head_dim = 256;
+    }
+    /* Where layer l's maps for this rank's first KV head start, in elements. */
+    int64_t at(int l, int rank, int world) const {
+        return en[(size_t)l] * kE + VMeanFix::kv0(rank, world) / 256 * kPer;
+    }
+};
+
+/* What a pass does around `layer`'s cache: the rotations by buffer, the store, each attention by
+ * its kv_dtype ("attn_paged" or "attn_paged:<kv_dtype>" when it ends in _pk), and kv_vpred by the
+ * buffer it changes (`vpred:v`, `vpred:out`) where its map lies in `fx`'s table, the map's element
+ * offset to `offs`. */
+std::vector<std::string> around_predicted(const RadBuilder& b, const RadCtx& c, int layer,
+                                          const VPredFix& fx, std::vector<int64_t>* offs) {
+    std::vector<std::string> seq;
+    const char* lo = reinterpret_cast<const char*>(fx.t.data());
+    const char* hi = lo + fx.t.size() * 4;
+    auto ends = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    auto name_of = [&](const RadOperand& d) {
+        return d.handle >= 1 && d.handle <= b.bufs.size() ? b.bufs[d.handle - 1].name
+                                                           : std::string("?");
+    };
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_rotate") {
+            const std::string nm = name_of(i.opd.at(0));
+            seq.push_back(ends(nm, "attn_q") ? "rot:q" : ends(nm, "attn_k") ? "rot:k"
+                        : ends(nm, "attn_v") ? "rot:v" : ends(nm, "attn_out") ? "rot:out"
+                        : "rot:" + nm);
+            continue;
+        }
+        if (o->op == "kv_vpred" && i.opd.size() >= 4 && i.opd[1].kind == RAD_OPK_RAW) {
+            const char* r = static_cast<const char*>(i.opd[1].raw);
+            if (r < lo || r >= hi) continue;
+            const std::string nm = name_of(i.opd.at(2));
+            seq.push_back(ends(nm, "attn_v") ? "vpred:v" : ends(nm, "attn_out") ? "vpred:out"
+                                                                                 : "vpred:" + nm);
+            offs->push_back((int64_t)(r - lo) / 4);
+            continue;
+        }
+        if (o->op != "kv_store" && o->op.rfind("attn_paged", 0) != 0) continue;
+        const std::string kd = pstr(o, "kv_dtype");
+        for (const RadOperand& d : i.opd)
+            if (d.kind == RAD_OPK_KV && d.offset == layer) {
+                seq.push_back(ends(kd, "_pk") ? o->op + ":" + kd : o->op);
+                break;
+            }
+    }
+    return seq;
+}
+
+/* Two programs' ops, in order, leaving out a predicted layer's kv_vpred pair and P K-hat attention
+ * and the folds such a layer does not declare: the rest must be the same ops, the same parameters. */
+std::string ops_but_prediction_diff(const RadBuilder& a, const RadBuilder& b) {
+    auto keep = [](const RecOp& o) {
+        if (o.op == "kv_vpred" || o.op == "attn_paged_gate_quant" ||
+            o.op == "qk_norm_rope_gate_kv_store" || o.op == "qk_norm_rope_gate_kv_store_streamed")
+            return false;
+        const std::string kd = o.op == "attn_paged" ? pstr(&o, "kv_dtype") : "";
+        return !(kd.size() > 3 && kd.compare(kd.size() - 3, 3, "_pk") == 0);
+    };
+    std::vector<const RecOp*> x, y;
+    for (const auto& o : a.ops) if (keep(o)) x.push_back(&o);
+    for (const auto& o : b.ops) if (keep(o)) y.push_back(&o);
+    if (x.size() != y.size()) return "op count";
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i]->op != y[i]->op || x[i]->p.size() != y[i]->p.size()) return "op " + x[i]->op;
+        for (size_t j = 0; j < x[i]->p.size(); ++j) {
+            const RecParam& p = x[i]->p[j];
+            const RecParam& q = y[i]->p[j];
+            if (p.key != q.key || p.ival != q.ival || p.ihi != q.ihi || p.dval != q.dval ||
+                p.sval != q.sval)
+                return "op " + x[i]->op + ", parameter " + p.key;
+        }
+    }
+    return "";
+}
+
+}  /* namespace */
+
+/* A `vpred` recipe layer on Flash-Next (RAD_KVQ_VPRED), layer 3 in k4h_v4 and in k4h_v2h (both
+ * rotated), layer 7 k6_v4 as it was, at one, two and four ranks: the layer declares two kv_vpred
+ * ops -- the store's over this rank's KV heads (gqa 1, k_quant k4h, minus) and the output's over its
+ * query heads (the rank's gqa, k_quant none, plus) -- and a second attn_paged at kv_dtype
+ * `<layout>_pk` with op_attn's parameters otherwise; every other op is the unpredicted recipe's,
+ * with the same groups. In a pass, at decode (the sparse path) and in a long prefill (the dense
+ * one): the rotations, then V less its prediction, the store, the attention and the P K-hat
+ * attention, then the prediction back on the output and its rotation back; both maps are this
+ * rank's slice of layer 3's entry (its first KV head's, replicated at four ranks). */
+TEST(a_vpred_kv_recipe_layer_on_flashnext_stores_v_less_its_prediction_and_adds_it_back) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VPredFix fx;
+    for (int q : { (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H })
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                std::vector<int32_t> plain(8, -1), pred(8, -1);
+                plain[3] = q | RAD_KVQ_ROTATED;
+                pred[3] = q | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+                plain[7] = pred[7] = RAD_KVQ_K6V4;
+                RadBuildCtx pc = with_recipe(q4_ctx(rank, world), plain);
+                RadBuildCtx vc = with_recipe(q4_ctx(rank, world), pred);
+                pc.kv_residency = vc.kv_residency = 1;
+                vc.kv_vpred = &fx.v;
+                RadBuilder a, b;
+                a.encs = b.encs = { { "draft_head", u2_head() } };
+                REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &vc), RAD_OK);
+                CHECK_EQ(ops_but_prediction_diff(a, b), std::string());
+                REQUIRE_EQ(a.kv_groups.size(), b.kv_groups.size());
+                for (size_t i = 0; i < a.kv_groups.size(); ++i)
+                    CHECK(!std::memcmp(&a.kv_groups[i].d, &b.kv_groups[i].d,
+                                       sizeof a.kv_groups[i].d));
+                CHECK(a.binds == b.binds);
+                const int64_t kvh = world == 4 ? 1 : 2 / world, nh = 24 / world;
+                const std::string pkd = std::string(q == RAD_KVQ_K4H ? "k4h_v4" : "k4h_v2h") + "_pk";
+                int subs = 0, adds = 0, pks = 0;
+                const RecOp* att = nullptr;
+                for (const auto& o : b.ops) {
+                    if (o.op == "attn_paged" && pstr(&o, "kv_dtype") == pkd.substr(0, pkd.size() - 3))
+                        att = &o;
+                    if (o.op == "attn_paged" && pstr(&o, "kv_dtype") == pkd) {
+                        ++pks;
+                        REQUIRE(att != nullptr);
+                        for (const char* k : { "q_len", "head_dim", "gqa", "n_head", "block_size",
+                                               "max_seqs", "max_ctx" })
+                            CHECK_EQ(pint(&o, k), pint(att, k));
+                    }
+                    if (o.op != "kv_vpred") continue;
+                    CHECK_EQ(pint(&o, "head_dim"), 256LL);
+                    CHECK_EQ(pstr(&o, "dtype"), std::string("bf16"));
+                    if (pint(&o, "sign") < 0) {
+                        ++subs;
+                        CHECK_EQ(pint(&o, "n_head"), (long long)kvh);
+                        CHECK_EQ(pint(&o, "gqa"), 1LL);
+                        CHECK_EQ(pstr(&o, "k_quant"), std::string("k4h"));
+                    } else {
+                        ++adds;
+                        CHECK_EQ(pint(&o, "n_head"), (long long)nh);
+                        CHECK_EQ(pint(&o, "gqa"), (long long)(nh / kvh));
+                        CHECK_EQ(pstr(&o, "k_quant"), std::string("none"));
+                    }
+                }
+                CHECK_EQ(subs, 1);
+                CHECK_EQ(adds, 1);
+                CHECK_EQ(pks, 1);
+
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    std::vector<int64_t> offs;
+                    const std::vector<std::string> seq = around_predicted(b, *v[0], 3, fx, &offs);
+                    const std::vector<std::string> head = { "rot:q", "rot:k", "rot:v", "vpred:v",
+                                                            "kv_store" };
+                    REQUIRE(seq.size() >= head.size() + 4);
+                    CHECK(std::vector<std::string>(seq.begin(), seq.begin() + head.size()) == head);
+                    /* Every launch of the attention has its P K-hat twin over the same rows. */
+                    const size_t j = seq.size() - 2;
+                    int outs = 0, pkl = 0;
+                    for (size_t x = head.size(); x < j; ++x) {
+                        outs += seq[x] == "attn_paged";
+                        pkl += seq[x] == "attn_paged:" + pkd;
+                        CHECK(seq[x] == "attn_paged" || seq[x] == "attn_paged:" + pkd);
+                    }
+                    CHECK(outs >= 1);
+                    CHECK_EQ(outs, pkl);
+                    CHECK_EQ(seq[head.size()], std::string("attn_paged"));
+                    CHECK_EQ(seq[j], std::string("vpred:out"));
+                    CHECK_EQ(seq[j + 1], std::string("rot:out"));
+                    REQUIRE_EQ(offs.size(), (size_t)2);
+                    CHECK_EQ(offs[0], fx.at(3, rank, world));
+                    CHECK_EQ(offs[1], fx.at(3, rank, world));
+                }
+            }
+}
+
+/* The calibration's fit (rad_calib_vpred.h) recovers a map it was given: K drawn with unequal
+ * channel scales and a mean, V = K A + b exactly, the sums accumulated as the tap accumulates them
+ * (upper triangle of K K^T), and the ridge solve gives A and b back to within the ridge's pull
+ * (lambda is 1e-4 of the mean K variance). With every K the same the moments are singular and the
+ * fit says so rather than write a map. */
+TEST(the_vpred_calibration_fit_recovers_a_known_map_from_its_sums) {
+    const int64_t D = 16;
+    const long long n = 4000;
+    std::mt19937 rng(9);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    std::vector<double> A((size_t)(D * D)), b((size_t)D);
+    for (auto& x : A) x = 0.3 * nd(rng);
+    for (auto& x : b) x = nd(rng);
+    std::vector<double> sk((size_t)D, 0.0), sv((size_t)D, 0.0), skk((size_t)(D * D), 0.0),
+        skv((size_t)(D * D), 0.0), k((size_t)D), v((size_t)D);
+    for (long long r = 0; r < n; ++r) {
+        for (int64_t i = 0; i < D; ++i) k[(size_t)i] = 0.5 + (1.0 + (double)i / 4.0) * nd(rng);
+        for (int64_t j = 0; j < D; ++j) {
+            v[(size_t)j] = b[(size_t)j];
+            for (int64_t i = 0; i < D; ++i) v[(size_t)j] += k[(size_t)i] * A[(size_t)(i * D + j)];
+        }
+        for (int64_t i = 0; i < D; ++i) {
+            sk[(size_t)i] += k[(size_t)i];
+            sv[(size_t)i] += v[(size_t)i];
+            for (int64_t j = i; j < D; ++j) skk[(size_t)(i * D + j)] += k[(size_t)i] * k[(size_t)j];
+            for (int64_t j = 0; j < D; ++j) skv[(size_t)(i * D + j)] += k[(size_t)i] * v[(size_t)j];
+        }
+    }
+    std::vector<double> fit;
+    REQUIRE(rad::arch::vpred_fit(D, n, sk, sv, skk, skv, &fit));
+    REQUIRE_EQ(fit.size(), (size_t)((D + 1) * D));
+    double worst = 0.0;
+    for (int64_t i = 0; i < D * D; ++i) worst = std::max(worst, std::fabs(fit[(size_t)i] - A[(size_t)i]));
+    for (int64_t j = 0; j < D; ++j) worst = std::max(worst, std::fabs(fit[(size_t)(D * D + j)] - b[(size_t)j]));
+    std::printf("    worst error of the fitted map %.3g\n", worst);
+    CHECK(worst < 2e-3);
+    /* Every K the same: no variance to fit, refused. */
+    std::vector<double> ck((size_t)D, 0.0), cv((size_t)D, 0.0), ckk((size_t)(D * D), 0.0),
+        ckv((size_t)(D * D), 0.0);
+    for (int64_t i = 0; i < D; ++i) {
+        ck[(size_t)i] = 2.0 * (double)n;
+        for (int64_t j = i; j < D; ++j) ckk[(size_t)(i * D + j)] = 4.0 * (double)n;
+    }
+    CHECK(!rad::arch::vpred_fit(D, n, ck, cv, ckk, ckv, &fit));
+}
+
+/* The MTP head shares the last attention layer's cache, so behind a `vpred` layer 7 (k4h_v4, whose
+ * group the head rotates in) its V goes in less layer 7's prediction, from layer 7's maps, and its
+ * attention adds it back; the trunk's layer 7 uses the same maps. The verify and the history pass
+ * lint clean. */
+TEST(the_mtp_head_behind_a_vpred_layer_on_flashnext_takes_that_layers_maps) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VPredFix fx;
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            std::vector<int32_t> r(8, -1);
+            r[3] = RAD_KVQ_NONE;
+            r[7] = RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+            RadBuildCtx ctx = with_recipe(q4_ctx(rank, world), r);
+            ctx.kv_vpred = &fx.v;
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+            std::vector<int64_t> offs;
+            const std::vector<std::string> seq = around_predicted(b, *v[1], 8, fx, &offs);
+            REQUIRE(!offs.empty());
+            CHECK_EQ(offs[0], fx.at(7, rank, world));
+            CHECK(std::find(seq.begin(), seq.end(), "vpred:v") <
+                  std::find(seq.begin(), seq.end(), "kv_store"));
+            std::vector<int64_t> o7;
+            (void)around_predicted(b, *v[0], 7, fx, &o7);
+            REQUIRE_EQ(o7.size(), (size_t)2);
+            CHECK_EQ(o7[0], fx.at(7, rank, world));
+            CHECK_EQ(o7[1], fx.at(7, rank, world));
+        }
+}
+
+/* Without a `vpred` layer nothing of the prediction reaches the program: the same recipe declares
+ * the same program byte for byte with the engine's maps handed over or not, at one, two and four
+ * ranks. */
+TEST(without_a_vpred_layer_the_flashnext_program_is_unchanged_byte_for_byte) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    VPredFix fx;
+    std::vector<int32_t> r(8, -1);
+    r[3] = (int)RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED;
+    r[7] = (int)RAD_KVQ_K4H | RAD_KVQ_ROTATED;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx pc = with_recipe(q4_ctx(rank, world), r);
+            RadBuildCtx tc = pc;
+            tc.kv_vpred = &fx.v;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &pc), RAD_OK);
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &tc), RAD_OK);
+            CHECK_EQ(program_diff(a, b), std::string());
+        }
+}
+
+/* What cannot be predicted is refused naming the layer (hand-built entries; the recipe parser
+ * never makes them): `vpred` on a layout whose K is not k4h's int4 (k6_v4, i8h), beside a V mean,
+ * without the engine's maps, with maps of another geometry or none for the layer; and on
+ * qwen35_fp8, which does not serve it. */
+TEST(a_vpred_layer_that_cannot_be_predicted_is_refused_naming_the_layer) {
+    MetaKV mk = q4_small();
+    VPredFix fx;
+    VMeanFix vm;
+    auto refusal = [&](const std::vector<int32_t>& r, const RadKvVPred* t) {
+        RadBuildCtx ctx = with_recipe(q4_ctx(0, 1), r);
+        ctx.kv_vpred = t;
+        ctx.kv_vmean = &vm.v;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&b, mk.meta(), &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    const int32_t vp = RAD_KVQ_VPRED, rot = RAD_KVQ_ROTATED;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K6V4 | vp, -1, -1, -1, RAD_KVQ_V4 }, &fx.v),
+              "layer 3 predicts V from K, which only a k4h_v4 or k4h_v2h layer"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_I8H | rot | vp, -1, -1, -1, RAD_KVQ_V4 }, &fx.v),
+              "layer 3 predicts V from K, which only a k4h_v4 or k4h_v2h layer"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K4H | rot | vp | RAD_KVQ_VMEAN, -1, -1, -1, RAD_KVQ_V4 },
+                      &fx.v),
+              "layer 3 predicts V from K, which only a k4h_v4 or k4h_v2h layer without a V mean"));
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K4H | rot | vp, -1, -1, -1, RAD_KVQ_V4 }, nullptr),
+              "layer 3 predicts V from K, which the engine did not hand over"));
+    VPredFix narrow;
+    narrow.v.head_dim = 128;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_V4, -1, -1, -1, RAD_KVQ_K4H | rot | vp }, &narrow.v),
+              "layer 7 predicts V from K and the engine's maps do not fit this model"));
+    VPredFix none;
+    none.en[3] = -1;
+    CHECK(has(refusal({ -1, -1, -1, RAD_KVQ_K4HV2H | rot | vp, -1, -1, -1, RAD_KVQ_V4 }, &none.v),
+              "or name no map for it"));
+
+    MetaKV q35 = q35fp8_meta();
+    const std::vector<int32_t> r35 = q35_recipe(RAD_KVQ_K4H | rot | vp, RAD_KVQ_V4);
+    const RadBuildCtx ctx = with_recipe(build_ctx(), r35);
+    RadBuilder b;
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen35_fp8::declare(&b, q35.meta(), &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(has(err, "layer 3 predicts V from K, which this plugin does not serve"));
+}
+
+/* The pager (spec §7.3, docs/OPS.md `qsa_page`) is part of the graph only when the deployment asked
+ * for the residency store: a window is declared on every QSA attention group, so the store is the
+ * gate. Off, the declaration holds no `qsa_page` and is the one a server keeping every block
+ * resident runs; on, each full-attention rank with a cache declares one per QSA layer (two trunk
+ * layers and the MTP head's), and a rank with no attention cache none. */
+TEST(flashnext_declares_qsa_page_only_when_the_residency_store_is_asked_for) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int store = 0; store < 2; ++store)
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.kv_residency = store;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+                int pages = 0;
+                for (const auto& o : b.ops) pages += o.op == "qsa_page";
+                const bool has_cache = !b.kv_groups[0].zero;
+                CHECK_EQ(pages, store && has_cache ? 3 : 0);
+                if (!pages) continue;
+                const RecOp* sel = find_op(b, "qsa_select");
+                const RecOp* pg = find_op(b, "qsa_page");
+                REQUIRE(sel != nullptr);
+                CHECK_EQ(pint(pg, "topk"), pint(sel, "topk"));
+                CHECK_EQ(pint(pg, "blocks"), pint(sel, "blocks"));
+                /* K and V of a four-token page, one layer: bf16, 2 * 4 * n_head_kv * head_dim. */
+                const RadKVGroupDecl& kd = b.kv_groups[0].d;
+                CHECK_EQ(pint(pg, "block_bytes"), 2 * 4 * kd.n_head_kv * kd.head_dim * 2);
+            }
+}
+
+/* With the store open the pager is issued between the select and the attention, on the decode rows
+ * only (they own the scratch pages), with the batch's store, this layer's fragment offset, the
+ * layer's pool and the scratch table; a step whose batch has no store, or no decode row, issues
+ * none. And every step still lints clean at one, two and four ranks with the op in the graph. */
+TEST(flashnext_steps_with_qsa_page_issue_it_between_select_and_attention_and_lint_clean) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    static char store[4096];
+    static const int64_t layer_off[64] = {};
+    static const int32_t scratch[64 * 513] = {};
+    static int64_t paged_counter = 0;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            ctx.kv_residency = 1;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            const bool has_cache = !b.kv_groups[0].zero;
+            for (int open = 0; open < 2; ++open)
+                for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000),
+                                       kit(b, { 1, 4 }, { 6 }, 300) }) {
+                    for (auto& gb : k->kv) if (open) {
+                        gb.residency_store = store;
+                        gb.residency_slot_bytes = (int64_t)sizeof store;
+                        gb.residency_slots = 1;
+                        gb.residency_layer_off = layer_off;
+                        gb.residency_scratch = scratch;
+                        gb.residency_scratch_pitch = 513;
+                        gb.residency_paged = &paged_counter;
+                    }
+                    const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    const auto pg = issues_of(b, *v[0], "qsa_page");
+                    const bool want = open && has_cache && k->b.n_tok_decode > 0;
+                    CHECK_EQ(pg.size(), (size_t)(want ? 2 : 0));
+                    if (!want) continue;
+                    for (const RecIssue* i : pg) {
+                        CHECK_EQ(i->n, k->b.n_tok_decode);
+                        CHECK_EQ(i->opd[0].rows, k->b.n_tok_decode);
+                        CHECK(i->opd[1].raw == (void*)store);
+                        /* The card's counter of rewritten entries rides as the fifth operand. */
+                        CHECK(i->opd.size() > 4 && i->opd[4].raw == (void*)&paged_counter);
+                    }
+                    /* Between: each page follows a select and precedes the next layer's. */
+                    int sel_seen = 0;
+                    for (const auto& i : v[0]->issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o) continue;
+                        if (o->op == "qsa_select") ++sel_seen;
+                        if (o->op == "qsa_page") CHECK(sel_seen > 0);
+                    }
+                }
+        }
+}
+
+/* The page cache (RadKVGroupBatch::residency_tags, ABI 51): each pager gets its own layer's plane
+ * of slot tags -- the plane is the count of the group's layers below it (residency_layer_off >= 0),
+ * so planes are dense over the layers the group holds and no two layers share one -- as rows x
+ * pitch i32, and the hit counter as its seventh operand. A batch without tags, or with fewer tag
+ * rows than the step's decode rows, passes neither and the pager copies as before. */
+TEST(flashnext_issues_each_pager_its_layers_page_cache_plane_and_the_hit_counter) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    static char store[4096];
+    static int64_t layer_off[64];
+    static const int32_t scratch[64 * 513] = {};
+    static int32_t tags[8 * 4 * 513];
+    static int64_t counters[2];
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.encs = { { "draft_head", u2_head() } };
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            ctx.kv_residency = 1;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            if (b.kv_groups[0].zero) continue;
+            /* First the layers the pagers run at (their pool operand names the layer); then a table
+             * holding only those, with every other layer -1. */
+            for (int64_t& o : layer_off) o = 0;
+            std::vector<int64_t> layers;
+            for (int mode = 0; mode < 4; ++mode) {
+                const auto k = kit(b, { 1, 1, 1, 1 }, {});
+                for (auto& gb : k->kv) {
+                    gb.residency_store = store;
+                    gb.residency_slot_bytes = (int64_t)sizeof store;
+                    gb.residency_slots = 1;
+                    gb.residency_layer_off = layer_off;
+                    gb.residency_scratch = scratch;
+                    gb.residency_scratch_pitch = 513;
+                    gb.residency_paged = &counters[0];
+                    if (mode >= 1) {
+                        gb.residency_tags = tags;
+                        gb.residency_tags_rows = mode == 3 ? 3 : 4;   /* 3: fewer than the rows */
+                        gb.residency_hits = &counters[1];
+                    }
+                }
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                const auto pg = issues_of(b, *v[0], "qsa_page");
+                REQUIRE(!pg.empty());
+                if (mode == 0) {
+                    for (const RecIssue* i : pg) layers.push_back(i->opd[2].offset);
+                    for (int64_t l = 0; l < 64; ++l)
+                        layer_off[l] = std::find(layers.begin(), layers.end(), l) != layers.end() ? l * 8 : -1;
+                    continue;
+                }
+                std::vector<int64_t> held;
+                for (int64_t l = 0; l < 64; ++l) if (layer_off[l] >= 0) held.push_back(l);
+                for (const RecIssue* i : pg) {
+                    REQUIRE(i->opd.size() >= 7);
+                    if (mode == 3) {
+                        CHECK(i->opd[5].kind == RAD_OPK_NONE);
+                        continue;
+                    }
+                    const int64_t l = i->opd[2].offset;
+                    const int64_t plane = std::find(held.begin(), held.end(), l) - held.begin();
+                    CHECK(plane < (int64_t)held.size());
+                    CHECK(i->opd[5].raw == (void*)(tags + plane * 4 * 513));
+                    CHECK_EQ(i->opd[5].rows, 4LL);
+                    CHECK_EQ(i->opd[5].cols, 513LL);
+                    CHECK(i->opd[6].raw == (void*)&counters[1]);
+                    CHECK(i->opd[4].raw == (void*)&counters[0]);
+                }
+                /* Distinct planes, one a layer. */
+                if (mode != 3) {
+                    std::vector<void*> ps;
+                    for (const RecIssue* i : pg) ps.push_back(i->opd[5].raw);
+                    std::sort(ps.begin(), ps.end());
+                    CHECK(std::adjacent_find(ps.begin(), ps.end()) == ps.end());
+                }
+            }
+        }
+}
+
 /* Sparse attention issues one row per query, chunked by the split-KV scratch it declared, never
  * by `max_seqs`: with four sequences allowed, a 1024-token chunk after a long history is one
  * launch of the gated form, or four of 256 rows where only the plain form resolves. Rows of four
@@ -9834,6 +12364,75 @@ TEST(flashnext_sparse_attention_chunks_by_its_scratch_not_by_max_seqs) {
 /* The indexer's unfinished block is state, not scratch: each QSA layer stores it in the linear
  * `kv_qsa_tail` group at its own layer, so two layers never share one tail and a slot survives
  * across steps. */
+/* Window residency (spec §7.3): the indexer knows how much of the history one query reads, and the
+ * attention helper does not, so rad_qsa.h annotates the group the attention reads and leaves the
+ * block-key group alone. The block keys are what the scorer gathers over the *whole* history, so a
+ * window on them would have the scorer read host memory for every step, which is the opposite of
+ * the saving. */
+TEST(flashnext_qsa_declares_a_window_on_its_attention_group_and_none_on_its_block_keys) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadBuilder b;
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    rad_kvgroup attn = 0, keys = 0;
+    for (size_t g = 0; g < b.kv_groups.size(); ++g) {
+        if (b.kv_groups[g].name == "kv_attn") attn = (rad_kvgroup)(g + 1);
+        if (b.kv_groups[g].name == "kv_qsa_bkey") keys = (rad_kvgroup)(g + 1);
+    }
+    REQUIRE(attn != 0);
+    REQUIRE(keys != 0);
+    CHECK_EQ((int)b.kv_groups[attn - 1].d.kind, (int)RAD_KV_FULL);
+    /* indexer_budget, from the checkpoint: the history one query scores, 512 four-token blocks. */
+    CHECK_EQ(b.kv_groups[attn - 1].d.residency_window, 2048ll);
+    CHECK_EQ(b.kv_groups[keys - 1].d.residency_window, 0ll);
+    /* And the store is a per-block one: every residency group holds blocks of its own size. */
+    CHECK_EQ(b.kv_groups[attn - 1].d.n_head_kv, 2);
+}
+
+/* The scheduler promotes a mixed step's decode rows only when the step may be dense, and it takes a
+ * step whose reach passes `window + block - 1` for sparse in every row (Scheduler::res_dense_rows):
+ * its decode rows keep their cold entries for the pager. That holds only while the attention's own
+ * dense bound (qsa_exact_to) is no larger. Pinned at the edge: one token past it every attention
+ * launch reads the selection, and at it the step is dense (the bound is exactly the plugin's). */
+TEST(flashnext_a_mixed_step_past_the_window_plus_a_block_reads_every_row_through_its_selection) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadBuilder b;
+    /* The attention block is `ratio` tokens on the card (rad_qsa.h, page_block_bytes); the fake's
+     * default of 16 would put the bound past the plugin's and hide the edge. */
+    b.kv_block = 4;
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    ctx.kv_residency = 1;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    int64_t win = 0;
+    for (const auto& g : b.kv_groups) if (g.name == "kv_attn") win = g.d.residency_window;
+    REQUIRE(win > 0);
+    REQUIRE(b.kv_block > 0);
+    const int64_t bound = win + b.kv_block - 1;
+    for (int past = 0; past < 2; ++past) {
+        auto k = kit(b, { 1, 1 }, { 32 }, 100);
+        /* The batch's reach is max_ctx_len + max_q_len (rad_block_attn_gated_fp8.h). */
+        k->b.max_ctx_len = (int32_t)(bound + past - k->b.max_q_len);
+        RadCtx c;
+        c.b = &b;
+        c.batch = &k->b;
+        qwen4exp_fp8::step(&c, &k->b);
+        int sparse = 0, dense = 0;
+        rad_buf sel = 0;
+        for (const RecIssue& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            if (o->op == "qsa_select") sel = i.opd[5].handle;
+            else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant")
+                ++(sel && i.opd[2].handle == sel ? sparse : dense);
+        }
+        CHECK(sparse + dense > 0);
+        if (past) CHECK_EQ(dense, 0);
+        else      CHECK(dense > 0);
+    }
+}
+
 TEST(flashnext_qsa_tail_is_per_layer_state) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
@@ -9856,6 +12455,236 @@ TEST(flashnext_qsa_tail_is_per_layer_state) {
                 layers.insert(o.offset);
             }
     CHECK(layers == (std::set<int64_t>{ 3, 7 }));
+}
+
+/* --qsa-bkey-dtype i8 (RadBuildCtx::qsa_bkey_dtype RAD_I8) at one and two ranks: the block-key
+ * group is declared RAD_I8 at head_dim 17, a 136-byte page for the 128 codes and their f16 scale
+ * (34 bytes a token a layer against bf16's 64), and every qsa_block_key and qsa_score -- the two
+ * trunk QSA layers' and the MTP head's -- takes key_dtype i8 and differs from the bf16 program in
+ * that parameter only. The default declares today's group (bf16, head_dim 16) and no key_dtype
+ * anywhere, so the bf16 program is unchanged. The probe says the plugin serves int8, a dtype it
+ * does not know is refused, and the int8 steps lint clean (decode, prefill, verify and the head). */
+TEST(flashnext_int8_block_keys_shrink_the_block_key_page_and_change_nothing_else) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.qsa_bkey_i8_ok, 1);
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuildCtx ctx = q4_ctx(rank, world);
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &ctx), RAD_OK);
+            ctx.qsa_bkey_dtype = RAD_I8;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            auto keys = [](const RadBuilder& x) -> const RecKV* {
+                for (const RecKV& g : x.kv_groups) if (g.name == "kv_qsa_bkey") return &g;
+                return nullptr;
+            };
+            const RecKV *ka = keys(a), *kb = keys(b);
+            REQUIRE(ka != nullptr);
+            REQUIRE(kb != nullptr);
+            CHECK_EQ(ka->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(ka->d.head_dim, 16);
+            CHECK_EQ(kb->d.dtype, (uint32_t)RAD_I8);
+            CHECK_EQ(kb->d.head_dim, 17);
+            CHECK_EQ(rad_dtype_bytes(kb->d.dtype, 2 * 4 * kb->d.head_dim), 136);
+            CHECK_EQ(kb->d.n_head_kv, ka->d.n_head_kv);
+            CHECK_EQ(kb->d.residency_window, 0ll);
+            REQUIRE_EQ(a.ops.size(), b.ops.size());
+            int keyed = 0;
+            for (size_t i = 0; i < a.ops.size(); ++i) {
+                const RecOp &x = a.ops[i], &y = b.ops[i];
+                REQUIRE_EQ(x.op, y.op);
+                CHECK_EQ(pstr(&x, "key_dtype"), std::string("<absent>"));
+                if (x.op != "qsa_block_key" && x.op != "qsa_score") {
+                    CHECK_EQ(y.p.size(), x.p.size());
+                    continue;
+                }
+                ++keyed;
+                CHECK_EQ(pstr(&y, "key_dtype"), std::string("i8"));
+                REQUIRE_EQ(y.p.size(), x.p.size() + 1);
+                for (size_t j = 0; j < x.p.size(); ++j) {
+                    CHECK_EQ(y.p[j].key, x.p[j].key);
+                    CHECK_EQ(y.p[j].ival, x.p[j].ival);
+                    CHECK_EQ(y.p[j].sval, x.p[j].sval);
+                }
+            }
+            CHECK_EQ(keyed, 6);   /* layers 3 and 7 and the MTP head, a store and a score each */
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, world);
+            CHECK_PASSES(b, v);
+        }
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    ctx.qsa_bkey_dtype = RAD_F8E4M3;
+    RadBuilder c;
+    c.encs = { { "draft_head", u2_head() } };
+    int rc = RAD_OK;
+    const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&c, &meta, &ctx); });
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+    CHECK(err.find("block keys") != std::string::npos);
+}
+
+/* --qsa-bkey-split on (RadBuildCtx::qsa_bkey_split) at two ranks: the block-key group is paged at
+ * 2 * ratio tokens with one key a page (head_dim 8 at bf16, a 256-byte page for two blocks' worth
+ * of tokens; 9 in int8, 144 bytes), so each rank holds half the keys. Every qsa_block_key states
+ * that block size and every qsa_work its rank; qsa_select is replaced, per QSA layer and in the MTP
+ * head, by qsa_select_part, an all_gather of one 1028-word list row a query (row-interleaved) and
+ * qsa_select_join. Everything else is today's op for op and parameter for parameter, and with the
+ * flag off the program has none of it. The split steps lint clean (decode, prefill, verify and the
+ * head) and each issue sizes the gather and narrows the score plane to its share. The probe says
+ * the plugin serves it; one rank and a value other than 0 or 1 are refused. */
+TEST(flashnext_split_block_keys_halve_the_block_key_pages_and_select_through_a_gather) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
+    CHECK_EQ(pb.qsa_bkey_split_ok, 1);
+    auto keys = [](const RadBuilder& x) -> const RecKV* {
+        for (const RecKV& g : x.kv_groups) if (g.name == "kv_qsa_bkey") return &g;
+        return nullptr;
+    };
+    for (bool i8 : { false, true })
+        for (int rank = 0; rank < 2; ++rank) {
+            RadBuildCtx ctx = q4_ctx(rank, 2);
+            ctx.qsa_bkey_dtype = i8 ? RAD_I8 : 0;
+            RadBuilder a, b;
+            a.encs = b.encs = { { "draft_head", u2_head() } };
+            REQUIRE_EQ(qwen4exp_fp8::declare(&a, &meta, &ctx), RAD_OK);
+            ctx.qsa_bkey_split = 1;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+            const RecKV *ka = keys(a), *kb = keys(b);
+            REQUIRE(ka != nullptr);
+            REQUIRE(kb != nullptr);
+            CHECK_EQ(ka->d.head_dim, i8 ? 17 : 16);
+            CHECK_EQ(kb->d.head_dim, i8 ? 9 : 8);
+            CHECK_EQ(kb->d.dtype, ka->d.dtype);
+            CHECK_EQ(kb->d.n_head_kv, 1);
+            CHECK_EQ(kb->d.residency_window, 0ll);
+            /* A page of the split group (2 * ratio = 8 tokens) holds one key: bytes a token a
+             * layer drop from 64 to 32 at bf16 and from 34 to 18 in int8. */
+            CHECK_EQ(rad_dtype_bytes(kb->d.dtype, 2 * 8 * kb->d.head_dim), i8 ? 144 : 256);
+            /* Off: no op of the split, and today's block size and qsa_work parameters. */
+            for (const RecOp& x : a.ops) {
+                CHECK(x.op != "qsa_select_part" && x.op != "qsa_select_join");
+                CHECK_EQ(pint(&x, "ranks"), -12345LL);
+                if (x.op == "qsa_block_key") CHECK_EQ(pint(&x, "block_size"), 4LL);
+            }
+            /* On: a's ops with each qsa_select replaced by part, gather, join. */
+            std::vector<const RecOp*> rest;
+            int parts = 0, joins = 0, gathers = 0, works = 0, stores = 0, unstated = 0;
+            for (const RecOp& y : b.ops) {
+                if (y.op == "qsa_select_part") {
+                    ++parts;
+                    CHECK_EQ(pint(&y, "ranks"), 2LL);
+                    CHECK_EQ(pint(&y, "rank"), (long long)rank);
+                    CHECK_EQ(pint(&y, "topk"), 512LL);
+                    continue;
+                }
+                if (y.op == "qsa_select_join") {
+                    ++joins;
+                    CHECK_EQ(pint(&y, "ranks"), 2LL);
+                    CHECK_EQ(pint(&y, "topk"), 512LL);
+                    continue;
+                }
+                if (y.op == "all_gather" && pint(&y, "row") == 1028) {
+                    ++gathers;
+                    CHECK_EQ(pint(&y, "world_size"), 2LL);
+                    CHECK_EQ(pstr(&y, "dtype"), std::string("f32"));
+                    continue;
+                }
+                rest.push_back(&y);
+            }
+            std::vector<const RecOp*> base;
+            for (const RecOp& x : a.ops) if (x.op != "qsa_select") base.push_back(&x);
+            CHECK_EQ(parts, 3);   /* layers 3 and 7 and the MTP head */
+            CHECK_EQ(joins, 3);
+            CHECK_EQ(gathers, 3);
+            REQUIRE_EQ(rest.size(), base.size());
+            for (size_t i = 0; i < rest.size(); ++i) {
+                const RecOp &x = *base[i], &y = *rest[i];
+                REQUIRE_EQ(x.op, y.op);
+                if (y.op == "qsa_work") {
+                    ++works;
+                    CHECK_EQ(pint(&y, "ranks"), 2LL);
+                    CHECK_EQ(pint(&y, "rank"), (long long)rank);
+                    REQUIRE_EQ(y.p.size(), x.p.size() + 2);
+                    continue;
+                }
+                /* Only the first qsa_block_key (layer 3's, the one the group binds to) states the
+                 * split block size; the others leave it out, so no attention group declared before
+                 * them can bind to one. */
+                if (y.op == "qsa_block_key" && pint(&y, "block_size") == -12345LL) {
+                    ++unstated;
+                    REQUIRE_EQ(y.p.size() + 1, x.p.size());
+                    for (size_t j = 0, k = 0; j < x.p.size(); ++j) {
+                        if (x.p[j].key == "block_size") continue;
+                        CHECK_EQ(y.p[k].key, x.p[j].key);
+                        CHECK_EQ(y.p[k].ival, x.p[j].ival);
+                        ++k;
+                    }
+                    continue;
+                }
+                REQUIRE_EQ(y.p.size(), x.p.size());
+                for (size_t j = 0; j < x.p.size(); ++j) {
+                    CHECK_EQ(y.p[j].key, x.p[j].key);
+                    if (y.op == "qsa_block_key" && y.p[j].key == "block_size") {
+                        ++stores;
+                        CHECK_EQ(y.p[j].ival, 8LL);
+                        continue;
+                    }
+                    CHECK_EQ(y.p[j].ival, x.p[j].ival);
+                    CHECK_EQ(y.p[j].ihi, x.p[j].ihi);
+                    CHECK_EQ(y.p[j].sval, x.p[j].sval);
+                }
+            }
+            CHECK_EQ(works, 3);
+            CHECK_EQ(stores, 1);     /* layer 3's */
+            CHECK_EQ(unstated, 2);   /* layer 7's and the MTP head's */
+            /* Decode, a prefill after a long history (sparse), a verify and the head's passes. */
+            for (const auto& k : { kit(b, { 1, 1, 1, 1 }, {}), kit(b, {}, { 64, 64 }, 9000) }) {
+                const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() }, rank, 2);
+                CHECK_PASSES(b, v);
+                /* The gather moves one 1028-word list a query row; the score plane is the share's
+                 * columns, ceil(live / 2), at the declared pitch. */
+                const auto ga = issues_of(b, *v[0], "all_gather");
+                const auto pa = issues_of(b, *v[0], "qsa_select_part");
+                const auto sc = issues_of(b, *v[0], "qsa_score");
+                REQUIRE(!pa.empty());
+                REQUIRE_EQ(sc.size(), pa.size());
+                int64_t listed = 0;
+                for (const RecIssue* g : ga)
+                    if (const RecOp* o = b.op_of(g->op); o && pint(o, "row") == 1028) {
+                        ++listed;
+                        CHECK_EQ(g->n, g->opd[0].rows * 1028);
+                    }
+                CHECK_EQ(listed, (int64_t)pa.size());
+                for (size_t i = 0; i < pa.size(); ++i) {
+                    CHECK_EQ(pa[i]->opd[0].cols, sc[i]->opd[5].cols);
+                    CHECK(pa[i]->opd[0].cols > 0);
+                }
+            }
+            const auto ver = kit(b, std::vector<int>(4, 4), {});
+            const auto his = history_pass(b, *ver);
+            const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+        }
+    for (int bad : { 1, 2 }) {
+        RadBuildCtx ctx = q4_ctx(0, bad == 1 ? 1 : 2);
+        ctx.qsa_bkey_split = bad;
+        RadBuilder c;
+        c.encs = { { "draft_head", u2_head() } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = qwen4exp_fp8::declare(&c, &meta, &ctx); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        CHECK(err.find("qsa-bkey-split") != std::string::npos);
+    }
 }
 
 /* The rope table has a row for every position a step can name: a verify and the draft rounds run
@@ -10356,6 +13185,232 @@ TEST(nomicbert_probe_reads_the_model_type) {
     MetaKV other = nb_meta().set("model_type", "bert");
     CHECK_EQ(stderr_of_rc([&] { return nomicbert::probe(other.meta(), &p); }),
              RAD_E_UNSUPPORTED);
+}
+
+/* Gemma 4 12B's media embedders (rad_block_gemma4_unified.h) in place of the tower and the
+ * conformer: a picture patch is a 48 x 48 window and an audio frame 640 samples, each one row. The
+ * position table [npos, 2, width] is read as its taps 0 (column) and 1 (row) of dimension 1; a
+ * vision pass is LayerNorm, the dense with its bias, LayerNorm, the two position rows (the column
+ * from coordinate plane 1, the row from plane 0) added in, LayerNorm (eps 1e-5, no config states it),
+ * the weightless RMS norm and the projection; an audio pass the norm and its projection. Every rank
+ * runs both whole and both lint clean; the probe says one patch a row and 750 frames. */
+TEST(the_gemma4_12b_embeds_images_and_audio_without_an_encoder) {
+    std::vector<const char*> keys(std::begin(k_gem12_keys), std::end(k_gem12_keys));
+    std::vector<const char*> vals(std::begin(k_gem12_vals), std::end(k_gem12_vals));
+    const char* mk[] = { "vision_config.model_type", "vision_config.mm_embed_dim",
+                         "vision_config.mm_posemb_size", "vision_config.model_patch_size",
+                         "vision_config.output_proj_dims", "vision_config.rms_norm_eps",
+                         "vision_config.patch_size", "vision_config.pooling_kernel_size",
+                         "audio_config.model_type", "audio_config.audio_embed_dim",
+                         "audio_config.rms_norm_eps", "processor.feature_extractor.sampling_rate",
+                         "processor.feature_extractor.audio_samples_per_token",
+                         "processor.audio_seq_length" };
+    const char* mv[] = { "gemma4_unified_vision", "3840", "1120", "48", "3840", "1e-06", "16", "3",
+                         "gemma4_unified_audio", "640", "1e-06", "16000", "640", "750" };
+    keys.insert(keys.end(), std::begin(mk), std::end(mk));
+    vals.insert(vals.end(), std::begin(mv), std::end(mv));
+    RadModelMeta meta = gemma4_12b_meta();
+    meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+
+    RadArchProbe pr{};
+    REQUIRE_EQ(gemma4_bf16::probe(&meta, &pr), RAD_OK);
+    CHECK_EQ(pr.enc_merge, 1);
+    CHECK_EQ(pr.audio_frames, 750);
+
+    for (int world : { 1, 2, 4 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_enc_patches = 1120;
+            ctx.max_audio_frames = 750;
+            REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK_EQ(b.encoder_name, std::string("vision"));
+            CHECK_EQ(b.encoder.patch_dim, 6912);
+            CHECK_EQ(b.encoder.merge, 1);
+            CHECK_EQ(b.encoder.max_patches, 1120);
+            CHECK_EQ(b.encoder.n_embd, 3840);
+            CHECK_EQ(b.audio_encoder_name, std::string("audio"));
+            CHECK_EQ(b.audio_encoder.patch_dim, 640);
+            CHECK_EQ(b.audio_encoder.merge, 1);
+            CHECK_EQ(b.audio_encoder.max_patches, 750);
+            CHECK_EQ(count_op(b, "scatter_rows"), 1);
+            for (int t = 0; t < 2; ++t) {
+                const RecMap* pos = find_map(b, t ? "v.pos_y.weight" : "v.pos_x.weight");
+                REQUIRE(pos != nullptr);
+                CHECK_EQ(pos->mode, (int)RAD_MAP_TAP);
+                CHECK_EQ(pos->concat_dim, 1);
+                CHECK(pos->src == std::vector<std::string>{ "model.vision_embedder.pos_embedding" });
+                REQUIRE_EQ(pos->src_index.size(), (size_t)1);
+                CHECK_EQ(pos->src_index[0], t);
+                const RecWeight* w = find_w(b, t ? "v.pos_y.weight" : "v.pos_x.weight");
+                REQUIRE(w != nullptr);
+                CHECK_EQ(w->d.shape[0], 1120);
+                CHECK_EQ(w->d.shape[1], 3840);
+            }
+            const struct { const char* d; const char* s; } src[] = {
+                { "v.ln1.weight", "model.vision_embedder.patch_ln1.weight" },
+                { "v.ln1.bias", "model.vision_embedder.patch_ln1.bias" },
+                { "v.in.weight", "model.vision_embedder.patch_dense.weight" },
+                { "v.in.bias", "model.vision_embedder.patch_dense.bias" },
+                { "v.ln2.weight", "model.vision_embedder.patch_ln2.weight" },
+                { "v.ln2.bias", "model.vision_embedder.patch_ln2.bias" },
+                { "v.pn.weight", "model.vision_embedder.pos_norm.weight" },
+                { "v.pn.bias", "model.vision_embedder.pos_norm.bias" },
+                { "v.embed.weight", "model.embed_vision.embedding_projection.weight" },
+                { "a.embed.weight", "model.embed_audio.embedding_projection.weight" } };
+            for (const auto& e : src) {
+                const RecMap* mp = find_map(b, e.d);
+                REQUIRE(mp != nullptr);
+                CHECK(mp->src == std::vector<std::string>{ e.s });
+                CHECK(find_w(b, e.d) != nullptr);
+            }
+            const RecWeight* dense = find_w(b, "v.in.weight");
+            REQUIRE(dense != nullptr);
+            CHECK_EQ(dense->d.shape[0], 3840);
+            CHECK_EQ(dense->d.shape[1], 6912);
+            CHECK_EQ(dense->d.shard, (int)RAD_SHARD_NONE);
+            CHECK(find_w(b, "v.blk.0.qkv") == nullptr);           /* no tower */
+            for (const auto& o : b.ops)
+                if (o.op == "layernorm") CHECK_NEAR(pflt(&o, "eps"), 1e-5, 0.0);
+
+            const auto vis = enc_pass(RAD_MM_IMAGE, 280, 6912);
+            RadCtx cv{ .b = &b, .batch = &vis->b };
+            cv.rank = rank; cv.world = world;
+            gemma4_bf16::step(&cv, &vis->b);
+            CHECK(cv.step_fail.empty());
+            CHECK_LINT(b, &cv);
+            const std::vector<std::string> want = { "layernorm", "gemm_nt_bias", "layernorm",
+                                                    "embed_lookup", "embed_lookup", "add", "add",
+                                                    "layernorm", "rmsnorm", "gemm_nt" };
+            CHECK_EQ(join(issued_ops(b, cv)), join(want));
+            REQUIRE_EQ(cv.issues.size(), want.size());
+            CHECK(cv.issues[0].opd[0].raw == vis->pix.data());
+            CHECK(cv.issues[3].opd[0].raw == vis->coord.data() + 280);   /* the column */
+            CHECK(cv.issues[4].opd[0].raw == vis->coord.data());         /* the row */
+            CHECK_EQ(cv.issues[3].opd[1].handle, (uint32_t)gemma4_bf16::g_model[rank].uvis.w_px);
+            CHECK_EQ(cv.issues[4].opd[1].handle, (uint32_t)gemma4_bf16::g_model[rank].uvis.w_py);
+            CHECK_EQ(cv.issues.back().n, 280);
+            CHECK_EQ(cv.issues.back().opd.back().handle, b.encoder.out);
+
+            const auto aud = enc_pass(RAD_MM_AUDIO, 125, 640);
+            RadCtx ca{ .b = &b, .batch = &aud->b };
+            ca.rank = rank; ca.world = world;
+            gemma4_bf16::step(&ca, &aud->b);
+            CHECK(ca.step_fail.empty());
+            CHECK_LINT(b, &ca);
+            CHECK_EQ(join(issued_ops(b, ca)), join({ "rmsnorm", "gemm_nt" }));
+            CHECK_EQ(ca.issues.back().n, 125);
+            CHECK_EQ(ca.issues.back().opd.back().handle, b.audio_encoder.out);
+
+            /* More patches than declared is refused, issuing nothing. */
+            const auto big = enc_pass(RAD_MM_IMAGE, 1121, 6912);
+            RadCtx cb{ .b = &b, .batch = &big->b };
+            gemma4_bf16::step(&cb, &big->b);
+            CHECK(!cb.step_fail.empty());
+            CHECK(cb.issues.empty());
+        }
+    }
+}
+
+/* The 12B (and the 31B) read a picture's placeholders both ways (use_bidirectional_attention
+ * "vision") on the sliding layers; the global layers stay causal, as transformers' Gemma 4 masks
+ * and KerasHub's have it. Every sliding layer declares a second attention without the causal
+ * bound (its window two-sided), the encoder says so to the core (RadEncoderDecl::bidirectional),
+ * and on a pass with a run (RadBatch::n_bidi) each sliding layer attends the run's rows again over
+ * their sequence's cache up to the run's end, written over the causal result in the same rows.
+ * Without the config key, nothing of it. */
+TEST(the_gemma4_12b_reads_a_pictures_rows_both_ways) {
+    std::vector<const char*> keys(std::begin(k_gem12_keys), std::end(k_gem12_keys));
+    std::vector<const char*> vals(std::begin(k_gem12_vals), std::end(k_gem12_vals));
+    const char* mk[] = { "vision_config.model_type", "vision_config.mm_embed_dim",
+                         "vision_config.mm_posemb_size", "vision_config.model_patch_size",
+                         "use_bidirectional_attention" };
+    const char* mv[] = { "gemma4_unified_vision", "3840", "1120", "48", "vision" };
+    keys.insert(keys.end(), std::begin(mk), std::end(mk));
+    vals.insert(vals.end(), std::begin(mv), std::end(mv));
+    static const int32_t row[] = { 40 }, seq[] = { 1 }, used[] = { 30 };
+    const int64_t L_sliding = 10;                    /* layers 5 and 11 are global */
+    /* A run of 10 rows within the window, and one longer than a window of 8, whose rows read the
+     * keys behind them only through the window (attn_paged_ahead). */
+    const int32_t run = 10;
+    static const int32_t rows[] = { run };
+    for (const int win : { 1024, 8 })
+    for (int mode = 0; mode < 2; ++mode) {          /* 0 on, 1 no key */
+        std::vector<const char*> wvals = vals;
+        for (size_t k = 0; k < keys.size(); ++k)
+            if (!std::strcmp(keys[k], "sliding_window")) wvals[k] = win == 8 ? "8" : "1024";
+        for (bool fused : { false, true }) {
+            for (int world : { 1, 2 }) {
+                for (int rank = 0; rank < world; ++rank) {
+                    RadBuilder b;
+                    if (fused) {
+                        const RadEncoding e = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+                        b.encs = { { "attn_qkv.", e }, { "attn_o.", e }, { "ffn_gate_up.", e },
+                                   { "ffn_down.", e } };
+                    }
+                    RadModelMeta meta = gemma4_12b_meta();
+                    meta.n_kv = (int)keys.size() - (mode == 1 ? 1 : 0);
+                    meta.kv_key = keys.data(); meta.kv_val = wvals.data();
+                    RadBuildCtx ctx = build_ctx(rank, world);
+                    ctx.max_enc_patches = 1120;
+                    const int rc = gemma4_bf16::declare(&b, &meta, &ctx);
+                    REQUIRE_EQ(rc, RAD_OK);
+                    const bool on = mode == 0;
+                    CHECK_EQ(b.encoder.bidirectional, on ? 1 : 0);
+                    int nc = 0;
+                    for (const auto& o : b.ops)
+                        if ((o.op == "attn_paged" || o.op == "attn_paged_qrow") && pint(&o, "causal") == 0) {
+                            ++nc;
+                            CHECK_EQ(pint(&o, "window"), win);
+                            CHECK_EQ(pint(&o, "head_dim"), 256);
+                        }
+                    CHECK_EQ(nc, on ? (int)L_sliding : 0);
+                    int na = 0;
+                    for (const auto& o : b.ops)
+                        if (o.op == "attn_paged_ahead" || o.op == "attn_paged_qrow_ahead") {
+                            ++na;
+                            CHECK_EQ(pint(&o, "causal"), 0);
+                            CHECK_EQ(pint(&o, "window"), win);
+                        }
+                    CHECK_EQ(na, on ? (int)L_sliding : 0);
+
+                    RadBatch batch = prefill_batch();
+                    batch.n_bidi = 1;
+                    batch.bidi_row = row; batch.bidi_n = rows; batch.bidi_seq = seq;
+                    batch.bidi_used = used;
+                    RadCtx c; c.b = &b; c.rank = rank; c.world = world; c.batch = &batch;
+                    gemma4_bf16::step(&c, &batch);
+                    CHECK_LINT(b, &c);
+                    CHECK(c.step_fail.empty());
+                    int again = 0;
+                    rad_op last_attn = 0;
+                    for (const auto& i : c.issues) {
+                        const RecOp* o = b.op_of(i.op);
+                        if (!o || (o->op != "attn_paged" && o->op != "attn_paged_qrow" &&
+                                   o->op != "attn_paged_ahead" && o->op != "attn_paged_qrow_ahead"))
+                            continue;
+                        if (pint(o, "causal") == 1) { last_attn = i.op; continue; }
+                        ++again;
+                        CHECK(last_attn != 0);                       /* behind the causal pass */
+                        const bool ahead = o->op.size() > 6 && o->op.compare(o->op.size() - 6, 6, "_ahead") == 0;
+                        CHECK_EQ(ahead, run > win);
+                        CHECK_EQ(i.n, run);
+                        REQUIRE(i.opd.size() == 8);
+                        CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_KV);
+                        CHECK(i.opd[3].raw == used);
+                        CHECK_EQ(i.opd[3].rows, 1);
+                        CHECK_EQ(i.opd[2].rows, 1);                  /* the run's sequence's table */
+                        CHECK(i.opd[6].kind == RAD_OPK_NONE);
+                        const int64_t qd = (16 / world) * (pint(o, "head_dim"));
+                        CHECK_EQ(i.opd[7].offset, 40 * qd);          /* its rows of the output */
+                        CHECK_EQ(i.opd[7].rows, run);
+                        last_attn = 0;
+                    }
+                    CHECK_EQ(again, on ? (int)L_sliding : 0);
+                }
+            }
+        }
+    }
 }
 
 /* ==================================================================== qwenimage21 */
@@ -11012,22 +14067,22 @@ struct ArchCases {
             qwen35_bf16::step, 0, {}, 0xf82117051023e608ull);
         add("qwen35_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            qwen35_fp8::step, 3, {}, 0x20ab9ed24e409329ull);
+            qwen35_fp8::step, 3, {}, 0x958b83102809266bull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x5b52afb1706a954eull);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x91408682a38a1754ull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0x365e4cbb415ac284ull);
+            qwen35_fp8::step, 7, {}, 0x60d33ded99aa451eull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x742a596708bbda1dull);
+            qwen35_w8a8::step, 7, {}, 0x570d3bc8fc15f701ull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x93b6390d30e59953ull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x6c5267846652829full);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
-            qwen35moe_fp8::step, 3, {}, 0x4c7e42e71f167042ull);
+            qwen35moe_fp8::step, 3, {}, 0x325d0299495a0dd8ull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
             qwen4exp_fp8::step, 3, {}, 0x9454e9dff6db286bull);
@@ -11770,10 +14825,10 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0x959ef6b7c6f57d8bull },
         { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
-        { "qwen35_fp8", 1, 0, 0xc56a518087e3f4b4ull, 0xa7ec3cf6252cd441ull },
-        { "qwen35_fp8", 2, 1, 0x6e644b3d13bac619ull, 0xdd5d65ef158c4136ull },
-        { "qwen35moe_fp8", 1, 0, 0x7a9330e0da08f97cull, 0x2b5989b2a6dbc7dfull },
-        { "qwen35moe_fp8", 2, 0, 0x3a2761e9546797f1ull, 0x4a597c66b5868eeeull },
+        { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
+        { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
+        { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },
+        { "qwen35moe_fp8", 2, 0, 0x46d061a0de9a8933ull, 0x4a597c66b5868eeeull },
     };
     for (const Case& cs : cases) {
         RadBuilder b;

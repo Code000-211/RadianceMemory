@@ -170,14 +170,16 @@ float row_sum(const float* x, int64_t n) {
     return s;
 }
 
+/* A NaN element is skipped, as libref's std::max(amax, |x|) skips it: vmaxps returns its second
+ * operand when either is NaN, so the running maximum goes second. */
 float row_amax(const float* x, int64_t n) {
     vf m0 = vf_zero(), m1 = vf_zero();
     int64_t i = 0;
     for (; i + 2 * VF_N <= n; i += 2 * VF_N) {
-        m0 = vf_max(m0, vf_abs(vf_loadu(x + i)));
-        m1 = vf_max(m1, vf_abs(vf_loadu(x + i + VF_N)));
+        m0 = vf_max(vf_abs(vf_loadu(x + i)), m0);
+        m1 = vf_max(vf_abs(vf_loadu(x + i + VF_N)), m1);
     }
-    for (; i + VF_N <= n; i += VF_N) m0 = vf_max(m0, vf_abs(vf_loadu(x + i)));
+    for (; i + VF_N <= n; i += VF_N) m0 = vf_max(vf_abs(vf_loadu(x + i)), m0);
     float m = vf_hmax(vf_max(m0, m1));
     for (; i < n; ++i) { float av = x[i] < 0 ? -x[i] : x[i]; if (av > m) m = av; }
     return m;

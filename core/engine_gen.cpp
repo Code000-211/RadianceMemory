@@ -1,6 +1,6 @@
 /* engine_gen.cpp -- a generator's loop: the driver's passes (core/gen/pass.h; driver.h for
- * images, audio_driver.h for audio, video_driver.h for video) run on the ranks like token steps, one at a time, each drained
- * before the next.
+ * images, audio_driver.h for audio, video_driver.h for video, shape_driver.h for shapes) run on the
+ * ranks like token steps, one at a time, each drained before the next.
  *
  * Draining is cheap: a pass is tens to thousands of milliseconds of device work, and the next
  * pass depends only on the driver's host bookkeeping, so the wait costs the microseconds of
@@ -29,6 +29,12 @@ static const char* pass_name(int gen) {
     case RAD_GEN_PASS_ADECODE: return "adecode";
     case RAD_GEN_PASS_VDECODE: return "vdecode";
     case RAD_GEN_PASS_VUPSCALE: return "vupscale";
+    case RAD_GEN_PASS_VENCODE: return "vencode";
+    case RAD_GEN_PASS_AENCODE: return "aencode";
+    case RAD_GEN_PASS_SCOND:   return "scond";
+    case RAD_GEN_PASS_SSTEP:   return "sstep";
+    case RAD_GEN_PASS_SLATENT: return "slatent";
+    case RAD_GEN_PASS_SQUERY:  return "squery";
     default:                   return "";
     }
 }

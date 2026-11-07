@@ -244,10 +244,74 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         }
         return RAD_OK;
     }
-    if (mt && !std::strcmp(mt, "gemma4_vision")) {
+    /* NVIDIA's Nemotron-H Omni states its tile budget in the processor configs (preprocessor and
+     * processor_config's image_processor carry the same keys) and its token ids in config.json,
+     * except <img> and </img>, which the vocabulary names (Processor::init). */
+    if (mt && !std::strcmp(mt, "radio")) {
+        family = Family::Radio;
+        auto geti = [&](const char* k, int64_t dflt) {
+            const std::string a = std::string("processor.image_processor.") + k;
+            const std::string b = std::string("preprocessor.") + k;
+            return rad_meta_geti(&m, a.c_str(), rad_meta_geti(&m, b.c_str(), dflt));
+        };
+        patch = (int32_t)geti("patch_size", rad_meta_geti(&m, "vision_config.patch_size", 0));
+        const double ratio = rad_meta_getf(&m, "downsample_ratio", 0.0);
+        merge = ratio > 0.0 ? (int32_t)std::lround(1.0 / ratio) : 0;
+        temporal = 1;
+        radio_tubelet = (int32_t)rad_meta_geti(
+            &m, "processor.video_temporal_patch_dim",
+            rad_meta_geti(&m, "video_temporal_patch_size",
+                          rad_meta_geti(&m, "vision_config.video_temporal_patch_size", 0)));
+        radio_prefix = (int32_t)(rad_meta_geti(&m, "vision_config.num_cls_tokens", 0) +
+                                 rad_meta_geti(&m, "vision_config.num_registers", 0));
+        tok_image = (int32_t)rad_meta_geti(&m, "img_context_token_id", -1);
+        if (patch <= 0 || merge <= 0 || radio_tubelet <= 0 || radio_prefix <= 0 || tok_image < 0) {
+            if (why) *why = "the container states no Nemotron-H Omni processor geometry "
+                            "(vision_config.patch_size, downsample_ratio, video_temporal_patch_size, "
+                            "num_cls_tokens + num_registers, img_context_token_id)";
+            return RAD_E_NOTFOUND;
+        }
+        radio_min_patches   = (int32_t)geti("min_num_patches", 1024);
+        radio_max_patches   = (int32_t)geti("max_num_patches", 13312);
+        radio_max_len       = (int32_t)geti("max_model_len", 16384);
+        radio_video_patches = (int32_t)geti("video_target_num_patches", 1024);
+        if (!read_triple(m, "processor.image_processor.norm_mean", mean) &&
+            !read_triple(m, "preprocessor.norm_mean", mean))
+            read_triple(m, "norm_mean", mean);
+        if (!read_triple(m, "processor.image_processor.norm_std", stdv) &&
+            !read_triple(m, "preprocessor.norm_std", stdv))
+            read_triple(m, "norm_std", stdv);
+        /* The model card's serving default: 2 frames a second, at most 128 (64 tubelets). */
+        fps        = 2.0;
+        min_frames = radio_tubelet;
+        max_frames = 128;
+        max_frame_rows = 0;
+        /* The pixel bands only have to be consistent for check(); the tile rule sizes by patches. */
+        const int64_t p2 = (int64_t)patch * patch;
+        image_min_pixels = (int64_t)radio_min_patches * p2;
+        image_max_pixels = std::max<int64_t>(image_min_pixels, (int64_t)radio_max_patches * p2);
+        video_min_pixels = video_max_pixels = (int64_t)radio_video_patches * p2;
+        std::string bad;
+        if (radio_min_patches <= 0 || radio_video_patches <= 0 || radio_max_len <= 0)
+            bad = "min_num_patches, video_target_num_patches and max_model_len must be positive";
+        if (bad.empty() && check(&bad) < 0) bad = "the container's Nemotron-H Omni processor "
+                                                  "configuration is inconsistent: " + bad;
+        if (!bad.empty()) {
+            if (why) *why = bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    /* Gemma 4 12B ("unified") has no tower: its embedder takes a whole 48 x 48 pooling window as
+     * one patch, so a patch is a row (merge 1), and its values are u / 255. The sizes are the
+     * same: a window is 48 pixels a side either way. */
+    const bool unified = mt && !std::strcmp(mt, "gemma4_unified_vision");
+    if (mt && (!std::strcmp(mt, "gemma4_vision") || unified)) {
         family   = Family::Gemma4;
-        patch    = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
-        merge    = (int32_t)rad_meta_geti(&m, "vision_config.pooling_kernel_size", 0);
+        unit_pixels = unified;
+        patch    = (int32_t)rad_meta_geti(&m, unified ? "vision_config.model_patch_size"
+                                                      : "vision_config.patch_size", 0);
+        merge    = unified ? 1 : (int32_t)rad_meta_geti(&m, "vision_config.pooling_kernel_size", 0);
         temporal = 1;
         if (patch <= 0 || merge <= 0) {
             if (why) *why = "the container states no vision tower geometry (vision_config."
@@ -267,7 +331,8 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         image_soft_tokens = (int32_t)rad_meta_geti(
             &m, "processor.image_processor.max_soft_tokens",
             rad_meta_geti(&m, "vision_soft_tokens_per_image",
-                          rad_meta_geti(&m, "vision_config.default_output_length", 280)));
+                          rad_meta_geti(&m, "vision_config.default_output_length",
+                                        rad_meta_geti(&m, "vision_config.num_soft_tokens", 280))));
         video_soft_tokens = (int32_t)rad_meta_geti(&m, "processor.video_processor.max_soft_tokens",
                                                    70);
         fps        = rad_meta_getf(&m, "processor.video_processor.fps", 1.0);
@@ -970,6 +1035,134 @@ void resize_bicubic_torch(const Frame& in, int32_t w, int32_t h, Frame* out) {
     resize_bicubic_impl(in, w, h, out, true);
 }
 
+/* Python's round(): the nearest integer, a tie to the even one. The default floating-point
+ * environment rounds that way, which nearbyint follows. */
+static inline int64_t py_round(double x) { return (int64_t)std::nearbyint(x); }
+
+void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp) {
+    const int64_t div = c.merge, lo = c.radio_min_patches;
+    const int64_t hi = c.radio_max_patches > 0 ? c.radio_max_patches : INT64_MAX;
+    const int64_t budget = std::max<int64_t>((int64_t)(c.radio_max_len - 4) * div * div, lo);
+    const int64_t avail = std::max<int64_t>(std::min<int64_t>(budget, hi), lo);
+    /* round(x + 0.5): x + 1 rounded down for a fraction, and for a whole x, x or x + 1 by parity
+     * (Python's tie to even), which the reference's comment does not say but its code does. */
+    const int64_t ch = py_round((double)h / (double)c.patch + 0.5);
+    const int64_t cw = py_round((double)w / (double)c.patch + 0.5);
+    const double factor = std::min(std::sqrt((double)avail / (double)(ch * cw)), 1.0);
+    int64_t th = (int64_t)std::floor(factor * (double)ch);
+    int64_t tw = (int64_t)std::floor(factor * (double)cw);
+    if (avail > lo && th * tw < lo) {
+        const double up = std::sqrt((double)lo / (double)(th * tw));
+        th = (int64_t)std::ceil(up * (double)th);
+        tw = (int64_t)std::ceil(up * (double)tw);
+    }
+    if (const int64_t r = th % div) th = (th + div - r) * tw <= avail ? th + div - r
+                                                                       : std::max(div, th - r);
+    if (const int64_t r = tw % div) tw = th * (tw + div - r) <= avail ? tw + div - r
+                                                                       : std::max(div, tw - r);
+    *wp = (int32_t)tw;
+    *hp = (int32_t)th;
+}
+
+void radio_video_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp) {
+    const int64_t div = c.merge, target = c.radio_video_patches;
+    const double aspect = (double)w / (double)std::max<int64_t>(h, 1);
+    int64_t ph = std::max<int64_t>(py_round(std::sqrt((double)target / aspect)), 1);
+    int64_t pw = std::max<int64_t>(py_round(std::sqrt((double)target * aspect)), 1);
+    if (div > 1) {
+        const int64_t rh = ph % div, rw = pw % div;
+        const int64_t phu = ph + (rh ? div - rh : 0), pwu = pw + (rw ? div - rw : 0);
+        if (phu * pwu <= target) {
+            ph = phu;
+            pw = pwu;
+        } else {
+            ph = std::max(div, ph - rh);
+            pw = std::max(div, pw - rw);
+        }
+    }
+    *wp = (int32_t)pw;
+    *hp = (int32_t)ph;
+}
+
+/* ATen's antialiased bicubic (Keys, a = -0.5) on float, one axis: output i reads inputs
+ * [lo, lo + n) at the filter's normalised weights, the support widened by the scale when
+ * shrinking. */
+namespace {
+struct AaTaps { std::vector<int32_t> lo, n; std::vector<float> w; int32_t width = 0; };
+inline float aa_cubic(float x) {
+    const float a = -0.5f;
+    x = std::fabs(x);
+    if (x < 1.0f) return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+    if (x < 2.0f) return ((a * x - 5.0f * a) * x + 8.0f * a) * x - 4.0f * a;
+    return 0.0f;
+}
+AaTaps aa_taps_f32(int32_t in, int32_t out) {
+    AaTaps t;
+    const float scale = (float)in / (float)out;
+    const float support = scale >= 1.0f ? 2.0f * scale : 2.0f;
+    const float inv = scale >= 1.0f ? 1.0f / scale : 1.0f;
+    t.width = (int32_t)std::ceil(support) * 2 + 1;
+    t.lo.resize((size_t)out);
+    t.n.resize((size_t)out);
+    t.w.assign((size_t)out * t.width, 0.0f);
+    for (int32_t i = 0; i < out; ++i) {
+        const float center = scale * ((float)i + 0.5f);
+        const int32_t lo = std::max((int32_t)(center - support + 0.5f), 0);
+        const int32_t n = std::min((int32_t)(center + support + 0.5f), in) - lo;
+        float* w = &t.w[(size_t)i * t.width];
+        float total = 0.0f;
+        for (int32_t j = 0; j < n && j < t.width; ++j) {
+            w[j] = aa_cubic(((float)(j + lo) - center + 0.5f) * inv);
+            total += w[j];
+        }
+        for (int32_t j = 0; j < n && j < t.width; ++j) w[j] = total != 0.0f ? w[j] / total : 0.0f;
+        t.lo[(size_t)i] = lo;
+        t.n[(size_t)i] = std::min(n, t.width);
+    }
+    return t;
+}
+}  /* namespace */
+
+void resize_bicubic_aa_f32(const Frame& in, int32_t w, int32_t h, std::vector<float>* out) {
+    std::vector<float> src((size_t)in.w * in.h * 3);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = (float)in.rgb[i];
+    /* Width first, then height; a side that keeps its size is skipped (its taps are the identity). */
+    std::vector<float> mid;
+    const std::vector<float>* cur = &src;
+    int32_t cw = in.w;
+    if (w != in.w) {
+        const AaTaps t = aa_taps_f32(in.w, w);
+        mid.assign((size_t)w * in.h * 3, 0.0f);
+        for (int32_t y = 0; y < in.h; ++y)
+            for (int32_t x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    float acc = 0.0f;
+                    const float* wt = &t.w[(size_t)x * t.width];
+                    for (int32_t j = 0; j < t.n[(size_t)x]; ++j)
+                        acc += src[((size_t)y * in.w + t.lo[(size_t)x] + j) * 3 + c] * wt[j];
+                    mid[((size_t)y * w + x) * 3 + c] = acc;
+                }
+        cur = &mid;
+        cw = w;
+    }
+    if (h != in.h) {
+        const AaTaps t = aa_taps_f32(in.h, h);
+        out->assign((size_t)cw * h * 3, 0.0f);
+        for (int32_t y = 0; y < h; ++y) {
+            const float* wt = &t.w[(size_t)y * t.width];
+            for (int32_t x = 0; x < cw; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    float acc = 0.0f;
+                    for (int32_t j = 0; j < t.n[(size_t)y]; ++j)
+                        acc += (*cur)[((size_t)(t.lo[(size_t)y] + j) * cw + x) * 3 + c] * wt[j];
+                    (*out)[((size_t)y * cw + x) * 3 + c] = acc;
+                }
+        }
+        return;
+    }
+    *out = *cur;
+}
+
 void cap_area(const Frame& in, int64_t max_pixels, Frame* out) {
     if (max_pixels <= 0 || (int64_t)in.w * in.h <= max_pixels) { *out = in; return; }
     const double scale = std::sqrt((double)max_pixels / ((double)in.w * in.h));
@@ -1071,7 +1264,8 @@ void patchify(const VisionConfig& c, const std::vector<const Frame*>& frames, It
  * processor's rescale u * (1/255). The processors AutoProcessor loads take that product in f32 for
  * pictures (Gemma4ImageProcessor) and in double, rounded to f32, for video (Gemma 4's and
  * EmbeddingGemma 2's video processors); `video` picks which, and the two differ for u = 127. One
- * frame per segment. */
+ * frame per segment. With `unit_pixels` (the 12B, merge 1: a row is one 48 x 48 window) the value
+ * is p itself, rounded to bf16. */
 void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& frames, bool video,
                      Item* it) {
     const int P = c.patch, M = c.merge;
@@ -1080,7 +1274,7 @@ void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& fra
     for (int v = 0; v < 256; ++v) {
         const float p = video ? (float)((double)v * (1.0 / 255.0))
                               : (float)v * (float)(1.0 / 255.0);
-        lut[v] = rad_f32_to_bf16(2.0f * (p - 0.5f));
+        lut[v] = rad_f32_to_bf16(c.unit_pixels ? p : 2.0f * (p - 0.5f));
     }
     const int64_t dim = it->patch_dim;
     it->pixels.assign((size_t)it->n_patch * (size_t)dim, 0);
@@ -1098,6 +1292,55 @@ void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& fra
                         }
                     }
     }
+}
+
+/* Radio's patch rows (Family::Radio), segment by segment: `n_prefix` zero rows, then the patches
+ * in merge-block order. A row is [the tubelet's frames (frame, channel, y, x) | the picture's
+ * (channel, y, x)]: a picture fills the second part, a video tubelet the first, the rest zero.
+ * Each value is (u / 255 - mean) / std in f32 on the resized float pixels, rounded to bf16, as the
+ * reference processor's tensor ops and the model's cast to bf16 give it. `frames` holds
+ * grid_t * tubelet frames of [grid_h * patch, grid_w * patch, 3] floats for a video, one for a
+ * picture. */
+void patchify_radio(const VisionConfig& c, const std::vector<const std::vector<float>*>& frames,
+                    bool video, Item* it) {
+    const int P = c.patch, M = c.merge, T = c.radio_tubelet;
+    const int gh = it->grid_h, gw = it->grid_w, W = gw * P;
+    const int64_t dim = it->patch_dim, pp = 3LL * P * P;
+    it->pixels.assign((size_t)it->n_patch * (size_t)dim, 0);
+    uint16_t* dst = it->pixels.data();
+    auto norm = [&](float u, int ch) {
+        return rad_f32_to_bf16((u / 255.0f - c.mean[ch]) / c.stdv[ch]);
+    };
+    for (int g = 0; g < it->grid_t; ++g) {
+        dst += (size_t)it->seg_prefix * dim;
+        for (int bh = 0; bh < gh / M; ++bh)
+            for (int bw = 0; bw < gw / M; ++bw)
+                for (int mh = 0; mh < M; ++mh)
+                    for (int mw = 0; mw < M; ++mw) {
+                        const int py0 = (bh * M + mh) * P, px0 = (bw * M + mw) * P;
+                        const int nf = video ? T : 1;
+                        uint16_t* o = dst + (video ? 0 : (int64_t)T * pp);
+                        for (int t = 0; t < nf; ++t) {
+                            const std::vector<float>& f = *frames[(size_t)(g * nf + t)];
+                            for (int ch = 0; ch < 3; ++ch)
+                                for (int y = 0; y < P; ++y)
+                                    for (int x = 0; x < P; ++x)
+                                        *o++ = norm(f[((size_t)(py0 + y) * W + px0 + x) * 3 + ch], ch);
+                        }
+                        dst += dim;
+                    }
+    }
+}
+
+/* Radio's item geometry: finish_item's, with the prefix rows counted in the patches. */
+void finish_item_radio(const VisionConfig& c, Item* it) {
+    it->patch_dim  = c.patch_dim();
+    it->seg_prefix = c.radio_prefix;
+    it->rows_h     = it->grid_h / c.merge;
+    it->rows_w     = it->grid_w / c.merge;
+    it->seg_rows   = it->rows_h * it->rows_w;
+    it->n_seg      = it->grid_t;
+    it->n_patch    = (int64_t)it->grid_t * (c.radio_prefix + (int64_t)it->grid_h * it->grid_w);
 }
 
 void finish_item(const VisionConfig& c, Item* it) {
@@ -1150,6 +1393,26 @@ int Processor::init(const VisionConfig& cfg,
         const int64_t seg = std::max<int64_t>((int64_t)(cfg.tile / cfg.patch) * (cfg.tile / cfg.patch),
                                               cfg.image_max_pixels / ((int64_t)cfg.patch * cfg.patch));
         if (seg > cfg.max_patches || seg > cfg.max_segment_patches) return RAD_E_INVAL;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
+    if (cfg.family == Family::Radio) {
+        /* The markers around a run are vocabulary words, not config ids. A tile is one segment of
+         * one pass with its prefix rows, so the picture budget is lowered to what a pass holds;
+         * a video frame's target must fit as it is. */
+        if (!token_id) return RAD_E_INVAL;
+        cfg_.tok_start = token_id("<img>");
+        cfg_.tok_end   = token_id("</img>");
+        if (cfg_.tok_start < 0 || cfg_.tok_end < 0) return RAD_E_NOTFOUND;
+        const int64_t cap = cfg.max_patches - cfg.radio_prefix;
+        if (cap < cfg.radio_min_patches || cap < cfg.radio_video_patches) return RAD_E_INVAL;
+        if (cfg_.radio_max_patches > cap) cfg_.radio_max_patches = (int32_t)cap;
+        /* A video's budget: max_frames frames in tubelets, each its prefix plus the frame target
+         * (the video tile never exceeds it). */
+        if (cfg_.max_video_patches <= 0)
+            cfg_.max_video_patches = (int64_t)((cfg.max_frames + cfg.radio_tubelet - 1) /
+                                               cfg.radio_tubelet) *
+                                     (cfg.radio_prefix + cfg.radio_video_patches);
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
@@ -1712,6 +1975,99 @@ int Processor::image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::st
     return RAD_OK;
 }
 
+/* NVIDIA's Nemotron-H Omni image processor: one tile, sized by radio_size, resized with torch's
+ * antialiased bicubic on float pixels (none when the size already fits). */
+int Processor::image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    int32_t wp = 0, hp = 0;
+    radio_size(f.w, f.h, c, &wp, &hp);
+    std::vector<float> px;
+    resize_bicubic_aa_f32(f, wp * c.patch, hp * c.patch, &px);
+    auto it = std::make_shared<Item>();
+    it->kind   = Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = hp;
+    it->grid_w = wp;
+    it->rope_1d = true;
+    finish_item_radio(c, it.get());
+    if (it->n_patch > c.max_patches) {
+        if (why) *why = "the image resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    patchify_radio(c, { &px }, false, it.get());
+    one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+/* Its video path: every frame at the video tile (radio_video_size of the first), `tubelet`
+ * frames a segment (the last repeated to fill one), each run labelled as the reference processor
+ * labels a tubelet -- "Frame i sampled at T seconds and frame i+1 sampled at T' seconds: ", T the
+ * frame's source index times int(1000 / fps) ms -- the runs joined by a newline. No pruning (EVS):
+ * every tubelet keeps all its rows. */
+int Processor::video_radio(const Video& v, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    if (v.frames.empty()) { if (why) *why = "the video decoded to no frames"; return RAD_E_INVAL; }
+    int32_t wp = 0, hp = 0;
+    radio_video_size(v.frames[0].w, v.frames[0].h, c, &wp, &hp);
+    const int32_t T = c.radio_tubelet;
+    const int64_t nf = (int64_t)v.frames.size();
+    auto it = std::make_shared<Item>();
+    it->kind   = Kind::Video;
+    it->grid_t = (int32_t)((nf + T - 1) / T);
+    it->grid_h = hp;
+    it->grid_w = wp;
+    it->rope_1d = true;
+    finish_item_radio(c, it.get());
+    if (c.radio_prefix + (int64_t)hp * wp > c.max_patches) {
+        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    if (it->n_patch > c.max_video_patches) {
+        if (why) *why = "the video is over the server's patch budget for one video";
+        return RAD_E_INVAL;
+    }
+    std::vector<std::vector<float>> resized((size_t)nf);
+    for (int64_t i = 0; i < nf; ++i)
+        resize_bicubic_aa_f32(v.frames[(size_t)i], wp * c.patch, hp * c.patch, &resized[(size_t)i]);
+    std::vector<const std::vector<float>*> frames;
+    for (int64_t i = 0; i < (int64_t)it->grid_t * T; ++i)
+        frames.push_back(&resized[(size_t)std::min(i, nf - 1)]);
+    patchify_radio(c, frames, true, it.get());
+    content_key(*it, &it->key_hi, &it->key_lo);
+
+    const int64_t frame_ms = v.info.fps > 0.0 ? (int64_t)(1000.0 / v.info.fps) : 0;
+    for (int32_t g = 0; g < it->grid_t; ++g) {
+        std::string label = g > 0 ? "\n" : "";
+        for (int32_t j = 0; j < T; ++j) {
+            const int64_t fi = (int64_t)g * T + j;
+            if (fi >= nf) break;
+            char part[96];
+            if (frame_ms > 0)
+                std::snprintf(part, sizeof part, "%s%s %lld sampled at %.2f seconds",
+                              j ? " and " : "", j ? "frame" : "Frame", (long long)(fi + 1),
+                              (double)(v.index[(size_t)fi] * frame_ms) / 1000.0);
+            else
+                std::snprintf(part, sizeof part, "%s%s %lld", j ? " and " : "",
+                              j ? "frame" : "Frame", (long long)(fi + 1));
+            label += part;
+        }
+        label += ": ";
+        const std::vector<int32_t> tt = encode_text_ ? encode_text_(label) : std::vector<int32_t>{};
+        if (tt.empty()) {
+            if (why) *why = "the tokenizer produced nothing for a video frame label";
+            return RAD_E_STATE;
+        }
+        it->expand.insert(it->expand.end(), tt.begin(), tt.end());
+        it->expand.push_back(c.tok_start);
+        it->seg_at.push_back((int32_t)it->expand.size());
+        it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_image);
+        it->expand.push_back(c.tok_end);
+    }
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
                           const ImageMode& mode) const {
     const VisionConfig& c = cfg_;
@@ -1723,6 +2079,7 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     if (c.family == Family::Pixtral) return image_pixtral(f, out, why);
     if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
     if (c.family == Family::Glm5Next) return image_glm5next(f, out, why);
+    if (c.family == Family::Radio) return image_radio(f, out, why);
     if (c.family == Family::UnlimitedOcr) return image_unlimitedocr(f, mode, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
@@ -1816,6 +2173,7 @@ int Processor::video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::str
 int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return video_gemma4(v, out, why);
+    if (c.family == Family::Radio) return video_radio(v, out, why);
     if (c.family == Family::Glm5Next || c.family == Family::Pixtral) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
@@ -2131,12 +2489,40 @@ static int qwen3asr_from_meta(const RadModelMeta& m, AudioConfig* c, std::string
     return RAD_OK;
 }
 
+/* Gemma4UnifiedAudioFeatureExtractor's framing (Gemma 4 12B): processor_config.json's
+ * `feature_extractor` and the clip cap `audio_seq_length` (in frames). The frame's width is what the
+ * embedder takes, so it stands in `n_mels` as a mel spectrum's bins do. */
+static int unified_from_meta(const RadModelMeta& m, AudioConfig* c, std::string* why) {
+    c->family       = AudioFamily::Gemma4Unified;
+    c->rate         = (int32_t)rad_meta_geti(&m, "processor.feature_extractor.sampling_rate", 16000);
+    c->frame_length = (int32_t)rad_meta_geti(
+        &m, "processor.feature_extractor.audio_samples_per_token",
+        rad_meta_geti(&m, "audio_config.audio_samples_per_token",
+                      rad_meta_geti(&m, "audio_config.audio_embed_dim", 0)));
+    c->hop          = c->frame_length;
+    c->n_mels       = c->frame_length;
+    c->max_samples  = rad_meta_geti(&m, "processor.audio_seq_length", 750) * c->frame_length;
+    c->tok_audio    = (int32_t)rad_meta_geti(&m, "audio_token_id", -1);
+    c->tok_start    = (int32_t)rad_meta_geti(&m, "boa_token_id", -1);
+    c->tok_end      = (int32_t)rad_meta_geti(&m, "eoa_token_id",
+                                             rad_meta_geti(&m, "eoa_token_index", -1));
+    if (c->rate <= 0 || c->frame_length <= 0 || c->max_samples <= 0 || c->tok_audio < 0 ||
+        c->tok_start < 0 || c->tok_end < 0) {
+        if (why) *why = "the container's audio framing is incomplete (sampling_rate, "
+                        "audio_samples_per_token, audio_seq_length, audio_token_id, boa_token_id, "
+                        "eoa_token_id)";
+        return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
 int AudioConfig::from_meta(const RadModelMeta& m, std::string* why) {
     const char* mt = rad_meta_gets(&m, "audio_config.model_type", "");
     if (mt && !std::strcmp(mt, "qwen3_asr_encoder")) return qwen3asr_from_meta(m, this, why);
+    if (mt && !std::strcmp(mt, "gemma4_unified_audio")) return unified_from_meta(m, this, why);
     if (!mt || std::strcmp(mt, "gemma4_audio")) {
         if (why) *why = "the container states no audio tower this processor knows (audio_config."
-                        "model_type gemma4_audio or qwen3_asr_encoder)";
+                        "model_type gemma4_audio, gemma4_unified_audio or qwen3_asr_encoder)";
         return RAD_E_NOTFOUND;
     }
     /* preprocessor_config.json's keys (`preprocessor.`), else processor_config.json's
@@ -2273,6 +2659,12 @@ int Processor::init_audio(const AudioConfig& cfg, std::string* why) {
         return refuse(RAD_E_INVAL, "the audio encoder's pass (" + std::to_string(cfg.max_frames) +
                                        " frames) is not whole rows of " +
                                        std::to_string(cfg.merge) + " frames");
+    /* The 12B's frames are samples: no window, no FFT, no mel bank. */
+    if (cfg.family == AudioFamily::Gemma4Unified) {
+        acfg_ = cfg;
+        audio_on_ = true;
+        return RAD_OK;
+    }
     const bool qwen = cfg.family == AudioFamily::Qwen3ASR;
     /* Gemma 4's FFT is radix 2; Qwen3-ASR's runs mixed radix over any length. */
     if (!qwen && (cfg.fft < 2 || (cfg.fft & (cfg.fft - 1)) != 0))
@@ -2481,11 +2873,44 @@ int Processor::audio_qwen3asr(const std::vector<float>& samples, std::shared_ptr
     return RAD_OK;
 }
 
+/* The 12B's clip (AudioFamily::Gemma4Unified): ceil(n / frame_length) frames of samples, the last
+ * zero-padded, each sample rounded to bf16 as the reference casts the frames for its embedder; one
+ * frame a placeholder. The reference cuts nothing; a clip past `max_samples` is cut there. */
+int Processor::audio_unified(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                             std::string* why) const {
+    const AudioConfig& c = acfg_;
+    const int64_t n = std::min<int64_t>((int64_t)samples.size(), c.max_samples);
+    const int64_t fl = c.frame_length, rows = (n + fl - 1) / fl;
+    if (rows * c.merge > c.max_frames) {
+        if (why) *why = "the clip is more frames than one audio encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Audio;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)rows;
+    it->grid_w = 1;
+    it->patch_dim = fl;
+    it->n_patch = rows;
+    it->valid = (int32_t)rows;
+    it->rows_h = (int32_t)rows;
+    it->rows_w = 1;
+    it->seg_rows = (int32_t)rows;
+    it->n_seg = rows > 0 ? 1 : 0;
+    it->pixels.assign((size_t)(rows * fl), 0);
+    for (int64_t i = 0; i < n; ++i) it->pixels[(size_t)i] = rad_f32_to_bf16(samples[(size_t)i]);
+    one_run(it.get(), c.tok_start, rows, c.tok_audio, c.tok_end);
+    if (rows == 0) it->encoded = true;
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::audio_from(const std::vector<float>& samples, std::shared_ptr<Item>* out,
                           std::string* why) const {
     if (!audio_on_) { if (why) *why = "this program declares no audio encoder"; return RAD_E_UNSUPPORTED; }
     const AudioConfig& c = acfg_;
     if (c.family == AudioFamily::Qwen3ASR) return audio_qwen3asr(samples, out, why);
+    if (c.family == AudioFamily::Gemma4Unified) return audio_unified(samples, out, why);
     const int64_t n = std::min<int64_t>((int64_t)samples.size(), c.max_samples);
     const int64_t real = c.real_frames(n);
     const int64_t rows = (real + c.merge - 1) / c.merge;

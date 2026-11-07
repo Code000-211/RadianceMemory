@@ -3,6 +3,7 @@
 
 #include "kvstream/carve.h"
 #include "kvstream/plan.h"
+#include "sched/geometry.h"
 
 #include <algorithm>
 #include <cassert>
@@ -102,8 +103,10 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
 
     forget();
     max_seqs_ = cfg.max_seqs > 0 ? cfg.max_seqs : 1;
+    n_spec_   = cfg.n_spec > 0 ? cfg.n_spec : 0;
     max_ctx_  = cfg.max_ctx > 0 ? cfg.max_ctx : 0;
-    max_tok_  = cfg.max_tok > 0 ? cfg.max_tok : 0;
+    /* One step's tokens: the prefill budget plus the decode headroom (step_tok). */
+    max_tok_  = cfg.max_tok > 0 ? step_tok(cfg) : 0;
 
     if (groups.empty()) {
         RAD_ERR("KV manager: no KV groups were declared; the architecture plugin declares at "
@@ -137,6 +140,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
         p.kind     = g.decl.kind == RAD_KV_RING ? RAD_KV_WINDOW : g.decl.kind;
         p.n_layers = (int64_t)g.layers.size();
         p.dense_read = g.dense_read;
+        p.layers   = g.layers;
 
         if (p.n_layers <= 0) {
             RAD_ERR("KV group '%s': no layers are bound to it, so its page size is unknown "
@@ -177,6 +181,50 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                 }
                 /* +1 because a window that is not block-aligned straddles one extra block. */
                 p.window_blocks = ceil_div(g.decl.window, p.block_size) + 1;
+            }
+            /* Window residency (RadKVGroupDecl::residency_window). Refused on a windowed group: its
+             * blocks below the window are recycled, so there is nothing left to demote, and the two
+             * mechanisms would fight over the same table entries. */
+            if (g.decl.residency_window > 0) {
+                if (p.kind == RAD_KV_WINDOW) {
+                    RAD_ERR("KV group '%s': a residency window (residency_window %lld) on a "
+                            "RAD_KV_WINDOW group. Blocks below a sliding window are recycled, not "
+                            "moved, so the two would fight over the same table entries",
+                            p.name.c_str(), (long long)g.decl.residency_window);
+                    return RAD_E_INVAL;
+                }
+                p.residency_window = g.decl.residency_window;
+                p.residency_blocks = ceil_div(g.decl.residency_window, p.block_size);
+                /* Tiered (RAD_KVQ_DEMOTE): the layers' recipe entries name the pair. The plugin
+                 * keys its groups by it, so a group whose layers disagree is a plugin fault; the
+                 * row width is the declared one (head_dim is half the row of the E4M3 group). */
+                int key = -1;
+                for (int l : p.layers) {
+                    if (l < 0 || (size_t)l >= cfg.kv_recipe.size() || cfg.kv_recipe[(size_t)l] < 0)
+                        continue;   /* the MTP head's layer shares its group's layout */
+                    const int k = cfg.kv_recipe[(size_t)l] & (RAD_KVQ_LAYOUT | RAD_KVQ_DEMOTE);
+                    if (key >= 0 && k != key && (RAD_KVQ_DEMOTE_OF(k) || RAD_KVQ_DEMOTE_OF(key))) {
+                        RAD_ERR("KV group '%s': layer %d's recipe entry names another resident or "
+                                "demote layout than the group's other layers; a store slot holds "
+                                "one group's block at one width", p.name.c_str(), l);
+                        return RAD_E_INVAL;
+                    }
+                    key = k;
+                }
+                if (key >= 0 && RAD_KVQ_DEMOTE_OF(key)) {
+                    const int64_t row = g.decl.head_dim * elt * 2;
+                    p.res_from     = key & RAD_KVQ_LAYOUT;
+                    p.res_to       = RAD_KVQ_DEMOTE_OF(key);
+                    p.res_head_dim = kv_layout_head_dim(p.res_from, row);
+                    const int64_t lb = p.layer_bytes_per_block();
+                    if (p.res_head_dim <= 0 || lb % row) {
+                        RAD_ERR("KV group '%s': a %lld-byte row is no %s row, so its blocks "
+                                "cannot be stored as %s", p.name.c_str(), (long long)row,
+                                kv_layout_name(p.res_from), kv_layout_name(p.res_to));
+                        return RAD_E_INVAL;
+                    }
+                    p.res_frag = lb / row * kv_layout_row_bytes(p.res_to, p.res_head_dim);
+                }
             }
         } else if (p.kind == RAD_KV_LINEAR || p.kind == RAD_KV_CONV) {
             if (p.kind == RAD_KV_CONV) {
@@ -300,6 +348,16 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     for (const auto& p : plans_)
         if (p.runtime_win && !p.zero)
             fixed += align_up(max_seqs_ * p.ring_blocks_max() * p.bytes_per_block, RAD_ALIGN_UNIT);
+    /* The pager's scratch pages, charged here so the split below and the VRAM budget (which reads
+     * ceiling() and fixed_bytes()) both see them: a row of the decode batch needs topk + 1 pages
+     * of its own, and they are not the sequences' to hold. Only when a store will be opened. */
+    if (cfg.residency_mib > 0)
+        for (auto& p : plans_)
+            if (p.residency() && !p.zero) {
+                p.scratch_pitch  = p.residency_blocks + 1;
+                p.scratch_blocks = p.scratch_pitch * scratch_rows();
+                fixed += p.scratch_blocks * p.bytes_per_block;
+            }
 
     fixed_ = fixed;
     ckpts_ = budget_ckpts;
@@ -381,12 +439,16 @@ int KVManager::declare_runtime_window(int32_t g, int64_t window_tokens) {
         fixed_ += align_up(max_seqs_ * q.ring_blocks_max() * q.bytes_per_block, RAD_ALIGN_UNIT);
         if (counted) {
             const int64_t was = q.window_blocks * q.bytes_per_block;
-            /* The plan counted this group's snapshot section, so both totals carry `was`.
-             * Saturating hides an accounting bug; surface it in debug builds. */
-            assert(window_ck_bytes_ >= was && checkpoint_bytes_ >= was &&
-                   "runtime window: snapshot byte totals below the section being removed");
-            window_ck_bytes_ = window_ck_bytes_ > was ? window_ck_bytes_ - was : 0;
-            checkpoint_bytes_ = checkpoint_bytes_ > was ? checkpoint_bytes_ - was : 0;
+            /* The plan counted this group's snapshot section, so both totals carry `was`; less
+             * is an accounting bug, and the pool would be sized from a wrong total. */
+            if (window_ck_bytes_ < was || checkpoint_bytes_ < was) {
+                RAD_ERR("kv group %d: runtime window: the snapshot byte totals (%lld, %lld) are "
+                        "below the %lld-byte section being removed", (int)g,
+                        (long long)window_ck_bytes_, (long long)checkpoint_bytes_, (long long)was);
+                return RAD_E_STATE;
+            }
+            window_ck_bytes_ -= was;
+            checkpoint_bytes_ -= was;
         }
     }
     return RAD_OK;
@@ -410,12 +472,19 @@ int KVManager::carve(Pool& kv_pool) {
 void KVManager::forget() {
     plans_.clear(); free_blocks_.clear(); refcount_.clear(); free_states_.clear();
     live_.clear(); free_usable_.clear(); bucket_blocks_.clear(); held_hist_.clear();
+    scratch_.clear(); res_layer_off_.clear();
     chunk_blocks_.clear(); short_peak_.clear();
     pool_ = nullptr;
     clears_.clear();
+    /* The store belongs to the engine and outlives a re-plan, so only what this manager allocated
+     * in it goes: plan_groups() runs before carve(), and a plan that is dropped must not leak
+     * slots. The cold entries are in the tables, so this runs before seqs_ is cleared. */
+    release_residency();
     seqs_.clear(); pending_.clear();
     configured_ = false;
     report_.clear();
+    res_slot_bytes_.clear();
+    res_stats_ = ResidencyStats{};
 }
 
 int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const {
@@ -520,8 +589,8 @@ int KVManager::carve_into(Pool& kv_pool) {
                 "  vram_kv            %10s\n"
                 "  short by           %10s\n"
                 "Lower --max-num-seqs, or give the cache more of the card: a smaller "
-                "--gpu-headroom-mib or a larger --host-pool-mib. The engine will not shrink one of "
-                "them for you (spec §6).",
+                "--gpu-headroom-mib, a larger --gpu-memory-mib, or a larger --host-pool-mib. The "
+                "engine will not shrink one of them for you (spec §6).",
                 humanb(fixed).c_str(), (long long)max_seqs_, humanb(budget_bytes).c_str(),
                 humanb(fixed - budget_bytes + 1).c_str());
         return RAD_E_NOMEM;
@@ -533,7 +602,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     /* ---- the paged split; under a cap, the least rank's ---- */
     std::vector<int64_t> blocks;
     (void)paged_split(budget_bytes, &blocks);
-    for (auto& p : plans_) if (p.paged()) p.n_blocks = blocks[p.index];
+    for (auto& p : plans_) if (p.paged()) p.n_blocks = blocks[p.index] + p.scratch_blocks;
 
     /* How much of that the pool backs, and the refusal of an unbacked streamed plan. */
     RAD_TRY(kvstream_apply(plans_, stream_, max_ctx_, max_seqs_));
@@ -550,8 +619,8 @@ int KVManager::carve_into(Pool& kv_pool) {
         }
         if (p.n_blocks <= 0) {
             RAD_ERR("KV group '%s': a %s KV pool leaves 0 blocks (%s a page) after the fixed "
-                    "linear/conv costs of %s. Raise --host-pool-mib or lower --gpu-headroom-mib, or "
-                    "lower --max-num-seqs.",
+                    "linear/conv costs of %s. Raise --host-pool-mib or --gpu-memory-mib, or lower "
+                    "--gpu-headroom-mib or --max-num-seqs.",
                     p.name.c_str(), humanb(budget_bytes).c_str(),
                     humanb(p.bytes_per_block).c_str(), humanb(fixed).c_str());
             return RAD_E_NOMEM;
@@ -593,15 +662,34 @@ int KVManager::carve_into(Pool& kv_pool) {
     refcount_.resize(plans_.size());
     cached_.resize(plans_.size());
     cache_only_.assign(plans_.size(), 0);
+    res_idle_.assign(plans_.size(), {});
     free_states_.resize(plans_.size());
+
+    /* ---- window residency ----
+     *
+     * Each residency group has its own arena (or shares one), its slot one block of it: under
+     * tensor parallelism every rank takes the same slot id for the same block, and only the
+     * offsets differ. */
+    size_residency();
+    ++res_epoch_;                                      /* the scratch pages' bytes are gone */
+    /* Row r of the scratch table is pages [r * pitch, (r + 1) * pitch): fixed for the engine's life. */
+    scratch_.assign(plans_.size(), {});
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const auto& p = plans_[i];
+        scratch_[i].resize((size_t)p.scratch_blocks);
+        for (int64_t b = 0; b < p.scratch_blocks; ++b) scratch_[i][(size_t)b] = (int32_t)b;
+    }
     for (size_t i = 0; i < plans_.size(); ++i) {
         const auto& p = plans_[i];
         if (p.paged()) {
             refcount_[i].assign((size_t)p.n_blocks, 0);
             cached_[i].assign((size_t)p.n_blocks, 0);
+            /* The scratch pages are ids [0, scratch_blocks): referenced for good and never free. */
+            for (int64_t b = 0; b < p.scratch_blocks; ++b) refcount_[i][(size_t)b] = 1;
             /* Ascending order is already a valid min-heap (see the loan block in kv.h). */
-            free_blocks_[i].resize((size_t)p.n_blocks);
-            for (int64_t b = 0; b < p.n_blocks; ++b) free_blocks_[i][(size_t)b] = (int32_t)b;
+            free_blocks_[i].resize((size_t)(p.n_blocks - p.scratch_blocks));
+            for (int64_t b = p.scratch_blocks; b < p.n_blocks; ++b)
+                free_blocks_[i][(size_t)(b - p.scratch_blocks)] = (int32_t)b;
         } else {
             /* Only logical slots are allocatable; copy k of slot s (s + k * n_seq_states) belongs
              * to whoever holds s. */
@@ -637,7 +725,7 @@ int KVManager::carve_into(Pool& kv_pool) {
         const auto& p = plans_[i];
         if (!p.paged()) continue;
         live_[i]        = p.n_blocks;
-        free_usable_[i] = p.n_blocks;
+        free_usable_[i] = p.n_blocks - p.scratch_blocks;
         /* Buffer floor: one step (max_tok tokens) of this group, so a prefill recalls at most
          * once a chunk and a decode step almost never. Clamped to the carve. */
         const int64_t chunk = blocks_for(p.index, max_tok_);
@@ -646,6 +734,9 @@ int KVManager::carve_into(Pool& kv_pool) {
          * block, and finding it walks at most 4096 counters. */
         bucket_blocks_[i] = std::max<int64_t>(1, ceil_div(p.n_blocks, 4096));
         held_hist_[i].assign((size_t)ceil_div(p.n_blocks, bucket_blocks_[i]), 0);
+        /* The scratch pages count as held, so a loan (which lends the top above the highest held
+         * block) cannot reach them. */
+        for (int64_t b = 0; b < p.scratch_blocks; ++b) ++held_hist_[i][(size_t)(b / bucket_blocks_[i])];
     }
 
     configured_ = true;
@@ -731,15 +822,31 @@ void KVManager::drop_block(int32_t g, int32_t b) {
     auto& rc = refcount_[(size_t)g][(size_t)b];
     if (rc <= 0) { RAD_ERR("KV group %d: double free of block %d", g, b); return; }
     if (cached_[(size_t)g][(size_t)b]) {
-        if (rc == 2) ++cache_only_[(size_t)g];
+        if (rc == 2) { ++cache_only_[(size_t)g]; note_cache_only((size_t)g, b); }
         else if (rc == 1) { --cache_only_[(size_t)g]; cached_[(size_t)g][(size_t)b] = 0; }
     }
-    if (--rc != 0) return;
+    if (--rc != 0) {
+        /* No longer shared with another sequence: one holder left, or one beside the cache, which
+         * follows a demotion (set_residency_cache). */
+        if ((rc == 1 && !cached_[(size_t)g][(size_t)b]) ||
+            (rc == 2 && cached_[(size_t)g][(size_t)b] && res_cache_))
+            ++res_skip_epoch_;
+        return;
+    }
+    forget_origin(g, b);                  /* a freed block is no longer a copy of anything */
     auto& fl = free_blocks_[(size_t)g];
     fl.push_back(b);
     std::push_heap(fl.begin(), fl.end(), std::greater<int32_t>());
     ++free_usable_[(size_t)g];
     note_held(g, b, -1);
+}
+
+/* The one place a table entry goes away. A cold entry holds no pool block, only its store slot. */
+void KVManager::drop_entry(int32_t g, int32_t entry) {
+    if (entry >= 0) { drop_block(g, entry); return; }
+    if (!rad_kv_entry_cold(entry)) return;                 /* -1: nothing was held */
+    slot_drop(g, rad_kv_entry_slot(entry));
+    --res_cold_;
 }
 
 void KVManager::add_ref(size_t g, int32_t b) {
@@ -785,7 +892,7 @@ int64_t KVManager::held_blocks(int32_t g) const {
     return held > 0 ? held : 0;
 }
 int64_t KVManager::total_blocks(int32_t g) const {
-    const KVGroupPlan* p = plan(g); return p ? p->n_blocks : 0;
+    const KVGroupPlan* p = plan(g); return p ? p->n_blocks - p->scratch_blocks : 0;
 }
 int64_t KVManager::live_blocks(int32_t g) const {
     return (g >= 0 && g < (int32_t)live_.size()) ? live_[(size_t)g] : 0;
@@ -982,7 +1089,7 @@ bool KVManager::can_ever_fit(int64_t n_tokens) const {
     for (const auto& p : plans_) {
         /* Both kinds are tested explicitly: the null group at handle 0 is neither and holds no
          * states, so a bare `else` would refuse every sequence. */
-        if (p.paged())         { if (blocks_for(p.index, n_tokens) > p.n_blocks) return false; }
+        if (p.paged())         { if (blocks_for(p.index, n_tokens) > p.n_blocks - p.scratch_blocks) return false; }
         else if (p.stateful()) { if (p.n_states < 1) return false; }
     }
     return true;
@@ -1068,6 +1175,7 @@ int KVManager::add_sequence(uint64_t id) {
     s.win.resize(plans_.size());
     s.state.assign(plans_.size(), -1);
     s.dirty_from.assign(plans_.size(), 0);
+    s.res.resize(plans_.size());
     seqs_.emplace(id, std::move(s));
     return RAD_OK;
 }
@@ -1080,13 +1188,13 @@ int KVManager::preempt(uint64_t id) {
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
     for (size_t g = 0; g < plans_.size(); ++g) {
-        for (int32_t b : s->blocks[g]) drop_block((int32_t)g, b);
+        for (int32_t e : s->blocks[g]) drop_entry((int32_t)g, e);
         s->blocks[g].clear();
         s->first_block_pos[g] = 0;
         /* The runtime window goes with the blocks: re-admission re-arms it at the prompt end
          * (the scheduler's admission path calls set_window again before the KV grows). */
         s->win[g] = SeqWindow{};
-        s->dirty_from[g] = 0;
+        table_changed(s, g, 0);
         /* The recurrent state goes too (see preempt in kv.h, spec §7.1). */
         if (s->state[g] >= 0) { drop_state((int32_t)g, s->state[g]); s->state[g] = -1; }
     }
@@ -1110,6 +1218,19 @@ int KVManager::rollback(uint64_t id, int64_t n_tokens) {
     for (const SeqWindow& w : s->win)
         if (w.set) return RAD_E_UNSUPPORTED;
 
+    /* The block that becomes the sequence's partial tail takes the next append, which cannot land
+     * in host memory. Demotion keeps the tail resident, so only a rollback past the whole
+     * window reaches a cold one; refuse before freeing anything and let the caller promote. */
+    if (n_tokens > 0) {
+        for (size_t g = 0; g < plans_.size(); ++g) {
+            const auto& p = plans_[g];
+            if (!p.paged() || n_tokens % p.block_size == 0) continue;
+            const int64_t keep = ceil_div(n_tokens, p.block_size) - s->first_block_pos[g] / p.block_size;
+            if (keep > 0 && keep <= (int64_t)s->blocks[g].size() &&
+                rad_kv_entry_cold(s->blocks[g][(size_t)(keep - 1)]))
+                return RAD_E_STATE;
+        }
+    }
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
         if (!p.paged()) continue;
@@ -1120,13 +1241,16 @@ int KVManager::rollback(uint64_t id, int64_t n_tokens) {
              * already recycled, so drop everything and rebase. */
             want = 0;
             s->first_block_pos[g] = (n_tokens / p.block_size) * p.block_size;
-            s->dirty_from[g] = 0;
+            table_changed(s, g, 0);
         }
         while ((int64_t)s->blocks[g].size() > want) {
-            drop_block((int32_t)g, s->blocks[g].back());
+            drop_entry((int32_t)g, s->blocks[g].back());
             s->blocks[g].pop_back();
         }
-        s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], (int64_t)s->blocks[g].size());
+        table_changed(s, g, (int64_t)s->blocks[g].size());
+        /* The new partial tail takes the next append: it stops being a copy of its origin. */
+        if (n_tokens % p.block_size != 0 && !s->blocks[g].empty() && s->blocks[g].back() >= 0)
+            forget_origin((int32_t)g, s->blocks[g].back());
     }
     s->n_tokens = n_tokens;
     return RAD_OK;
@@ -1289,7 +1413,10 @@ void KVManager::cache_reserved_block(int32_t g, int32_t b) {
     if (b < 0 || b >= (int32_t)refcount_[(size_t)g].size()) return;
     if (refcount_[(size_t)g][(size_t)b] <= 0) return;
     uint8_t& mark = cached_[(size_t)g][(size_t)b];
-    if (!mark) { mark = 1; if (refcount_[(size_t)g][(size_t)b] == 1) ++cache_only_[(size_t)g]; }
+    if (!mark) {
+        mark = 1;
+        if (refcount_[(size_t)g][(size_t)b] == 1) { ++cache_only_[(size_t)g]; note_cache_only((size_t)g, b); }
+    }
 }
 
 /* Releasing a marked block releases the cache's reference, so the mark goes with it; other
@@ -1316,6 +1443,751 @@ int32_t KVManager::block_refcount(int32_t g, int32_t b) const {
 std::vector<BlockCopy> KVManager::take_pending_copies() {
     std::vector<BlockCopy> out;
     out.swap(pending_);
+    return out;
+}
+
+/* ------------------------------------------------------------------ window residency */
+
+int64_t residency_split_tokens(int64_t cap_bytes, const std::vector<ResidencySplit>& groups) {
+    long double per_token = 0;   /* store bytes a token of every group costs */
+    for (const ResidencySplit& r : groups) {
+        if (r.slot_bytes <= 0 || r.block_size <= 0) return 0;
+        per_token += (long double)r.slot_bytes / (long double)r.block_size;
+    }
+    if (groups.empty() || cap_bytes <= 0) return 0;
+    const auto bytes = [&](int64_t t) {
+        int64_t n = 0;
+        for (const ResidencySplit& r : groups) n += t / r.block_size * r.slot_bytes;
+        return n;
+    };
+    int64_t t = (int64_t)((long double)cap_bytes / per_token);
+    while (t > 0 && bytes(t) > cap_bytes) --t;     /* the rounding of the division, at most */
+    return t;
+}
+
+void KVManager::size_residency() {
+    const size_t n = plans_.size();
+    if (res_origin_.size() != n) res_origin_.resize(n);
+    if (res_arena_.size() < n) res_arena_.resize(n, nullptr);
+    if (res_rank_off_.size() < n) res_rank_off_.resize(n, 0);
+    res_refs_.resize(std::max(res_refs_.size(), n));
+    res_slots_.resize(std::max(res_slots_.size(), n), 0);
+    /* Under tensor parallelism every rank takes the same slot id for the same block, so a group's
+     * slot is the sum of the ranks' shards of its block and each rank writes only its own window,
+     * at its `rank_off`. A slot holds one block of one group (residency_demote takes a fresh slot
+     * per group and entry), so a group with its own arena wastes none of it; one arena shared by
+     * every group is as wide as the widest. The pitch is the open store's slot; without a store,
+     * what this rank would need (the engine sizes each group's store from residency_block_bytes()). */
+    constexpr int64_t unit = 256;
+    res_slot_bytes_.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (!plans_[i].residency()) continue;
+        const HostArena* a = res_store((int32_t)i);
+        res_slot_bytes_[i] = a ? a->slot_bytes()
+                               : ceil_div(res_rank_off_[i] + plans_[i].residency_bytes(), unit) * unit;
+    }
+
+    /* The pager's per-layer view of the same layout: a group's bytes in a slot are its layers'
+     * fragments in the order they were bound (residency_ptr / TierExec::issue_moves), each one
+     * block of that layer's pool. Indexed by model layer, which is what the pager's layer operand
+     * carries. */
+    res_layer_off_.assign(plans_.size(), {});
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const auto& p = plans_[i];
+        if (!p.residency() || p.layers.empty()) continue;
+        int top = 0;
+        for (int l : p.layers) top = std::max(top, l + 1);
+        auto& v = res_layer_off_[i];
+        v.assign((size_t)top, -1);
+        for (size_t j = 0; j < p.layers.size(); ++j)
+            v[(size_t)p.layers[j]] = res_rank_off_[i] + (int64_t)j * p.residency_frag();
+    }
+}
+
+const std::vector<int32_t>& KVManager::scratch_table(int32_t g) const {
+    static const std::vector<int32_t> none;
+    return g >= 0 && g < (int32_t)scratch_.size() ? scratch_[(size_t)g] : none;
+}
+int64_t KVManager::residency_tags_bytes(int32_t g) const {
+    const KVGroupPlan* p = plan(g);
+    if (!p || p->scratch_blocks <= 0) return 0;
+    int64_t planes = 0;
+    for (int64_t o : residency_layer_off(g)) planes += o >= 0;
+    return planes * scratch_rows() * p->scratch_pitch * (int64_t)sizeof(int32_t);
+}
+
+int64_t KVManager::residency_tags_bytes() const {
+    int64_t n = 0;
+    for (int32_t g = 0; g < (int32_t)plans_.size(); ++g) n += residency_tags_bytes(g);
+    return n;
+}
+
+int32_t* KVManager::residency_tags(int32_t g) const {
+    if (!res_tags_ || res_tags_cap_ < residency_tags_bytes() || residency_tags_bytes(g) <= 0)
+        return nullptr;
+    int64_t off = 0;
+    for (int32_t i = 0; i < g; ++i) off += residency_tags_bytes(i);
+    return (int32_t*)((char*)res_tags_ + off);
+}
+
+const std::vector<int64_t>& KVManager::residency_layer_off(int32_t g) const {
+    static const std::vector<int64_t> none;
+    return g >= 0 && g < (int32_t)res_layer_off_.size() ? res_layer_off_[(size_t)g] : none;
+}
+
+int KVManager::res_store_check(int32_t g, const HostArena* store, int64_t rank_off) const {
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->residency()) return RAD_E_INVAL;
+    const size_t gi = (size_t)g;
+    const HostArena* cur = gi < res_arena_.size() ? res_arena_[gi] : nullptr;
+    int64_t moving = 0;
+    for (const Demoting& d : res_demoting_) moving += d.group == g;
+    for (const Promoting& pr : res_pending_) moving += pr.group == g;
+    for (const Demoting& d : res_quarantine_demote_) moving += d.group == g;
+    for (const Promoting& pr : res_quarantine_promote_) moving += pr.group == g;
+    const int64_t held = gi < res_slots_.size() ? res_slots_[gi] : 0;
+    if (store != cur && cur && (held > 0 || moving > 0)) {
+        RAD_ERR("KV residency: group '%s's store was replaced with %lld slots held and %lld "
+                "transfers outstanding -- their slots would name bytes in a store that is gone",
+                p->name.c_str(), (long long)held, (long long)moving);
+        return RAD_E_STATE;
+    }
+    /* A slot too small for this rank's window would put its blocks in the next slot's bytes. */
+    if (store && store->enabled() &&
+        (rank_off > 0 ? rank_off : 0) + p->residency_bytes() > store->slot_bytes()) {
+        RAD_ERR("KV residency: a store slot of %s cannot hold group '%s's %s at offset %lld",
+                humanb(store->slot_bytes()).c_str(), p->name.c_str(),
+                humanb(p->residency_bytes()).c_str(), (long long)rank_off);
+        return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
+int KVManager::set_residency_store(int32_t g, HostArena* store, int64_t rank_off) {
+    RAD_TRY(res_store_check(g, store, rank_off));
+    size_residency();                                  /* the per-group vectors, sized */
+    res_arena_[(size_t)g] = store;
+    res_rank_off_[(size_t)g] = rank_off > 0 ? rank_off : 0;
+    ++res_epoch_;
+    /* The slot size is derived from the plans at carve, so a store set before configure() needs no
+     * number here; one set after keeps the size the carve computed. */
+    size_residency();
+    return RAD_OK;
+}
+
+int KVManager::set_residency_store(HostArena* store, int64_t rank_off) {
+    /* Every group checked before any is set, so a refusal changes nothing. */
+    for (int32_t g = 0; g < (int32_t)plans_.size(); ++g)
+        if (plans_[(size_t)g].residency()) RAD_TRY(res_store_check(g, store, rank_off));
+    for (int32_t g = 0; g < (int32_t)plans_.size(); ++g)
+        if (plans_[(size_t)g].residency()) RAD_TRY(set_residency_store(g, store, rank_off));
+    return RAD_OK;
+}
+
+void KVManager::release_residency() {
+    /* Every slot with a reference goes, whoever held it (a table, a promotion in flight, an origin,
+     * the prefix cache -- which a re-plan reconfigures); the held blocks go with the pool. */
+    for (size_t g = 0; g < res_refs_.size(); ++g)
+        if (HostArena* a = res_store((int32_t)g))
+            for (size_t i = 0; i < res_refs_[g].size(); ++i)
+                if (res_refs_[g][i] > 0) a->free((int32_t)i);
+    res_refs_.clear();
+    res_slots_.clear();
+    ++res_epoch_;
+    res_origin_.assign(plans_.size(), {});
+    res_emul_.assign(plans_.size(), {});
+    res_pending_.clear();
+    res_demoting_.clear();
+    res_quarantine_demote_.clear();
+    res_quarantine_promote_.clear();
+    res_idle_.assign(plans_.size(), {});
+    res_cold_ = 0;
+}
+
+int64_t KVManager::residency_block_bytes(int32_t g) const {
+    if (g < 0 || g >= (int32_t)plans_.size()) return 0;
+    return plans_[(size_t)g].residency() ? plans_[(size_t)g].residency_bytes() : 0;
+}
+
+int64_t KVManager::residency_shard_bytes() const {
+    int64_t b = 0;
+    for (const KVGroupPlan& p : plans_)
+        if (p.residency()) b = std::max(b, p.residency_bytes());
+    return b;
+}
+
+int64_t KVManager::residency_slot_bytes(int32_t g) const {
+    return g >= 0 && (size_t)g < res_slot_bytes_.size() ? res_slot_bytes_[(size_t)g] : 0;
+}
+
+int64_t KVManager::residency_slot_bytes() const {
+    int64_t b = 0;
+    for (int64_t x : res_slot_bytes_) b = std::max(b, x);
+    return b;
+}
+
+bool KVManager::residency_emulated(int32_t g, int32_t b) const {
+    return g >= 0 && (size_t)g < res_emul_.size() && res_emul_[(size_t)g].count(b) > 0;
+}
+
+int32_t KVManager::residency_slot(int32_t, int32_t entry) const {
+    return rad_kv_entry_cold(entry) ? rad_kv_entry_slot(entry) : -1;
+}
+
+bool KVManager::residency_cold(int32_t g, int32_t entry) const {
+    return residency_slot(g, entry) >= 0;
+}
+
+void* KVManager::residency_ptr(int32_t g, int32_t entry) const {
+    return residency_slot_ptr(g, residency_slot(g, entry));
+}
+
+void* KVManager::residency_slot_ptr(int32_t g, int32_t slot) const {
+    const HostArena* a = res_store(g);
+    auto* p = a && slot >= 0 ? (char*)a->at(slot) : nullptr;
+    return p ? p + res_rank_off_[(size_t)g] : nullptr;
+}
+
+int32_t KVManager::slot_new(int32_t g) {
+    HostArena* a = res_store(g);
+    if (!a) return -1;
+    const int32_t slot = a->alloc();
+    if (slot < 0) return -1;
+    auto& refs = res_refs_[(size_t)g];                 /* sized by size_residency() */
+    if ((size_t)slot >= refs.size()) refs.resize((size_t)slot + 1, 0);
+    refs[(size_t)slot] = 1;
+    ++res_slots_[(size_t)g];
+    return slot;
+}
+
+void KVManager::slot_ref(int32_t g, int32_t slot) { ++res_refs_[(size_t)g][(size_t)slot]; }
+
+void KVManager::slot_drop(int32_t g, int32_t slot) {
+    if (slot_refs(g, slot) <= 0) {
+        RAD_ERR("KV residency: a reference dropped on group %d's store slot %d that holds none",
+                g, slot);
+        return;
+    }
+    if (--res_refs_[(size_t)g][(size_t)slot] > 0) return;
+    --res_slots_[(size_t)g];
+    ++res_epoch_;                                      /* the slot may next hold another block */
+    if (HostArena* a = res_store(g)) a->free(slot);
+}
+
+void KVManager::forget_origin(int32_t g, int32_t b) {
+    /* Written or freed: the emulation's next demotion of this block is a first one. */
+    if (g >= 0 && (size_t)g < res_emul_.size()) res_emul_[(size_t)g].erase(b);
+    if (g < 0 || (size_t)g >= res_origin_.size()) return;
+    auto it = res_origin_[(size_t)g].find(b);
+    if (it == res_origin_[(size_t)g].end()) return;
+    const int32_t slot = it->second;
+    res_origin_[(size_t)g].erase(it);
+    slot_drop(g, slot);
+}
+
+int KVManager::retain_entry(int32_t g, int32_t e) {
+    if (e >= 0) return retain_block(g, e);
+    if (!rad_kv_entry_cold(e)) return RAD_E_INVAL;
+    const int32_t slot = rad_kv_entry_slot(e);
+    if (slot_refs(g, slot) <= 0) {
+        RAD_ERR("KV group %d: retain of free store slot %d -- the cache is naming a cold entry it "
+                "does not hold", g, slot);
+        return RAD_E_STATE;
+    }
+    slot_ref(g, slot);
+    return RAD_OK;
+}
+
+void KVManager::release_entry(int32_t g, int32_t e) {
+    if (e >= 0) release_block(g, e);
+    else if (rad_kv_entry_cold(e)) slot_drop(g, rad_kv_entry_slot(e));
+}
+
+int32_t KVManager::entry_refs(int32_t g, int32_t e) const {
+    if (e >= 0) return block_refcount(g, e);
+    if (!rad_kv_entry_cold(e)) return 0;
+    return slot_refs(g, rad_kv_entry_slot(e));
+}
+
+bool KVManager::residency_move_pending(const BlockMove& m, bool to_host) const {
+    if (to_host) {
+        for (const Demoting& d : res_demoting_)
+            if (d.group == m.group && d.block == m.block && d.slot == m.host_slot) return true;
+        return false;
+    }
+    for (const Promoting& pr : res_pending_)
+        if (pr.group == m.group && pr.slot == m.host_slot && pr.block == m.block) return true;
+    return false;
+}
+
+void KVManager::residency_complete() {
+    for (const Promoting& pr : res_pending_) slot_drop(pr.group, pr.slot);
+    res_pending_.clear();
+}
+
+void KVManager::residency_demote_landed() {
+    for (const Demoting& d : res_demoting_) {
+        drop_block(d.group, d.block);            /* the only reference: the block is free again */
+        ++res_stats_.freed_blocks;
+        res_stats_.freed_bytes += plans_[(size_t)d.group].bytes_per_block;
+        if (d.seq != kCacheSeq) seq_res(d.seq).freed_bytes += plans_[(size_t)d.group].bytes_per_block;
+    }
+    res_demoting_.clear();
+}
+
+/* Exact only because nothing ran between the naming and the failed issue: the scheduler names a
+ * batch and hands it to the mover in one call (Scheduler::res_sweep, the promotion before a build),
+ * so every entry a move re-pointed still holds what the move wrote there. A record that does not
+ * match is a caller that broke that order; it is quarantined, not repaired by guesswork. */
+int64_t KVManager::residency_abort(const std::vector<BlockMove>& moves, bool to_host,
+                                   std::vector<uint64_t>* seqs) {
+    int64_t undone = 0;
+    auto note_seq = [&](uint64_t id) {
+        if (seqs && std::find(seqs->begin(), seqs->end(), id) == seqs->end()) seqs->push_back(id);
+    };
+    for (const BlockMove& m : moves) {
+        const int32_t g = m.group;
+        if (g < 0 || (size_t)g >= plans_.size()) continue;
+        if (to_host) {
+            /* The emulation's round trip in place: the entry never changed. Forgetting the mark
+             * lets the next sweep try the block again. */
+            if (m.host_slot == -1) {
+                if ((size_t)g < res_emul_.size() && res_emul_[(size_t)g].erase(m.block)) ++undone;
+                continue;
+            }
+            auto it = std::find_if(res_demoting_.begin(), res_demoting_.end(), [&](const Demoting& d) {
+                return d.group == g && d.block == m.block && d.slot == m.host_slot;
+            });
+            if (it == res_demoting_.end()) {
+                RAD_ERR("KV residency: abort of a demotion of block %d (group %d, slot %d) that "
+                        "is not in flight", m.block, g, m.host_slot);
+                continue;
+            }
+            const Demoting d = *it;
+            res_demoting_.erase(it);
+            const int32_t cold = rad_kv_cold_entry(d.slot);
+            if (d.seq != kCacheSeq) {
+                Seq* s = find(d.seq);
+                auto* tbl = s ? &s->blocks[(size_t)g] : nullptr;
+                if (!tbl || d.idx < 0 || d.idx >= (int64_t)tbl->size() || (*tbl)[(size_t)d.idx] != cold) {
+                    RAD_ERR("KV residency: request %llu's entry %lld no longer names slot %d; the "
+                            "failed demotion of block %d is quarantined",
+                            (unsigned long long)d.seq, (long long)d.idx, d.slot, d.block);
+                    res_quarantine_demote_.push_back(d);
+                    ++res_stats_.quarantined;
+                    continue;
+                }
+                /* The block still holds this table's bytes: the gather only read it. Its one
+                 * reference, the landing's, becomes the table's again. */
+                (*tbl)[(size_t)d.idx] = d.block;
+                table_changed(s, (size_t)g, d.idx);
+                slot_drop(g, d.slot);                        /* the table's slot reference */
+                --res_cold_;
+                note_seq(d.seq);
+            }
+            if (d.cache) {
+                /* The cache's entry followed into the slot with a reference of its own: it names
+                 * the block again, with a block reference again. */
+                if (res_cache_restore_ && res_cache_restore_(g, cold, d.block)) {
+                    slot_drop(g, d.slot);
+                    if (d.seq != kCacheSeq) {
+                        add_ref((size_t)g, d.block);         /* 1 -> 2: table and cache */
+                        cached_[(size_t)g][(size_t)d.block] = 1;
+                    } else {
+                        cache_reserved_block(g, d.block);    /* the landing's 1 is the cache's */
+                    }
+                } else {
+                    /* No entry names the slot: whoever holds it reads bytes never written. Keep
+                     * the slot held (it is not ours to drop) and say so; nothing should get here. */
+                    RAD_ERR("KV residency: the prefix cache no longer names slot %d of group %d "
+                            "after a failed demotion", d.slot, g);
+                    if (d.seq == kCacheSeq) drop_block(g, d.block);
+                }
+            }
+            ++undone;
+        } else {
+            auto it = std::find_if(res_pending_.begin(), res_pending_.end(), [&](const Promoting& p) {
+                return p.group == g && p.block == m.block && p.slot == m.host_slot;
+            });
+            if (it == res_pending_.end()) {
+                RAD_ERR("KV residency: abort of a promotion into block %d (group %d, slot %d) "
+                        "that is not in flight", m.block, g, m.host_slot);
+                continue;
+            }
+            const Promoting pr = *it;
+            res_pending_.erase(it);
+            Seq* s = find(pr.seq);
+            auto* tbl = s ? &s->blocks[(size_t)g] : nullptr;
+            if (!tbl || pr.idx < 0 || pr.idx >= (int64_t)tbl->size() ||
+                (*tbl)[(size_t)pr.idx] != pr.block) {
+                RAD_ERR("KV residency: request %llu's entry %lld no longer names block %d; the "
+                        "failed promotion from slot %d is quarantined",
+                        (unsigned long long)pr.seq, (long long)pr.idx, pr.block, pr.slot);
+                res_quarantine_promote_.push_back(pr);
+                ++res_stats_.quarantined;
+                continue;
+            }
+            /* Cold again on the slot, whose reference the pending record held for the table. The
+             * fresh block was never filled: back to the pool (an origin reference goes with it,
+             * forget_origin). */
+            (*tbl)[(size_t)pr.idx] = rad_kv_cold_entry(pr.slot);
+            table_changed(s, (size_t)g, pr.idx);
+            ++res_cold_;
+            drop_block(g, pr.block);
+            note_seq(pr.seq);
+            ++undone;
+        }
+    }
+    res_stats_.aborted += undone;
+    return undone;
+}
+
+int64_t KVManager::residency_fail_inflight(std::vector<uint64_t>* seqs) {
+    /* What the failed transfers wrote: a demotion's slot (the copy out), a promotion's block (the
+     * copy in). Any table naming one reads bytes nobody can vouch for. */
+    std::vector<std::pair<int32_t, int32_t>> bad;
+    for (const Demoting& d : res_demoting_) bad.push_back({ d.group, rad_kv_cold_entry(d.slot) });
+    for (const Promoting& p : res_pending_) bad.push_back({ p.group, p.block });
+    if (seqs && !bad.empty()) {
+        for (const auto& [id, s] : seqs_) {
+            bool hit = false;
+            for (const auto& [g, e] : bad) {
+                if ((size_t)g >= s.blocks.size()) continue;
+                const auto& tbl = s.blocks[(size_t)g];
+                if (std::find(tbl.begin(), tbl.end(), e) != tbl.end()) { hit = true; break; }
+            }
+            if (hit && std::find(seqs->begin(), seqs->end(), id) == seqs->end()) seqs->push_back(id);
+        }
+    }
+    /* Held for ever: a demotion's block keeps the landing's reference, a promotion's slot keeps
+     * the pending record's, and the promoted block gains one so the failed sequence's release
+     * cannot hand it to the pool while a broken stream may still write it. */
+    for (const Promoting& p : res_pending_) add_ref((size_t)p.group, p.block);
+    const int64_t n = (int64_t)(res_demoting_.size() + res_pending_.size());
+    res_quarantine_demote_.insert(res_quarantine_demote_.end(), res_demoting_.begin(), res_demoting_.end());
+    res_quarantine_promote_.insert(res_quarantine_promote_.end(), res_pending_.begin(), res_pending_.end());
+    res_demoting_.clear();
+    res_pending_.clear();
+    res_stats_.quarantined += n;
+    return n;
+}
+
+KVManager::SeqResidency& KVManager::seq_res(uint64_t id) {
+    auto it = res_seq_.try_emplace(id).first;
+    /* Over the cap, the oldest other session goes; never the one being counted. */
+    if (res_seq_.size() > kResidencySessions) {
+        auto victim = res_seq_.begin();
+        if (victim == it) ++victim;
+        res_seq_.erase(victim);
+    }
+    return it->second;
+}
+
+int64_t KVManager::residency_scratch_bytes() const {
+    int64_t n = 0;
+    for (const KVGroupPlan& p : plans_) n += p.scratch_blocks * p.bytes_per_block;
+    return n;
+}
+
+/* Each distinct store once: groups sharing one arena share its bytes. */
+int64_t KVManager::residency_host_bytes() const {
+    int64_t n = 0;
+    for (size_t g = 0; g < res_arena_.size(); ++g)
+        if (const HostArena* a = res_store((int32_t)g);
+            a && std::find(res_arena_.begin(), res_arena_.begin() + (ptrdiff_t)g, a) ==
+                     res_arena_.begin() + (ptrdiff_t)g)
+            n += a->used_slots() * a->slot_bytes();
+    return n;
+}
+
+int64_t KVManager::residency_host_cap_bytes() const {
+    int64_t n = 0;
+    for (size_t g = 0; g < res_arena_.size(); ++g)
+        if (const HostArena* a = res_store((int32_t)g);
+            a && std::find(res_arena_.begin(), res_arena_.begin() + (ptrdiff_t)g, a) ==
+                     res_arena_.begin() + (ptrdiff_t)g)
+            n += a->cap_bytes();
+    return n;
+}
+
+int KVManager::residency_demote(uint64_t id, int32_t g, int64_t keep_head, int64_t keep_tail,
+                                std::vector<BlockMove>* out, int64_t max_blocks) {
+    if (!out) return RAD_E_INVAL;
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->residency() || !p->paged()) return RAD_E_INVAL;
+    int64_t left = max_blocks;
+    Seq* s = find(id);
+    if (!s) return RAD_E_NOTFOUND;
+    auto& tbl = s->blocks[(size_t)g];
+    if (keep_head < 0) keep_head = 0;
+    if (keep_tail < 0) keep_tail = 0;
+    const int64_t end = (int64_t)tbl.size();
+    /* The last block is the partial one an append writes into; it stays whatever the caller says,
+     * because demoting it would leave the next token's write in host memory. */
+    if (keep_tail > end) keep_tail = end;
+    int64_t last = end - keep_tail;      /* one past the last entry the window covers */
+    if (last > end - 1) last = end - 1;
+    if (last < keep_head) last = keep_head;
+    /* Skips are counted here and charged once a call, not with a session lookup (a map search)
+     * per entry. */
+    int64_t skipped = 0;
+    auto charge_skips = [&] {
+        if (skipped <= 0) return;
+        res_stats_.demote_skipped += skipped;
+        seq_res(id).skipped += skipped;
+        skipped = 0;
+    };
+    /* Resume where the last call left off: the entries before `from` were all decided and
+     * nothing since has changed them (table_changed lowers it) or unshared one (the epoch). Each
+     * would only `continue` below without using `left`, so the moves are the full walk's. The
+     * re-walk's repeated skip counts are not repeated: `skipped` counts each decision once. */
+    Seq::ResCursor& cur = s->res[(size_t)g];
+    if (cur.epoch != res_skip_epoch_ || cur.head != keep_head) cur = { keep_head, keep_head, res_skip_epoch_ };
+    int64_t& from = cur.from;
+    int64_t i = std::max<int64_t>(keep_head, from);
+    bool decided = true;                 /* every entry from `from` to `i` is decided */
+    for (; i < last && left > 0; ++i) {
+        if (decided) from = i;
+        const int32_t b = tbl[(size_t)i];
+        if (b < 0) continue;                               /* already cold (or empty) */
+        /* A block another live sequence also holds (a child, or a second hit on the same cache
+         * entry) is read by that sequence's step through its own table: it stays, since dropping
+         * this table's reference would free no VRAM. One that only the prefix cache holds beside
+         * this table moves, and the cache's entry follows it into the slot (cache_follows), so
+         * every later reader adopts it cold and promotes a block of its own. */
+        const bool cached = cached_[(size_t)g][(size_t)b] != 0;
+        const bool with_cache = cached && refcount_[(size_t)g][(size_t)b] == 2 && res_cache_;
+        if ((cached || refcount_[(size_t)g][(size_t)b] > 1) && !with_cache) {
+            ++skipped;
+            continue;
+        }
+        /* The cache's entry names `slot` with a reference of its own and drops its block
+         * reference; the block keeps this table's. False: the cache names no such entry, the
+         * block stays as before. */
+        auto cache_follows = [&](int32_t slot) {
+            if (!res_cache_(g, b, rad_kv_cold_entry(slot))) return false;
+            slot_ref(g, slot);
+            uncache((size_t)g, b);
+            --refcount_[(size_t)g][(size_t)b];             /* 2 -> 1: never frees */
+            return true;
+        };
+        /* The emulation (residency_emulate): the round trip in place, once, in the order and
+         * under the bound the demotion below takes; the entry and the block stay. */
+        if (res_emulate_) {
+            if (res_emul_.size() != plans_.size()) res_emul_.resize(plans_.size());
+            if (!res_emul_[(size_t)g].insert(b).second) continue;   /* as an entry already cold */
+            out->push_back(BlockMove{g, b, -1});
+            --left;
+            ++res_stats_.demoted;
+            res_stats_.demoted_bytes += p->residency_bytes();
+            SeqResidency& sr = seq_res(id);
+            ++sr.demoted;
+            sr.link_bytes += p->residency_bytes();
+            continue;
+        }
+        /* A block promoted from a slot and untouched since (a prefix block is immutable; only the
+         * partial tail is written, and a write ends the origin) still equals that slot: point the
+         * entry back at it, move nothing, free the block now. The origin's reference becomes the
+         * entry's. No copy means nothing reads the block, so it needs no landing; the stream order
+         * of the steps that already read it is what protects it from its next owner. Not counted
+         * against `max_blocks`, which bounds link traffic. */
+        auto& origin = res_origin_[(size_t)g];             /* sized by size_residency() */
+        if (auto og = origin.find(b); og != origin.end()) {
+            const int32_t slot = og->second;
+            if (with_cache && !cache_follows(slot)) { ++skipped; continue; }
+            origin.erase(og);
+            tbl[(size_t)i] = rad_kv_cold_entry(slot);
+            s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
+            drop_block(g, b);
+            ++res_cold_;
+            ++res_stats_.demoted;
+            ++res_stats_.repointed;
+            ++res_stats_.freed_blocks;
+            res_stats_.freed_bytes += p->bytes_per_block;
+            SeqResidency& sr = seq_res(id);
+            ++sr.demoted;
+            sr.freed_bytes += p->bytes_per_block;
+            continue;
+        }
+        if (!res_store(g)) {
+            RAD_ERR("KV group '%s': residency was asked for with no store open (--qsa-window-mib)",
+                    p->name.c_str());
+            charge_skips();
+            return RAD_E_STATE;
+        }
+        const int32_t slot = slot_new(g);
+        if (slot < 0) {                                    /* store full: this one stays */
+            ++skipped;
+            decided = false;                               /* retried when a slot frees */
+            continue;
+        }
+        if (with_cache && !cache_follows(slot)) { slot_drop(g, slot); ++skipped; continue; }
+        /* The entry is cold from here; the block keeps its one reference until the copy lands. */
+        tbl[(size_t)i] = rad_kv_cold_entry(slot);
+        s->dirty_from[(size_t)g] = std::min<int64_t>(s->dirty_from[(size_t)g], i);
+        res_demoting_.push_back({ g, b, slot, id, i, with_cache });
+        ++res_cold_;
+        out->push_back(BlockMove{g, b, slot});
+        --left;
+        ++res_stats_.demoted;
+        res_stats_.demoted_bytes += p->residency_bytes();
+        SeqResidency& sr = seq_res(id);
+        ++sr.demoted;
+        sr.link_bytes += p->residency_bytes();
+    }
+    if (decided) from = i;
+    charge_skips();
+    return RAD_OK;
+}
+
+void KVManager::uncache(size_t g, int32_t b) {
+    uint8_t& mark = cached_[g][(size_t)b];
+    if (!mark) return;
+    mark = 0;
+    if (refcount_[g][(size_t)b] == 1) --cache_only_[g];
+}
+
+void KVManager::note_cache_only(size_t g, int32_t b) {
+    if (res_cache_ && plans_[g].residency() && res_store((int32_t)g) && g < res_idle_.size())
+        res_idle_[g].push_back(b);
+}
+
+int64_t KVManager::residency_demote_cached(std::vector<BlockMove>* out, int64_t max_blocks) {
+    if (!out || !res_cache_) return 0;
+    int64_t n = 0, skipped = 0;
+    for (size_t g = 0; g < res_idle_.size() && g < plans_.size() && n < max_blocks; ++g) {
+        const KVGroupPlan& p = plans_[g];
+        auto& q = res_idle_[g];
+        if (!p.residency() || !p.paged() || !res_store((int32_t)g)) { q.clear(); continue; }
+        while (!q.empty() && n < max_blocks) {
+            const int32_t b = q.front();
+            /* Taken lazily: adopted, released or demoted since it was noted means not now. */
+            if (b < 0 || (size_t)b >= refcount_[g].size() || !cached_[g][(size_t)b] ||
+                refcount_[g][(size_t)b] != 1) {
+                q.pop_front();
+                continue;
+            }
+            if (res_emulate_) {                            /* the round trip in place, once */
+                q.pop_front();
+                if (res_emul_.size() != plans_.size()) res_emul_.resize(plans_.size());
+                if (!res_emul_[g].insert(b).second) continue;
+                out->push_back(BlockMove{(int32_t)g, b, -1});
+                ++n;
+                ++res_stats_.demoted;
+                res_stats_.demoted_bytes += p.residency_bytes();
+                continue;
+            }
+            auto& origin = res_origin_[g];
+            if (auto og = origin.find(b); og != origin.end()) {
+                /* Unchanged since its promotion from a slot: the cache takes the origin's
+                 * reference and the block goes free now, as residency_demote() re-points. */
+                q.pop_front();
+                const int32_t slot = og->second;
+                if (!res_cache_((int32_t)g, b, rad_kv_cold_entry(slot))) { ++skipped; continue; }
+                origin.erase(og);
+                uncache(g, b);
+                drop_block((int32_t)g, b);                 /* the cache's, the last */
+                ++res_stats_.demoted;
+                ++res_stats_.repointed;
+                ++res_stats_.freed_blocks;
+                res_stats_.freed_bytes += p.bytes_per_block;
+                continue;
+            }
+            const int32_t slot = slot_new((int32_t)g);     /* the cache's reference */
+            if (slot < 0) { ++skipped; break; }            /* store full: retried next sweep */
+            q.pop_front();
+            if (!res_cache_((int32_t)g, b, rad_kv_cold_entry(slot))) {
+                slot_drop((int32_t)g, slot);
+                ++skipped;
+                continue;
+            }
+            /* The cache's block reference becomes the landing's, as a table's does. */
+            uncache(g, b);
+            res_demoting_.push_back({ (int32_t)g, b, slot, kCacheSeq, -1, true });
+            out->push_back(BlockMove{(int32_t)g, b, slot});
+            ++n;
+            ++res_stats_.demoted;
+            res_stats_.demoted_bytes += p.residency_bytes();
+        }
+    }
+    res_stats_.demote_skipped += skipped;
+    return n;
+}
+
+int KVManager::residency_promote(uint64_t id, int32_t g, const std::vector<int64_t>& table_idx,
+                                 std::vector<BlockMove>* out) {
+    if (!out) return RAD_E_INVAL;
+    const KVGroupPlan* p = plan(g);
+    if (!p || !p->residency()) return RAD_E_INVAL;
+    Seq* s = find(id);
+    if (!s) return RAD_E_NOTFOUND;
+    auto& tbl = s->blocks[(size_t)g];
+    for (int64_t i : table_idx) {
+        if (i < 0 || i >= (int64_t)tbl.size()) {
+            RAD_ERR("KV group '%s': residency promote named table entry %lld of a %lld-entry "
+                    "table -- another sequence's bytes would be served",
+                    p->name.c_str(), (long long)i, (long long)tbl.size());
+            return RAD_E_INVAL;
+        }
+        const int32_t e = tbl[(size_t)i];
+        if (!rad_kv_entry_cold(e)) continue;                /* already resident */
+        int32_t fresh = -1;
+        RAD_TRY(grab_block(g, &fresh));
+        /* Resident from here on: the step that issues this restore reads the block next, so the
+         * entry must not wait for the copy. This table's slot reference is held until
+         * residency_complete(), so the bytes outlive the transfer that reads them. A slot another
+         * owner holds too (the cache) is not ours to free: the block is its copy, and remembering
+         * that lets a later demotion point back at it instead of copying it out again. */
+        const int32_t slot = rad_kv_entry_slot(e);
+        const bool shared = slot_refs(g, slot) > 1;
+        tbl[(size_t)i] = fresh;
+        table_changed(s, (size_t)g, i);
+        --res_cold_;
+        /* A tiered block keeps its slot too: its pool bytes are the slot's expanded, and a
+         * second requantisation from them would round the block twice (KVGroupPlan::tiered). */
+        const bool origin = (shared || p->tiered()) && (size_t)g < res_origin_.size();
+        if (origin) {
+            slot_ref(g, slot);
+            res_origin_[(size_t)g][fresh] = slot;
+        }
+        res_pending_.push_back({ g, slot, fresh, id, i, origin });
+        out->push_back(BlockMove{g, fresh, slot});
+        ++res_stats_.promoted;
+        ++res_stats_.promoted_misses;
+        res_stats_.promoted_bytes += p->residency_bytes();
+        SeqResidency& sr = seq_res(id);
+        ++sr.promoted;
+        sr.link_bytes += p->residency_bytes();
+    }
+    return RAD_OK;
+}
+
+int KVManager::residency_promote_all(uint64_t id, std::vector<BlockMove>* out) {
+    if (!out) return RAD_E_INVAL;
+    if (!find(id)) return RAD_E_NOTFOUND;
+    /* Count first: a half-promoted sequence would still be undense, and the caller's only recourse
+     * is to preempt something and ask again. */
+    std::vector<std::vector<int64_t>> cold(plans_.size());
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        if (!plans_[g].residency()) continue;
+        cold[g] = residency_cold_entries(id, (int32_t)g);
+        if ((int64_t)cold[g].size() > available_blocks((int32_t)g)) return RAD_E_FULL;
+    }
+    for (size_t g = 0; g < plans_.size(); ++g)
+        if (!cold[g].empty()) {
+            RAD_TRY(residency_promote(id, (int32_t)g, cold[g], out));
+        }
+    return RAD_OK;
+}
+
+std::vector<int64_t> KVManager::residency_cold_entries(uint64_t id, int32_t g) const {
+    std::vector<int64_t> out;
+    if (g < 0 || g >= (int32_t)plans_.size()) return out;
+    const Seq* s = find(id);
+    if (!s) return out;
+    const auto& tbl = s->blocks[(size_t)g];
+    for (size_t i = 0; i < tbl.size(); ++i)
+        if (rad_kv_entry_cold(tbl[i])) out.push_back((int64_t)i);
     return out;
 }
 
@@ -1349,9 +2221,9 @@ void KVManager::recycle_window(Seq* s, int64_t keep_from) {
         int64_t target   = std::max<int64_t>(first,
                                              keep_from / p.block_size - (p.window_blocks - 1));
         while (first < target && !s->blocks[g].empty()) {
-            drop_block((int32_t)g, s->blocks[g].front());
+            drop_entry((int32_t)g, s->blocks[g].front());
             s->blocks[g].erase(s->blocks[g].begin());
-            s->dirty_from[g] = 0;
+            table_changed(s, g, 0);
             ++first;
         }
         if (s->blocks[g].empty()) first = target;   /* nothing held: rebase to the window */
@@ -1392,8 +2264,12 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
              * it needs one extra block. */
             if (s->n_tokens > 0 && s->n_tokens % p.block_size != 0) {
                 int64_t bi = s->n_tokens / p.block_size - first;
-                if (bi >= 0 && bi < (int64_t)s->blocks[g].size()
-                    && refcount_[g][(size_t)s->blocks[g][(size_t)bi]] > 1) need[g] += 1;
+                if (bi >= 0 && bi < (int64_t)s->blocks[g].size()) {
+                    const int32_t e = s->blocks[g][(size_t)bi];
+                    /* The append writes this block; in host memory it cannot take it. */
+                    if (rad_kv_entry_cold(e)) return RAD_E_STATE;
+                    if (e >= 0 && refcount_[g][(size_t)e] > 1) need[g] += 1;
+                }
             }
             if (need[g] > available_blocks((int32_t)g)) return RAD_E_FULL;
             RAD_TRY(grow_for((int32_t)g, need[g]));
@@ -1411,11 +2287,12 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                 int64_t bi = s->n_tokens / p.block_size - first;
                 if (bi >= 0 && bi < (int64_t)s->blocks[g].size()) {
                     int32_t old = s->blocks[g][(size_t)bi];
-                    if (refcount_[g][(size_t)old] > 1) {
+                    if (old >= 0) forget_origin((int32_t)g, old);   /* the append writes it */
+                    if (old >= 0 && refcount_[g][(size_t)old] > 1) {
                         int32_t fresh = -1;
                         grab_block((int32_t)g, &fresh);
                         s->blocks[g][(size_t)bi] = fresh;
-                        s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], bi);
+                        table_changed(s, g, bi);
                         drop_block((int32_t)g, old);
                         pending_.push_back({(int32_t)g, old, fresh});
                     }
@@ -1425,8 +2302,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                 ? window_table_len(p, s->win[g], n_tokens) - first
                 : ceil_div(n_tokens, p.block_size) - first;
             if ((int64_t)s->blocks[g].size() < want)
-                s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g],
-                                                     (int64_t)s->blocks[g].size());
+                table_changed(s, g, (int64_t)s->blocks[g].size());
             while ((int64_t)s->blocks[g].size() < want) {
                 int32_t b = -1;
                 grab_block((int32_t)g, &b);
@@ -1457,12 +2333,21 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
     if (!s->blocks[(size_t)g].empty()) return RAD_E_STATE;
     if (s->n_tokens != 0 && s->n_tokens != n_tokens) return RAD_E_INVAL;
 
+    /* A cold entry (a cache hit on a block that was paged out) is taken as it is: the slot gains a
+     * reference and the next dense step promotes it. Only a residency group has any. Everything is
+     * checked before anything is bumped, so a refusal leaves no reference behind. */
     for (int32_t b : blocks) {
-        if (b < 0 || b >= p->n_blocks) return RAD_E_INVAL;
-        add_ref((size_t)g, b);
+        if (b >= p->n_blocks) return RAD_E_INVAL;
+        if (b >= 0) continue;
+        if (!p->residency() || !rad_kv_entry_cold(b)) return RAD_E_INVAL;
+        if (slot_refs(g, rad_kv_entry_slot(b)) <= 0) return RAD_E_STATE;
+    }
+    for (int32_t b : blocks) {
+        if (b >= 0) add_ref((size_t)g, b);
+        else { slot_ref(g, rad_kv_entry_slot(b)); ++res_cold_; }
     }
     s->blocks[(size_t)g] = blocks;
-    s->dirty_from[(size_t)g] = 0;
+    table_changed(s, (size_t)g, 0);
     s->n_tokens = n_tokens;
     return RAD_OK;
 }
@@ -1484,6 +2369,12 @@ int KVManager::fork(uint64_t parent, uint64_t child) {
      * shared (see fork in kv.h, spec §7.3). */
     for (size_t g = 0; g < plans_.size(); ++g)
         if (plans_[g].stateful() && free_states_[g].empty()) return RAD_E_FULL;
+
+    /* A cold block is held by one table and is read by nobody who could promote it, so a child
+     * cannot share it; the caller promotes the parent first (residency_promote_all). */
+    for (size_t g = 0; g < plans_.size(); ++g)
+        for (int32_t e : pa->blocks[g])
+            if (rad_kv_entry_cold(e)) return RAD_E_STATE;
 
     int st = add_sequence(child);
     if (st < 0) return st;
@@ -1721,8 +2612,11 @@ bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out)
         const int64_t lo = window_lo(p, pos), hi = pos / p.block_size;
         const int64_t first = s->first_block_pos[g] / p.block_size;
         if (lo < first || hi - first > (int64_t)s->blocks[g].size()) return false;
-        for (int64_t j = lo; j < hi; ++j)
-            (*out)[row0 + (size_t)(j - lo)] = s->blocks[g][(size_t)(j - first)];
+        for (int64_t j = lo; j < hi; ++j) {
+            const int32_t e = s->blocks[g][(size_t)(j - first)];
+            if (rad_kv_entry_cold(e)) return false;     /* a snapshot names pool blocks only */
+            (*out)[row0 + (size_t)(j - lo)] = e;
+        }
     }
     return true;
 }
@@ -1752,7 +2646,7 @@ int KVManager::seed_window(uint64_t id, int64_t pos) {
             grab_block((int32_t)g, &b);
             s->blocks[g].push_back(b);
         }
-        s->dirty_from[g] = 0;
+        table_changed(s, g, 0);
     }
     if (s->n_tokens == 0) s->n_tokens = pos;
     return RAD_OK;

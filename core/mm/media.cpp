@@ -702,21 +702,41 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
     return RAD_OK;
 }
 
+namespace {
+
+/* The H.264 encoder the round trip uses: libx264, the reference's, else libopenh264 (the published
+ * image carries libopenh264 and no libx264). Not any H.264 encoder: the hardware ones need a device
+ * context this path does not set up. */
+const AVCodec* h264_encoder() {
+    for (const char* name : { "libx264", "libopenh264" })
+        if (const AVCodec* c = avcodec_find_encoder_by_name(name)) return c;
+    return nullptr;
+}
+
+}  /* namespace */
+
 bool h264_roundtrip_available() {
-    return avcodec_find_encoder_by_name("libx264") && avcodec_find_decoder(AV_CODEC_ID_H264);
+    return h264_encoder() && avcodec_find_decoder(AV_CODEC_ID_H264);
 }
 
 /* PyAV's single-frame round trip: VideoFrame.from_ndarray(rgb24).reformat("yuv420p") (plain
  * SWS_BILINEAR, BT.601 coefficients, limited-range output), libx264 with the given crf, then the
- * decoded frame's to_ndarray("rgb24"), which to_rgb reproduces. */
+ * decoded frame's to_ndarray("rgb24"), which to_rgb reproduces. Without libx264, libopenh264 takes
+ * the frame at a quantiser held at the crf, about the compression libx264's crf gives a single intra
+ * frame, so the first frame is close to the reference's but not exact. libopenh264 takes no side
+ * under 16, so a smaller picture is encoded with its last row and column repeated out to 16 and
+ * the decoded frame cut back. */
 int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why) {
     std::string w;
     if (!why) why = &w;
     const int W = in.w & ~1, H = in.h & ~1;
     if (W <= 0 || H <= 0) { *why = "the picture is smaller than 2x2"; return RAD_E_INVAL; }
-    const AVCodec* enc = avcodec_find_encoder_by_name("libx264");
+    const AVCodec* enc = h264_encoder();
     const AVCodec* dcd = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!enc || !dcd) { *why = "this libavcodec has no libx264 encoder or H.264 decoder"; return RAD_E_UNSUPPORTED; }
+    if (!enc) { *why = "this libavcodec has no H.264 encoder"; return RAD_E_UNSUPPORTED; }
+    if (!dcd) { *why = "this libavcodec has no H.264 decoder"; return RAD_E_UNSUPPORTED; }
+    const bool x264 = !std::strcmp(enc->name, "libx264");
+    const int EW = x264 ? W : std::max(W, 16), EH = x264 ? H : std::max(H, 16);
     AVCodecContext* ec = avcodec_alloc_context3(enc);
     AVCodecContext* dc = avcodec_alloc_context3(dcd);
     AVFrame* yuv = av_frame_alloc();
@@ -733,8 +753,8 @@ int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why) {
         *why = "out of memory";
         st = RAD_E_NOMEM;
     } else {
-        ec->width = W;
-        ec->height = H;
+        ec->width = EW;
+        ec->height = EH;
         ec->pix_fmt = AV_PIX_FMT_YUV420P;
         ec->time_base = AVRational{ 1, 1 };
         ec->framerate = AVRational{ 1, 1 };
@@ -742,19 +762,26 @@ int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why) {
          * that many slices, which shapes the bitstream. */
         ec->thread_count = 0;
         ec->thread_type = FF_THREAD_SLICE;
-        av_opt_set(ec->priv_data, "preset", "veryfast", 0);
-        av_opt_set(ec->priv_data, "crf", std::to_string(crf).c_str(), 0);
+        if (x264) {
+            av_opt_set(ec->priv_data, "preset", "veryfast", 0);
+            av_opt_set(ec->priv_data, "crf", std::to_string(crf).c_str(), 0);
+        } else {
+            /* libopenh264's rate control held between qmin and qmax: its "off" mode encodes at the
+             * layer quantiser FFmpeg leaves at the library's default and ignores both. */
+            ec->qmin = ec->qmax = std::clamp(crf, 1, 51);
+            av_opt_set(ec->priv_data, "rc_mode", "quality", 0);
+        }
         int e = avcodec_open2(ec, enc, nullptr);
-        if (e < 0) fail("opening libx264", e);
+        if (e < 0) fail(x264 ? "opening libx264" : "opening the H.264 encoder", e);
         if (st == RAD_OK && (e = avcodec_open2(dc, dcd, nullptr)) < 0) fail("opening the H.264 decoder", e);
         if (st == RAD_OK) {
             yuv->format = AV_PIX_FMT_YUV420P;
-            yuv->width = W;
-            yuv->height = H;
+            yuv->width = EW;
+            yuv->height = EH;
             if ((e = av_frame_get_buffer(yuv, 0)) < 0) fail("allocating a frame", e);
         }
         if (st == RAD_OK) {
-            sws = sws_getContext(W, H, AV_PIX_FMT_RGB24, W, H, AV_PIX_FMT_YUV420P, SWS_BILINEAR,
+            sws = sws_getContext(EW, EH, AV_PIX_FMT_RGB24, EW, EH, AV_PIX_FMT_YUV420P, SWS_BILINEAR,
                                  nullptr, nullptr, nullptr);
             if (!sws) fail("no RGB to yuv420p conversion", 0);
         }
@@ -765,14 +792,17 @@ int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why) {
             if (!rgb) fail("out of memory", AVERROR(ENOMEM));
             else {
                 rgb->format = AV_PIX_FMT_RGB24;
-                rgb->width = W;
-                rgb->height = H;
+                rgb->width = EW;
+                rgb->height = EH;
                 if ((e = av_frame_get_buffer(rgb, 0)) < 0) fail("allocating a frame", e);
                 else {
-                    for (int y = 0; y < H; ++y)
-                        std::memcpy(rgb->data[0] + (ptrdiff_t)y * rgb->linesize[0],
-                                    in.rgb.data() + (size_t)y * in.w * 3, (size_t)W * 3);
-                    if (sws_scale(sws, rgb->data, rgb->linesize, 0, H, yuv->data, yuv->linesize) != H)
+                    for (int y = 0; y < EH; ++y) {
+                        uint8_t* row = rgb->data[0] + (ptrdiff_t)y * rgb->linesize[0];
+                        std::memcpy(row, in.rgb.data() + (size_t)std::min(y, H - 1) * in.w * 3,
+                                    (size_t)W * 3);
+                        for (int x = W; x < EW; ++x) std::memcpy(row + x * 3, row + (W - 1) * 3, 3);
+                    }
+                    if (sws_scale(sws, rgb->data, rgb->linesize, 0, EH, yuv->data, yuv->linesize) != EH)
                         fail("colour conversion failed", 0);
                 }
                 av_frame_free(&rgb);
@@ -795,6 +825,19 @@ int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why) {
                 st = to_rgb(dec, &back, out, why);
                 sws_freeContext(back);
                 got = st == RAD_OK;
+                if (got && (out->w != W || out->h != H)) {
+                    if (out->w < W || out->h < H) {
+                        fail("the round trip decoded to a smaller frame", 0);
+                        got = false;
+                    } else {
+                        for (int y = 0; y < H; ++y)
+                            std::memmove(out->rgb.data() + (size_t)y * W * 3,
+                                         out->rgb.data() + (size_t)y * out->w * 3, (size_t)W * 3);
+                        out->rgb.resize((size_t)W * H * 3);
+                        out->w = W;
+                        out->h = H;
+                    }
+                }
             }
             av_frame_unref(dec);
         }

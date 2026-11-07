@@ -24,12 +24,20 @@
 // from that kernel's table, which holds only this step's positions (a block completing at decode
 // starts three positions back).
 //
+// With `key_dtype` i8 the key is stored as an int8 page instead (docs/QSA.md, "Block-key
+// storage"): the bf16 key's n codes, one f16 scale for the whole key and zero padding to the page's
+// width, by i8h's rule for a head (libref/ref_attn.cpp: scale f16(fmin(amax / 127, 512)), codes
+// clamp(rint(x / scale), +-127), 0 at a zero scale). The absmax is a block reduction of fmaxf from
+// NaN as the identity, which drops a NaN in any order, as libref's fmax does, so the page is
+// libref's byte for byte given the same bf16 key.
+//
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"
 #include "rad_yarn.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"   // r4d_wave_sum
 
 #include <hip/hip_runtime.h>
@@ -54,12 +62,13 @@ __device__ __forceinline__ int qbk_comp(int mode, int i, int s0, int s1, int s2)
     return i < s0 ? 0 : (i < s0 + s1 ? 1 : 2);
 }
 
-__global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
+__device__ __forceinline__ void qsa_block_key_kernel_body(
     const uint16_t* __restrict__ k, const float* __restrict__ w,
     const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
     uint16_t* __restrict__ out,
     int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
-    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
+    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn,
+    int i8w) {
 
     __shared__ float sh[kMaxN];
     __shared__ float red[kMaxN / 32];
@@ -91,9 +100,8 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
     if (t < n) sh[t] = acc * inv * (wadd + w[t]);
     __syncthreads();
 
-    if (t >= n) return;
-    float res = sh[t];
-    if (t < rot) {
+    float res = t < n ? sh[t] : 0.0f;
+    if (t < n && t < rot) {
         const int half = rot >> 1;
         const bool first = t < half;
         const int pt = first ? t + half : t - half;
@@ -114,14 +122,64 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
         res = first ? (res * c - xp * s) : (xp * s + res * c);
     }
     /* With `page`, block b is written to its page of the paged block-key store (docs/QSA.md);
-     * a negative entry (no page) is skipped. Without it the write is contiguous. */
+     * a negative entry (no page) is skipped. Without it the write is contiguous. The entry is the
+     * same for the whole workgroup, so the int8 path's barrier below is reached by all or none. */
     long long orow = b;
     if (page) {
         const int32_t p = page[b];
         if (p < 0) return;
         orow = p;
     }
-    ((__hip_bfloat16*)out)[(size_t)orow * o_ld + t] = __float2bfloat16(res);
+    const __hip_bfloat16 rb = __float2bfloat16(res);
+    if (!i8w) {
+        if (t < n) ((__hip_bfloat16*)out)[(size_t)orow * o_ld + t] = rb;
+        return;
+    }
+    /* int8: `i8w` is the page's width in bytes and `o_ld` its pitch. `red` is free again: its
+     * last reads were before the barrier above. */
+    const float x = __bfloat162float(rb);
+    float amax = t < n ? fabsf(x) : __builtin_nanf("");
+    for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
+    if ((t & 31) == 0) red[t >> 5] = amax;
+    __syncthreads();
+    amax = __builtin_nanf("");
+    for (int i = 0; i < nw; ++i) amax = fmaxf(amax, red[i]);
+    const __fp16 s16 = (__fp16)fminf(amax / 127.0f, 512.0f);
+    const float sc = (float)s16;
+    uint8_t* __restrict__ o8 = (uint8_t*)out + (size_t)orow * o_ld;
+    if (t < n) {
+        const float r = sc > 0.0f ? rintf(x / sc) : 0.0f;
+        o8[t] = (uint8_t)(int)fminf(fmaxf(r, -127.0f), 127.0f);
+    }
+    if (t == 0) {
+        o8[n]     = (uint8_t)(__builtin_bit_cast(uint16_t, s16) & 0xFFu);
+        o8[n + 1] = (uint8_t)(__builtin_bit_cast(uint16_t, s16) >> 8);
+    }
+    for (int i = n + 2 + t; i < i8w; i += (int)blockDim.x) o8[i] = 0;
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+__global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
+    const uint16_t* __restrict__ k, const float* __restrict__ w,
+    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
+    uint16_t* __restrict__ out,
+    int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
+    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn,
+    int i8w) {
+    qsa_block_key_kernel_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn,
+                              i8w);
+}
+__global__ __launch_bounds__(kMaxN) void r4dchain_qsa_block_key(
+    const uint16_t* __restrict__ k, const float* __restrict__ w,
+    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
+    uint16_t* __restrict__ out,
+    int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
+    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn,
+    int i8w) {
+    r4d_chain_wait();
+    qsa_block_key_kernel_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn,
+                              i8w);
+    r4d_chain_done();
 }
 
 }  // namespace
@@ -136,7 +194,7 @@ static int r4d_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lon
                                       int n, int ratio, int rot, float eps, float wadd,
                                       float theta, float rscale, long long pos0, int k_ld,
                                       int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc,
-                                      RadStream stream, RadYarn yarn) {
+                                      RadStream stream, RadYarn yarn, int i8w) {
     if (!k || !w || !out || (pos0 < 0 && !bpos)) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n <= 0 || n > kMaxN || ratio <= 0) return R4D_NO(RAD_E_SHAPE);
     if (rot < 0 || rot > n || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
@@ -144,10 +202,10 @@ static int r4d_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lon
     if (!o_ld) o_ld = n;
     /* n threads rounded up to whole waves for the block reduction (extra threads contribute 0). */
     const int thr = ((n + 31) / 32) * 32;
-    return R4D_EMIT(stream, qsa_block_key_kernel, dim3((unsigned)M), dim3((unsigned)thr), 0,
+    return R4D_EMIT(stream, g_r4d_chain_arg ? &r4dchain_qsa_block_key : &qsa_block_key_kernel, dim3((unsigned)M), dim3((unsigned)thr), 0,
                     (const uint16_t*)k, (const float*)w, (const int32_t*)page,
                     (const int32_t*)bpos, (uint16_t*)out, n, ratio, rot, eps, wadd, theta, rscale,
-                    pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
+                    pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn, i8w);
 }
 
 // ============================================================== the plugin ABI entry point
@@ -171,15 +229,20 @@ extern "C" int r4d_rad_qsa_block_key(const RadArgs* a, RadStream stream) {
     const long long rot   = r4d_geti_or(a, "rotary_dim", 0);
     const long long pos0  = r4d_geti_or(a, "pos0", -1);
     if (n <= 0 || ratio <= 0 || (pos0 < 0 && !bp)) return R4D_NO(RAD_E_INVAL);
-    /* block_size sizes the block-key KV group and must equal the compress ratio, so a page holds
-     * exactly one block. */
+    /* block_size sizes the block-key KV group: the compress ratio, or a multiple of it when the
+     * keys are split across ranks (one page per `ranks` blocks, docs/QSA.md). A page holds one
+     * key either way, which the page-width checks below hold. */
     const long long bs = r4d_geti_or(a, "block_size", ratio);
-    if (bs != ratio) return R4D_NO(RAD_E_SHAPE);
+    if (bs < ratio || bs % ratio) return R4D_NO(RAD_E_SHAPE);
     /* With a page list, M is the number of blocks completing this step, not the store's height
      * (the whole pool). */
     const long long M = pg ? r4d_numel(pg) : o->shape[0];
     const long long ow = o->shape[0] > 0 ? r4d_numel(o) / o->shape[0] : 0;
-    if (M < 1 || ow != n) return R4D_NO(RAD_E_SHAPE);
+    /* `key_dtype` i8: a byte-wide page of at least the n codes and the f16 scale. */
+    const char* kd = r4d_gets(a, "key_dtype");
+    if (kd && std::strcmp(kd, "i8")) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (M < 1 || (kd ? ow < n + 2 : ow != n)) return R4D_NO(RAD_E_SHAPE);
+    if (kd && rad_dtype_bits(o->dtype) != 8) return R4D_NO(RAD_E_SHAPE);
     if (pg && o->shape[0] < 1) return R4D_NO(RAD_E_SHAPE);
     /* `pos` is one position per block, or a rank-2 [>= M, 1 or 3] column slice with a block's
      * components side by side and blocks a row pitch apart (qsa_work's output). */
@@ -217,11 +280,13 @@ extern "C" int r4d_rad_qsa_block_key(const RadArgs* a, RadStream stream) {
     if (!rad_yarn_valid(yarn) ||
         (yarn.factor != 0.0f && (rot <= 0 || r4d_getf(a, "scale", 1.0) != 1.0)))
         return R4D_NO(RAD_E_INVAL);
+    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     return r4d_qsa_block_key_bf16_emit(
         r4d_addr(k), r4d_addr(w), r4d_addr(pg), r4d_addr(bp), r4d_addr(o),
         (int)M, (int)n, (int)ratio, (int)rot,
         (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 1.0),
         (float)r4d_getf(a, "theta", 10000.0), (float)r4d_getf(a, "scale", 1.0),
-        pos0, (int)kp, (int)op, mode, sec[0], sec[1], sec[2], bstep, mc, stream, yarn);
+        pos0, (int)kp, (int)op, mode, sec[0], sec[1], sec[2], bstep, mc, stream, yarn,
+        kd ? (int)ow : 0);
 }
 

@@ -3560,4 +3560,124 @@ TEST(the_coupled_evidence_survives_the_drafters_greedy_build) {
     CHECK_EQ(ev.rows, (int64_t)6);
 }
 
+/* The planes are sized for the rows a step can sample: one per token the step carries, so never
+ * more than max_tok, and never fewer than max_seqs (a drafter's greedy pass). */
+TEST(the_sampler_rows_are_bounded_by_the_steps_tokens) {
+    Registry reg;
+    (void)reg.load_plugin(home() + "/kernels/libref.so", 0);
+    RadModelMeta meta{};
+    meta.arch_id = "sampler_rows";
+    meta.name = "sampler_rows";
+    RadBuildCtx bc{};
+    bc.max_seqs = 4;
+    bc.max_tok = 8;
+    bc.max_ctx = 64;
+    bc.max_spec = 7;
+    bc.scope = "";
+    Builder b(reg, meta, bc);
+    Sampler s;
+    SamplerConfig cfg;
+    cfg.n_vocab = 16;
+    cfg.n_vocab_local = 16;
+    cfg.max_seqs = 4;
+    cfg.max_spec = 7;
+    cfg.max_tok = 8;
+    cfg.max_hist = 16;
+    cfg.max_candidates = 8;
+    CHECK_OK(s.declare(&b, cfg));
+    const int32_t d[7] = { 1, 2, 3, 4, 5, 6, 7 };
+    Request r = make_req(1, { 1 }, greedy_params());
+    r.n_draft = 7;
+    r.draft = d;
+    CHECK_OK(s.build_step({ &r }));
+    Request q = make_req(2, { 1 }, greedy_params());
+    CHECK_EQ(s.build_step({ &r, &q }), RAD_E_FULL);
+    CHECK_OK(s.build_greedy(4));
+
+    /* A token bound below the sequences: a greedy pass still fits every sequence. */
+    Builder b2(reg, meta, bc);
+    Sampler t;
+    cfg.max_tok = 2;
+    CHECK_OK(t.declare(&b2, cfg));
+    CHECK_OK(t.build_greedy(4));
+    CHECK_EQ(t.build_greedy(5), RAD_E_FULL);
+}
+
+/* A DRAFT PASS'S BUILD LEAVES THE STEP'S STAGING TO ITS UPLOAD.
+ *
+ * issue_serial_drafter and block_pass build their greedy passes right after the step's chain was
+ * issued, and on a card that chain's uploads read the pinned staging only when the stream reaches
+ * them, behind the step's forward pass. build_greedy zeroed the n-gram pairs there, so on a server
+ * with a drafter a banning request uploaded n = 0 and was never banned on the card. Host-site ops
+ * join their stream before they run, so the race itself cannot show on the host backend; the
+ * pairs are checked instead, and the ban still runs in the step after the greedy build. */
+TEST(a_drafters_greedy_build_leaves_the_steps_ngram_pairs_to_its_upload) {
+    HostChain ch(16, 2, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp = greedy_params();
+    sp.ngram_ban_n = 2;
+    sp.ngram_window = 8;
+    /* 4 followed 3 once, so after the last 3 the ban removes 4 and 5 is the argmax. */
+    std::vector<float> lg(16, 0.0f);
+    lg[4] = 2.0f;
+    lg[5] = 1.0f;
+    Request a = make_req(1, { 3, 4, 3 }, sp);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 5);
+    CHECK_EQ(ch.s.staged_ngram(0)[0], 2);
+    CHECK_EQ(ch.s.staged_ngram(0)[1], 8);
+
+    CHECK_OK(ch.s.build_greedy(2));
+    CHECK_EQ(ch.s.staged_ngram(0)[0], 2);
+    CHECK_EQ(ch.s.staged_ngram(0)[1], 8);
+
+    Request b = make_req(2, { 3, 4, 3 }, sp);
+    CHECK_OK(ch.step({ &b }, lg, &tok));
+    CHECK_EQ(tok[0], 5);
+}
+
+/* A top-1 row keeps its one candidate through every cut, so a step of top-1 rows issues none: a
+ * greedy row asking for logprobs (a top-1 chain row, as every greedy row is under a split
+ * vocabulary) with top-p, min-p, typical and XTC set samples its argmax and its logprob without
+ * them. A row with more than one candidate issues all four. Every row of a drafter's greedy pass
+ * is top-1 too, with those fields at 0; under a split vocabulary it issued top-p and typical, a
+ * max and a sum over the candidate width a row, every round. */
+TEST(a_top1_row_issues_no_candidate_cut) {
+    HostChain ch(32, 2, 0);
+    NEED_CHAIN(ch)
+    auto issued = [&](const char* name) {
+        ch.ctx.flush_issued();
+        for (const OpInfo& o : ch.prog.ops)
+            if (o.op == name && o.issued) return true;
+        return false;
+    };
+    static const char* const kCuts[] = { "sample_topp", "sample_minp", "sample_typical",
+                                         "sample_xtc" };
+    SamplingParams g = greedy_params();
+    g.n_probs = 1;
+    g.top_p = 0.5f;
+    g.min_p = 0.1f;
+    g.typical_p = 0.5f;
+    g.xtc_probability = 1.0f;
+    g.xtc_threshold = 0.01f;
+    std::vector<float> lg(32);
+    for (int t = 0; t < 32; ++t) lg[(size_t)t] = 0.1f * (float)t;
+    Request a = make_req(1, { 1 }, g);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 31);
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, lg[31] - log_sum_exp(lg), 1e-5);
+    for (const char* op : kCuts) CHECK(!issued(op));
+
+    SamplingParams two = g;
+    two.temp = 1.0f;
+    two.top_k = 2;
+    Request b = make_req(2, { 1 }, two);
+    CHECK_OK(ch.step({ &b }, lg, &tok));
+    for (const char* op : kCuts) CHECK(issued(op));
+}
+
 RAD_TEST_MAIN()

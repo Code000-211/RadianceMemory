@@ -6,6 +6,7 @@
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
+#include "gen/shape_driver.h"
 #include "kld.h"
 #include "mm/processor.h"
 #include "mm/media.h"
@@ -41,9 +42,219 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+#include <string>
+#endif
+
 namespace rad {
+
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+namespace {
+struct KVRollbackTestEvidence {
+    bool waiting_for_greedy = false;
+    std::string report_path;
+    uint64_t seq = 0;
+    int step = -1;
+    int proposals = 0;
+    int accepted = -1;
+    int32_t group = -1;
+    int64_t prefix_before = 0;
+    int64_t rollback_tokens_before = 0;
+    int64_t rollback_to_tokens = 0;
+    int64_t prefix_after_rollback = -1;
+    int64_t first_block_pos = 0;
+    int64_t block_size = 0;
+    int64_t n_layers = 0;
+    int64_t bytes_per_layer = 0;
+    std::vector<int32_t> logical_blocks;
+    std::vector<int32_t> physical_slots;
+    std::vector<uint8_t> before;
+    uint64_t after_hash = 0;
+    bool bytes_equal = false;
+    bool mapping_equal = false;
+    bool negative_control_detected = false;
+};
+
+uint64_t kv_test_hash(const std::vector<uint8_t>& bytes) {
+    uint64_t h = 14695981039346656037ull;
+    for (uint8_t b : bytes) h = (h ^ b) * 1099511628211ull;
+    return h;
+}
+
+bool kv_test_bytes_equal(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+template<class RankT>
+bool kv_test_snapshot(RankT& rank, uint64_t seq, int32_t group, int64_t prefix_tokens,
+                      int64_t* first_block_pos, std::vector<int32_t>* logical,
+                      std::vector<int32_t>* physical, std::vector<uint8_t>* bytes) {
+    const KVGroupPlan* p = rank.kv.plan(group);
+    if (!p || p->zero || !p->paged() || p->kind != RAD_KV_FULL || p->streamed() ||
+        p->n_layers <= 0 || p->block_size <= 0 || !p->base) return false;
+    const auto& table = rank.kv.block_table(seq, group);
+    const int64_t first_pos = rank.kv.first_block_pos(seq, group);
+    if (first_pos < 0 || prefix_tokens < first_pos) return false;
+    const int64_t complete = (prefix_tokens - first_pos) / p->block_size;
+    if (complete <= 0 || complete > (int64_t)table.size()) return false;
+    if (first_block_pos) *first_block_pos = first_pos;
+    /* Snapshot every complete block in the retained pre-verify prefix. The trailing partial
+     * block is omitted because accepted verify tokens may legitimately fill its unused slots. */
+    const int64_t nblocks = complete;
+    const int64_t layer_bytes = p->layer_bytes_per_block();
+    const int64_t block_bytes = p->n_layers * layer_bytes;
+    if (nblocks <= 0 || layer_bytes <= 0 || p->bytes_per_block != block_bytes) return false;
+    if (rad_dev_set(rank.device) < 0 || rad_stream_sync(rank.ctx.stream()) < 0) return false;
+    logical->clear();
+    physical->clear();
+    logical->reserve((size_t)nblocks);
+    physical->reserve((size_t)nblocks);
+    bytes->resize((size_t)nblocks * (size_t)block_bytes);
+    for (int64_t b = 0; b < nblocks; ++b) {
+        const int32_t id = table[(size_t)b];
+        if (id < 0 || id >= p->pool_blocks()) return false;
+        logical->push_back((int32_t)(first_pos / p->block_size + b));
+        physical->push_back(id);
+        for (int64_t layer = 0; layer < p->n_layers; ++layer) {
+            const auto* src = static_cast<const uint8_t*>(p->base) +
+                              layer * p->layer_stride() + (int64_t)id * layer_bytes;
+            auto* dst = bytes->data() + b * block_bytes + layer * layer_bytes;
+            if (rad_memcpy_async(dst, src, layer_bytes, rank.ctx.stream()) < 0) return false;
+        }
+    }
+    return rad_stream_sync(rank.ctx.stream()) >= 0;
+}
+
+void kv_test_write_report(const KVRollbackTestEvidence& e, bool greedy, int greedy_token,
+                          int64_t tokens_at_greedy) {
+    if (e.report_path.empty()) return;
+    std::ofstream f(e.report_path, std::ios::trunc);
+    if (!f) return;
+    f << "{\"partial_rejection_observed\":true,\"step\":" << e.step
+      << ",\"sequence\":" << e.seq << ",\"proposals\":" << e.proposals
+      << ",\"accepted\":" << e.accepted << ",\"group\":" << e.group
+      << ",\"prefix_tokens_before_verify\":" << e.prefix_before
+      << ",\"rollback_tokens_before\":" << e.rollback_tokens_before
+      << ",\"rollback_to_tokens\":" << e.rollback_to_tokens
+      << ",\"prefix_tokens_after\":" << e.prefix_after_rollback
+      << ",\"first_block_pos\":" << e.first_block_pos
+      << ",\"block_size\":" << e.block_size << ",\"layers\":" << e.n_layers
+      << ",\"bytes_per_layer\":" << e.bytes_per_layer << ",\"logical_blocks\":[";
+    for (size_t i = 0; i < e.logical_blocks.size(); ++i) f << (i ? "," : "") << e.logical_blocks[i];
+    f << "],\"physical_slots\":[";
+    for (size_t i = 0; i < e.physical_slots.size(); ++i) f << (i ? "," : "") << e.physical_slots[i];
+    f << "],\"committed_prefix_bytes\":" << e.before.size()
+      << ",\"before_hash\":" << kv_test_hash(e.before)
+      << ",\"after_hash\":" << e.after_hash
+      << ",\"bytes_equal\":" << (e.bytes_equal ? "true" : "false")
+      << ",\"mapping_equal\":" << (e.mapping_equal ? "true" : "false")
+      << ",\"negative_control_detected\":" << (e.negative_control_detected ? "true" : "false")
+      << ",\"next_greedy_decode_observed\":" << (greedy ? "true" : "false")
+      << ",\"tokens_at_next_greedy_decode\":" << (greedy ? tokens_at_greedy : -1)
+      << ",\"next_greedy_token\":" << (greedy ? greedy_token : -1) << "}\n";
+}
+
+KVRollbackTestEvidence& kv_test_evidence() {
+    static KVRollbackTestEvidence e;
+    return e;
+}
+
+template<class Output, class Ranks>
+void kv_test_before_commit(const StepPlan& plan, const Output& so, int step, Ranks& ranks) {
+    auto& e = kv_test_evidence();
+    if (!e.waiting_for_greedy && !e.report_path.empty() && e.accepted < 0) {
+        for (size_t i = 0; i < plan.e.size(); ++i) {
+            const StepEntry& entry = plan.e[i];
+            if (entry.seq == e.seq && step == e.step && entry.n_spec == e.proposals &&
+                (so.accepted[i] <= 0 || so.accepted[i] >= e.proposals)) {
+                e = KVRollbackTestEvidence{};
+                return;
+            }
+        }
+    }
+    if (!e.waiting_for_greedy) return;
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        const StepEntry& entry = plan.e[i];
+        if (entry.seq == e.seq && entry.req && entry.req->sp.greedy() &&
+            so.first_row[i] >= 0) {
+            kv_test_write_report(e, true, so.token[i], ranks[0]->kv.seq_tokens(e.seq));
+            e.waiting_for_greedy = false;
+            break;
+        }
+    }
+}
+
+template<class Ranks>
+void kv_test_prepare(const StepPlan& plan, int step, Ranks& ranks) {
+    auto& e = kv_test_evidence();
+    if (!e.report_path.empty() || e.waiting_for_greedy) return;
+    const char* path = std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT");
+    if (!path || !*path) return;
+    for (const StepEntry& entry : plan.e) {
+        if (!entry.req || entry.n_spec != 7) continue;
+        const int64_t prefix = entry.ctx_len;
+        for (int32_t g = 0; g < ranks[0]->kv.n_groups(); ++g) {
+            const KVGroupPlan* p = ranks[0]->kv.plan(g);
+            if (!p || p->kind != RAD_KV_FULL || p->zero || p->streamed() ||
+                prefix < p->block_size) continue;
+            KVRollbackTestEvidence candidate;
+            candidate.report_path = path;
+            candidate.seq = entry.seq;
+            candidate.step = step;
+            candidate.proposals = entry.n_spec;
+            candidate.group = g;
+            candidate.prefix_before = prefix;
+            candidate.block_size = p->block_size;
+            candidate.n_layers = p->n_layers;
+            candidate.bytes_per_layer = p->layer_bytes_per_block();
+            if (!kv_test_snapshot(*ranks[0], entry.seq, g, prefix, &candidate.first_block_pos,
+                                  &candidate.logical_blocks, &candidate.physical_slots,
+                                  &candidate.before)) continue;
+            e = std::move(candidate);
+            return;
+        }
+    }
+}
+
+template<class RankT>
+void kv_test_rollback(uint64_t seq, int proposals, int accepted, int64_t valid,
+                      bool before, RankT& rank) {
+    auto& e = kv_test_evidence();
+    if (e.report_path.empty() || e.waiting_for_greedy || seq != e.seq ||
+        proposals != e.proposals || proposals != 7 || accepted <= 0 || accepted >= proposals)
+        return;
+    if (before) {
+        e.accepted = accepted;
+        e.rollback_tokens_before = rank.kv.seq_tokens(seq);
+        e.rollback_to_tokens = valid;
+        return;
+    }
+    std::vector<int32_t> logical, physical;
+    std::vector<uint8_t> after;
+    int64_t first_block_pos = -1;
+    const bool copied = kv_test_snapshot(rank, seq, e.group, std::min(e.prefix_before, valid),
+                                         &first_block_pos, &logical, &physical, &after);
+    bool mapping_equal = copied && first_block_pos == e.first_block_pos &&
+                         logical == e.logical_blocks && physical == e.physical_slots;
+    const bool bytes_equal = copied && kv_test_bytes_equal(after, e.before);
+    e.after_hash = copied ? kv_test_hash(after) : 0;
+    e.bytes_equal = bytes_equal;
+    std::vector<uint8_t> mutated = e.before;
+    if (!mutated.empty()) mutated[0] ^= 1;
+    e.negative_control_detected = !mutated.empty() && !kv_test_bytes_equal(e.before, mutated);
+    const int64_t after_tokens = rank.kv.seq_tokens(seq);
+    mapping_equal = mapping_equal && after_tokens == e.rollback_to_tokens;
+    e.mapping_equal = mapping_equal;
+    e.prefix_after_rollback = after_tokens;
+    kv_test_write_report(e, false, -1, -1);
+    e.waiting_for_greedy = true;
+    (void)valid;  // rollback's requested length is emitted by the manager as after_tokens
+}
+} // namespace
+#endif
 
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
@@ -74,6 +285,24 @@ Engine::~Engine() {
         cvec_views_[(size_t) r->index].dir = nullptr;
     }
     cvec_views_.clear();
+    /* The V mean tables, the same way. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= kv_vmean_views_.size()) continue;
+        const void* d = kv_vmean_views_[(size_t) r->index].table;
+        if (!d || rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        kv_vmean_views_[(size_t) r->index].table = nullptr;
+    }
+    kv_vmean_views_.clear();
+    /* The K-to-V map tables, the same way. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= kv_vpred_views_.size()) continue;
+        const void* d = kv_vpred_views_[(size_t) r->index].table;
+        if (!d || rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        kv_vpred_views_[(size_t) r->index].table = nullptr;
+    }
+    kv_vpred_views_.clear();
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
@@ -108,6 +337,8 @@ Engine::~Engine() {
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
     table_copies_.clear();
+    for (TableCopy& c : table_files_) ::munmap(c.base, c.bytes);
+    table_files_.clear();
     for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
     card_copies_.clear();
     for (TableShare& t : table_shares_) table_share_close(&t);
@@ -164,6 +395,10 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     }
     sc.max_seqs      = cfg_.max_seqs;
     sc.max_spec      = cfg_.n_spec;
+    /* The real step bound, not the sizing declare's level: the sampler's planes must be the same
+     * buffers in every declare of the program (plan_level compares them), and a step can sample
+     * no more rows than the real bound lets it carry tokens. */
+    sc.max_tok       = cfg_.max_tok;
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
@@ -171,11 +406,14 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
      * same chain against its own buffer. PERSIST, since the step loop copies it back after the
-     * step, when a transient's storage may belong to another buffer. */
+     * step, when a transient's storage may belong to another buffer. One id per sampler row,
+     * capped as the rows are (SamplerConfig::max_tok). */
     RadBufDecl d{};
     d.dtype    = RAD_I32;
     d.rank     = 1;
     d.shape[0] = cfg_.max_seqs * (cfg_.n_spec > 0 ? cfg_.n_spec + 1 : 1);
+    if (cfg_.max_tok > 0)
+        d.shape[0] = std::min<int64_t>(d.shape[0], std::max<int64_t>(cfg_.max_tok, cfg_.max_seqs));
     d.kind     = RAD_BUF_PERSIST;
     tok = rad_decl_buffer(b, "sampler.tokens", &d);
     return tok ? RAD_OK : RAD_E_STATE;
@@ -506,6 +744,9 @@ int Engine::issue_ahead(const RadBatch** out) {
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    kv_test_prepare(sched_.plan(), nb->step, ranks_);
+#endif
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
@@ -567,6 +808,15 @@ int Engine::step_loop() {
         return fail_loop(RAD_E_UNSUPPORTED);
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    if (std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT")) {
+        sched_.set_kv_rollback_test_hook([this](uint64_t seq, int proposals, int accepted,
+                                                int64_t valid, bool before) {
+            if (!ranks_.empty()) kv_test_rollback(seq, proposals, accepted, valid, before,
+                                                   *ranks_[0]);
+        });
+    }
+#endif
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
@@ -620,6 +870,9 @@ int Engine::step_loop() {
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+        kv_test_prepare(plan, b->step, ranks_);
+#endif
         /* One entry per request; Sampler::build_step expands each into 1 + n_draft rows itself
          * (giving each position its RNG coordinate), so one push per row would stage (1+n)^2 rows.
          * `first_row` indexes sampled tokens, so it counts rows. */
@@ -883,6 +1136,9 @@ int Engine::step_loop() {
             res.first_row = so.first_row.data();
         }
         res.path = so.path.empty() ? nullptr : so.path.data();
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+        kv_test_before_commit(plan, so, b->step, ranks_);
+#endif
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
@@ -1809,17 +2065,20 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
     const bool video_gen = ranks_[0]->program.is_video_generator();
+    const bool shape_gen = ranks_[0]->program.is_shape_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
-                "rad_declare_audio_generator, rad_declare_video_generator), so a step produces "
+                "rad_declare_audio_generator, rad_declare_video_generator, "
+                "rad_declare_shape_generator), so a step produces "
                 "nothing anyone can read. An encoder-only plugin cannot serve.",
                 plugins_.arch_plugin.c_str());
         return RAD_E_UNSUPPORTED;
     }
     if (generator) {
-        const char* const what = audio_gen ? "audio" : video_gen ? "video" : "images";
+        const char* const what = audio_gen ? "audio" : video_gen ? "video"
+                               : shape_gen ? "shapes" : "images";
         if (cfg_.kld() || cfg_.n_spec > 0) {
             RAD_ERR("the '%s' plugin makes %s: --kld and speculative decoding have no tokens to "
                     "work on", plugins_.arch_plugin.c_str(), what);
@@ -1828,6 +2087,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         for (size_t i = 1; i < ranks_.size(); ++i)
             if (ranks_[i]->program.is_audio_generator() != audio_gen ||
                 ranks_[i]->program.is_video_generator() != video_gen ||
+                ranks_[i]->program.is_shape_generator() != shape_gen ||
                 !ranks_[i]->program.is_pass_driven()) {
                 RAD_ERR("rank %zu declared a different generator from rank 0's", i);
                 return RAD_E_STATE;
@@ -1838,6 +2098,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
               "after them"
             : video_gen
             ? "a video generator: a prompt is read by its own request's steps and keeps no KV"
+            : shape_gen
+            ? "a shape generator: a picture is read by its own request's steps and keeps no KV"
             : "an image generator: a conditioning is read by its own request's images and by "
               "nothing after them";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
@@ -1903,7 +2165,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * whose stream it is given (spec §1). */
     RAD_TRY(rad_dev_set(ranks_[0]->device));
 
-    kv_iface_ = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
+    {
+        auto kvb = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
+        for (size_t i = 1; i < ranks_.size(); ++i) kvb->peers.push_back(&ranks_[i]->kv);
+        kv_iface_ = std::move(kvb);
+    }
     pc_iface_ = std::make_unique<PCBinding<PrefixCache>>(&ranks_[0]->prefix);
     /* The control vector's identity partitions the block cache (PCBinding::salt_id): a request
      * that runs with the projection on never adopts a block or a linear-state snapshot produced
@@ -1994,7 +2260,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program, rk->pools.kv().base(),
                         rank_stream_views_[r].data() });
     }
-    if (video_gen) {
+    if (shape_gen) {
+        /* As for the image generator below. */
+        std::vector<gen::ShapeDriver::RankIO> gio;
+        for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
+        auto d = std::make_unique<gen::ShapeDriver>();
+        RAD_TRY(d->init(ranks_[0]->program, gio));
+        shp_gen_ = d.get();
+        gen_ = std::move(d);
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+    } else if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
@@ -2042,6 +2317,91 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * the card there is no such cost and every lone prefill spans. */
         sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+    }
+
+    /* Window residency (spec §7.3): the scheduler names the blocks, this runs them. Installed only
+     * when the store is open and every rank can move bytes (bring-up refuses otherwise), so a
+     * server without --kv-residency-mib never gets a mover and the scheduler demotes and promotes
+     * nothing -- the same code path as before the pager existed. */
+    if (!gen_ && ranks_[0]->resx.enabled()) {
+        Scheduler::ResidencyMover m;
+        /* Every rank moves its own shard of the same block ids; the manager's records are rank
+         * 0's. One group a call (the scheduler cuts the list at group changes), cut here at the
+         * batch size TierExec stages. A demotion is ordered after the rank's compute stream, a
+         * promotion makes it wait: the host waits for neither. */
+        m.move = [this](const std::vector<BlockMove>& mv, bool to_host) {
+            int rc = RAD_OK;
+            for (auto& r : ranks_) {
+                if (rc < 0) break;                   /* the batch is put back whole anyway */
+                if (rad_dev_set(r->device) != RAD_OK) { rc = RAD_E_DEVICE; break; }
+                for (size_t a = 0; a < mv.size(); a += TierExec::kMoveBatch) {
+                    const std::vector<BlockMove> part(
+                        mv.begin() + (std::ptrdiff_t)a,
+                        mv.begin() + (std::ptrdiff_t)std::min(mv.size(), a + TierExec::kMoveBatch));
+                    const int st = r->resx.issue_moves(part, r->ctx.stream(), to_host);
+                    if (st < 0) { if (rc == RAD_OK) rc = st; break; }
+                }
+            }
+            /* A failed batch is put back by the scheduler (KVManager::residency_abort), which
+             * frees its slots and blocks: every rank's queued part must have finished first, the
+             * ranks that succeeded included, or a copy still queued writes a block or slot its
+             * next owner already holds. A host wait, but only on failure. */
+            if (rc < 0)
+                for (auto& r : ranks_)
+                    if (rad_dev_set(r->device) == RAD_OK) (void)r->resx.moves_drain();
+            (void)rad_dev_set(ranks_[0]->device);
+            return rc;
+        };
+        /* A poll of one event a rank: the step path never waits on the host for a transfer. A
+         * failure on any rank is the batch's failure: never reported landed. */
+        m.landed = [this]() -> int {
+            int st = 1;
+            for (auto& r : ranks_) {
+                const int q = r->resx.moves_state();
+                if (q < 0) return q;
+                if (q == 0) st = 0;
+            }
+            return st;
+        };
+        /* RADIANCE_DEBUG_KV_TIER: `sync` waits for each sweep to land before the next step plans,
+         * so the step at which a demoted block is first read does not depend on the transfer's
+         * timing; `emulate` also turns every demotion into the demote -> expand round trip in place
+         * (KVManager::residency_emulate), the reference a tiered recipe's residency-on output is
+         * compared with byte for byte under `sync`. In the KL mode, which scores prefill chunks
+         * and runs no decode step, the emulation sweeps after every step and unbounded. */
+        /* A sweep's bound in blocks, from a byte budget a rank (TierExec::sweep_blocks), for the
+         * widest residency group's block: the copy a step pays is bounded in link time. */
+        int64_t widest = 0;
+        for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g)
+            if (const KVGroupPlan* p = ranks_[0]->kv.plan(g); p && p->residency())
+                widest = std::max(widest, ranks_[0]->kv.residency_block_bytes(g));
+        int64_t sweep = TierExec::sweep_blocks(widest);
+        RAD_INFO("kv residency: a sweep moves at most %lld blocks of %s a rank (%s), after any "
+                 "step, of sequences not prefilling",
+                 (long long)sweep, humanb(widest).c_str(), humanb(sweep * widest).c_str());
+        if (const char* t = std::getenv("RADIANCE_DEBUG_KV_TIER"); t && *t) {
+            const bool emul = !std::strcmp(t, "emulate");
+            if (!emul && std::strcmp(t, "sync")) {
+                RAD_ERR("RADIANCE_DEBUG_KV_TIER=%s: the switch is 'sync' or 'emulate'", t);
+                return RAD_E_INVAL;
+            }
+            m.sync = true;
+            m.every_step = emul && cfg_.kld();
+            if (m.every_step) sweep = (int64_t)1 << 40;
+            for (auto& r : ranks_) r->kv.residency_emulate(emul);
+            RAD_WARN("kv residency: RADIANCE_DEBUG_KV_TIER=%s -- %s; every sweep is waited for",
+                     t, emul ? (m.every_step ? "the demote -> expand round trip in place after "
+                                               "every step (KL mode), nothing moves"
+                                             : "the demote -> expand round trip in place, nothing "
+                                               "moves")
+                             : "blocks move as ever");
+        }
+        sched_.set_residency_mover(std::move(m), sweep);
+        /* The pager's count, read back when a statistics poll asks (rank 0's counter). */
+        static_cast<KVBinding<KVManager>*>(kv_iface_.get())->paged_read =
+            [this] { return ranks_[0]->resx.paged_in(); };
+        static_cast<KVBinding<KVManager>*>(kv_iface_.get())->hits_read =
+            [this] { return ranks_[0]->resx.hits_in(); };
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
@@ -2140,6 +2500,7 @@ std::string Engine::engine_info() const {
     e["tp_attn_split"]          = cfg_.tp_attn_rows ? "rows" : "heads";
     e["weight_prefetch"]        = cfg_.weight_prefetch;
     e["max_num_batched_tokens"] = cfg_.max_tok;
+    e["decode_headroom"]        = decode_headroom(cfg_);
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
     e["embedding_placement"]    = { { "asked", table_placement_name(cfg_.embedding_placement) },
@@ -2596,6 +2957,7 @@ int Engine::run_server() {
     o.image_model = img_gen_ != nullptr;
     o.audio_model = aud_gen_ != nullptr;
     o.video_model = vid_gen_ != nullptr;
+    o.shape_model = shp_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
     /* clef's learned scalars, which the server applies to what the head returns (server/clef.h);
      * rad-convert writes them beside decision.type. */
@@ -2792,6 +3154,18 @@ int Engine::run_server() {
                 return RAD_E_INVAL;
             }
             if (cfg_.image_tokens) vc.max_image_tokens = *cfg_.image_tokens;
+        } else if (vc.family == mm::Family::Radio) {
+            /* NVIDIA's processor sizes a picture and a video frame by patch budgets
+             * (min_num_patches..max_num_patches, video_target_num_patches), not pixel bands. */
+            if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.image_tokens ||
+                cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_max_frame_tokens) {
+                RAD_ERR("media: this model's processor sizes images and video frames by its patch "
+                        "budgets (min_num_patches, max_num_patches, video_target_num_patches), so "
+                        "--image-min/max-pixels, --image-tokens, --video-min/max-pixels and "
+                        "--video-max-frame-tokens do nothing on it");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.video_min_frames) vc.min_frames = *cfg_.video_min_frames;
         } else {
             if (cfg_.image_tokens) {
                 RAD_ERR("media: --image-tokens is a token budget, and this model's processor "
@@ -2892,6 +3266,16 @@ int Engine::run_server() {
                      ranks_[0]->program.encoder_name.c_str(), mm_proc->config().image_soft_tokens,
                      mm_proc->config().video_soft_tokens, mm_proc->config().fps,
                      mm_proc->config().max_frames, (long long)encd.max_patches);
+        else if (mm_proc->config().family == mm::Family::Radio)
+            RAD_INFO("media: %s%s through '%s'; an image becomes one tile of %d..%d patches "
+                     "(a quarter as many tokens), a video frame about %d patches, %d frames a "
+                     "tubelet at %.3g frames a second, at most %d frames, no pruning; %lld "
+                     "patches a pass", o.allow_image ? "images" : "",
+                     o.allow_video ? " and video" : "", ranks_[0]->program.encoder_name.c_str(),
+                     mm_proc->config().radio_min_patches, mm_proc->config().radio_max_patches,
+                     mm_proc->config().radio_video_patches, mm_proc->config().radio_tubelet,
+                     mm_proc->config().fps, mm_proc->config().max_frames,
+                     (long long)encd.max_patches);
         else
             RAD_INFO("media: %s%s through '%s'; an image resizes to at most %lld pixels (%lld "
                      "patches a pass), a video to %lld pixels over all its frames",
@@ -2961,7 +3345,13 @@ int Engine::run_server() {
             return rc;
         }
         o.allow_audio = true;
-        if (mm::decoder_available())
+        if (mm::decoder_available() && ac.family == mm::AudioFamily::Gemma4Unified)
+            RAD_INFO("media: audio through '%s'; a clip is cut at %.3g s, a token is a frame of %d "
+                     "samples (%d ms); %lld frames a pass",
+                     ranks_[0]->program.audio_encoder_name.c_str(),
+                     (double)mm_proc->audio_config().max_samples / (double)ac.rate, ac.frame_length,
+                     ac.frame_length * 1000 / ac.rate, (long long)aend.max_patches);
+        else if (mm::decoder_available())
             RAD_INFO("media: audio through '%s'; a clip is cut at %.3g s, %d mel bins a %d ms frame, "
                      "%d frames a token; %lld frames a pass",
                      ranks_[0]->program.audio_encoder_name.c_str(),
@@ -3159,6 +3549,29 @@ int Engine::run_server() {
 
     /* A video generator's endpoints: the driver's queue and the declared prompt, sizes and
      * lengths. */
+    struct ShapeBridge final : server::IShapeGen {
+        gen::ShapeDriver* drv = nullptr;
+        const gen::ShapeGenInfo& info() const override { return drv->info(); }
+        int submit(std::unique_ptr<gen::ShapeRequest> r, std::string* why) override {
+            return drv->submit(std::move(r), why);
+        }
+        int64_t queued() const override { return drv->queued(); }
+        int64_t running() const override { return drv->running(); }
+    } shape_bridge;
+    if (shp_gen_) {
+        shape_bridge.drv = shp_gen_;
+        d.shapes = &shape_bridge;
+        const gen::ShapeGenInfo& in = shp_gen_->info();
+        if (cfg_.served_model_name.empty() && !in.name.empty()) {
+            o.model_id = in.name;
+            decide("--served-model-name", o.model_id, "a shape generator: its own name");
+        }
+        RAD_INFO("shape: '%s', a %lldx%lld picture to a field sampled at %lld cells a side by "
+                 "default (%lld..%lld), %lld steps by default at guidance %g",
+                 in.name.c_str(), (long long)in.canvas, (long long)in.canvas,
+                 (long long)in.default_resolution, (long long)in.min_resolution,
+                 (long long)in.max_resolution, (long long)in.default_steps, in.default_guidance);
+    }
     struct VideoBridge final : server::IVideoGen {
         gen::VideoDriver*    drv = nullptr;
         server::VideoGenInfo inf;
@@ -3209,8 +3622,8 @@ int Engine::run_server() {
         in.decoder_max_area = pg.vgen_str.decoder_max_area;
         if (in.image_cond && in.image_crf > 0 && !mm::h264_roundtrip_available())
             RAD_WARN("video: '%s' prepares a first frame with an H.264 round trip at crf %d, which "
-                     "needs libx264; this build's libavcodec has none, so input_reference is "
-                     "refused", in.name.c_str(), (int)in.image_crf);
+                     "needs an H.264 encoder and decoder; this build's libavcodec lacks one, so "
+                     "input_reference is refused", in.name.c_str(), (int)in.image_crf);
         in.max_lanes = vd.max_lanes;
         in.max_ref_images = vd.max_ref_images;
         in.max_ref_videos = vd.max_ref_videos;
@@ -3308,6 +3721,9 @@ int Engine::run_server() {
     else if (vid_gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/videos; completions and chat are 501%s)",
                  o.host.c_str(), o.port, keyed);
+    else if (shp_gen_)
+        RAD_INFO("serving on http://%s:%d  (/generate, /send and /status/{uid}; completions and "
+                 "chat are 501%s)", o.host.c_str(), o.port, keyed);
     else if (gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "
                  "501%s)", o.host.c_str(), o.port,

@@ -16,6 +16,7 @@
 #include "diag/diag.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <regex>
@@ -455,11 +456,43 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     Config d;
     REQUIRE_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.prefill_interleave, 0);
+    CHECK(!d.prefill_interleave_set);   /* not given: bring-up serves auto:1 */
     Config c;
     CHECK_EQ(parse({ "--prefill-interleave", "4" }, &c), RAD_OK);
     CHECK_EQ(c.prefill_interleave, 4);
+    CHECK(c.prefill_interleave_set);
     CHECK_EQ(parse({ "--prefill-interleave", "65" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--prefill-interleave", "-1" }, &c), RAD_E_INVAL);
+    /* auto sizes the hold from measured step costs (Scheduler::interleave_steps) */
+    Config a;
+    CHECK_EQ(parse({ "--prefill-interleave", "auto" }, &a), RAD_OK);
+    CHECK_EQ(a.prefill_interleave, -1);
+    CHECK_EQ(parse({ "--prefill-interleave", "automatic" }, &c), RAD_E_INVAL);
+    /* auto:SHARE gives decode-only steps SHARE of a chunk step's time, in (0, 4] */
+    Config h;
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:1" }, &h), RAD_OK);
+    CHECK_EQ(h.prefill_interleave, -1);
+    CHECK(h.prefill_interleave_share == 1.0);
+    CHECK(a.prefill_interleave_share == 0.25);
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-interleave", "auto:x" }, &c), RAD_E_INVAL);
+}
+
+/* --decode-headroom is auto by default (resolved at bring-up), N rows, or 0 for the budget alone. */
+TEST(decode_headroom_takes_auto_or_a_row_count) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.decode_headroom, -1);
+    Config c;
+    CHECK_EQ(parse({ "--decode-headroom", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.decode_headroom, 0);
+    CHECK_EQ(parse({ "--decode-headroom", "96" }, &c), RAD_OK);
+    CHECK_EQ(c.decode_headroom, 96);
+    CHECK_EQ(parse({ "--decode-headroom", "auto" }, &c), RAD_OK);
+    CHECK_EQ(c.decode_headroom, -1);
+    CHECK_EQ(parse({ "--decode-headroom", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--decode-headroom", "x" }, &c), RAD_E_INVAL);
 }
 
 /* ================================================================== the table, the parser and the help agree
@@ -494,6 +527,17 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
     return out;
 }
 
+/* --kv-recipe reads its file at parse, so its legal value is a file that exists: a one-line
+ * recipe, written once. */
+std::string inventory_recipe() {
+    const std::string path = radtest::tmp_path("inventory.kvrecipe");
+    if (FILE* fp = std::fopen(path.c_str(), "w")) {
+        std::fputs("layer 3 k6_v4\n", fp);
+        std::fclose(fp);
+    }
+    return path;
+}
+
 /* A legal value for every option that takes one, with any option it cannot be given without. */
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
@@ -503,18 +547,23 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
-        { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } }, { "--decode-headroom", { "64" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
-        { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--gpu-memory-mib", { "16384" } }, { "--gpu-headroom-mib", { "128" } },
+        { "--kv-cache-dtype", { "fp8" } },
+        { "--kv-recipe", { inventory_recipe(), "--kv-cache-dtype", "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
+        { "--qsa-bkey-dtype", { "i8" } },
+        { "--qsa-bkey-split", { "on" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
+        { "--kv-residency-mib", { "256" } }, { "--kv-residency-sink-tokens", { "512" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
@@ -818,6 +867,37 @@ TEST(the_state_cache_dtype_is_f32_or_f16) {
     CHECK_EQ(parse({ "--state-cache-dtype" }, &c), RAD_E_INVAL);
 }
 
+TEST(the_qsa_block_key_dtype_is_bf16_by_default_or_i8) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.qsa_bkey_dtype, std::string("bf16"));
+    Config c;
+    CHECK_EQ(parse({ "--qsa-bkey-dtype", "i8" }, &c), RAD_OK);
+    CHECK_EQ(c.qsa_bkey_dtype, std::string("i8"));
+    CHECK_EQ(parse({ "--qsa-bkey-dtype", "bf16" }, &c), RAD_OK);
+    CHECK_EQ(c.qsa_bkey_dtype, std::string("bf16"));
+    CHECK_EQ(parse({ "--qsa-bkey-dtype", "fp8" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-bkey-dtype", "int8" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-bkey-dtype" }, &c), RAD_E_INVAL);
+}
+
+/* --qsa-bkey-split: off by default (every block key on every rank, today's program), `on` or
+ * `off` and nothing else; whether the deployment can serve it (--tp 2 or more, a plugin that
+ * splits) is decided at startup, not here. */
+TEST(the_qsa_block_key_split_is_off_by_default_and_takes_on_or_off) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.qsa_bkey_split);
+    Config c;
+    CHECK_EQ(parse({ "--qsa-bkey-split", "on" }, &c), RAD_OK);
+    CHECK(c.qsa_bkey_split);
+    CHECK_EQ(parse({ "--qsa-bkey-split", "off" }, &c), RAD_OK);
+    CHECK(!c.qsa_bkey_split);
+    CHECK_EQ(parse({ "--qsa-bkey-split", "1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-bkey-split", "yes" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--qsa-bkey-split" }, &c), RAD_E_INVAL);
+}
+
 TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config c;
     CHECK_EQ(parse({ "--kv-cache-dtype", "bf16" }, &c), RAD_OK);
@@ -837,6 +917,750 @@ TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
+}
+
+/* --kv-recipe FILE: one `layer N LAYOUT` line an attention layer, comments and blank lines
+ * skipped, read at parse into the per-layer form the plugin gets (a RAD_KVQ_* or -1 by layer). */
+TEST(a_kv_recipe_file_is_read_into_one_layout_a_layer) {
+    const std::string path = radtest::tmp_path("mixed.kvrecipe");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    const std::string body = "# Qwen3.8-27B, a 0.04 KL budget\n"
+                             "\n"
+                             "layer 3 fp8      # the first attention layer keeps fp8\n"
+                             "layer 7\tk6_v4\n"
+                             "  layer 11 fp8_v4\n";
+    CHECK_EQ(std::fwrite(body.data(), 1, body.size(), fp), body.size());
+    std::fclose(fp);
+
+    Config c;
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }, &c), RAD_OK);
+    CHECK_EQ(c.kv_recipe_path, path);
+    const std::vector<int32_t> want = { -1, -1, -1, RAD_KVQ_NONE, -1, -1, -1, RAD_KVQ_K6V4,
+                                        -1, -1, -1, RAD_KVQ_V4 };
+    CHECK(c.kv_recipe == want);
+    CHECK_EQ(kv_recipe_summary(c.kv_recipe),
+             std::string("fp8 at layer 3; fp8_v4 at layer 11; k6_v4 at layer 7"));
+    CHECK_EQ(kv_recipe_summary({ RAD_KVQ_V4, -1, RAD_KVQ_V4 }), std::string("fp8_v4 at layers 0, 2"));
+
+    /* A recipe sets layouts within the fp8 cache (a `bf16` layer the per-layer exception), so it
+     * needs that flag, given before or after it; bf16 (the default) and the uniform narrow names
+     * are refused. */
+    CHECK_EQ(parse_fresh({ "--kv-recipe", path.c_str(), "--kv-cache-dtype", "fp8" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--kv-recipe", path.c_str() }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "k6_v4", "--kv-recipe", path.c_str() }),
+             RAD_E_INVAL);
+    unlink(path.c_str());
+    CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }),
+             RAD_E_INVAL);   /* gone */
+
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.kv_recipe.empty());
+}
+
+/* A recipe that loads short is a deployment nobody measured, so every malformed line is refused
+ * with the file and the line named, and nothing of it is kept. */
+TEST(a_malformed_kv_recipe_is_refused_by_name_and_line) {
+    const char* name = "--kv-recipe r.txt";
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, name, &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        CHECK(has(err, name));
+        return err;
+    };
+    CHECK(has(refusal("layer 3 fp8\nlayers 7 fp8\n"), "line 2: 'layers' is not a recipe line"));
+    CHECK(has(refusal("layer 3\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+    CHECK(has(refusal("layer 3 fp8 k6_v4\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+    CHECK(has(refusal("layer -3 fp8\n"), "layer '-3' is not a layer number"));
+    CHECK(has(refusal("layer three fp8\n"), "layer 'three' is not a layer number"));
+    CHECK(has(refusal("layer 3x fp8\n"), "layer '3x' is not a layer number"));
+    CHECK(has(refusal("layer 4096 fp8\n"), "layer '4096' is not a layer number"));
+    CHECK(has(refusal("layer 3 k4_v2\n"), "line 1: layer 3: 'k4_v2' is not a KV layout"));
+    CHECK(has(refusal("layer 3 f16\n"), "'f16' is not a KV layout"));
+    CHECK(has(refusal("layer 3 fp8\n# again\nlayer 3 k6_v4\n"), "line 3: layer 3 is named twice"));
+    CHECK(has(refusal(""), "names no layer"));
+    CHECK(has(refusal("# only a comment\n\n"), "names no layer"));
+
+    /* The flag refuses the same file by its path. */
+    const std::string path = radtest::tmp_path("bad.kvrecipe");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    std::fputs("layer 3 fp8\nlayer 7 int2\n", fp);
+    std::fclose(fp);
+    int rc = RAD_OK;
+    const std::string err = stderr_of(
+        [&] { rc = parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }); });
+    CHECK_EQ(rc, RAD_E_INVAL);
+    CHECK(has(err, "--kv-recipe " + path + " line 2: layer 7: 'int2' is not a KV layout"));
+}
+
+/* A recipe line may end in `rotated`: that layer's K and V are stored rotated by the normalised
+ * Hadamard (RAD_KVQ_ROTATED beside its layout, on any layout), and the startup summary names the
+ * rotated layers apart. Any other fourth word is refused like any other malformed line. */
+TEST(a_kv_recipe_line_ending_in_rotated_marks_that_layer_rotated) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 3 fp8 rotated\nlayer 7 k6_v4\nlayer 11 k6_v4 rotated # KVarN\n"
+                             "layer 15 fp8_v4\n",
+                             "r.txt", &r),
+             RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    const std::vector<int32_t> want = { -1, -1, -1, RAD_KVQ_NONE | rot, -1, -1, -1, RAD_KVQ_K6V4,
+                                        -1, -1, -1, RAD_KVQ_K6V4 | rot, -1, -1, -1, RAD_KVQ_V4 };
+    CHECK(r == want);
+    CHECK_EQ(kv_recipe_summary(r), std::string("fp8_v4 at layer 15; k6_v4 at layer 7; fp8 rotated "
+                                               "at layer 3; k6_v4 rotated at layer 11"));
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 3 fp8 rotate\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+    CHECK(has(refusal("layer 3 fp8 rotated rotated\n"), "or 'layer N LAYOUT rotated'"));
+    CHECK(has(refusal("layer 3 rotated fp8\n"), "line 1: a recipe line is 'layer N LAYOUT'"));
+}
+
+/* k4h_v4 (four-bit K and V) is a rotated layout: a `layer N k4h_v4` line marks the layer rotated
+ * as `layer N k4h_v4 rotated` does, so a recipe rad-autoquant writes from the layout table (no
+ * `rotated` word) is the rotated deployment, and an unrotated k4h_v4 layer cannot be asked for.
+ * It is priced at 288 bits a 32 + 32 group, 18/32 of fp8, and --kv-cache-dtype does not take it. */
+TEST(a_k4h_v4_recipe_line_is_rotated_whether_or_not_it_says_so) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 0 k4h_v4\nlayer 1 k4h_v4 rotated\nlayer 2 fp8\n", "r.txt", &r),
+             RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_K4H | rot, RAD_KVQ_K4H | rot, RAD_KVQ_NONE }));
+    CHECK_EQ(kv_recipe_summary(r), std::string("fp8 at layer 2; k4h_v4 rotated at layers 0, 1"));
+    CHECK_EQ(kv_layout_of("k4h_v4"), (int)RAD_KVQ_K4H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_K4H)), std::string("k4h_v4"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4H), 288);
+
+    std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "k4h_v4" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v4'"));
+    std::vector<int32_t> out;
+    err = stderr_of([&] { CHECK_EQ(kv_recipe_parse("layer 0 k4h\n", "r.txt", &out), RAD_E_INVAL); });
+    CHECK(has(err, "'k4h' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, k5_v4, k4h_v4, k4h_v2h or "
+                   "i8h"));
+}
+
+/* k4h_v2h (int4 K, KVarN-normalised int2 V) is rotated as k4h_v4 is: its line loads rotated with
+ * or without the word, beside k4h_v4 in the summary, priced at 224 bits a 32 + 32 group (14/32 of
+ * fp8), and it is a recipe word only, never a --kv-cache-dtype. */
+TEST(a_k4h_v2h_recipe_line_is_rotated_and_priced_at_fourteen_thirty_seconds_of_fp8) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 0 k4h_v2h\nlayer 1 k4h_v4\nlayer 2 k4h_v2h rotated\n", "r.txt", &r),
+             RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_K4HV2H | rot, RAD_KVQ_K4H | rot,
+                                      RAD_KVQ_K4HV2H | rot }));
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("k4h_v4 rotated at layer 1; k4h_v2h rotated at layers 0, 2"));
+    CHECK_EQ(kv_layout_of("k4h_v2h"), (int)RAD_KVQ_K4HV2H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_K4HV2H)), std::string("k4h_v2h"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K4HV2H), 224);
+    const std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "k4h_v2h" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k4h_v2h'"));
+}
+
+/* k5_v4 (int5 K, int4 V, f16 scales a group of 32; RAD_KVQ_K5V4) is k6_v4's kind, not the k4h
+ * layouts': a plain line loads unrotated and `rotated` rotates it; it takes `vmean` (its V is
+ * integer); it is priced at 320 bits a 32 + 32 group (5.0 bits an element, 20/32 of fp8), its row
+ * 320 bytes at head_dim 256; it is a recipe word only, never a --kv-cache-dtype; it is no resident
+ * layout of a tiered layer and no demote layout; and since RadianceMemory #22 rad-autoquant
+ * calibrates it by default (opt-in under #19, kv_layout_opt_in), so no layout is opt-in today. */
+TEST(a_k5_v4_recipe_line_is_rotated_only_when_it_says_so_and_priced_at_five_bits) {
+    std::vector<int32_t> r;
+    std::string file;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 0 k5_v4\nlayer 1 k6_v4\nlayer 2 k5_v4 rotated vmean\n"
+                             "layer 3 k5_v4 vmean\n", "r.txt", &r, &file), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vm = RAD_KVQ_VMEAN;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_K5V4, RAD_KVQ_K6V4, RAD_KVQ_K5V4 | rot | vm,
+                                      RAD_KVQ_K5V4 | vm }));
+    CHECK_EQ(kv_recipe_summary(r), std::string("k6_v4 at layer 1; k5_v4 at layers 0, 3; k5_v4 rotated "
+                                               "at layer 2; V mean subtracted at layers 2, 3"));
+    CHECK_EQ(kv_layout_of("k5_v4"), (int)RAD_KVQ_K5V4);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_K5V4)), std::string("k5_v4"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_K5V4), 320);
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_K5V4, 256), 320ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K5V4, 320), 256ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K5V4, 322), -1ll);
+    /* No layout is opt-in: k5_v4 is a default candidate like every other (#22). */
+    for (int q : kv_layouts()) CHECK(!kv_layout_opt_in(q));
+    CHECK(!kv_layout_opt_in(99));
+
+    std::string err = stderr_of([&] { CHECK(parse_fresh({ "--kv-cache-dtype", "k5_v4" }) < 0); });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'k5_v4'"));
+    std::vector<int32_t> out;
+    err = stderr_of([&] {
+        CHECK_EQ(kv_recipe_parse("layer 0 k5_v4 rotated demote k4h_v4\n", "r.txt", &out), RAD_E_INVAL);
+    });
+    CHECK(has(err, "'demote k4h_v4' under k5_v4: the resident layout of a tiered layer is i8h or fp8"));
+    err = stderr_of([&] {
+        CHECK_EQ(kv_recipe_parse("layer 0 i8h demote k5_v4\n", "r.txt", &out), RAD_E_INVAL);
+    });
+    CHECK(has(err, "'demote k5_v4': a demote layout is k4h_v4 or k4h_v2h"));
+}
+
+/* i8h (int8 K and V, one f16 scale a token and head) is rotated as the k4h layouts are: its line
+ * loads rotated with or without the word, it takes `vmean` (its V is integer), it is priced at 516
+ * bits a 32 + 32 group (258/256 of fp8 at head_dim 256), and it is a recipe word only, never a
+ * --kv-cache-dtype. */
+TEST(an_i8h_recipe_line_is_rotated_takes_a_v_mean_and_is_priced_just_over_fp8) {
+    std::vector<int32_t> r;
+    std::string file;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 0 i8h\nlayer 1 fp8\nlayer 2 i8h rotated vmean\n",
+                             "r.txt", &r, &file), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_I8H | rot, RAD_KVQ_NONE,
+                                      RAD_KVQ_I8H | rot | RAD_KVQ_VMEAN }));
+    CHECK_EQ(file, std::string("m.txt"));
+    CHECK_EQ(kv_recipe_summary(r), std::string("fp8 at layer 1; i8h rotated at layers 0, 2; V mean "
+                                               "subtracted at layer 2"));
+    CHECK_EQ(kv_layout_of("i8h"), (int)RAD_KVQ_I8H);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_I8H)), std::string("i8h"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_I8H), 516);
+    const std::string err = stderr_of([&] {
+        CHECK(parse_fresh({ "--kv-cache-dtype", "i8h" }) < 0);
+    });
+    CHECK(has(err, "--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not 'i8h'"));
+}
+
+/* bf16 is a recipe layout too (RAD_KVQ_BF16): the layer keeps the unquantised cache, beside fp8
+ * layouts in the same file, priced at 1024 bits a 32 + 32 group (twice fp8) and listed first, the
+ * widest. It is neither rotated, centred nor tiered, so `rotated`, `vmean` and `demote` on its line
+ * are refused with the line. A recipe naming only bf16 still needs --kv-cache-dtype fp8, the recipe's flag, and
+ * --kv-cache-dtype bf16 stays the whole-model spelling of it. */
+TEST(a_bf16_recipe_line_keeps_that_layer_unquantised_and_takes_no_rotation_v_mean_or_demote) {
+    std::vector<int32_t> r;
+    CHECK_EQ(kv_recipe_parse("layer 0 bf16\nlayer 1 i8h\nlayer 2 bf16  # the sensitive one\n"
+                             "layer 3 fp8\n", "r.txt", &r), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED;
+    CHECK(r == std::vector<int32_t>({ RAD_KVQ_BF16, RAD_KVQ_I8H | rot, RAD_KVQ_BF16,
+                                      RAD_KVQ_NONE }));
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("bf16 at layers 0, 2; fp8 at layer 3; i8h rotated at layer 1"));
+    CHECK_EQ(kv_layout_of("bf16"), (int)RAD_KVQ_BF16);
+    CHECK_EQ(std::string(kv_layout_name(RAD_KVQ_BF16)), std::string("bf16"));
+    CHECK_EQ(kv_layout_group_bits(RAD_KVQ_BF16), 1024);
+    REQUIRE(!kv_layouts().empty());
+    CHECK_EQ(kv_layouts()[0], (int)RAD_KVQ_BF16);
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 0 fp8\nlayer 3 bf16 rotated\n"),
+              "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'rotated'"));
+    CHECK(has(refusal("vmean m.txt\nlayer 3 bf16 vmean\n"),
+              "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'vmean'"));
+    CHECK(has(refusal("vmean m.txt\nlayer 3 bf16 rotated vmean\n"), "takes no 'rotated'"));
+    /* Nor a demote layout: it rounds nothing, so a tiered bf16 layer would only be a narrower
+     * layout's block in the store, and the transcode serves i8h and fp8 resident. */
+    CHECK(has(refusal("layer 3 bf16 demote k4h_v4\n"),
+              "r.txt line 1: layer 3: bf16 is the unquantised cache and takes no 'demote'"));
+    CHECK(has(refusal("layer 0 i8h\nlayer 3 bf16 demote k4h_v2h\n"),
+              "r.txt line 2: layer 3: bf16 is the unquantised cache and takes no 'demote'"));
+
+    const std::string path = radtest::tmp_path("bf16.kvrecipe");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    std::fputs("layer 3 bf16\nlayer 7 bf16\n", fp);
+    std::fclose(fp);
+    Config c;
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", path.c_str() }, &c), RAD_OK);
+    CHECK(c.kv_recipe == std::vector<int32_t>({ -1, -1, -1, RAD_KVQ_BF16, -1, -1, -1,
+                                                RAD_KVQ_BF16 }));
+    std::string err = stderr_of([&] {
+        CHECK_EQ(parse_fresh({ "--kv-cache-dtype", "bf16", "--kv-recipe", path.c_str() }),
+                 RAD_E_INVAL);
+    });
+    CHECK(has(err, "pass --kv-cache-dtype fp8"));
+    unlink(path.c_str());
+}
+
+/* `demote LAYOUT` (RAD_KVQ_DEMOTE, bits 16-23 of the entry): window residency stores the layer's
+ * demoted blocks in that layout. It comes after `rotated` and before `vmean`; the demote layout is
+ * k4h_v4 or k4h_v2h, the resident one i8h or fp8, and fp8 must say `rotated`, since the demoted
+ * block keeps the layer's basis and those layouts hold rotated keys only. `vmean` needs integer V
+ * in either layout, so a rotated fp8 layer demoted to k4h takes it. The summary names the pair. */
+TEST(a_kv_recipe_line_may_name_a_demote_layout_for_the_layers_demoted_blocks) {
+    std::vector<int32_t> r;
+    std::string file;
+    CHECK_EQ(kv_recipe_parse("vmean m.txt\nlayer 3 i8h demote k4h_v2h vmean\n"
+                             "layer 7 fp8 rotated demote k4h_v4 vmean\nlayer 11 i8h demote k4h_v4\n"
+                             "layer 15 i8h\n", "r.txt", &r, &file), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vm = RAD_KVQ_VMEAN;
+    const int32_t d2 = RAD_KVQ_K4HV2H << RAD_KVQ_DEMOTE_SHIFT, d4 = RAD_KVQ_K4H << RAD_KVQ_DEMOTE_SHIFT;
+    REQUIRE_EQ(r.size(), (size_t)16);
+    CHECK_EQ(r[3], RAD_KVQ_I8H | rot | vm | d2);
+    CHECK_EQ(r[7], RAD_KVQ_NONE | rot | vm | d4);
+    CHECK_EQ(r[11], RAD_KVQ_I8H | rot | d4);
+    CHECK_EQ(r[15], RAD_KVQ_I8H | rot);
+    CHECK_EQ(RAD_KVQ_DEMOTE_OF(r[3]), (int)RAD_KVQ_K4HV2H);
+    CHECK_EQ(RAD_KVQ_DEMOTE_OF(r[15]), 0);
+    CHECK_EQ(r[3] & RAD_KVQ_LAYOUT, (int)RAD_KVQ_I8H);
+    CHECK_EQ(kv_recipe_summary(r),
+             std::string("i8h rotated at layer 15; i8h rotated demote k4h_v4 at layer 11; "
+                         "i8h rotated demote k4h_v2h at layer 3; fp8 rotated demote k4h_v4 at "
+                         "layer 7; V mean subtracted at layers 3, 7"));
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_I8H, 256), 516ll);
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_K4HV2H, 256), 224ll);
+    CHECK_EQ(kv_layout_row_bytes(RAD_KVQ_NONE, 256), 512ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_I8H, 516), 256ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K4H, 288), 256ll);
+    CHECK_EQ(kv_layout_head_dim(RAD_KVQ_K4H, 290), -1ll);
+
+    auto refusal = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(refusal("layer 3 i8h demote fp8_v4\n"), "a demote layout is k4h_v4 or k4h_v2h"));
+    CHECK(has(refusal("layer 3 i8h demote i8h\n"), "a demote layout is k4h_v4 or k4h_v2h"));
+    CHECK(has(refusal("layer 3 k6_v4 demote k4h_v4\n"),
+              "the resident layout of a tiered layer is i8h or fp8"));
+    CHECK(has(refusal("layer 3 fp8 demote k4h_v2h\n"),
+              "write 'layer 3 fp8 rotated demote k4h_v2h'"));
+    CHECK(has(refusal("layer 3 i8h demote\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 rotated\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h vmean demote k4h_v4\nvmean m.txt\n"), "then 'demote LAYOUT'"));
+    CHECK(has(refusal("layer 3 i8h demote k4h_v4 demote k4h_v2h\n"), "then 'demote LAYOUT'"));
+}
+
+namespace {
+
+/* A V mean file for `layers` of a model with `heads` KV heads of `dim`: head h of layer l holds
+ * l + h / 8 + d / 1024 at dim d, so every value says where it came from. */
+std::string vmean_text(const std::vector<int>& layers, int heads, int dim) {
+    std::string t = "# a calibration run's means\nkv_vmean 1 head_dim " + std::to_string(dim) +
+                    " kv_heads " + std::to_string(heads) + " rows 4096\n";
+    char buf[64];
+    for (int l : layers)
+        for (int h = 0; h < heads; ++h) {
+            t += "layer " + std::to_string(l) + " head " + std::to_string(h);
+            for (int d = 0; d < dim; ++d) {
+                std::snprintf(buf, sizeof buf, " %.9g", l + h / 8.0 + d / 1024.0);
+                t += buf;
+            }
+            t += "\n";
+        }
+    return t;
+}
+
+void write_file(const std::string& path, const std::string& text) {
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    CHECK_EQ(std::fwrite(text.data(), 1, text.size(), fp), text.size());
+    std::fclose(fp);
+}
+
+}  /* namespace */
+
+/* A recipe line may end in `vmean` (after `rotated`): that layer subtracts a static V mean
+ * (RAD_KVQ_VMEAN beside its layout and rotation), read from the file the recipe's `vmean FILE`
+ * line names, beside the recipe unless the path is absolute. The file's values are kept as
+ * written, by layer and KV head, and the startup summary lists the centred layers. */
+TEST(a_kv_recipe_layer_ending_in_vmean_takes_its_mean_from_the_file_the_recipe_names) {
+    const std::string dir = radtest::tmp_path("vmean.d");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/flash15.kvmean", vmean_text({ 3, 7, 11, 15 }, 2, 8));
+    write_file(dir + "/r.kvrecipe", "vmean flash15.kvmean   # beside the recipe\n"
+                                    "layer 3 fp8\n"
+                                    "layer 7 k6_v4 vmean\n"
+                                    "layer 11 fp8_v4 rotated vmean\n"
+                                    "layer 15 k4h_v2h vmean\n");
+    Config c;
+    const std::string rp = dir + "/r.kvrecipe";
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }, &c), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vm = RAD_KVQ_VMEAN;
+    REQUIRE_EQ(c.kv_recipe.size(), (size_t)16);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)RAD_KVQ_NONE);
+    CHECK_EQ(c.kv_recipe[7], (int32_t)(RAD_KVQ_K6V4 | vm));
+    CHECK_EQ(c.kv_recipe[11], (int32_t)(RAD_KVQ_V4 | rot | vm));
+    CHECK_EQ(c.kv_recipe[15], (int32_t)(RAD_KVQ_K4HV2H | rot | vm));
+    CHECK_EQ(c.kv_vmean.head_dim, 8);
+    CHECK_EQ(c.kv_vmean.n_head_kv, 2);
+    CHECK_EQ(c.kv_vmean.rows, 4096LL);
+    CHECK_EQ(c.kv_vmean.path, dir + "/flash15.kvmean");
+    REQUIRE_EQ(c.kv_vmean.layer.size(), (size_t)4);
+    CHECK_EQ(c.kv_vmean.layer.at(11)[8 + 3], (float)(11 + 1 / 8.0 + 3 / 1024.0));
+    CHECK_EQ(kv_recipe_summary(c.kv_recipe),
+             std::string("fp8 at layer 3; k6_v4 at layer 7; fp8_v4 rotated at layer 11; k4h_v2h "
+                         "rotated at layer 15; V mean subtracted at layers 7, 11, 15"));
+
+    /* An absolute path is taken as written. */
+    write_file(dir + "/flash7.kvmean", vmean_text({ 7 }, 2, 8));
+    write_file(dir + "/abs.kvrecipe", "vmean " + dir + "/flash7.kvmean\nlayer 7 k4h_v4 vmean\n");
+    Config d;
+    const std::string ap = dir + "/abs.kvrecipe";
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", ap.c_str() }, &d), RAD_OK);
+    CHECK_EQ(d.kv_recipe[7], (int32_t)(RAD_KVQ_K4H | rot | vm));
+    /* Without a `vmean` line or word nothing is read and nothing is kept. */
+    Config e;
+    CHECK_EQ(kv_recipe_parse("layer 3 k6_v4\n", "r.txt", &e.kv_recipe), RAD_OK);
+    CHECK(e.kv_vmean.layer.empty());
+}
+
+/* A V mean that loads wrong is a deployment nobody measured, so the recipe and the file are
+ * refused with the file, the line and the layer named: `vmean` on fp8, or out of order; a `vmean`
+ * word with no file line and a file line no layer reads; and in the file a bad header, a line of
+ * the wrong width, a value that is not a finite number, a head outside the header's, a (layer,
+ * head) twice, a layer missing a head, a `vmean` layer the file does not hold, and a layer the
+ * recipe does not name. The engine refuses the file for a model of other heads or head_dim. */
+TEST(a_malformed_or_mismatched_v_mean_is_refused_by_name) {
+    auto recipe = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        std::string file;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out, &file); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    CHECK(has(recipe("vmean m.txt\nlayer 3 fp8 vmean\n"),
+              "line 2: layer 3: 'vmean' is for a layout with integer V"));
+    CHECK(has(recipe("vmean m.txt\nlayer 3 k6_v4 vmean rotated\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("vmean m.txt\nlayer 3 k6_v4 vmean vmean\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("layer 3 k6_v4 vmean\n"),
+              "1 layer(s) say 'vmean' and no 'vmean FILE' line names their means"));
+    CHECK(has(recipe("vmean m.txt\nlayer 3 k6_v4\n"), "'vmean m.txt' and no layer says 'vmean'"));
+    CHECK(has(recipe("vmean\nlayer 3 k6_v4 vmean\n"), "line 1: 'vmean FILE' names the V mean file"));
+
+    auto file = [&](const std::string& text) {
+        KvVMean out;
+        out.head_dim = 7;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_vmean_parse(text, "m.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.layer.empty());
+        CHECK_EQ(out.head_dim, 0);
+        CHECK(has(err, "m.txt"));
+        return err;
+    };
+    const std::string hdr = "kv_vmean 1 head_dim 2 kv_heads 2 rows 9\n";
+    CHECK(has(file("layer 3 head 0 1 2\n"), "line 1: the first line is 'kv_vmean 1 head_dim D"));
+    CHECK(has(file("kv_vmean 2 head_dim 2 kv_heads 2 rows 9\n"), "line 1: the first line is"));
+    CHECK(has(file(""), "no 'kv_vmean 1 head_dim D kv_heads H rows R' line"));
+    CHECK(has(file(hdr + "layer 3 head 0 1\n"), "line 2: layer 3 head 0 has 1 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 2 3\n"), "has 3 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 nan\n"), "'nan' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 1e999\n"), "'1e999' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 2x\n"), "'2x' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 2 1 2\n"), "line 2: layer 3: head 2 is outside the file's 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 1 2\nlayer 3 head 1 1 2\nlayer 3 head 0 1 2\n"),
+              "line 4: layer 3 head 0 is listed twice"));
+    CHECK(has(file(hdr + "layer 3 head 1 1 2\n"), "layer 3 has no line for head 0"));
+    CHECK(has(file(hdr + "layer -1 head 0 1 2\n"), "line 2: a line is 'layer L head H'"));
+
+    /* Through the flag: the file's layers against the recipe's. */
+    const std::string dir = radtest::tmp_path("vmean.bad");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/m.kvmean", vmean_text({ 3, 9 }, 2, 8));
+    auto flag = [&](const std::string& text) {
+        write_file(dir + "/r.kvrecipe", text);
+        const std::string rp = dir + "/r.kvrecipe";
+        int rc = RAD_OK;
+        const std::string err = stderr_of(
+            [&] { rc = parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        return err;
+    };
+    CHECK(has(flag("vmean m.kvmean\nlayer 3 k6_v4 vmean\nlayer 7 k6_v4 vmean\nlayer 9 fp8\n"),
+              "layer 7 says 'vmean' and " + dir + "/m.kvmean has no V mean for it"));
+    CHECK(has(flag("vmean m.kvmean\nlayer 3 k6_v4 vmean\n"),
+              "holds layer 9, which the recipe does not name"));
+    CHECK(has(flag("vmean gone.kvmean\nlayer 3 k6_v4 vmean\n"),
+              "cannot read its V mean file '" + dir + "/gone.kvmean'"));
+
+    /* Against the model, at startup. */
+    KvVMean v;
+    REQUIRE_EQ(kv_vmean_parse(vmean_text({ 3 }, 2, 8), "m.txt", &v), RAD_OK);
+    std::vector<int32_t> r(4, -1);
+    r[3] = RAD_KVQ_K6V4 | RAD_KVQ_VMEAN;
+    std::vector<uint16_t> t = { 1 };
+    std::string err = stderr_of([&] { CHECK_EQ(kv_vmean_table(v, r, 16, 2, 4, &t), RAD_E_INVAL); });
+    CHECK(has(err, "m.txt holds 2 KV heads of 8 and this model has 2 of 16"));
+    CHECK(t.empty());
+    err = stderr_of([&] { CHECK_EQ(kv_vmean_table(v, r, 8, 4, 8, &t), RAD_E_INVAL); });
+    CHECK(has(err, "this model has 4 of 8"));
+    r[1] = RAD_KVQ_V4 | RAD_KVQ_VMEAN;
+    err = stderr_of([&] { CHECK_EQ(kv_vmean_table(v, r, 8, 2, 4, &t), RAD_E_INVAL); });
+    CHECK(has(err, "m.txt has no V mean for layer 1"));
+}
+
+/* The table the engine uploads (RadKvVMean): per layer and basis, -mu by KV head then +mu by query
+ * head, query head h taking KV head h / gqa; the plain basis is the file's values, the rotated one
+ * H mu / sqrt(D) in had_rotate's (Sylvester) order; both the one bf16 rounding of mu, the
+ * subtraction its exact negation; a layer without `vmean` is zero. Small enough to check by hand:
+ * D = 4, two KV heads, four query heads. */
+TEST(the_v_mean_table_holds_minus_mu_by_kv_head_and_mu_by_query_head_in_both_bases) {
+    KvVMean v;
+    REQUIRE_EQ(kv_vmean_parse("kv_vmean 1 head_dim 4 kv_heads 2 rows 1\n"
+                              "layer 1 head 0 1 2 3 4\nlayer 1 head 1 0.5 0 0 -0.5\n"
+                              "layer 0 head 0 9 9 9 9\nlayer 0 head 1 9 9 9 9\n",
+                              "m.txt", &v),
+             RAD_OK);
+    std::vector<int32_t> r = { RAD_KVQ_K6V4, RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VMEAN };
+    std::vector<uint16_t> t;
+    REQUIRE_EQ(kv_vmean_table(v, r, 4, 2, 4, &t), RAD_OK);
+    const size_t E = (2 + 4) * 4;
+    REQUIRE_EQ(t.size(), 2 * 2 * E);
+    auto f = [](uint16_t b) {
+        const uint32_t u = (uint32_t)b << 16;
+        float x;
+        std::memcpy(&x, &u, 4);
+        return x;
+    };
+    for (size_t i = 0; i < 2 * E; ++i) CHECK_EQ(t[i], (uint16_t)0);   /* layer 0: no vmean */
+    const float plain[2][4] = { { 1, 2, 3, 4 }, { 0.5f, 0, 0, -0.5f } };
+    /* H4 / 2 over (1, 2, 3, 4): (10, -2, -4, 0) / 2; over (0.5, 0, 0, -0.5): (0, 1, 1, 0) / 2. */
+    const float rotd[2][4] = { { 5, -1, -2, 0 }, { 0, 0.5f, 0.5f, 0 } };
+    for (int b = 0; b < 2; ++b) {
+        const uint16_t* e = t.data() + (2 + b) * E;
+        const float (*mu)[4] = b ? rotd : plain;
+        for (int k = 0; k < 2; ++k)
+            for (int d = 0; d < 4; ++d) {
+                CHECK_EQ(f(e[k * 4 + d]), -mu[k][d]);
+                CHECK_EQ((uint16_t)(e[k * 4 + d] ^ 0x8000u), e[8 + 2 * k * 4 + d]);
+            }
+        for (int h = 0; h < 4; ++h)
+            for (int d = 0; d < 4; ++d) CHECK_EQ(f(e[8 + h * 4 + d]), mu[h / 2][d]);
+    }
+}
+
+/* A `vpred FILE` text: per layer and KV head the bias line, then the rows (in reverse order, which
+ * the format allows), each value telling its layer, head, row and column apart. */
+std::string vpred_text(const std::vector<int>& layers, int heads, int dim) {
+    std::string t = "# a calibration run's maps\nkv_vpred 1 head_dim " + std::to_string(dim) +
+                    " kv_heads " + std::to_string(heads) + " rows 2048\n";
+    char buf[64];
+    for (int l : layers)
+        for (int h = 0; h < heads; ++h) {
+            t += "layer " + std::to_string(l) + " head " + std::to_string(h) + " bias";
+            for (int d = 0; d < dim; ++d) {
+                std::snprintf(buf, sizeof buf, " %.9g", -(l + h / 8.0 + d / 1024.0));
+                t += buf;
+            }
+            t += "\n";
+            for (int i = dim - 1; i >= 0; --i) {
+                t += "layer " + std::to_string(l) + " head " + std::to_string(h) + " row " +
+                     std::to_string(i);
+                for (int d = 0; d < dim; ++d) {
+                    std::snprintf(buf, sizeof buf, " %.9g", l + h / 8.0 + i / 64.0 + d / 4096.0);
+                    t += buf;
+                }
+                t += "\n";
+            }
+        }
+    return t;
+}
+
+/* `vpred FILE` and a layer ending in `vpred` (RAD_KVQ_VPRED): the map file beside the recipe, read
+ * whole, each (layer, head)'s rows and bias where the format says; only the marked layers carry
+ * the bit, k4h layers are rotated as always, and the summary names the predicted layers. Without
+ * a `vpred` word nothing is read: the recipe is what it was. */
+TEST(a_kv_recipe_layer_ending_in_vpred_takes_its_maps_from_the_file_the_recipe_names) {
+    const std::string dir = radtest::tmp_path("vpred.d");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/flash.kvpred", vpred_text({ 3, 7, 11 }, 2, 8));
+    write_file(dir + "/r.kvrecipe", "vpred flash.kvpred   # beside the recipe\n"
+                                    "layer 3 k4h_v4 vpred\n"
+                                    "layer 7 k4h_v2h rotated vpred\n"
+                                    "layer 11 i8h\n");
+    Config c;
+    const std::string rp = dir + "/r.kvrecipe";
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }, &c), RAD_OK);
+    const int32_t rot = RAD_KVQ_ROTATED, vp = RAD_KVQ_VPRED;
+    REQUIRE_EQ(c.kv_recipe.size(), (size_t)12);
+    CHECK_EQ(c.kv_recipe[3], (int32_t)(RAD_KVQ_K4H | rot | vp));
+    CHECK_EQ(c.kv_recipe[7], (int32_t)(RAD_KVQ_K4HV2H | rot | vp));
+    CHECK_EQ(c.kv_recipe[11], (int32_t)(RAD_KVQ_I8H | rot));
+    CHECK(c.kv_vmean.layer.empty());
+    CHECK_EQ(c.kv_vpred.head_dim, 8);
+    CHECK_EQ(c.kv_vpred.n_head_kv, 2);
+    CHECK_EQ(c.kv_vpred.rows, 2048LL);
+    CHECK_EQ(c.kv_vpred.path, dir + "/flash.kvpred");
+    REQUIRE_EQ(c.kv_vpred.layer.size(), (size_t)3);
+    /* Layer 7, head 1: row 5 column 2, then the bias's column 6. */
+    const std::vector<float>& m7 = c.kv_vpred.layer.at(7);
+    REQUIRE_EQ(m7.size(), (size_t)(2 * 9 * 8));
+    CHECK_EQ(m7[(1 * 9 + 5) * 8 + 2], (float)(7 + 1 / 8.0 + 5 / 64.0 + 2 / 4096.0));
+    CHECK_EQ(m7[(1 * 9 + 8) * 8 + 6], (float)-(7 + 1 / 8.0 + 6 / 1024.0));
+    CHECK_EQ(kv_recipe_summary(c.kv_recipe),
+             std::string("i8h rotated at layer 11; k4h_v4 rotated at layer 3; k4h_v2h rotated at "
+                         "layer 7; V predicted from K at layers 3, 7"));
+    /* Without a `vpred` line or word nothing is read and nothing is kept. */
+    Config e;
+    std::string pf = "x";
+    CHECK_EQ(kv_recipe_parse("layer 3 k4h_v4\n", "r.txt", &e.kv_recipe, nullptr, &pf), RAD_OK);
+    CHECK(pf.empty());
+    CHECK_EQ(e.kv_recipe[3], (int32_t)(RAD_KVQ_K4H | rot));
+    CHECK(e.kv_vpred.layer.empty());
+}
+
+/* A map that loads wrong is a deployment nobody measured, so the recipe and the file are refused
+ * with the file, the line and the layer named: `vpred` on a layout other than k4h_v4 / k4h_v2h, on
+ * a tiered layer, beside `vmean`, out of order or twice; a `vpred` word with no file line and a
+ * file line no layer reads; in the file a bad header, a line of the wrong width or kind, a value
+ * that is not a finite number, a head or row outside the header's, a bias or row twice, a head
+ * missing its bias or a row; a `vpred` layer the file does not hold and a layer the recipe does
+ * not name; and at startup a file of other heads or head_dim. */
+TEST(a_malformed_or_mismatched_vpred_map_is_refused_by_name) {
+    auto recipe = [&](const std::string& text) {
+        std::vector<int32_t> out = { 1 };
+        std::string vm, vp;
+        int rc = RAD_OK;
+        const std::string err =
+            stderr_of([&] { rc = kv_recipe_parse(text, "r.txt", &out, &vm, &vp); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.empty());
+        return err;
+    };
+    for (const char* lay : { "fp8", "fp8_v4", "k6_v4", "i8h", "bf16" })
+        CHECK(has(recipe(std::string("vpred p.txt\nlayer 3 ") + lay + " vpred\n"),
+                  std::string(lay) == "bf16" ? "takes no 'vpred'"
+                                             : "line 2: layer 3: 'vpred' predicts V from the int4 K"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 i8h demote k4h_v4 vpred\n"), "'vpred' predicts V"));
+    CHECK(has(recipe("vpred p.txt\nvmean m.txt\nlayer 3 k4h_v4 vmean vpred\n"),
+              "line 3: 'vmean' and 'vpred' are one or the other"));
+    CHECK(has(recipe("vpred p.txt\nvmean m.txt\nlayer 3 k4h_v4 vpred vmean\n"),
+              "'vmean' and 'vpred' are one or the other"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 k4h_v4 vpred rotated\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 k4h_v4 vpred vpred\n"), "line 2: a recipe line is"));
+    CHECK(has(recipe("layer 3 k4h_v4 vpred\n"),
+              "1 layer(s) say 'vpred' and no 'vpred FILE' line names their maps"));
+    CHECK(has(recipe("vpred p.txt\nlayer 3 k4h_v4\n"), "'vpred p.txt' and no layer says 'vpred'"));
+    CHECK(has(recipe("vpred\nlayer 3 k4h_v4 vpred\n"),
+              "line 1: 'vpred FILE' names the K-to-V map file"));
+
+    auto file = [&](const std::string& text) {
+        KvVPred out;
+        out.head_dim = 7;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = kv_vpred_parse(text, "p.txt", &out); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(out.layer.empty());
+        CHECK_EQ(out.head_dim, 0);
+        CHECK(has(err, "p.txt"));
+        return err;
+    };
+    const std::string hdr = "kv_vpred 1 head_dim 2 kv_heads 1 rows 9\n";
+    const std::string head0 = "layer 3 head 0 bias 1 2\nlayer 3 head 0 row 0 1 2\n";
+    CHECK(has(file("layer 3 head 0 bias 1 2\n"), "line 1: the first line is 'kv_vpred 1 head_dim D"));
+    CHECK(has(file("kv_vmean 1 head_dim 2 kv_heads 1 rows 9\n"), "line 1: the first line is"));
+    CHECK(has(file(""), "no 'kv_vpred 1 head_dim D kv_heads H rows R' line"));
+    CHECK(has(file(hdr + "layer 3 head 0 bias 1\n"), "line 2: layer 3 head 0 has 1 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 1 1 2 3\n"), "has 3 values; head_dim is 2"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 1 1 nan\n"), "'nan' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 bias 1 1e999\n"), "'1e999' is not a finite number"));
+    CHECK(has(file(hdr + "layer 3 head 0 mean 1 2\n"), "line 2: a line is 'layer L head H bias'"));
+    CHECK(has(file(hdr + "layer 3 head 1 bias 1 2\n"), "line 2: layer 3: head 1 is outside the file's 1"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 2 1 2\n"), "line 2: layer 3 head 0: row 2 is outside 0..1"));
+    CHECK(has(file(hdr + head0 + "layer 3 head 0 row 0 1 2\n"),
+              "line 4: layer 3 head 0: its row 0 is listed twice"));
+    CHECK(has(file(hdr + head0 + "layer 3 head 0 bias 1 2\n"), "its bias is listed twice"));
+    CHECK(has(file(hdr + head0), "layer 3 head 0 has no row 1"));
+    CHECK(has(file(hdr + "layer 3 head 0 row 0 1 2\nlayer 3 head 0 row 1 1 2\n"),
+              "layer 3 head 0 has no bias"));
+
+    /* Through the flag: the file's layers against the recipe's. */
+    const std::string dir = radtest::tmp_path("vpred.bad");
+    mkdir(dir.c_str(), 0755);
+    write_file(dir + "/p.kvpred", vpred_text({ 3, 9 }, 2, 8));
+    auto flag = [&](const std::string& text) {
+        write_file(dir + "/r.kvrecipe", text);
+        const std::string rp = dir + "/r.kvrecipe";
+        int rc = RAD_OK;
+        const std::string err = stderr_of(
+            [&] { rc = parse_fresh({ "--kv-cache-dtype", "fp8", "--kv-recipe", rp.c_str() }); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        return err;
+    };
+    CHECK(has(flag("vpred p.kvpred\nlayer 3 k4h_v4 vpred\nlayer 7 k4h_v4 vpred\nlayer 9 fp8\n"),
+              "layer 7 says 'vpred' and " + dir + "/p.kvpred has no maps for it"));
+    CHECK(has(flag("vpred p.kvpred\nlayer 3 k4h_v4 vpred\n"),
+              "holds layer 9, which the recipe does not name"));
+    CHECK(has(flag("vpred gone.kvpred\nlayer 3 k4h_v4 vpred\n"),
+              "cannot read its K-to-V map file '" + dir + "/gone.kvpred'"));
+
+    /* Against the model, at startup. */
+    KvVPred v;
+    REQUIRE_EQ(kv_vpred_parse(vpred_text({ 3 }, 2, 8), "p.txt", &v), RAD_OK);
+    std::vector<int32_t> r(4, -1);
+    r[3] = RAD_KVQ_K4H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+    std::vector<float> t = { 1 };
+    std::vector<int32_t> en = { 1 };
+    std::string err = stderr_of([&] { CHECK_EQ(kv_vpred_table(v, r, 16, 2, &t, &en), RAD_E_INVAL); });
+    CHECK(has(err, "p.txt holds 2 KV heads of 8 and this model has 2 of 16"));
+    CHECK(t.empty());
+    CHECK(en.empty());
+    err = stderr_of([&] { CHECK_EQ(kv_vpred_table(v, r, 8, 4, &t, &en), RAD_E_INVAL); });
+    CHECK(has(err, "this model has 4 of 8"));
+    r[1] = RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED;
+    err = stderr_of([&] { CHECK_EQ(kv_vpred_table(v, r, 8, 2, &t, &en), RAD_E_INVAL); });
+    CHECK(has(err, "p.txt has no maps for layer 1"));
+}
+
+/* The table the engine uploads (RadKvVPred) holds each vpred layer's maps in the rotated basis a
+ * k4h layer stores: with k' = k H and v' = v H (H the normalised Sylvester Hadamard, symmetric and
+ * its own inverse) a map v ~ k A + b becomes v' ~ k' (H A H) + b H. Checked as that identity in
+ * f64 at D = 4: for a K vector, k' A' + b' is (k A + b) H to f32 rounding, for every head. A layer
+ * without `vpred` has no entry (-1) and takes no room. */
+TEST(the_vpred_table_holds_each_layers_maps_rotated_into_the_stored_basis) {
+    KvVPred v;
+    REQUIRE_EQ(kv_vpred_parse(vpred_text({ 0, 2 }, 2, 4), "p.txt", &v), RAD_OK);
+    std::vector<int32_t> r = { RAD_KVQ_K4H | RAD_KVQ_ROTATED, RAD_KVQ_I8H | RAD_KVQ_ROTATED,
+                               RAD_KVQ_K4HV2H | RAD_KVQ_ROTATED | RAD_KVQ_VPRED };
+    std::vector<float> t;
+    std::vector<int32_t> en;
+    REQUIRE_EQ(kv_vpred_table(v, r, 4, 2, &t, &en), RAD_OK);
+    REQUIRE_EQ(en.size(), (size_t)3);
+    CHECK_EQ(en[0], -1);
+    CHECK_EQ(en[1], -1);
+    CHECK_EQ(en[2], 0);
+    REQUIRE_EQ(t.size(), (size_t)(2 * 5 * 4));
+    const int D = 4;
+    auto had = [&](std::vector<double> x) {   /* x H, H = H4 / 2 */
+        const double s[4][4] = { { 1, 1, 1, 1 }, { 1, -1, 1, -1 }, { 1, 1, -1, -1 }, { 1, -1, -1, 1 } };
+        std::vector<double> y(4, 0.0);
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i) y[(size_t)j] += x[(size_t)i] * s[i][j] / 2.0;
+        return y;
+    };
+    const std::vector<double> k = { 0.5, -1.25, 2.0, 0.75 };
+    for (int h = 0; h < 2; ++h) {
+        const float* src = v.layer.at(2).data() + h * (D + 1) * D;
+        const float* rot = t.data() + h * (D + 1) * D;
+        std::vector<double> pred(4, 0.0), kr = had(k), predr(4, 0.0);
+        for (int j = 0; j < D; ++j) {
+            pred[(size_t)j] = src[D * D + j];
+            predr[(size_t)j] = rot[D * D + j];
+            for (int i = 0; i < D; ++i) {
+                pred[(size_t)j] += k[(size_t)i] * src[i * D + j];
+                predr[(size_t)j] += kr[(size_t)i] * rot[i * D + j];
+            }
+        }
+        const std::vector<double> want = had(pred);
+        for (int j = 0; j < D; ++j) CHECK(std::fabs(predr[(size_t)j] - want[(size_t)j]) < 1e-5);
+    }
 }
 
 /* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
@@ -901,9 +1725,28 @@ TEST(the_ngram_table_takes_a_directory_for_a_shared_ram_copy) {
     CHECK(s.ngram_placement == TablePlacement::Ram);
     CHECK(s.ngram_share_dir.empty());
     Config c;
-    for (const char* bad : { "ram=", "vram=/tmp/x", "disk=/tmp/x", "auto=/tmp/x" })
+    for (const char* bad : { "ram=", "disk=", "vram=/tmp/x", "auto=/tmp/x" })
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--embedding-placement", "ram=/tmp/x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--embedding-placement", "disk=/tmp/x" }, &c), RAD_E_INVAL);
+}
+
+/* disk=DIR is disk read from the table's own file in DIR (#130); it and ram=DIR replace each
+ * other, and a plain placement drops both directories. */
+TEST(the_ngram_table_takes_a_directory_for_its_own_file_on_disk) {
+    Config s;
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Disk);
+    CHECK_EQ(s.ngram_disk_dir, std::string("/mnt/optane"));
+    CHECK(s.ngram_share_dir.empty());
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane", "--ngram-placement", "ram=/dev/shm" },
+                   &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK(s.ngram_disk_dir.empty());
+    CHECK_EQ(s.ngram_share_dir, std::string("/dev/shm"));
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/optane", "--ngram-placement", "disk" }, &s),
+             RAD_OK);
+    CHECK(s.ngram_disk_dir.empty());
 }
 
 /* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text
@@ -1387,6 +2230,26 @@ TEST(gpu_headroom_parses_under_both_spellings) {
     CHECK_EQ(d.gpu_headroom_mib, 96ll);
 }
 
+/* --gpu-memory-mib is the inverse of --gpu-headroom-mib; they cannot be combined. The default
+ * headroom is not "given", so memory alone is legal and leaves the default until the resolver. */
+TEST(gpu_memory_mib_parses_and_excludes_headroom) {
+    Config a;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000" }, &a), RAD_OK);
+    CHECK_EQ(a.gpu_memory_mib, 28000ll);
+    CHECK_EQ(a.gpu_headroom_mib, 96ll);
+    CHECK(a.given.count("--gpu-memory-mib"));
+    CHECK(!a.given.count("--gpu-headroom-mib"));
+
+    Config z;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "0" }, &z), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "-1" }, &z), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "8x" }, &z), RAD_E_INVAL);
+
+    Config b, c;
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000", "--gpu-headroom-mib", "96" }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--gpu-memory-mib", "28000", "--gpu-headroom", "96" }, &c), RAD_E_INVAL);
+}
+
 TEST(the_kernel_hierarchy_is_separated_by_commas_or_colons_and_ordered) {
     Config c;
     CHECK_EQ(parse({ "--kernels", "libr4d.so,libref.so" }, &c), RAD_OK);
@@ -1525,6 +2388,19 @@ TEST(usage_names_every_flag_it_documents) {
 
 /* --rope-scaling is validated at the command line: a typo is refused rather than serving the
  * trained rotary at a length it cannot reach. */
+/* KV streaming and window residency both own a sparse attention group's placement, so a server
+ * runs one of them: either flag alone parses, the two together are refused by name. */
+TEST(kv_streaming_and_window_residency_are_refused_together) {
+    Config a, b, c;
+    CHECK_EQ(parse({ "--kv-resident", "65536" }, &a), RAD_OK);
+    CHECK_EQ(parse({ "--kv-residency-mib", "4096" }, &b), RAD_OK);
+    std::string log;
+    int st = RAD_OK;
+    log = stderr_of([&] { st = parse({ "--kv-resident", "65536", "--kv-residency-mib", "4096" }, &c); });
+    CHECK_EQ(st, (int)RAD_E_INVAL);
+    CHECK(has(log, "--kv-resident") && has(log, "--kv-residency-mib"));
+}
+
 TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     for (const char* ok : { "yarn:4", "yarn:2.5", "yarn:4:262144", "none" }) {
         Config c;

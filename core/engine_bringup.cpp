@@ -11,6 +11,7 @@
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
+#include "gen/shape_driver.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -478,6 +479,35 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     }
     table_copy_of_.push_back({ src, base });
     *out = base;
+    return RAD_OK;
+}
+
+/* --ngram-placement disk=DIR: the container's [src, src + n) at file offset `foff` read from its own
+ * file, DIR/ngram-<id>.bin (the table's bytes and nothing else, the id table_share_id's: the
+ * container's path, size and mtime and the table's place in it). The first start fills it from the
+ * container through a temporary name and renames it, so a file under the real name is complete; a
+ * later start checks samples of it against the container. Mapped read-only in place of the
+ * container's range, which is all the disk gather needs: it finds the file behind the mapping and
+ * reads it directly (libavx avx_ngram.cpp, table_file). */
+int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
+                           std::string* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string id = table_share_id(file_->path(), foff, n);
+    if (id.empty()) {
+        *why = fmt("the container %s cannot be stat'ed, which names the table's file", file_->path());
+        return RAD_E_IO;
+    }
+    const std::string& dir = cfg_.ngram_disk_dir;
+    const std::string path = dir + (dir.back() == '/' ? "" : "/") + "ngram-" + id + ".bin";
+    TableCopy c;
+    bool filled = false;
+    const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
+    if (rc != RAD_OK) return rc;
+    table_files_.push_back(c);
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+             filled ? ", filled from the container" : "",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    *out = c.base;
     return RAD_OK;
 }
 
@@ -967,6 +997,7 @@ int Engine::load_plugins() {
 
     const Plugin* ap = rad_tools_registry().plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
+    arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
 }
 
@@ -985,6 +1016,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.kv_dtype = cfg_.kv_cache_dtype == "bf16" ? RAD_BF16 : RAD_F8E4M3;
     bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4
                 : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
+    /* --kv-recipe: each attention layer's layout, read by a plugin that said it reads it (declare
+     * below refuses the flag otherwise). Config owns the array for the life of the engine. */
+    if (!cfg_.kv_recipe.empty()) {
+        bc.kv_recipe   = cfg_.kv_recipe.data();
+        bc.n_kv_recipe = (int32_t)cfg_.kv_recipe.size();
+    }
     bc.attn_prefill_fp8 = cfg_.attn_prefill_fp8;
     bc.tp_attn_rows = cfg_.tp_attn_rows;
     bc.weight_prefetch_off = cfg_.weight_prefetch ? 0 : 1;
@@ -995,8 +1032,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.gen_max_pixels = cfg_.image_gen_max_pixels;
     bc.gen_max_refs   = cfg_.image_gen_max_refs;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
+    bc.qsa_bkey_dtype = cfg_.qsa_bkey_dtype == "i8" ? RAD_I8 : 0;
+    bc.qsa_bkey_split = cfg_.qsa_bkey_split ? 1 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
+    bc.kv_residency = cfg_.residency_mib > 0;   /* the pager op is declared only when asked for */
+    bc.expert_file_tier = cfg_.weights_disk_tier ? 1 : 0;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
     bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
@@ -1004,8 +1045,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
      * (core/kld.h); KL mode has no speculation. */
     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
-     * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
-    bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+     * (Scheduler::step) plus the decode headroom, so a wider step is one sequence; 0 without a
+     * span, where a step of several sequences may take the whole step_tok. */
+    bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, mixed_step_tok(cfg_)) : 0;
     /* --kv-resident in tokens, raised to kStreamFloorTokens as kvstream_ring_shape raises it: the
      * arch declares kv_resolve's ring depth from this, and the kernel refuses a carve deeper than
      * the declared table. */
@@ -1021,6 +1063,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
         cvec_views_[(size_t) rank].dir)
         bc.cvec = &cvec_views_[(size_t) rank];
+    /* The recipe's V means, this rank's copy; a plugin reads them at declare only. */
+    if (rank >= 0 && rank < (int) kv_vmean_views_.size() && kv_vmean_views_[(size_t) rank].table)
+        bc.kv_vmean = &kv_vmean_views_[(size_t) rank];
+    /* The recipe's maps from K to V likewise. */
+    if (rank >= 0 && rank < (int) kv_vpred_views_.size() && kv_vpred_views_[(size_t) rank].table)
+        bc.kv_vpred = &kv_vpred_views_[(size_t) rank];
     return bc;
 }
 
@@ -1110,6 +1158,25 @@ int Engine::declare() {
             if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
+        } else if (pb.gen_rows > 0 && pb.gen_shape) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "a shape generator: a denoising step's two branches or a query pass's "
+                       "points, whichever is more");
+            }
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 1;
+                decide("--max-num-seqs", "1", "a shape generator: a pass is one request's");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "a shape generator: a pass's rows");
+            }
+            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
         } else if (pb.gen_rows > 0 && pb.gen_video) {
             if (!cfg_.given.count("--max-num-batched-tokens")) {
                 cfg_.max_tok = pb.gen_rows;
@@ -1175,6 +1242,52 @@ int Engine::declare() {
             return RAD_E_UNSUPPORTED;
         }
     }
+    /* --kv-recipe likewise: a plugin that does not say it reads the recipe
+     * (RadArchProbe::kv_recipe_ok) would store every layer as plain E4M3, and one that does may
+     * still lack a layout's rows for this model (kv_quant_ok). The refusal names the first layer
+     * that asks for the missing layout; which layers keep an attention cache is the plugin's to
+     * check, at declare. */
+    if (!cfg_.kv_recipe.empty()) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        if (!pb.kv_recipe_ok) {
+            RAD_ERR("--kv-recipe %s: the '%s' plugin does not declare its KV cache per layer "
+                    "(--kv-cache-dtype sets one layout for every layer)",
+                    cfg_.kv_recipe_path.c_str(), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        /* A rotated layer is its layout's rows behind a separate op (had_rotate), so only the
+         * layout asks the plugin for rows. */
+        for (size_t l = 0; l < cfg_.kv_recipe.size(); ++l) {
+            const int q = cfg_.kv_recipe[l] < 0 ? -1 : cfg_.kv_recipe[l] & RAD_KVQ_LAYOUT;
+            if (q <= RAD_KVQ_NONE || (pb.kv_quant_ok & (1 << q))) continue;
+            RAD_ERR("--kv-recipe %s: layer %zu asks for %s, which the '%s' plugin does not serve "
+                    "for this model (fp8 does)", cfg_.kv_recipe_path.c_str(), l,
+                    kv_layout_name(q), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        /* The `vmean` layers' table, against this model's heads; uploaded per rank at declare.
+         * Whether the plugin serves RAD_KVQ_VMEAN is its own to say, naming the layer. */
+        kv_vmean_table_.clear();
+        if (!cfg_.kv_vmean.layer.empty()) {
+            RAD_TRY(kv_vmean_table(cfg_.kv_vmean, cfg_.kv_recipe, meta_.head_dim,
+                                   meta_.n_head_kv ? meta_.n_head_kv : meta_.n_head, meta_.n_head,
+                                   &kv_vmean_table_));
+            RAD_INFO("kv recipe %s: V means from %s (%lld tokens)", cfg_.kv_recipe_path.c_str(),
+                     cfg_.kv_vmean.path.c_str(), cfg_.kv_vmean.rows);
+        }
+        /* The `vpred` layers' maps, rotated and checked against this model's heads; uploaded per
+         * rank at declare. Whether the plugin serves RAD_KVQ_VPRED is its own to say. */
+        kv_vpred_table_.clear();
+        kv_vpred_entry_.clear();
+        if (!cfg_.kv_vpred.layer.empty()) {
+            RAD_TRY(kv_vpred_table(cfg_.kv_vpred, cfg_.kv_recipe, meta_.head_dim,
+                                   meta_.n_head_kv ? meta_.n_head_kv : meta_.n_head,
+                                   &kv_vpred_table_, &kv_vpred_entry_));
+            RAD_INFO("kv recipe %s: K-to-V maps from %s (%lld tokens)", cfg_.kv_recipe_path.c_str(),
+                     cfg_.kv_vpred.path.c_str(), cfg_.kv_vpred.rows);
+        }
+    }
     /* The row split is a graph only the plugin can declare, and it splits over ranks. A plugin
      * that does not say it serves it (RadArchProbe::tp_attn_rows_ok), or a single rank, would
      * serve the head split under a name that promised the other, so the flag is refused rather
@@ -1208,6 +1321,37 @@ int Engine::declare() {
         }
         RAD_INFO("recurrent state cache: f16 (--state-cache-dtype), half the state memory; lossy, "
                  "the generated text differs from f32");
+    }
+    /* Likewise int8 block keys: a plugin that does not say it stores them would keep bf16 under a
+     * flag that promised half the indexer's cache. */
+    if (cfg_.qsa_bkey_dtype == "i8") {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        if (!pb.qsa_bkey_i8_ok) {
+            RAD_ERR("--qsa-bkey-dtype i8: the '%s' plugin does not store a QSA indexer's block keys "
+                    "in int8 for this model", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_INFO("QSA block keys: int8 with an f16 scale a block (--qsa-bkey-dtype), about half "
+                 "the indexer's cache; lossy, the selection differs slightly from bf16");
+    }
+    /* Block keys split across the ranks: one rank has nothing to split with, and a plugin that
+     * does not say it splits them would keep every key on every rank under the flag. */
+    if (cfg_.qsa_bkey_split) {
+        if (cfg_.tp < 2) {
+            RAD_ERR("--qsa-bkey-split on needs --tp 2 or more: one rank holds every block key");
+            return RAD_E_INVAL;
+        }
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        if (!pb.qsa_bkey_split_ok) {
+            RAD_ERR("--qsa-bkey-split on: the '%s' plugin does not split a QSA indexer's block keys "
+                    "across ranks for this model", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_INFO("QSA block keys: split across the %d ranks (--qsa-bkey-split), block b on rank "
+                 "b %% %d; the selection is the unsplit one byte for byte, plus one gather a QSA "
+                 "layer a step", cfg_.tp, cfg_.tp);
     }
     /* Resolved here, not at argument parsing: the plugin states its drafter's depth, and it is
      * selected only once the container is open. Every consumer of `n_spec` (buffer sizing, kernel
@@ -1299,6 +1443,54 @@ int Engine::declare() {
                        : "the model carries no vision tower");
     }
 
+    /* --decode-headroom, resolved where max_seqs and the speculative window are final and before
+     * any declare, which sizes every buffer holding a whole step at step_tok (geometry.h). Zero
+     * where no decode row can share a step with a prefill chunk (a generator's passes, KL mode's
+     * scoring), and auto is 0 under --deterministic, which keeps the schedule it had. */
+    {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        const char* none = pb.gen_rows > 0 ? "a generator: its passes carry no decode rows"
+                         : cfg_.kld() ? "KL mode scores documents and decodes nothing" : nullptr;
+        const bool asked = cfg_.decode_headroom >= 0;
+        std::string why;
+        if (none) {
+            if (cfg_.decode_headroom > 0)
+                RAD_WARN("--decode-headroom %lld: no headroom, %s", (long long)cfg_.decode_headroom,
+                         none);
+            cfg_.decode_headroom = 0;
+            why = none;
+        } else if (asked) {
+            why = cfg_.decode_headroom > 0 ? "as given" : "as given: the prefill budget alone";
+        } else if (cfg_.deterministic) {
+            cfg_.decode_headroom = 0;
+            why = "--deterministic keeps the schedule without headroom (--decode-headroom N "
+                  "overrides it)";
+        } else {
+            cfg_.decode_headroom = decode_headroom_auto(cfg_.max_seqs, cfg_.n_spec);
+            why = fmt("(max-num-seqs %lld - 1) x (1 + %d drafts) decode rows beside a prefill, "
+                      "rounded up to %lld and at most %lld", (long long)cfg_.max_seqs,
+                      std::max(cfg_.n_spec, 0), (long long)kDecodeHeadroomAlign,
+                      (long long)kDecodeHeadroomCap);
+        }
+        decide("--decode-headroom", std::to_string(cfg_.decode_headroom), why);
+        /* --prefill-interleave not given: auto:1, decode-only steps for as long as a chunk step
+         * took, so decoders keep about half their rate while prompts prefill (measured on
+         * Flash-Next: 8 decoders beside a 64K prefill, 12 -> 41 tokens/s each). Not where the
+         * schedule must not follow timing (--deterministic) or nothing decodes. */
+        if (!cfg_.prefill_interleave_set) {
+            if (none || cfg_.deterministic) {
+                decide("--prefill-interleave", "0", none ? none : "--deterministic keeps a "
+                       "timing-independent schedule (--prefill-interleave N or auto overrides it)");
+            } else {
+                cfg_.prefill_interleave = -1;
+                cfg_.prefill_interleave_share = 1.0;
+                decide("--prefill-interleave", "auto:1", "decode-only steps for as long as a chunk "
+                       "step took while prompts prefill beside decoding sequences");
+            }
+        }
+    }
+
     /* Control vectors are resolved before any rank declares, because the plugin reads the
      * direction table from RadBuildCtx. Only `--control-vector off|on` loads one; without it
      * nothing is looked for and the graph declares no projection op. With it, a plugin that does
@@ -1332,6 +1524,8 @@ int Engine::declare() {
             return RAD_E_INVAL;
         }
     }
+    kv_vmean_views_.assign(ranks_.size(), RadKvVMean{});
+    kv_vpred_views_.assign(ranks_.size(), RadKvVPred{});
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
@@ -1385,7 +1579,58 @@ int Engine::declare() {
                 }
                 cvec_views_[(size_t)ri] = control_vector_view(cvec_, d);
             }
-            const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
+            /* This rank's copy of the V mean table likewise; once, as a later declare reuses it. */
+            if (!kv_vmean_table_.empty() && !kv_vmean_views_[(size_t)ri].table) {
+                const int64_t bytes = (int64_t)kv_vmean_table_.size() * 2;
+                void* d = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+                RadStream s = nullptr;
+                int rc = d && rad_stream_create(&s, 0) >= 0 ? 0 : -1;
+                if (rc == 0) {
+                    rc = rad_memcpy_async(d, kv_vmean_table_.data(), bytes, s);
+                    rad_stream_sync(s);
+                    rad_stream_destroy(s);
+                }
+                if (rc < 0) {
+                    RAD_ERR("rank %d: could not put the KV recipe's V means on the card: %s", ri,
+                            rad_dev_last_error());
+                    if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+                    st[(size_t)ri] = RAD_E_DEVICE;
+                    return;
+                }
+                RadKvVMean& v = kv_vmean_views_[(size_t)ri];
+                v.table     = d;
+                v.n_layers  = (int64_t)cfg_.kv_recipe.size();
+                v.n_head_kv = cfg_.kv_vmean.n_head_kv;
+                v.n_head    = meta_.n_head;
+                v.head_dim  = cfg_.kv_vmean.head_dim;
+            }
+            /* This rank's copy of the K-to-V maps likewise. */
+            if (!kv_vpred_table_.empty() && !kv_vpred_views_[(size_t)ri].table) {
+                const int64_t bytes = (int64_t)kv_vpred_table_.size() * 4;
+                void* d = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+                RadStream s = nullptr;
+                int rc = d && rad_stream_create(&s, 0) >= 0 ? 0 : -1;
+                if (rc == 0) {
+                    rc = rad_memcpy_async(d, kv_vpred_table_.data(), bytes, s);
+                    rad_stream_sync(s);
+                    rad_stream_destroy(s);
+                }
+                if (rc < 0) {
+                    RAD_ERR("rank %d: could not put the KV recipe's K-to-V maps on the card: %s", ri,
+                            rad_dev_last_error());
+                    if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+                    st[(size_t)ri] = RAD_E_DEVICE;
+                    return;
+                }
+                RadKvVPred& v = kv_vpred_views_[(size_t)ri];
+                v.table     = d;
+                v.entry     = kv_vpred_entry_.data();
+                v.n_layers  = (int64_t)kv_vpred_entry_.size();
+                v.n_head_kv = cfg_.kv_vpred.n_head_kv;
+                v.head_dim  = cfg_.kv_vpred.head_dim;
+            }
+            /* Sized for a whole step: the prefill budget plus the decode headroom. */
+            const RadBuildCtx bc = build_ctx(ri, step_tok(cfg_));
             LoraDeclare ld;
             ld.cfg = &cfg_.lora;
             ld.targets = lora_targets_;
@@ -1587,6 +1832,12 @@ void Engine::probe_arena_levels() {
     if (!pb.shape_probe_ok) {
         RAD_INFO("activation arena: not lent -- the '%s' plugin does not declare at a smaller step "
                  "size (RadArchProbe::shape_probe_ok)", plugins_.arch_plugin.c_str());
+        if (decode_headroom(cfg_) > 0)
+            RAD_INFO("decode headroom: %lld rows on a %lld-token budget, steps of up to %lld tokens; "
+                     "the activation arena is %s a rank, its cost over --decode-headroom 0 not "
+                     "measured (the plugin declares at no smaller step)",
+                     (long long)decode_headroom(cfg_), (long long)cfg_.max_tok,
+                     (long long)step_tok(cfg_), humanb(ranks_[0]->program.arena_bytes).c_str());
         return;
     }
     int64_t lo = 1;
@@ -1594,12 +1845,23 @@ void Engine::probe_arena_levels() {
     while (lo < rows_min) lo <<= 1;
     lo = std::max<int64_t>(lo, 256);
     std::vector<int64_t> want;
-    for (int64_t R = lo; R < cfg_.max_tok; R *= 4) want.push_back(R);
+    const int64_t top = step_tok(cfg_);
+    for (int64_t R = lo; R < top; R *= 4) want.push_back(R);
     arena_span_rows_ = 0;
-    const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
-    if (span_rows >= lo && span_rows < cfg_.max_tok &&
+    const int64_t span_rows = cfg_.prefill_span > 1 ? mixed_step_tok(cfg_) : 0;
+    if (span_rows >= lo && span_rows < top &&
         std::find(want.begin(), want.end(), span_rows) == want.end()) {
         want.push_back(span_rows);
+        std::sort(want.begin(), want.end());
+    }
+    /* What the decode headroom costs: the arena at the prefill budget alone, declared to be
+     * measured and not kept as a level (a level there would raise the stager's smallest pass
+     * past a whole chunk). */
+    const int64_t bare_rows = decode_headroom(cfg_) > 0 && cfg_.max_tok < top ? cfg_.max_tok : 0;
+    const bool bare_only = bare_rows > 0 &&
+                           std::find(want.begin(), want.end(), bare_rows) == want.end();
+    if (bare_only) {
+        want.push_back(bare_rows);
         std::sort(want.begin(), want.end());
     }
 
@@ -1647,6 +1909,25 @@ void Engine::probe_arena_levels() {
         const int64_t R = want[l];
         size_t bad = nr;
         for (size_t i = 0; i < nr && bad == nr; ++i) if (!ok[l * nr + i]) bad = i;
+        if (R == bare_rows) {
+            /* The headroom's cost, the largest rank's; a level only where it is a level anyway. */
+            if (bad < nr) {
+                RAD_INFO("decode headroom: %lld rows on a %lld-token budget, steps of up to %lld "
+                         "tokens; its activation cost is not measured (no sizing declare at %lld "
+                         "rows: %s)", (long long)decode_headroom(cfg_), (long long)cfg_.max_tok,
+                         (long long)top, (long long)R, why[l * nr + bad].c_str());
+            } else {
+                int64_t extra = 0;
+                for (size_t i = 0; i < nr; ++i)
+                    extra = std::max(extra, ranks_[i]->program.arena_bytes - got[l * nr + i].end);
+                RAD_INFO("decode headroom: %lld rows on a %lld-token budget, steps of up to %lld "
+                         "tokens; the activation arena is %s a rank, %s more than at the budget "
+                         "alone (--decode-headroom 0)", (long long)decode_headroom(cfg_),
+                         (long long)cfg_.max_tok, (long long)top,
+                         humanb(ranks_[0]->program.arena_bytes).c_str(), humanb(extra).c_str());
+            }
+            if (bare_only) continue;
+        }
         if (bad < nr) {
             RAD_WARN("activation arena: no level for %lld-token steps on rank %d -- %s",
                      (long long)R, ranks_[bad]->index, why[l * nr + bad].c_str());
@@ -1805,10 +2086,12 @@ int Engine::plan() {
             for (size_t i = 0; i < kg.g.size(); ++i) {
                 const int64_t w = probe.state_index_width((int32_t)i);
                 if (w > 0) kg.g[i].sidx_width = w;
+                if (const KVGroupPlan* gp = probe.plan((int32_t)i)) kg.g[i].scratch_pitch = gp->scratch_pitch;
             }
             f.staging = r->program.is_generator()       ? gen::Driver::device_bytes(r->program)
                       : r->program.is_audio_generator() ? gen::AudioDriver::device_bytes(r->program)
                       : r->program.is_video_generator() ? gen::VideoDriver::device_bytes(r->program)
+                      : r->program.is_shape_generator() ? gen::ShapeDriver::device_bytes(r->program)
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
@@ -3034,6 +3317,26 @@ int Engine::load_weights() {
                                "rows are read from the container%s", into, why.c_str(),
                                card ? " by the host gather" : ""));
                 }
+                /* --ngram-placement disk=DIR: the table's own file instead of the container. */
+                if (cfg_.ngram_resolved == TablePlacement::Disk && !cfg_.ngram_disk_dir.empty() &&
+                    is_ngram_table(r->program, (rad_weight)i) && n >= kTableShareMin) {
+                    void* m = nullptr;
+                    for (size_t k = 0; k < table_files_.size() && !m; ++k)
+                        if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;
+                    std::string why;
+                    if (!m) {
+                        const int fs = table_file_map((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
+                                                      &m, &why);
+                        if (fs != RAD_OK) {
+                            RAD_ERR("--ngram-placement disk=%s: '%s': %s",
+                                    cfg_.ngram_disk_dir.c_str(), w.name.c_str(), why.c_str());
+                            return fs;
+                        }
+                        table_file_src_.push_back(w.host_ptr);
+                    }
+                    w.ptr = m;
+                    w.host_ptr = m;
+                }
                 /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
                  * too large to be resident, so the default 128 KiB readahead would read 32 pages
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
@@ -3488,6 +3791,165 @@ int Engine::configure_kv() {
         for (auto& r : ranks_)
             r->kv.set_checkpoint_store(&ck_store_, shard_off[(size_t)(&r - &ranks_[0])]);
     }
+
+    /* ---------------- window residency (spec §7.3) ---------------- */
+    /* A group whose consumer reads a window of its history declares it (RadKVGroupDecl::
+     * residency_window, set by arch/common/rad_qsa.h); the blocks the window does not cover can
+     * then live in a pinned store instead of VRAM. One slot is one block, so this runs after the
+     * carve, which is where a block's size exists, and under tensor parallelism the slot holds
+     * every rank's shard at its own offset. A slot holds one block of one group, and each group
+     * has its own store of slots its block's size (KVManager::set_residency_store): under a
+     * per-layer recipe the groups are layouts of different widths, and one store sized for the
+     * widest would leave every narrower block's slot mostly empty. */
+    {
+        /* Per residency group (rank 0's index): every rank's offset in its slot, and the slot. */
+        struct ResGroup { int32_t g; int64_t slot = 0, block_size = 0, slots = 0; std::vector<int64_t> off; };
+        std::vector<ResGroup> rgs;
+        int64_t window_tokens = 0, n_groups = 0;
+        std::string per_group;   /* each group's block, for the store's line */
+        for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g) {
+            const KVGroupPlan* pp = ranks_[0]->kv.plan(g);
+            if (!pp || !pp->residency()) continue;
+            const KVGroupPlan& p = *pp;
+            window_tokens = std::max(window_tokens, p.residency_window);
+            ++n_groups;
+            ResGroup rg{g};
+            rg.block_size = p.block_size;
+            for (const auto& r : ranks_) {
+                rg.off.push_back(rg.slot);
+                rg.slot += r->kv.residency_block_bytes(g);
+            }
+            rg.slot = align_up(rg.slot, (int64_t)256);
+            rgs.push_back(rg);
+        }
+        bool tiered = false;
+        for (const auto& p : ranks_[0]->kv.plans()) tiered = tiered || (p.residency() && p.tiered());
+        if (tiered && cfg_.residency_mib <= 0)
+            RAD_WARN("kv residency: --kv-recipe %s names demote layouts, which only a window-"
+                     "residency store holds; without --kv-residency-mib every block stays in its "
+                     "resident layout", cfg_.kv_recipe_path.c_str());
+        if (n_groups == 0) {
+            if (cfg_.residency_mib > 0)
+                RAD_WARN("kv residency: --kv-residency-mib %lld does nothing here: no KV group "
+                         "declares a residency window, which only a sparse consumer sets "
+                         "(arch/common/rad_qsa.h, spec §7.3)", (long long)cfg_.residency_mib);
+        } else if (cfg_.residency_mib <= 0) {
+            RAD_INFO("kv residency: %lld group(s) declare a %lld-token window, and "
+                     "--kv-residency-mib 0 keeps every block of them resident",
+                     (long long)n_groups, (long long)window_tokens);
+        } else {
+            const int64_t cap = cfg_.residency_mib << 20;
+            /* The groups demote the same tokens, so the budget is split to hold the same tokens
+             * of each: in proportion to a group's slot bytes a token. */
+            std::vector<ResidencySplit> split;
+            for (const ResGroup& rg : rgs) split.push_back({ rg.slot, rg.block_size });
+            const int64_t tokens = residency_split_tokens(cap, split);
+            int64_t total_slots = 0, widest = 0;
+            for (ResGroup& rg : rgs) {
+                rg.slots = tokens / rg.block_size;
+                total_slots += rg.slots;
+                widest = std::max(widest, rg.slot);
+            }
+            if (tokens <= 0 || std::any_of(rgs.begin(), rgs.end(),
+                                           [](const ResGroup& rg) { return rg.slots <= 0; })) {
+                RAD_ERR("kv residency: --kv-residency-mib %lld holds no block of every group (the "
+                        "widest slot %s). Raise it or pass 0 to keep every block resident",
+                        (long long)cfg_.residency_mib, humanb(widest).c_str());
+                return RAD_E_NOMEM;
+            }
+            res_stores_.clear();
+            res_stores_.resize((size_t)ranks_[0]->kv.n_groups());
+            int64_t store_bytes = 0;
+            for (const ResGroup& rg : rgs) {
+                auto& st = res_stores_[(size_t)rg.g];
+                st = std::make_unique<HostArena>();
+                /* Host-mapped, because the pager reads it from the card: a host that cannot map
+                 * the store refuses by flag name (HostArena::open_mapped says so) rather than
+                 * opening a store nothing can page from. */
+                if (const int rc = st->open_mapped(rg.slot, rg.slot * rg.slots); rc == RAD_E_UNSUPPORTED)
+                    return rc;
+                else if (rc != RAD_OK) {
+                    RAD_ERR("kv residency: the host did not map %s for %lld blocks of group '%s': %s",
+                            humanb(rg.slot * rg.slots).c_str(), (long long)rg.slots,
+                            ranks_[0]->kv.plan(rg.g)->name.c_str(), rad_dev_last_error());
+                    return RAD_E_NOMEM;
+                }
+                store_bytes += st->cap_bytes();
+                for (size_t i = 0; i < ranks_.size(); ++i)
+                    RAD_TRY(ranks_[i]->kv.set_residency_store(rg.g, st.get(), rg.off[i]));
+                const KVGroupPlan& p = *ranks_[0]->kv.plan(rg.g);
+                per_group += (per_group.empty() ? "" : ", ") + p.name + " " +
+                             std::to_string(rg.slots) + " slots of " + humanb(rg.slot) + " (" +
+                             humanb(p.bytes_per_block) + ", " + std::to_string(p.n_layers) +
+                             " layers of " + humanb(p.layer_bytes_per_block()) + ")";
+                /* Tiered: what a slot and the pager's link carry instead (RAD_KVQ_DEMOTE). */
+                if (p.tiered())
+                    per_group += fmt(" stored as %s, %s a block (%s a layer paged in)",
+                                     kv_layout_name(p.res_to), humanb(p.residency_bytes()).c_str(),
+                                     humanb(p.residency_frag()).c_str());
+            }
+            /* What the pager's scratch pages cost the card (KVGroupPlan::scratch_blocks, charged to
+             * the KV budget before the split), per rank 0's groups. */
+            int64_t scratch_bytes = 0, scratch_pages = 0;
+            for (const auto& p : ranks_[0]->kv.plans()) {
+                scratch_bytes += p.scratch_blocks * p.bytes_per_block;
+                scratch_pages += p.scratch_blocks;
+            }
+            RAD_INFO("kv residency: store %s of host-mapped memory, %lld blocks in %lld groups' "
+                     "stores (%lld tokens of each group), a slot one block of its group, rank 0's: "
+                     "%s; scratch reservation %s of VRAM (%lld pages for %lld decode rows, charged "
+                     "to the KV budget); window %lld tokens",
+                     humanb(store_bytes).c_str(), (long long)total_slots, (long long)n_groups,
+                     (long long)tokens, per_group.c_str(), humanb(scratch_bytes).c_str(),
+                     (long long)scratch_pages, (long long)ranks_[0]->kv.scratch_rows(),
+                     (long long)window_tokens);
+            /* The transfers (TierExec::issue_moves) on every rank, over the residency groups, and
+             * the pager's counter on each rank's card. A rank that cannot move the bytes would
+             * leave the store open and the window unenforced, which is worse than refusing the
+             * flag, so it stops the start. The scheduler's sweep and the engine's mover are
+             * installed in Engine::init once the scheduler exists (TierExec::sweep_blocks). */
+            std::vector<int32_t> rg;
+            for (int32_t g = 0; g < ranks_[0]->kv.n_groups(); ++g)
+                if (const KVGroupPlan* p = ranks_[0]->kv.plan(g); p && p->residency()) rg.push_back(g);
+            for (auto& r : ranks_) {
+                LogRank lr(r->index);
+                RAD_TRY(rad_dev_set(r->device));
+                const int rc = r->resx.configure(&rad_tools_registry(), &r->kv, &r->tiers, rg,
+                                                 TierExec::kMoveBatch, 1, 1,
+                                                 /*leader=*/&r == &ranks_[0], r->device, 0,
+                                                 /*shared=*/r->mover.transfer_stream());
+                int64_t* paged = rc == RAD_OK ? r->resx.paged_counter() : nullptr;
+                if (rc != RAD_OK || !paged) {
+                    RAD_ERR("kv residency: rank %d cannot move blocks between the pool and the "
+                            "store (%s). Pass --kv-residency-mib 0 to keep every block resident",
+                            r->index, rc != RAD_OK ? rad_strerror(rc) : "no memory for the pager's counter");
+                    return rc != RAD_OK ? rc : RAD_E_NOMEM;
+                }
+                r->kv.set_residency_paged(paged);
+                /* The page cache (docs/OPS.md `qsa_page`, `tags`): a scratch page keeps the block it
+                 * last received, so a step selecting it again copies nothing. Without its memory
+                 * the pager copies every cold entry, as before; RADIANCE_QSA_PAGE_CACHE=0 asks for
+                 * that (the A/B the cache's speed is measured against). */
+                static const char* pc = std::getenv("RADIANCE_QSA_PAGE_CACHE");
+                const int64_t tb = r->kv.residency_tags_bytes();
+                int32_t* tags = (pc && !std::strcmp(pc, "0")) ? nullptr : r->resx.page_tags(tb);
+                r->kv.set_residency_hits(r->resx.hits_counter());
+                r->kv.set_residency_tags(tags, tags ? tb : 0);
+                if (&r == &ranks_[0])
+                    RAD_INFO("kv residency: page cache %s (%s of VRAM for the slot tags of %lld "
+                             "scratch rows)",
+                             tags ? "on" : (pc && !std::strcmp(pc, "0") ? "off (RADIANCE_QSA_PAGE_CACHE=0)"
+                                                                      : "off (no memory)"),
+                             humanb(tags ? tb : 0).c_str(), (long long)r->kv.scratch_rows());
+            }
+            RAD_TRY(rad_dev_set(ranks_[0]->device));
+            RAD_INFO("kv residency: window enforced -- after a step, blocks outside the sink and "
+                     "the %lld-token tail leave the pool for the store, %d per batch and at most "
+                     "%s a rank per step; a prefill row promotes its sequence whole first",
+                     (long long)window_tokens, TierExec::kMoveBatch,
+                     humanb(TierExec::kSweepBytes).c_str());
+        }
+    }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(r->prefix.configure(cfg_, &r->kv, geo_.checkpoint_interval));
@@ -3632,6 +4094,20 @@ int Engine::configure_kv() {
     }
 
     RAD_INFO("kv: %s", ranks_[0]->kv.report().c_str());
+    /* A recipe's layers by layout, and what they buy: the least any trunk attention group holds,
+     * which is what a sequence can reach (the per-group lines above carry the rest). */
+    if (!cfg_.kv_recipe.empty()) {
+        const KVManager& kv = ranks_[0]->kv;
+        int64_t tokens = -1;
+        for (int32_t g = 0; g < kv.n_groups(); ++g) {
+            const KVGroupPlan* p = kv.plan(g);
+            if (!p || p->kind != RAD_KV_FULL || p->drafter || p->zero) continue;
+            const int64_t t = kv.total_blocks(g) * p->block_size;
+            if (tokens < 0 || t < tokens) tokens = t;
+        }
+        RAD_INFO("kv recipe %s: %s; the pool holds %lld tokens", cfg_.kv_recipe_path.c_str(),
+                 kv_recipe_summary(cfg_.kv_recipe).c_str(), (long long)tokens);
+    }
     kvstream_report(stream, stream_host, (int)ranks_.size());
     /* The prefix cache's report: on or off, groups covered and skipped. It names the two things
      * that silently disable caching on a hybrid model: a windowed group cannot be served a prefix,
@@ -3845,6 +4321,7 @@ int Engine::start() {
         /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
+        d.arch_pass_key = arch_pass_key_;
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
@@ -3890,10 +4367,15 @@ int Engine::start() {
                                 },
                                 &r->ctx));
         if (r->fstager.enabled() && r->index == 0)
-            RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
-                     "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+            RAD_INFO("file stager: it covers %zu routed layers (a pool-cached unit of one may "
+                     "be read from the container); each pass reads a layer's (up to %s) into one "
+                     "of two VRAM buffers before its first expert op, so every step is paced by the drive%s",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
+                     r->fstager.whole_rows() > 0
+                         ? fmt("; a pass of %lld tokens or more reads its layers whole, each "
+                               "while the card computes the one before",
+                               (long long)r->fstager.whole_rows()).c_str()
+                         : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);
@@ -4025,7 +4507,7 @@ int Engine::start() {
         }
         (void)rad_dev_set(ranks_[0]->device);
         if (ok) {
-            arena_rows_.push_back(cfg_.max_tok);
+            arena_rows_.push_back(step_tok(cfg_));
             for (const ArenaLevel& lv : ranks_[0]->arena_levels) arena_rows_.push_back(lv.rows);
             std::string lv;
             for (size_t k = 1; k < arena_rows_.size(); ++k)
@@ -4112,10 +4594,16 @@ int Engine::start() {
                      : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
+            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
+            const std::string fix = cfg_.gpu_memory_mib > 0
+                ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
+                      "for one.",
+                      (long long)(props.vram_bytes / MiB - need_head))
+                : fmt("Set --gpu-headroom-mib to at least %lld: what is left here rises with it "
+                      "one for one.", (long long)need_head);
             RAD_WARN("card %d settled at %s free against %s, which leaves %s for a kernel's first "
                      "launch to load its code object and size its scratch in -- under the %s this "
-                     "engine allows for its own. %s Set --gpu-headroom-mib to at least %lld: what "
-                     "is left here rises with it one for one.",
+                     "engine allows for its own. %s %s",
                      r->device, humanb(got).c_str(), asked.c_str(),
                      humanb(std::max<int64_t>(room, 0)).c_str(), humanb(allowance).c_str(),
                      got < want
@@ -4123,7 +4611,7 @@ int Engine::start() {
                                "another process on it or an allocation the budget does not "
                                "count.", humanb(want - got).c_str()).c_str()
                          : "",
-                     (long long)(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib));
+                     fix.c_str());
         } else if (got < want) {
             RAD_INFO("card %d settled at %s free against %s: %s of the headroom was taken after "
                      "the budget read the card, by another process on it or an allocation the "
@@ -4185,6 +4673,8 @@ int Engine::load_vocab() {
             return RAD_E_FORMAT;
         }
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), vs.h, vb));
+    } else if (meta_textless(rad_meta_gets(&meta_, "radiance.text", nullptr))) {
+        vocab_textless(vb);
     } else if (ckpt_->is_gguf()) {
         /* GGUF names its pre-tokeniser; the chain is reconstructed from the name or refused (a
          * container converted with --tokenizer bakes in the declared one). */

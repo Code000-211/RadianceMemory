@@ -222,6 +222,15 @@ void IdleTiers::drop_rooted(const BlockHash& key) {
 void IdleTiers::forget(const BlockHash& key) {
     std::lock_guard lk(mu_);
     drop_rooted(key);
+    drop_copy(key);
+}
+
+void IdleTiers::forget_copy(const BlockHash& key) {
+    std::lock_guard lk(mu_);
+    drop_copy(key);
+}
+
+void IdleTiers::drop_copy(const BlockHash& key) {
     auto it = recs_.find(key);
     if (it == recs_.end()) return;
     Rec& r = it->second;
@@ -536,7 +545,10 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
 static bool chain_extends(const std::vector<BlockHash>& shorter,
                           const std::vector<BlockHash>& longer) {
     if (shorter.size() > longer.size()) return false;
-    for (size_t i = 0; i < shorter.size(); ++i) if (shorter[i] != longer[i]) return false;
+    /* Hashes are chained, so the last block decides; it is compared first, and a chain that
+     * diverges anywhere rejects in one compare. */
+    if (!shorter.empty() && shorter.back() != longer[shorter.size() - 1]) return false;
+    for (size_t i = 0; i + 1 < shorter.size(); ++i) if (shorter[i] != longer[i]) return false;
     return true;
 }
 
@@ -546,7 +558,7 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
     std::lock_guard lk(mu_);
 
     /* A session is a leaf of the prefix trie. Each turn arrives under a new request id, so the
-     * candidates are the sessions sharing this root (a handful at most):
+     * candidates are the sessions sharing this root (at most kRootSessions):
      *
      *   - a chain this one extends is no longer a leaf and is absorbed;
      *   - a chain that extends this one means this is not a leaf either (a preempted request
@@ -590,6 +602,22 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
     s.chain = chain;
     s.label = std::move(kept_label);
     at_root.push_back(id);
+    /* Rows under one root are pruned only when the root block goes, and a prompt every request
+     * shares (a decision model's instructions) never goes: the list grew by a row a request and
+     * each insert walked it under the lock the engine threads take (#375: prefill from 9k to
+     * 2.5k tok/s after 500K requests). Past kRootSessions the least recently used row is
+     * dropped; a row is bookkeeping, so its blocks stay cached. */
+    if (at_root.size() > kRootSessions) {
+        uint64_t oldest = 0, oldest_ns = ~uint64_t{0};
+        for (uint64_t sid : at_root) {
+            auto it = sessions_.find(sid);
+            if (it != sessions_.end() && it->second.last_used_ns < oldest_ns) {
+                oldest_ns = it->second.last_used_ns;
+                oldest = sid;
+            }
+        }
+        if (oldest) drop_session(oldest);
+    }
 }
 
 void IdleTiers::drop_session(uint64_t id) {

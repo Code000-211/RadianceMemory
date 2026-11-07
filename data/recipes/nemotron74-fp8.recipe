@@ -1,0 +1,21 @@
+# nemotron74-fp8.recipe -- Nemotron-3.5-Bolt-74B-A9B (nemotron_h_omni) from its bf16 checkpoint: every
+# block linear and every routed expert as block fp8 (E4M3 codes, a bf16 scale a 128x128 tile); the
+# rest as the checkpoint holds it: dt's 128 rows of in_proj (32 a rank at four ranks, no whole scale
+# block), the convolution, A_log, dt_bias, D, the norms, the router (f32), the embedding and lm_head.
+#
+#   rad-convert <checkpoint> --recipe data/recipes/nemotron74-fp8.recipe -o nemotron74-fp8.rad
+#
+# It is the container the GPTQ calibration runs on (RADIANCE_CALIB_DIR; whole experts per rank,
+# RADIANCE_CALIB_LAYERS to split the per-expert Hessians over runs) and the fp8 reference for the
+# four-bit containers.
+
+blk.*.ssm_in_z.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_in_xbc.weight              rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_qkv.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_latent_in.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_latent_out.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_up_shexp.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_*_exps.*.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16

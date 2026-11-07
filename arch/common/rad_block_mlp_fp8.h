@@ -124,9 +124,9 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                swiglu_limit));
 
     /* The fold: decl_gated_fold (an fp8a8 tile) for block-fp8 weights, decl_gated_fold_mx for plain
-     * MXFP4 at one to 16 rows (eight where K is short). Other gate_up encodings (M2XFP4 included),
-     * and a clamped (swiglu_limit) product, take the pair. Over int8 codes only a host kernel would
-     * take it, which would pin the layer's weights to the host. */
+     * MXFP4 at one to 16 rows (eight where K is short), decl_gated_fold_iqr for an IQR weight
+     * whose input and output are the rotated int8 trunk's fed pairs, to 16 rows. Other gate_up
+     * encodings (M2XFP4 included), and a clamped (swiglu_limit) product, take the pair. */
     const bool fold_ok = swiglu_limit <= 0 && !gate_up.f32_scale;
     if (fold_ok && !gate_up.bf16 && !gate_up.mx && !gate_up.m2x && !gate_up.paro5 && !gate_up.w4 &&
         !gate_up.i8)
@@ -136,6 +136,14 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                        ? std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s, w.ffn.x }
                                        : std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s },
                                    &gated_rows, wide_fold);
+    else if (fold_ok && gate_up.iqr && w.h.q8_fed && w.h.q8_rot && w.ffn.q8_fed && w.ffn.q8_rot)
+        op_gated = decl_gated_fold_iqr(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
+                                       { w.h.q8, w.h.s8 },
+                                       gq_ffn.want_x
+                                           ? std::initializer_list<rad_buf>{ w.ffn.q8, w.ffn.s8,
+                                                                             w.ffn.x }
+                                           : std::initializer_list<rad_buf>{ w.ffn.q8, w.ffn.s8 },
+                                       &gated_rows);
     else if (fold_ok && gate_up.mx && !gate_up.paro)
         op_gated = decl_gated_fold_mx(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
                                       gate_up.wref, { w.h.q, w.h.s },
@@ -199,10 +207,11 @@ inline void MlpFP8::body(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
                     brow_slice(w.ffn.s, r0, rows, g.n_ff / RAD_FP8_BLOCK),
                     gq_ffn.want_x ? brow_slice(w.ffn.x, r0, rows, g.n_ff) : RAD_NONE);
     } else if (op_gated && rows <= gated_rows) {
-        RAD_ISSUE_N(c, op_gated, rows, brow_slice(w.h.q, r0, rows, g.n_embd),
-                    brow_slice(w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK), RAD_W(gate_up.w),
-                    RAD_W(gate_up.ws), brow_slice(w.ffn.q, r0, rows, g.n_ff),
-                    brow_slice(w.ffn.s, r0, rows, g.n_ff / RAD_FP8_BLOCK),
+        /* The fp8a8 fold's E4M3 pairs, or the IQR fold's int8 ones (cq / cs: the fed pair). */
+        RAD_ISSUE_N(c, op_gated, rows, brow_slice(w.h.cq(), r0, rows, g.n_embd),
+                    brow_slice(w.h.cs(), r0, rows, g.n_embd / RAD_FP8_BLOCK), RAD_W(gate_up.w),
+                    RAD_W(gate_up.ws), brow_slice(w.ffn.cq(), r0, rows, g.n_ff),
+                    brow_slice(w.ffn.cs(), r0, rows, g.n_ff / RAD_FP8_BLOCK),
                     gq_ffn.want_x ? brow_slice(w.ffn.x, r0, rows, g.n_ff) : RAD_NONE);
     } else {
         gate_up.step(c, w.h, w.gate_up, T, r0, rows);

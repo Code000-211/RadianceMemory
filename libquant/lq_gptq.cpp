@@ -181,6 +181,7 @@ struct Slot {
     std::mutex mu;
     bool done = false;
     Gram g;                          /* null = looked and found nothing */
+    std::vector<int32_t> order;      /* gptq_factor_ordered's column order */
 };
 
 struct Cache {
@@ -210,15 +211,32 @@ std::vector<int32_t> gptq_act_order(const char* dir, const char* name, int64_t K
     return perm;
 }
 
+namespace {
+Gram factor_impl(const char* dir, const char* name, int64_t K, int64_t domain, double damp,
+                 const int32_t* perm, std::vector<int32_t>* order);
+}  /* namespace */
+
 Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, double damp,
                  const int32_t* perm) {
+    return factor_impl(dir, name, K, domain, damp, perm, nullptr);
+}
+
+Gram gptq_factor_ordered(const char* dir, const char* name, int64_t K, int64_t domain, double damp,
+                         std::vector<int32_t>* order) {
+    return factor_impl(dir, name, K, domain, damp, nullptr, order);
+}
+
+namespace {
+Gram factor_impl(const char* dir, const char* name, int64_t K, int64_t domain, double damp,
+                 const int32_t* perm, std::vector<int32_t>* order) {
     if (!dir || !*dir || !name || !*name || K <= 0) return nullptr;
     const std::string stem = calib_resolve(dir, name, K);
     const bool layer = stem == calib_stem(name);
     char dk[32];
     std::snprintf(dk, sizeof dk, "%.17g", damp);
     const std::string key = std::string(dir) + "|" + stem + "|" + std::to_string(K) + "|" +
-                            std::to_string(domain) + "|" + dk + (perm ? "|act" : "");
+                            std::to_string(domain) + "|" + dk + (perm ? "|act" : "") +
+                            (order ? "|ord" : "");
 
     /* A layer's factor is shared by its experts, so it is built once and cached, under a lock of
      * its own: weights quantised side by side (rad-convert --gpus) factor different layers at
@@ -246,15 +264,23 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
             slot = it->second;
         }
         lk = std::unique_lock<std::mutex>(slot->mu);
-        if (slot->done) return slot->g;
+        if (slot->done) {
+            if (order) *order = slot->order;
+            return slot->g;
+        }
     }
     auto keep = [&](Gram u) {
         if (slot) {
             slot->g = u;
             slot->done = true;
+            if (order) slot->order = *order;
         }
         return u;
     };
+    if (order) {
+        order->resize((size_t)K);
+        for (int64_t i = 0; i < K; ++i) (*order)[(size_t)i] = (int32_t)i;
+    }
 
     std::vector<double> acc;
     const int found = calib_sum(dir, stem, K, domain, &acc);
@@ -262,6 +288,14 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
         std::fprintf(stderr, "libquant: no calibration for '%s' in %s (looked for gram.r*.%s.bin); "
                              "rounding it to nearest\n", name, dir, stem.c_str());
         return keep(nullptr);
+    }
+    /* gptq_factor_ordered: the order from the same sum (gptq_act_order's: descending diagonal,
+     * ties in column order), read once for both. */
+    if (order) {
+        std::stable_sort(order->begin(), order->end(), [&](int32_t x, int32_t y) {
+            return acc[(size_t)x * (size_t)K + (size_t)x] > acc[(size_t)y * (size_t)K + (size_t)y];
+        });
+        perm = order->data();
     }
     /* Under act order the factor is of P H P^T, since the recursion runs over columns in
      * quantisation order. */
@@ -323,6 +357,7 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
                              "K=%lld\n", stem.c_str(), found, (long long)K);
     return keep(u);
 }
+}  /* namespace */
 
 void gptq_tcq_dyn_scales(const Grid& g, const float* w, int64_t K, Scales& scales, int64_t r0,
                          int64_t r1, int64_t b0, int64_t b1) {
@@ -483,6 +518,16 @@ int gptq_quantise(const Grid& g, float* w, int32_t* codes, Scales& scales, int64
         gptq_tcq_colf(w, scales, N, K);
     }
     if (g.tcq_L) {
+        /* Only the last run can be short, and one shorter than a state's codes cannot hold its
+         * seam: the decoder refuses it (grid_tcq_decode), so the encoder does too. */
+        const int64_t c = (g.tcq_L + g.tcq_k - 1) / g.tcq_k;
+        if (N > 0 && N - (N - 1) / g.tcq_rows * g.tcq_rows < c) {
+            if (why) *why = "the last trellis run is " +
+                            std::to_string(N - (N - 1) / g.tcq_rows * g.tcq_rows) + " row(s) of " +
+                            std::to_string(N) + " (tcq_rows " + std::to_string(g.tcq_rows) +
+                            "), shorter than the " + std::to_string(c) + " a seam state needs";
+            return RAD_E_SHAPE;
+        }
         if (gpu_enabled()) {
             std::string w1;
             const int st = gptq_tcq_gpu(g, w, codes, scales, N, K, u, dynamic, &w1);
@@ -612,6 +657,35 @@ void gptq_tcq_refine(const Grid& g, const float* x, float* w, int32_t* codes, co
     }
 }
 }  /* namespace */
+
+void gptq_rescale_rows(const float* x, float* w, Scales& scales, int64_t N, int64_t K,
+                       const float* h) {
+    if (!x || !w || !h || N <= 0 || K <= 0 || scales.nc != 1 || scales.br != 1) return;
+    std::vector<float> hx((size_t)(N * K)), hw((size_t)(N * K));
+    mat_hess(x, N, K, h, hx.data());
+    mat_hess(w, N, K, h, hw.data());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t n = 0; n < N; ++n) {
+        float* wr = w + (size_t)(n * K);
+        const float* xr = hx.data() + (size_t)(n * K);
+        const float* qr = hw.data() + (size_t)(n * K);
+        double num = 0.0, den = 0.0;
+        for (int64_t j = 0; j < K; ++j) {
+            num += (double)wr[j] * xr[j];
+            den += (double)wr[j] * qr[j];
+        }
+        if (!(num > 0.0) || !(den > 0.0)) continue;
+        const float a = (float)(num / den);
+        BlockScale& b = scales.b[(size_t)n];
+        b.s *= a;
+        b.stored *= a;
+        b.inv = 1.0f / b.s;
+        b.inv_d = 1.0 / (double)b.s;
+        for (int64_t j = 0; j < K; ++j) wr[j] *= a;
+    }
+}
 
 void gptq_refine(const Grid& g, const float* x, float* w, int32_t* codes, const Scales& scales,
                  int64_t N, int64_t K, const float* h, double damp, int passes) {

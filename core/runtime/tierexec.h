@@ -120,6 +120,89 @@ public:
      * off-device or already has work outstanding. */
     bool plan_promote(const BlockHash& key, TierJob* out);           /* leader only */
 
+    /* ---------------- window residency (spec §7.3) ----------------
+     *
+     * Moves one group's blocks between the pool and the manager's pinned store. `to_host` packs them
+     * out of the pool with gather_rows and writes their slots; the reverse copies the slots in and
+     * scatters them back, then makes `compute` wait -- the step that follows reads them.
+     *
+     * One group a call, up to kMoveBatch blocks. Both directions run on the transfer stream, so a
+     * promotion always sees what the demotion before it wrote. The caller owns the order: a demote
+     * belongs after the step that wrote the blocks, a promote before the step that reads them.
+     *
+     * A block the manager has no slot for is refused rather than half-moved: a promotion into a
+     * block the sequence no longer holds would serve another sequence's bytes.
+     *
+     * A tiered group (KVGroupPlan::tiered, RAD_KVQ_DEMOTE) is requantised on the card between the
+     * gather and the copy out (`kv_transcode` into the demote layout) and expanded between the
+     * copy in and the scatter, so the slot holds the narrower bytes and the pool only ever the
+     * resident layout. Under the emulation (KVManager::residency_emulate) a demotion names no
+     * slot (host_slot -1) and is that round trip in place: gather, both transcodes, scatter into
+     * the same blocks, no copy; an untiered group's round trip is no change and moves nothing.
+     *
+     * Every demotion, the emulation's too, makes `compute` wait for it before the steps that
+     * follow: they read the block as cold through the pager (or, emulated, its new bytes), and a
+     * pager reading a slot the copy has not finished filling would serve stale bytes. Steps
+     * issued before it already ran past the block, which it waited for. */
+    static constexpr int kMoveBatch = 16;
+    /* Block indices the staging ring holds (move_idx_host_): 64 batches. A run of batches issued
+     * once everything before it has landed starts the ring over, so a run of at most this many
+     * blocks never waits on the host for a wrap (MoveStats::idx_syncs). */
+    static constexpr int64_t kMoveIdxCap = 64 * kMoveBatch;
+    /* What one residency sweep may move, per rank: the blocks of `block_bytes` (a rank's share of
+     * one block in the store, KVManager::residency_block_bytes) in kSweepBytes, at least four
+     * batches and at most the index ring, so a sweep never waits on the host.
+     *
+     * 32 MiB is about 1.5 ms of a PCIe 4.0 x16 link (~22 GB/s), each rank on its own: a demotion
+     * runs on the transfer stream after the step already queued and only the step after it waits
+     * for it (issue_moves), so a copy well under one decode step is hidden behind it. On
+     * Flash-Next at --tp 2 a rank's fp8 block is 13 x 2 KiB = 26 KiB, which the ring caps at 1 024
+     * blocks (26 MiB, 4 096 tokens) a sweep: a 128K-token middle (~31K blocks) drains in ~31
+     * sweeps instead of ~490 at the old fixed 64. The host pays ~30 async calls a batch (the index
+     * upload, n_layers gathers, one copy a block), ~2 K a sweep and rank. */
+    static constexpr int64_t kSweepBytes = (int64_t)32 << 20;
+    static constexpr int64_t sweep_blocks(int64_t block_bytes) {
+        const int64_t n = block_bytes > 0 ? kSweepBytes / block_bytes : kMoveIdxCap;
+        return n < 4 * kMoveBatch ? 4 * kMoveBatch : n > kMoveIdxCap ? kMoveIdxCap : n;
+    }
+    int  issue_moves(const std::vector<BlockMove>& moves, RadStream compute, bool to_host);
+    /* idx_syncs: host waits for the index ring's wrap (a run longer than the ring, or one issued
+     * while an earlier one is still in flight). */
+    struct MoveStats { int64_t out_blocks = 0, in_blocks = 0, out_bytes = 0, in_bytes = 0, idx_syncs = 0; };
+    const MoveStats& move_stats() const { return mv_; }
+    /* Whether every move issued so far has landed: a poll of one event, no host sync. 1 when
+     * landed (or nothing was issued), 0 while in flight, < 0 when the transfer failed. A failure
+     * is never landed: the caller's tables name the slots and blocks those copies were to fill,
+     * and reporting them landed would free a demoted block (its slot never written) or keep a
+     * promoted block whose bytes never arrived -- either way a later step reads what another
+     * sequence left there as its own history. */
+    int  moves_state() const;
+    bool moves_landed() const { return moves_state() == 1; }
+    /* Waits on the host for everything queued on the transfer stream: after a failed
+     * issue_moves(), before the caller puts the tables back and hands the blocks to someone else,
+     * so no copy a failed batch had already queued can still write them. */
+    int  moves_drain();
+    /* Only the leader's manager holds the move records (rank 0 hands out slot ids and blocks); a
+     * follower carries out the same list into its own shard and has nothing to check it against. */
+
+    /* ---------------- the pager's counter ----------------
+     *
+     * One int64 on this rank's card that `qsa_page` adds the cold entries it rewrote to
+     * (RadKVGroupBatch::residency_paged). Allocated by the first call, zeroed, and never moved, so
+     * the batch can carry its address from the start. null when the card has no memory for it.
+     * paged_in() reads it back with one small copy on the transfer stream and waits for that copy
+     * only -- never for the step -- so it belongs on a statistics poll, not on the step path. */
+    int64_t* paged_counter();
+    int64_t  paged_in();
+    /* The page cache's: its hit counter, the int64 after paged_counter() (allocated, zeroed and read
+     * back with it; RadKVGroupBatch::residency_hits), and its tag planes, `bytes` of zeroed device
+     * memory allocated by the first call and never moved (null when the card has none, or bytes
+     * <= 0). */
+    int64_t* hits_counter() { int64_t* p = paged_counter(); return p ? p + 1 : nullptr; }
+    int64_t  hits_in();
+    int32_t* page_tags(int64_t bytes);
+
+
     /* ---------------- RADIANCE_DEBUG_TIER_VERIFY, the replicated window ----------------
      *
      * A replicated group's bytes are the plugin's claim. Under the variable a follower gathers the
@@ -157,6 +240,11 @@ private:
          * window; a follower gathers it only to verify, and scatters it on every restore. */
         bool     replicated = false;
         Resolved gather, scatter;
+        /* A tiered residency group (KVGroupPlan::tiered): `kv_transcode` into the store's layout
+         * and back, one layer's fragment of a slot `sfrag` bytes, `rows` (token, head) rows of
+         * `rf` bytes in the pool and `rt` in the store. Unresolved for any other group. */
+        Resolved to_store, to_pool;
+        int64_t  sfrag = 0, rows = 0, rf = 0, rt = 0;
     };
 
     /* Builds the staging and index buffers, events and transfer stream lazily on the first pass
@@ -170,8 +258,12 @@ private:
      * checked here, where the job can still be refused. */
     bool blocks_backed(const std::vector<int32_t>& blocks, const char* what);
     void warn_once(const char* what, int st);
+    /* One launch per (group, layer). `pitch` is the staging stride between consecutive jobs:
+     * one cache entry for the idle tiers, one block for a residency move. `stage_off` is where
+     * this group's bytes start inside a job's staging slot. */
     int  run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int64_t layer,
-                  void* stage_base, const int32_t* d_idx, int64_t n_jobs);
+                  void* stage_base, const int32_t* d_idx, int64_t n_jobs,
+                  int64_t pitch, int64_t stage_off);
     /* One strided copy per window per run of consecutive arena slots, `n` entries starting at job
      * `first` of `order`. To host when `out` (the replicated window from the leader only), from
      * host otherwise. */
@@ -227,6 +319,11 @@ private:
     RadEvent  ev_compute_ = nullptr;  /* the compute stream, as a copy out found it */
     RadEvent  ev_copy_ = nullptr;     /* the last copy out, landed */
     RadEvent  ev_restore_ = nullptr;  /* the last restore, landed */
+    RadEvent  ev_move_ = nullptr;     /* the last residency move, either direction, landed */
+    bool      moved_ = false;         /* a move was recorded on ev_move_ */
+    int64_t*  paged_dev_ = nullptr;   /* paged_counter(), device */
+    int64_t*  paged_host_ = nullptr;  /* its readback target, pinned */
+    int32_t*  tags_dev_ = nullptr;    /* page_tags(), device */
     bool      copy_out_ = false;
     /* Transfer stream. Each stream costs a hardware queue, and a fourth queue costs this card 65% of
      * its decode step, so the tier borrows the expert mover's maintenance stream
@@ -244,6 +341,23 @@ private:
      * window, above. A copy out is hashed once landed (first seen by copy_state). */
     bool      verify_ = false;
     bool      verify_rep_ = false;    /* a follower gathering the replicated groups to verify */
+    /* Residency staging (issue_moves): one batch of one group's blocks, both directions, plus the
+     * block indices it gathers with. Allocated with the rest of the device state and only when some
+     * group declares a residency window, so a server that never moves a block pays nothing. */
+    void*     move_stage_ = nullptr;
+    /* A tiered group's blocks in the store's layout, between the transcode and the copy. */
+    void*     move_stage2_ = nullptr;
+    /* One `kv_transcode` launch over `rows` contiguous rows of `src` into `dst`. */
+    int       run_xc(const Resolved& r, const void* src, int64_t src_row, void* dst, int64_t dst_row,
+                     int64_t rows);
+    /* Pinned, kMoveIdxCap entries used as a ring: the upload is a kernel reading host memory when
+     * the transfer stream reaches it, which is after the compute it waits for, so a batch issued
+     * later in the same sweep must not overwrite the indices of one not yet uploaded. */
+    int32_t*  move_idx_host_ = nullptr;
+    int64_t   move_idx_off_ = 0;      /* the next free entry of move_idx_host_ */
+    int32_t*  move_idx_dev_ = nullptr;
+    int64_t   move_bytes_ = 0;      /* bytes one block of the widest residency group takes */
+    MoveStats mv_;
     std::unordered_map<BlockHash, uint64_t, BlockHashHash> out_sum_;
     std::unordered_map<BlockHash, uint64_t, BlockHashHash> rep_sum_;   /* follower */
     struct VerifyNote { BlockHash key; int32_t host_slot = -1; int64_t ord = -1; };

@@ -61,6 +61,30 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
             close();
             return RAD_E_UNSUPPORTED;
         }
+        /* A tiered residency group: the two transcodes, at a batch's rows. */
+        if (p->residency() && p->tiered()) {
+            gi.sfrag = p->residency_frag();
+            gi.rf = kv_layout_row_bytes(p->res_from, p->res_head_dim);
+            gi.rt = kv_layout_row_bytes(p->res_to, p->res_head_dim);
+            gi.rows = gi.rf > 0 ? gi.frag / gi.rf : 0;
+            Geometry x;
+            x.set_i("M", (int64_t)kMoveBatch * gi.n_layers * gi.rows);
+            x.set_i("head_dim", p->res_head_dim);
+            x.set_s("from", kv_layout_name(p->res_from));
+            x.set_s("to", kv_layout_name(p->res_to));
+            gi.to_store = reg->resolve("kv_transcode", x, RAD_DOMAIN_DEVICE);
+            x.set_s("from", kv_layout_name(p->res_to));
+            x.set_s("to", kv_layout_name(p->res_from));
+            gi.to_pool = reg->resolve("kv_transcode", x, RAD_DOMAIN_DEVICE);
+            if (!gi.to_store || !gi.to_pool || gi.rows <= 0) {
+                RAD_WARN("kv residency: no device kv_transcode between %s and %s at head_dim %lld "
+                         "for group %d, so its blocks cannot be stored in the demote layout",
+                         kv_layout_name(p->res_from), kv_layout_name(p->res_to),
+                         (long long)p->res_head_dim, (int)g);
+                close();
+                return RAD_E_UNSUPPORTED;
+            }
+        }
         gi_.push_back(gi);
     }
     if (gi_.empty()) return RAD_E_UNSUPPORTED;
@@ -192,6 +216,9 @@ void TierExec::close() {
     if (stream_ && own_stream_) rad_stream_destroy(stream_);
     stream_ = nullptr; shared_ = nullptr; own_stream_ = false;
     release_device();
+    if (paged_dev_)  { (void)rad_dev_set(device_); rad_dev_free(paged_dev_, RAD_MEM_DEVICE); paged_dev_ = nullptr; }
+    if (paged_host_) { rad_dev_free(paged_host_, RAD_MEM_HOST_PINNED); paged_host_ = nullptr; }
+    if (tags_dev_)   { (void)rad_dev_set(device_); rad_dev_free(tags_dev_, RAD_MEM_DEVICE); tags_dev_ = nullptr; }
     copy_out_ = false;
     gi_.clear();
     order_.clear();
@@ -212,6 +239,11 @@ void TierExec::release_device() {
     if (idx_dev_)  { rad_dev_free(idx_dev_, RAD_MEM_DEVICE); idx_dev_ = nullptr; }
     if (idx_host_) { rad_dev_free(idx_host_, RAD_MEM_HOST_PINNED); idx_host_ = nullptr; }
     if (vrep_)     { rad_dev_free(vrep_, RAD_MEM_HOST_PINNED); vrep_ = nullptr; }
+    if (move_stage_)    { rad_dev_free(move_stage_, RAD_MEM_DEVICE); move_stage_ = nullptr; }
+    if (move_stage2_)   { rad_dev_free(move_stage2_, RAD_MEM_DEVICE); move_stage2_ = nullptr; }
+    if (move_idx_dev_)  { rad_dev_free(move_idx_dev_, RAD_MEM_DEVICE); move_idx_dev_ = nullptr; }
+    if (move_idx_host_) { rad_dev_free(move_idx_host_, RAD_MEM_HOST_PINNED); move_idx_host_ = nullptr; }
+    move_bytes_ = 0;
     for (int i = 0; i < kRing; ++i) {
         if (ring_ev_[i]) rad_event_destroy(ring_ev_[i]);
         ring_ev_[i] = nullptr;
@@ -220,6 +252,8 @@ void TierExec::release_device() {
     if (ev_compute_) { rad_event_destroy(ev_compute_); ev_compute_ = nullptr; }
     if (ev_copy_)    { rad_event_destroy(ev_copy_);    ev_copy_ = nullptr; }
     if (ev_restore_) { rad_event_destroy(ev_restore_); ev_restore_ = nullptr; }
+    if (ev_move_)    { rad_event_destroy(ev_move_);    ev_move_ = nullptr; }
+    moved_ = false;
 }
 
 /* Builds the device side on first use, never at bringup (same rule as Ctx::lane_init()). Built
@@ -238,7 +272,7 @@ int TierExec::device_init() {
     idx_dev_  = (int32_t*)rad_dev_alloc(idx_n * (int64_t)sizeof(int32_t), RAD_MEM_DEVICE);
     idx_host_ = (int32_t*)rad_dev_alloc(idx_n * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
     bool ev = rad_event_create(&ev_compute_) == RAD_OK && rad_event_create(&ev_copy_) == RAD_OK &&
-              rad_event_create(&ev_restore_) == RAD_OK;
+              rad_event_create(&ev_restore_) == RAD_OK && rad_event_create(&ev_move_) == RAD_OK;
     for (int i = 0; i < kRing && ev; ++i) ev = rad_event_create(&ring_ev_[i]) == RAD_OK;
     /* The verify scratch is a diagnostic's: without it the replicated groups go unchecked, and
      * the tiers run as they would without RADIANCE_DEBUG_TIER_VERIFY. */
@@ -254,6 +288,28 @@ int TierExec::device_init() {
     if (!stage_ || !idx_dev_ || !idx_host_ || !ev) {
         release_device();
         return RAD_E_NOMEM;
+    }
+    /* Residency staging, only when a group declares a window (spec §7.3). One block of the widest
+     * such group, a batch of them, and the indices to gather with: nothing here is touched by the
+     * idle tiers, so the two paths cannot share a buffer by accident. */
+    for (const GroupInfo& x : gi_)
+        if (!x.zero && kv_->plan(x.g) && kv_->plan(x.g)->residency())
+            move_bytes_ = std::max(move_bytes_, x.n_layers * x.frag);
+    if (move_bytes_ > 0) {
+        move_stage_    = rad_dev_alloc((int64_t)kMoveBatch * move_bytes_, RAD_MEM_DEVICE);
+        move_idx_dev_  = (int32_t*)rad_dev_alloc((int64_t)kMoveBatch * sizeof(int32_t), RAD_MEM_DEVICE);
+        move_idx_host_ = (int32_t*)rad_dev_alloc(kMoveIdxCap * (int64_t)sizeof(int32_t),
+                                                 RAD_MEM_HOST_PINNED);
+        move_idx_off_  = 0;
+        if (!move_stage_ || !move_idx_dev_ || !move_idx_host_) { release_device(); return RAD_E_NOMEM; }
+        int64_t sbytes = 0;
+        for (const GroupInfo& x : gi_)
+            if (!x.zero && x.to_store) sbytes = std::max(sbytes, x.n_layers * x.sfrag);
+        if (sbytes > 0 &&
+            !(move_stage2_ = rad_dev_alloc((int64_t)kMoveBatch * sbytes, RAD_MEM_DEVICE))) {
+            release_device();
+            return RAD_E_NOMEM;
+        }
     }
     /* Borrow the mover's maintenance stream if there is one; both move bytes nobody waits for,
      * and a fourth hardware queue costs about 13 ms per decode step. Never the step's own
@@ -274,7 +330,8 @@ int TierExec::device_init() {
 /* One (group, layer) launch. Staging rows are at stride entry_bytes_ from `stage_base` (the first
  * entry's slot), so each fragment lands inside its own contiguous staging entry. */
 int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int64_t layer,
-                       void* stage_base, const int32_t* d_idx, int64_t n_jobs) {
+                       void* stage_base, const int32_t* d_idx, int64_t n_jobs,
+                       int64_t pitch, int64_t stage_off) {
     RadTensor pool{};
     pool.dtype = RAD_U8;
     pool.rank = 2;
@@ -291,9 +348,9 @@ int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int
     pack.dtype = RAD_U8;
     pack.rank = 2;
     pack.shape[0] = n_jobs;      pack.shape[1] = gi.frag;
-    pack.stride[0] = entry_bytes_;   /* one entry's stride, not one row's */
+    pack.stride[0] = pitch;          /* one entry's stride, not one row's */
     pack.stride[1] = 1;
-    pack.data = (char*)stage_base + gi.off + layer * gi.frag;
+    pack.data = (char*)stage_base + stage_off + layer * gi.frag;
 
     RadTensor t3[3];
     if (scatter) { t3[0] = pack; t3[1] = idx; t3[2] = pool; }
@@ -303,6 +360,26 @@ int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int
      * band's upper bound; kernels take the row count from the operand extent. */
     RadArgs a{};
     a.t = t3; a.n_t = 3;
+    a.p = r.geom.params(); a.n_p = r.geom.n_params();
+    a.instance = r.instance;
+    return r.row->info->launch(&a, stream_);
+}
+
+int TierExec::run_xc(const Resolved& r, const void* src, int64_t src_row, void* dst,
+                     int64_t dst_row, int64_t rows) {
+    RadTensor t2[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        t2[i].dtype = RAD_U8;
+        t2[i].rank = 2;
+        t2[i].shape[0] = rows;
+        t2[i].shape[1] = i ? dst_row : src_row;
+        t2[i].stride[0] = t2[i].shape[1];
+        t2[i].stride[1] = 1;
+    }
+    t2[0].data = (void*)src;
+    t2[1].data = dst;
+    RadArgs a{};
+    a.t = t2; a.n_t = 2;
     a.p = r.geom.params(); a.n_p = r.geom.n_params();
     a.instance = r.instance;
     return r.row->info->launch(&a, stream_);
@@ -476,7 +553,8 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
             for (size_t gidx = 0; gidx < gi_.size(); ++gidx)
                 for (int64_t l = 0; l < gi_[gidx].n_layers && gathers(gi_[gidx]); ++l)
                     TIER_TRY(run_rows(gi_[gidx].gather, /*scatter=*/false, gi_[gidx], l, stage_,
-                                      idx_dev_ + (int64_t)gidx * n + s, c),
+                                      idx_dev_ + (int64_t)gidx * n + s, c, entry_bytes_,
+                                      gi_[gidx].off),
                              "the gather out of the pool");
             TIER_TRY(copy_runs(order_, (size_t)s, c, /*out=*/true), "the copy to host memory");
         }
@@ -497,6 +575,217 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
     }
     return RAD_OK;
 }
+/* Window residency transfers (spec §7.3). Same split as everywhere else in this file: the manager
+ * names the blocks and holds the cold/resident bit, this runs the bytes.
+ *
+ * A demotion is ordered after the step that wrote the blocks (`compute`), so the gather reads what
+ * the kernels wrote. A promotion is ordered on the transfer stream and then made a dependency of
+ * `compute`, so the step that reads those blocks runs after they land -- the only wait this costs,
+ * and it is the step's own, not the host's. */
+int TierExec::issue_moves(const std::vector<BlockMove>& moves, RadStream compute, bool to_host) {
+    if (moves.empty()) return RAD_OK;
+    if (!enabled_ || !kv_) return RAD_E_STATE;
+    if ((int64_t)moves.size() > kMoveBatch) return RAD_E_INVAL;
+    const int32_t g = moves[0].group;
+    for (const BlockMove& m : moves)
+        if (m.group != g || m.block < 0) return RAD_E_INVAL;
+    const GroupInfo* gi = nullptr;
+    for (const GroupInfo& x : gi_) if (x.g == g) gi = &x;
+    if (!gi) return RAD_E_INVAL;
+    /* A rank that keeps no cache for this group (rad_kv_group_zero) has no bytes of the block to
+     * move: the other ranks' shards still go, and this one is done. */
+    if (gi->zero) return RAD_OK;
+    if (RAD_OK != device_init()) return RAD_E_DEVICE;
+    if (!move_stage_ || move_bytes_ <= 0) return RAD_E_INVAL;
+    /* Every id must be a block of this group's carve: a gather over an unbacked id faults the
+     * whole card, and a scatter into one overwrites expert weights in use. */
+    std::vector<int32_t> ids;
+    ids.reserve(moves.size());
+    for (const BlockMove& m : moves) ids.push_back(m.block);
+    if (!blocks_backed(ids, to_host ? "residency demote" : "residency promote")) return RAD_E_STATE;
+    /* A move is one the manager handed out in this direction and has not yet been told landed
+     * (a demote still holds its pool block; a promote still holds its slot); anything else is a
+     * caller that reordered or invented its list. */
+    /* The emulation's demotions name no slot: the leader holds each block's mark instead. */
+    const bool emul = to_host && kv_->residency_emulating();
+    for (const BlockMove& m : moves)
+        if (emul ? m.host_slot != -1 || (leader_ && !kv_->residency_emulated(g, m.block))
+                 : m.host_slot < 0 || (leader_ && !kv_->residency_move_pending(m, to_host)))
+            return RAD_E_STATE;
+    if (to_host ? !gi->gather.row : !gi->scatter.row) return RAD_E_NOKERNEL;
+    const bool tiered = gi->to_store && gi->to_pool && move_stage2_;
+    if (emul && !tiered) return RAD_OK;            /* a round trip through the same bytes */
+
+    const int64_t n = (int64_t)moves.size();
+    const int64_t blk = gi->n_layers * gi->frag;
+    /* What a slot holds of the group's block: the demote layout's rows when tiered. */
+    const int64_t sblk = tiered ? gi->n_layers * gi->sfrag : blk;
+    const int64_t rows = n * gi->n_layers * gi->rows;   /* every staged row, tiered */
+    if (blk > move_bytes_) return RAD_E_INVAL;
+
+    /* Both directions after everything compute had been given when this was issued. A demotion
+     * reads blocks the steps wrote. A promotion writes into a block the pool just handed out, and
+     * a step issued ahead may still read that block under its previous owner -- a block freed
+     * when its demotion landed, or a re-pointed one freed at once -- so the write must not overtake
+     * those reads. A stream wait, not a host sync. */
+    if (compute) {
+        TIER_TRY(rad_event_record(ev_compute_, compute), "ordering the move after the steps");
+        TIER_TRY(rad_event_wait(stream_, ev_compute_), "ordering the move after the steps");
+    }
+
+    /* Each batch its own entries (see move_idx_host_): the engine issues a sweep's batches back to
+     * back, and with one shared buffer every batch queued behind a busy compute stream gathered the
+     * last batch's blocks. Once every earlier move has landed (one event query) no upload is
+     * queued, so the ring starts over: a sweep goes out only once the last one landed, so one of
+     * up to kMoveIdxCap blocks never wraps. Without this a sweep of that size starting part way
+     * round would wait here, on the host, for the step its copies are queued behind. A wrap that
+     * is still needed (a longer run: a promotion of a whole middle) waits for the uploads queued. */
+    if (move_idx_off_ > 0 && moves_landed()) move_idx_off_ = 0;
+    if (move_idx_off_ + n > kMoveIdxCap) {
+        TIER_TRY(rad_stream_sync(stream_), "reusing the residency block indices");
+        move_idx_off_ = 0;
+        ++mv_.idx_syncs;
+    }
+    int32_t* idx_host = move_idx_host_ + move_idx_off_;
+    move_idx_off_ += n;
+    for (int64_t i = 0; i < n; ++i) idx_host[i] = moves[(size_t)i].block;
+    TIER_TRY(rad_memcpy_async(move_idx_dev_, idx_host, n * (int64_t)sizeof(int32_t), stream_),
+             "the residency block-index upload");
+
+    if (to_host) {
+        for (int64_t l = 0; l < gi->n_layers; ++l)
+            TIER_TRY(run_rows(gi->gather, /*scatter=*/false, *gi, l, move_stage_, move_idx_dev_, n,
+                              blk, /*stage_off=*/0),
+                     "the residency gather out of the pool");
+        /* The staged blocks are back to back, each its layers' fragments, so the stage is one
+         * plane of rows in either layout. */
+        if (tiered)
+            TIER_TRY(run_xc(gi->to_store, move_stage_, gi->rf, move_stage2_, gi->rt, rows),
+                     "the residency requantise into the demote layout");
+        if (emul) {
+            TIER_TRY(run_xc(gi->to_pool, move_stage2_, gi->rt, move_stage_, gi->rf, rows),
+                     "the emulated expand back into the resident layout");
+            for (int64_t l = 0; l < gi->n_layers; ++l)
+                TIER_TRY(run_rows(gi->scatter, /*scatter=*/true, *gi, l, move_stage_,
+                                  move_idx_dev_, n, blk, /*stage_off=*/0),
+                         "the emulated round trip back into the pool");
+        } else {
+            const char* out = tiered ? (const char*)move_stage2_ : (const char*)move_stage_;
+            for (int64_t i = 0; i < n; ++i) {
+                void* host = kv_->residency_slot_ptr(g, moves[(size_t)i].host_slot);
+                if (!host) return RAD_E_STATE;
+                TIER_TRY(rad_memcpy_async(host, out + i * sblk, sblk, stream_),
+                         "the residency copy to host memory");
+            }
+            mv_.out_blocks += n;
+            mv_.out_bytes  += n * sblk;
+        }
+        /* The steps after this read the demoted blocks through the pager (or the emulation's new
+         * bytes in place), so they wait for it (see the header). */
+        TIER_TRY(rad_event_record(ev_restore_, stream_), "marking the residency demotion");
+        if (compute) {
+            TIER_TRY(rad_event_wait(compute, ev_restore_),
+                     "ordering the next step after the residency demotion");
+        }
+    } else {
+        char* in = tiered ? (char*)move_stage2_ : (char*)move_stage_;
+        for (int64_t i = 0; i < n; ++i) {
+            const void* host = kv_->residency_slot_ptr(g, moves[(size_t)i].host_slot);
+            if (!host) return RAD_E_STATE;
+            TIER_TRY(rad_memcpy_async(in + i * sblk, host, sblk, stream_),
+                     "the residency copy out of host memory");
+        }
+        if (tiered)
+            TIER_TRY(run_xc(gi->to_pool, move_stage2_, gi->rt, move_stage_, gi->rf, rows),
+                     "the residency expand into the resident layout");
+        for (int64_t l = 0; l < gi->n_layers; ++l)
+            TIER_TRY(run_rows(gi->scatter, /*scatter=*/true, *gi, l, move_stage_, move_idx_dev_, n,
+                              blk, /*stage_off=*/0),
+                     "the residency scatter into the pool");
+        /* The step that follows reads these blocks: it waits for them, not for the host. */
+        TIER_TRY(rad_event_record(ev_restore_, stream_), "marking the residency restore");
+        if (compute) {
+            TIER_TRY(rad_event_wait(compute, ev_restore_),
+                     "ordering the step after the residency restore");
+        }
+        mv_.in_blocks += n;
+        mv_.in_bytes  += n * sblk;
+    }
+    /* Last, so the event covers the whole batch on the transfer stream, in either direction. */
+    TIER_TRY(rad_event_record(ev_move_, stream_), "marking the residency move");
+    moved_ = true;
+    ++st_.passes;
+    return RAD_OK;
+}
+
+int TierExec::moves_state() const {
+    if (!moved_ || !ev_move_) return 1;
+    const int q = rad_event_query(ev_move_);
+    return q < 0 ? q : q != 0 ? 1 : 0;
+}
+
+int TierExec::moves_drain() {
+    if (!stream_) return RAD_OK;
+    TIER_TRY(rad_stream_sync(stream_), "draining the residency transfers of a failed batch");
+    return RAD_OK;
+}
+
+int64_t* TierExec::paged_counter() {
+    if (paged_dev_) return paged_dev_;
+    if (rad_dev_set(device_) != RAD_OK) return nullptr;
+    /* [0] the entries the pager rewrote, [1] those of them the page cache served. */
+    paged_dev_  = (int64_t*)rad_dev_alloc(2 * sizeof(int64_t), RAD_MEM_DEVICE);
+    paged_host_ = (int64_t*)rad_dev_alloc(2 * sizeof(int64_t), RAD_MEM_HOST_PINNED);
+    /* Zeroed on a stream of its own, once: no stream exists yet (device_init is lazy), and the
+     * default stream is not valid on every backend. */
+    RadStream zs = nullptr;
+    const bool zeroed = paged_dev_ && paged_host_ && rad_stream_create(&zs, 0) == RAD_OK &&
+                        rad_memset_async(paged_dev_, 0, 2 * sizeof(int64_t), zs) == RAD_OK &&
+                        rad_stream_sync(zs) == RAD_OK;
+    if (zs) rad_stream_destroy(zs);
+    if (!zeroed) {
+        if (paged_dev_)  rad_dev_free(paged_dev_, RAD_MEM_DEVICE);
+        if (paged_host_) rad_dev_free(paged_host_, RAD_MEM_HOST_PINNED);
+        paged_dev_ = nullptr; paged_host_ = nullptr;
+    }
+    return paged_dev_;
+}
+
+int64_t TierExec::paged_in() {
+    if (!paged_dev_ || !paged_host_ || rad_dev_set(device_) != RAD_OK) return 0;
+    /* Before the first move there is no transfer stream, and nothing can be cold, so the count is
+     * zero; the default stream would serialise with the step. */
+    if (!stream_) return 0;
+    *paged_host_ = 0;
+    if (rad_memcpy_async(paged_host_, paged_dev_, sizeof(int64_t), stream_) != RAD_OK ||
+        rad_stream_sync(stream_) != RAD_OK)
+        return 0;
+    return *paged_host_;
+}
+
+int64_t TierExec::hits_in() {
+    if (!paged_dev_ || !paged_host_ || rad_dev_set(device_) != RAD_OK || !stream_) return 0;
+    paged_host_[1] = 0;
+    if (rad_memcpy_async(paged_host_ + 1, paged_dev_ + 1, sizeof(int64_t), stream_) != RAD_OK ||
+        rad_stream_sync(stream_) != RAD_OK)
+        return 0;
+    return paged_host_[1];
+}
+
+int32_t* TierExec::page_tags(int64_t bytes) {
+    if (tags_dev_ || bytes <= 0) return tags_dev_;
+    if (rad_dev_set(device_) != RAD_OK) return nullptr;
+    tags_dev_ = (int32_t*)rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+    /* Zeroed as the counter is: tag 0 is "no slot". */
+    RadStream zs = nullptr;
+    const bool zeroed = tags_dev_ && rad_stream_create(&zs, 0) == RAD_OK &&
+                        rad_memset_async(tags_dev_, 0, bytes, zs) == RAD_OK &&
+                        rad_stream_sync(zs) == RAD_OK;
+    if (zs) rad_stream_destroy(zs);
+    if (!zeroed && tags_dev_) { rad_dev_free(tags_dev_, RAD_MEM_DEVICE); tags_dev_ = nullptr; }
+    return tags_dev_;
+}
+
 
 int TierExec::copy_state() {
     if (!copy_out_) return 1;
@@ -615,7 +904,7 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
             for (size_t gidx = 0; gidx < ng && st == RAD_OK; ++gidx)
                 for (int64_t l = 0; l < gi_[gidx].n_layers && st == RAD_OK && !gi_[gidx].zero; ++l)
                     st = run_rows(gi_[gidx].scatter, /*scatter=*/true, gi_[gidx], l, stage_,
-                                  d + (int64_t)gidx * c + b, cc);
+                                  d + (int64_t)gidx * c + b, cc, entry_bytes_, gi_[gidx].off);
         }
         if (st == RAD_OK) done = s + (size_t)c;
     }

@@ -64,6 +64,11 @@ struct Engine::Rank {
      * every KV block. Both are inert unless --prefix-cache-mib sizes the host tier. */
     IdleTiers tiers;
     TierExec  tierx;
+    /* Window residency (spec §7.3): this rank's half of the pager's transfers, over the residency
+     * groups only. Separate from `tierx` because the idle tiers move whole cache entries of the
+     * prefix-cached groups and a server can run either without the other. Also owns the card-side
+     * counter of pages the pager rewrote. Configured only when the store is open. */
+    TierExec  resx;
     /* The activation arena's smaller levels, smallest step first (Engine::probe_arena_levels). */
     std::vector<ArenaLevel> arena_levels;
     /* Per Ctx level (0 is the full plan): the bytes at the top of this rank's arena that level

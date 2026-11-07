@@ -70,15 +70,120 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [3HD/4, 5HD/4)     V's int4 codes
  *     [5HD/4, 21HD/16)   K's scales (absmax / 31)
  *     [21HD/16, 22HD/16) V's scales (absmax / 7)
+ *   RAD_KVQ_K4H (k4h_v4, ABI 41), 18 * HD / 16 bytes, K and V both stored rotated:
+ *     [0, HD/2)          K's int4 codes, as V's codes above
+ *     [HD/2, HD)         V's int4 codes
+ *     [HD, 17HD/16)      K's scales (absmax / 7)
+ *     [17HD/16, 18HD/16) V's scales (absmax / 7)
+ *   RAD_KVQ_K4HV2H (k4h_v2h, ABI 42), 14 * HD / 16 bytes, K and V both stored rotated:
+ *     [0, HD/2)          K's int4 codes, as k4h_v4's
+ *     [HD/2, 3HD/4)      V's int2 codes, dim d in bits 2 * (d % 4) of byte d / 4
+ *     [3HD/4, 13HD/16)   K's scales (absmax / 7)
+ *     [13HD/16, 14HD/16) V's scales (variance-normalised, below)
+ *   RAD_KVQ_I8H (i8h, ABI 44), 2 * HD + 4 bytes, K and V both stored rotated:
+ *     [0, HD)            K's int8 codes, dim d in byte d
+ *     [HD, 2HD)          V's int8 codes
+ *     [2HD, 2HD + 2)     K's scale, one for the token's whole head (absmax / 127)
+ *     [2HD + 2, 2HD + 4) V's scale, likewise
+ *   RAD_KVQ_K5V4 (k5_v4, ABI 48), 20 * HD / 16 bytes:
+ *     [0, HD/2)          K's low four bits, as V's codes below
+ *     [HD/2, 5HD/8)      K's fifth (high) bits, a 4-byte word per group of 32 dims whose byte j
+ *                        holds dim 16c + 8h + 2j + p (c, h, p in 0..1) at bit 4c + 2h + p
+ *     [5HD/8, 9HD/8)     V's int4 codes, as k6_v4's
+ *     [9HD/8, 19HD/16)   K's scales (absmax / 15)
+ *     [19HD/16, 20HD/16) V's scales (absmax / 7)
  *
- * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
+ * k4h_v4 is k6_v4 without K's high-bit words, K's codes and scales read as V's. Four-bit K holds
+ * only where the rotation has spread K's outlier channels, so a k4h_v4 layer is always a rotated
+ * one (RAD_KVQ_ROTATED below): its kv_recipe entry carries the flag, the engine never sets
+ * kv_quant to it, and a plugin refuses an entry without the flag rather than store unrotated keys
+ * in four bits.
+ *
+ * k4h_v2h is k4h_v4 with V in two bits, which hold only with KVarN's variance normalisation
+ * (arXiv 2606.03458): a V code u (0..3) is the odd value 2u - 3 (-3, -1, 1, 3) times its group's
+ * scale; the codes are the group's values over its root mean square rounded to the nearest odd
+ * level, and the scale keeps the group's sum of squares, so no token's magnitude moves in the
+ * rounding. libref's kv_store is the contract (libref/ref_attn.cpp, docs/OPS.md). Rotated always,
+ * as k4h_v4.
+ *
+ * i8h is the 8-bit layout of the rotated family: with the outlier channels spread by the
+ * rotation one scale holds a whole head of a token, so the row costs 8.06 bits an element (fp8's
+ * 8 plus 32 bits of scales a token and head) with seven bits of resolution where E4M3 has three.
+ * Rotated always, as k4h_v4. Its row is 516 bytes at head_dim 256, a multiple of four but not of
+ * sixteen, so its kernels read codes as 4-byte words.
+ *
+ * k5_v4 is k6_v4 with one high bit a K dim instead of two (5.0 bits an element): unrotated or
+ * rotated as k6_v4 (RAD_KVQ_ROTATED is the recipe's choice), V and its scales as k6_v4's. A kernel
+ * lane's eight dims (16c + 8h ..) of a group take their high bits as one shift and mask of the
+ * group's word, byte j's bit 4c + 2h for the even dim and the next bit for the odd one. libref's
+ * kv_store is the contract (libref/ref_attn.cpp).
+ *
+ * Codes are two's complement (int4 -7..7, int5 -15..15, int6 -31..31, int8 -127..127). The group is declared at RAD_F8E4M3 with
  * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
- * it. */
+ * it.
+ *
+ *   RAD_KVQ_BF16 (bf16, ABI 46), 4 * HD bytes: a kv_recipe entry only. The layer keeps the cache
+ *     --kv-cache-dtype bf16 keeps -- a group declared RAD_BF16 at head_dim HD, served by the bf16
+ *     store and attention rows -- while the recipe's other layers keep theirs. The widest layout,
+ *     so the one a KL limit below every narrowed cache's is met with. Never rotated or centred
+ *     (the recipe parser refuses both and a plugin refuses such an entry): it rounds nothing for
+ *     a rotation or a mean to help. */
 enum {
     RAD_KVQ_NONE = 0,
     RAD_KVQ_V4   = 1,
-    RAD_KVQ_K6V4 = 2
+    RAD_KVQ_K6V4 = 2,
+    RAD_KVQ_K4H  = 3,
+    RAD_KVQ_K4HV2H = 4,
+    RAD_KVQ_I8H  = 5,
+    RAD_KVQ_BF16 = 6,
+    RAD_KVQ_K5V4 = 7
 };
+
+/* A RadBuildCtx::kv_recipe entry is a layout above, alone or with RAD_KVQ_ROTATED set (ABI 40):
+ * the layer stores K and V rotated by the normalised Hadamard over head_dim (`had_rotate`,
+ * docs/OPS.md), rotates its query before the attention and the attention output back after it.
+ * The rotation is its own inverse, so the scores and the output are the unrotated ones (to the
+ * rounding of the extra passes), and the layout's store and attention rows read the rotated values
+ * as they read any others. RAD_KVQ_LAYOUT masks the layout out of an entry.
+ *
+ * RAD_KVQ_VMEAN (ABI 43, --kv-recipe `vmean`): the layer subtracts a calibrated mean of V, per KV
+ * head, from V before its store, and adds it back to the attention output before the output's
+ * rotation (RadBuildCtx::kv_vmean holds the vectors). A row of attention weights sums to one, so
+ * P (V - mu) + mu = P V: exact but for the rounding of the two adds, while the integer V layouts
+ * stop spending their group scale's range on the offset. Only on a layout with integer V (fp8_v4,
+ * k6_v4, k5_v4, k4h_v4, k4h_v2h, i8h); K, the cache layout and the attention rows are unchanged.
+ *
+ * RAD_KVQ_VPRED (ABI 49, --kv-recipe `vpred`): the layer stores V less a calibrated affine
+ * prediction from the same token's K as the cache holds it (K-hat, after the layout's own K
+ * rounding), V - (K-hat A + b) per KV head, and its attention adds (P K-hat) A + b back to the
+ * output: a second attention over the cache with the keys as values (attn_paged at kv_dtype
+ * `<layout>_pk`) gives P K-hat, and `kv_vpred` applies the map on both sides (docs/OPS.md). A row of
+ * attention weights sums to one, so the output is the unpredicted one but for roundings; V's
+ * integer layout quantises a residual with less variance. Only on k4h_v4 and k4h_v2h (whose K is
+ * int4 in groups of 32 and whose layers are rotated); not with RAD_KVQ_VMEAN (the map's bias is the
+ * mean's place) nor with a demote layout. The maps are RadBuildCtx::kv_vpred's.
+ *
+ * RAD_KVQ_DEMOTE (ABI 47, --kv-recipe `demote LAYOUT`): bits 16-23 hold a second layout, the one a
+ * block of this layer takes in the window-residency store (spec §7.3) when the sweep demotes it;
+ * 0 is none, the block's bytes moving as they are. The pool, the attention and the store kernel
+ * keep the first layout. A demotion requantises a block's rows into the demote layout on the card
+ * (`kv_transcode`, docs/OPS.md), and the pager (`qsa_page` with `store_layout`) and a promotion
+ * expand them back, so attention reads one layout per layer and a block brought back keeps the
+ * demote layout's precision. The two layouts share the layer's basis (RAD_KVQ_ROTATED) and V mean
+ * (RAD_KVQ_VMEAN): the transcode decodes and encodes values and never rotates or centres. Served
+ * today as i8h or fp8 (rotated) resident with k4h_v4 or k4h_v2h demoted; a RAD_KVQ_BF16 entry takes
+ * none. A plugin keys its KV groups by the pair, since a store slot holds one group's block at one
+ * width. */
+enum {
+    RAD_KVQ_LAYOUT  = 0xff,
+    RAD_KVQ_ROTATED = 0x100,
+    RAD_KVQ_VMEAN   = 0x200,
+    RAD_KVQ_VPRED   = 0x400,
+    RAD_KVQ_DEMOTE  = 0xff0000,
+    RAD_KVQ_DEMOTE_SHIFT = 16
+};
+/* The demote layout of a kv_recipe entry, 0 (RAD_KVQ_NONE) for none. */
+#define RAD_KVQ_DEMOTE_OF(e) (((e) & RAD_KVQ_DEMOTE) >> RAD_KVQ_DEMOTE_SHIFT)
 
 /* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
  * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */
@@ -295,7 +400,128 @@ typedef struct RadBuildCtx {
      * fixed buffers ignores them, and the core says so at startup. */
     int64_t  gen_max_pixels;
     int64_t  gen_max_refs;
+
+    /* ---- appended in ABI 37 (where a routed expert may live) */
+    /* --weights-disk-tier: nonzero when weights may stay in the container. An expert read from the
+     * drive has to be stored whole, so a plugin that can lay its routed experts out either way
+     * keeps them whole for this; 0 leaves it free to split them across the ranks by width. */
+    int      expert_file_tier;
+
+    /* ---- appended in ABI 38 (the pager) */
+    /* Nonzero: the engine was asked for a window-residency store (--kv-residency-mib), so a
+     * sparse consumer's selection may name cold blocks (spec §7.3, docs/OPS.md `qsa_page`) and
+     * the plugin should issue the pager between its selection and its attention. Zero, the
+     * default, is a graph with no pager op: a server that keeps every block resident pays
+     * nothing. This is the request, not the outcome -- whether a step finds the store open is
+     * RadKVGroupBatch::residency_store, and a plugin issues the op only when that is non-null.
+     *
+     * At 204, the tail padding after expert_file_tier (kv_recipe, ABI 39, starts at 208): the
+     * core writes the struct and a plugin built against an older one never reads it. Zero-defaulted,
+     * so a plugin built against the older struct is unchanged. */
+    int      kv_residency;
+
+    /* ---- appended in ABI 39 (a per-layer KV recipe) */
+    /* --kv-recipe: the trunk's attention layer l keeps its cache in layout kv_recipe[l], a
+     * RAD_KVQ_* where RAD_KVQ_NONE is plain E4M3, with RAD_KVQ_ROTATED set where that layer runs
+     * rotated (from ABI 40), RAD_KVQ_VMEAN where it subtracts a V mean (from ABI 43, the means
+     * in kv_vmean) and a RAD_KVQ_DEMOTE layout for its demoted blocks (from ABI 47), or -1 where the recipe names no layer l (l < n_kv_recipe; past it
+     * there is no entry either). Null without a recipe, and then
+     * kv_quant is every layer's layout. With one, kv_dtype is RAD_F8E4M3 and kv_quant
+     * RAD_KVQ_NONE; the engine sets it only for a plugin whose probe has
+     * RadArchProbe::kv_recipe_ok and, for each layout the recipe names, that layout's bit in
+     * kv_quant_ok. A plugin with kv_recipe_ok serves RAD_KVQ_ROTATED on every layout it serves
+     * but RAD_KVQ_BF16. The plugin refuses an entry for a layer that keeps no attention cache, and an
+     * attention layer with none, naming the layer: a recipe written for another model must not
+     * load as a near miss. A recipe giving every layer one layout is that layout's
+     * --kv-cache-dtype, the same program byte for byte.
+     *
+     * Both past the old end (as the layout rule requires: tests/abi_layout_test.cpp). */
+    const int32_t* kv_recipe;
+    int32_t        n_kv_recipe;
+
+    /* ---- appended in ABI 43 (a static V mean per layer) */
+    /* The V means of the recipe's `vmean` layers (RAD_KVQ_VMEAN), this rank's device copy; null
+     * when no layer takes one. Read at declare only. A plugin that does not serve RAD_KVQ_VMEAN
+     * refuses the entry, naming the layer.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    const struct RadKvVMean* kv_vmean;
+
+    /* ---- appended in ABI 45 (int8 block keys) */
+    /* --qsa-bkey-dtype: the dtype a sparse indexer stores its block keys at. 0, the default, is the
+     * plugin's own (bf16 on Qwen3.8-Flash-Next: the program and every byte as before ABI 45);
+     * RAD_I8 is int8 codes with one f16 scale a block key (docs/QSA.md, "Block-key storage"). The
+     * engine sets it only for a plugin whose probe has RadArchProbe::qsa_bkey_i8_ok and refuses
+     * the flag otherwise; a plugin refuses a value it does not know.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int32_t  qsa_bkey_dtype;
+
+    /* ---- appended in ABI 50 (block keys split across ranks) */
+    /* --qsa-bkey-split on: a sparse indexer's block keys split across the tensor-parallel ranks,
+     * block b stored and scored on rank b % world_size only, the ranks' local top-k lists gathered
+     * and merged into the selection the unsplit scores give, byte for byte (docs/QSA.md, "Block
+     * keys split across ranks"). 0, the default, keeps every block key on every rank: the program
+     * and every byte as before ABI 50. The engine sets it only at more than one rank and for a
+     * plugin whose probe has RadArchProbe::qsa_bkey_split_ok, and refuses the flag otherwise.
+     *
+     * In the padding after qsa_bkey_dtype (which ends at 236; kv_vpred, ABI 49, starts at 240):
+     * the core writes the struct and a plugin built against an older one never reads it. */
+    int32_t  qsa_bkey_split;
+
+    /* ---- appended in ABI 49 (V predicted from K) */
+    /* The maps of the recipe's `vpred` layers (RAD_KVQ_VPRED), this rank's device copy; null when
+     * no layer takes one. Read at declare only. A plugin that does not serve RAD_KVQ_VPRED refuses
+     * the entry, naming the layer.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    const struct RadKvVPred* kv_vpred;
 } RadBuildCtx;
+
+/* ================================================================== a static V mean per layer */
+/* What a RAD_KVQ_VMEAN layer subtracts from V before its store and adds to its attention output,
+ * prepared once by the engine from the recipe's mean file (--kv-recipe `vmean FILE`, docs/GUIDE.md
+ * §4.4) and uploaded to every rank whole: it is small (24 KiB at Flash-Next), and a rank's KV
+ * heads and query heads are then a slice at an offset it already knows (Geom::kv_off and the
+ * query span), replicated KV heads included.
+ *
+ * `table` is bf16, the attention's activation dtype, [n_layers][2][(n_head_kv + n_head) *
+ * head_dim]; entry [l][r] is layer l's mean in basis r, 0 as the projection writes V and 1
+ * rotated by the normalised Hadamard over head_dim (`had_rotate`), as a rotated layer stores it.
+ * Each entry is first -mu by KV head (n_head_kv * head_dim, what the store's input gets added),
+ * then +mu by query head (n_head * head_dim, query head h taking KV head h / (n_head /
+ * n_head_kv), what the attention output gets added). Both are the one bf16 rounding of mu and
+ * its exact negation, so the subtraction and the addition cancel exactly in the attention's
+ * arithmetic. Entries of layers without RAD_KVQ_VMEAN are zero and not read. Both bases are
+ * there because the MTP head, which shares the last attention layer's cache, takes that layer's
+ * mean in its own basis. */
+typedef struct RadKvVMean {
+    const void* table;       /* device, this rank's copy, bf16 */
+    int64_t     n_layers;    /* entries: the recipe's length (RadBuildCtx::n_kv_recipe) */
+    int64_t     n_head_kv;   /* the model's, over every rank */
+    int64_t     n_head;
+    int64_t     head_dim;
+} RadKvVMean;
+
+/* ================================================================== V predicted from K */
+/* What a RAD_KVQ_VPRED layer predicts V from, prepared once by the engine from the recipe's map file
+ * (--kv-recipe `vpred FILE`, docs/GUIDE.md §4.4) and uploaded to every rank whole (3.1 MiB a
+ * layer at Flash-Next's two KV heads of 256), a rank's KV heads being a slice at the offset it
+ * already knows (Geom::kv_off), replicated heads included.
+ *
+ * `table` is f32, [entries][n_head_kv][head_dim + 1][head_dim]: per KV head the map A's head_dim
+ * rows (row i the weights of K-hat's dim i into V's dims), then the bias b, in the rotated basis
+ * (the normalised Hadamard over head_dim, `had_rotate`'s), as a vpred layer, always rotated,
+ * stores K and V. `entry` (host, n_layers long) is layer l's entry in `table`, or -1 for a layer
+ * without RAD_KVQ_VPRED. The MTP head, which shares the last attention layer's cache, takes that
+ * layer's map. A query head h of a rank reads the map of its cache head, h / gqa. */
+typedef struct RadKvVPred {
+    const void*    table;      /* device, this rank's copy, f32 */
+    const int32_t* entry;      /* host, [n_layers] */
+    int64_t        n_layers;   /* the recipe's length (RadBuildCtx::n_kv_recipe) */
+    int64_t        n_head_kv;  /* the model's, over every rank */
+    int64_t        head_dim;
+} RadKvVPred;
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
@@ -474,6 +700,19 @@ typedef struct RadKVGroupDecl {
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
     int64_t  conv_width;      /* RAD_KV_CONV */
+    /* RAD_KV_FULL only: the tokens of a sequence's history the consumer of this group reads,
+     * counted back from the tail (spec §7.3, "window residency"). A block below that window may
+     * leave VRAM for host memory and is promoted back before a step reads it, so a sparse
+     * consumer -- one that reads a selected part of the history rather than all of it -- can hold
+     * a context whose whole cache it has no room for. 0 keeps the whole history resident, which
+     * is what a dense consumer needs.
+     *
+     * Declared by the plugin that owns the sparse read (arch/common/rad_qsa.h), not by the
+     * attention helper: the window is the consumer's reach, and only the plugin knows it. An
+     * over-estimate costs VRAM and nothing else; an under-estimate costs a promotion in the step
+     * that reads past it, which is correct but slower, so the number is a performance knob and
+     * never a correctness one. */
+    int64_t  residency_window;
     /* Block size is not declared. It is taken from the resolved attention kernel's constraints at
      * declare, so the core needs no edit when a kernel changes (spec §7.2). Read it back with
      * rad_kv_block_size() after declaring the attention op that consumes this group. */
@@ -487,6 +726,18 @@ int64_t     rad_kv_block_size(RadBuilder* b, rad_kvgroup g);
  * mirror row's. 0 for a group that is not paged, or before the block size is known. Additive
  * export. */
 int64_t     rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g);
+/* The sparse consumer's reach, in tokens, for a RAD_KV_FULL group: the history this group's
+ * consumer reads, counted from the tail (spec §7.3, "window residency"). A block outside it may
+ * leave VRAM for host memory and is promoted back before a step reads it, so a model whose
+ * attention reads a selected part of its history holds a context whose whole cache it has no room
+ * for. 0 (the default) keeps every block resident.
+ *
+ * Called by the plugin that owns the sparse read, after the group is declared -- the attention
+ * helper cannot know this. It is a hint for eviction and never a correctness bound: the engine
+ * promotes on the step that reads past it, so an under-estimate costs link traffic and an
+ * over-estimate costs VRAM. Adding this export does not by itself move RAD_ABI_VERSION, but
+ * RadKVGroupDecl gained the field, which does (ABI 38). */
+int         rad_kv_set_residency_window(RadBuilder* b, rad_kvgroup g, int64_t tokens);
 
 /* Bind a layer to a group, so the block manager knows how many state instances a sequence owns. */
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g);
@@ -886,6 +1137,13 @@ typedef struct RadEncoderDecl {
      * position tables or kernels are per geometry; the core ends a pass where the grid changes.
      * 0 packs segments of any grid into a pass. */
     int32_t     one_grid;
+
+    /* ---- appended in ABI 32 (runs the language model reads both ways) */
+    /* 1: the language model attends the placeholders of one picture or video frame to each other
+     * both ways (Gemma 4's use_bidirectional_attention "vision"), text before and after them
+     * causally. The core then ends no prefill chunk inside such a run and states each trunk pass's
+     * runs (RadBatch::n_bidi). 0 for an audio encoder. */
+    int32_t     bidirectional;
 } RadEncoderDecl;
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
@@ -1471,6 +1729,87 @@ typedef struct RadVideoGenDecl {
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
 
+/* ================================================================== the shape generator */
+/* A program that makes a 3-D shape from one picture: an image encoder reads the picture, a
+ * denoiser steps a set of latent rows by flow matching, guided against an unconditioned branch,
+ * and a decoder turns the latent into an occupancy field that the core samples at points of its
+ * choosing and meshes. The core drives the passes (RadBatch::gen, RadShapeGenBatch), one request
+ * a pass:
+ *
+ *   RAD_GEN_PASS_SCOND    the request's picture through the image encoder into the request's
+ *                         lane: what the denoiser reads of it at every step, for both branches
+ *                         (the picture's and the unconditioned one).
+ *   RAD_GEN_PASS_SSTEP    one denoising step of one lane over both branches, `step_rows` rows:
+ *                         each branch's conditioning and latent, laid out as the plugin likes, the
+ *                         latents two entries of `latent_rows` (the conditioned first) for the
+ *                         image generator's sampler ops. The first step draws the lane's noise.
+ *   RAD_GEN_PASS_SLATENT  the lane's final latent through the decoder's network, into the lane:
+ *                         what every query pass of the request reads. Runs once, after the last
+ *                         step.
+ *   RAD_GEN_PASS_SQUERY   the field at `n_query` points (RadShapeGenBatch::query, at most
+ *                         `max_query`), one f32 a point in `field_out`, which the core reads
+ *                         back.
+ *
+ * The picture. The core decodes it with its alpha (opaque without one) and prepares it as
+ * Hunyuan3D-2's ImageProcessorV2 and image encoder do: the alpha's bounding box (its last row and
+ * column left out, as the reference's slice leaves them) scaled with OpenCV's INTER_AREA to
+ * (1 - border_ratio) of the longer side of the square that holds the picture, centred on it and
+ * flattened onto white; that square resized to `canvas` x `canvas` with INTER_CUBIC; then as 0..1
+ * values bilinearly resized to `enc_size` x `enc_size` (half-pixel centres, torchvision's), each
+ * channel normalised by `pix_mean` and `pix_std`, and cut into (enc_size / enc_patch)^2 patches of
+ * enc_patch x enc_patch pixels, row-major, each patch's values channel-major then row-major (a
+ * convolution's weight order). An SCOND pass carries those patches.
+ *
+ * The sampler: a request's `steps` are sigma grid points, sigma_i = i / (steps - 1) for i in
+ * [0, steps), numpy's linspace(0, 1) taken to f32; the latent starts as noise at sigma 0 and an
+ * evaluation at each sigma but the last steps it to the next (the reference evaluates at the
+ * last too, against itself, a step of zero). The model's timestep is sigma, the guided velocity
+ * neg + cfg (pos - neg), and the step x + (sigma_next - sigma) v.
+ *
+ * The field: the decoder's logit at a point, inside the shape above `level`. The core samples the
+ * cube [-bounds, bounds]^3 on a grid of `resolution` cells a side ((resolution + 1)^3 points,
+ * numpy's linspace in f32 along each axis), coarse to fine as FlashVDM's hierarchical decoding
+ * does: the whole grid at the coarsest level (resolution halved while it stays at least 63), then
+ * at each finer level only the points near where the coarser one crosses `level` or is within
+ * 0.95 of it. The surface is marching cubes over the finest grid, a vertex at grid index g placed
+ * at g 2 bounds / (resolution + 1) - bounds, as the reference places it.
+ *
+ * A program declares exactly one of this, the other generators, logits or pooled vectors. */
+enum { RAD_GEN_PASS_SCOND = 15, RAD_GEN_PASS_SSTEP = 16, RAD_GEN_PASS_SLATENT = 17,
+       RAD_GEN_PASS_SQUERY = 18 };
+
+typedef struct RadShapeGenDecl {
+    const char* name;             /* "hunyuan3d-2" -- the served model id and messages */
+
+    /* The picture (above). */
+    int64_t     canvas;
+    double      border_ratio;
+    int64_t     enc_size, enc_patch;
+    double      pix_mean[3], pix_std[3];
+
+    /* The latent: `latent_rows` rows of `latent_channels` a branch; a step's rows, both branches
+     * with their conditioning. */
+    int64_t     latent_rows, latent_channels, step_rows;
+
+    /* The sampler (above) and the guidance a request that names none runs at. */
+    int64_t     default_steps, max_steps;
+    double      default_guidance;
+
+    /* The field (above): the cube's half side, the iso value, and the grid's resolution a request
+     * that names none is sampled at, with the range a request may name. */
+    double      bounds;
+    double      level;
+    int64_t     default_resolution, min_resolution, max_resolution;
+
+    /* `max_lanes` requests may hold state at once. `field_out` is a device f32 buffer of at least
+     * `max_query` elements. */
+    int64_t     max_lanes;
+    int64_t     max_query;
+    rad_buf     field_out;
+} RadShapeGenDecl;
+
+int rad_declare_shape_generator(RadBuilder* b, const RadShapeGenDecl* d);
+
 /* ================================================================== diagnostics */
 /* A plugin may annotate the graph dump. Free-form, printed under --debug-graph. */
 void rad_note(RadBuilder* b, const char* fmt, ...);
@@ -1605,6 +1944,31 @@ typedef struct RadArchProbe {
      * gen_patches answer for them. */
     int64_t gen_max_pixels;
     int64_t gen_max_refs;
+
+    /* ---- appended in ABI 33 (the shape generator) */
+    /* Nonzero for a shape generator, which the engine sizes as it does a video generator from
+     * `gen_rows` (its largest pass: a step's two branches, or a query pass's points). It keeps no
+     * KV. */
+    int32_t gen_shape;
+
+    /* ---- appended in ABI 39 (a per-layer KV recipe) */
+    /* Nonzero when the plugin declares each attention layer's cache from RadBuildCtx::kv_recipe.
+     * --kv-recipe is refused at startup with the plugin named when this is 0: a plugin that
+     * ignored the recipe would store every layer as plain E4M3. At 124, the tail padding after
+     * gen_shape: the engine zeroes the probe before the plugin fills it. */
+    int32_t kv_recipe_ok;
+
+    /* ---- appended in ABI 45 (int8 block keys) */
+    /* Nonzero when the plugin stores its indexer's block keys in int8 under
+     * RadBuildCtx::qsa_bkey_dtype RAD_I8. --qsa-bkey-dtype i8 is refused at startup with the
+     * plugin named when this is 0. 64-bit so it starts past the older struct's tail padding. */
+    int64_t qsa_bkey_i8_ok;
+
+    /* ---- appended in ABI 50 (block keys split across ranks) */
+    /* Nonzero when the plugin splits its indexer's block keys across the ranks under
+     * RadBuildCtx::qsa_bkey_split. --qsa-bkey-split on is refused at startup with the plugin named
+     * when this is 0. */
+    int64_t qsa_bkey_split_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
@@ -1846,6 +2210,12 @@ int         rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadB
 struct RadCtx;
 struct RadBatch;
 void        rad_arch_step(struct RadCtx* c, const struct RadBatch* batch);
+/* Optional. Return a stable fingerprint of actual dispatch geometry whose grid depends on live
+ * per-group seqused values. `kv_used_max_h[g]` is the host maximum for batch->kv[g], and
+ * rad_ctx_wgp_count(c) supplies the device's WGP count. Return 0 when exact geometry is unknown;
+ * that pass runs live and is not recorded. */
+uint64_t    rad_arch_pass_key(struct RadCtx* c, const struct RadBatch* batch,
+                              const int32_t* kv_used_max_h);
 
 #ifdef __cplusplus
 }   /* extern "C" */

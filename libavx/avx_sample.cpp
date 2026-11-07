@@ -685,9 +685,9 @@ AVX_KERNEL(sample_argmax) {
  * pass the test after the first few thousand columns.
  *
  * The sum is f32 in four accumulators. Its terms are in (0, 1] and a logprob carries only its
- * relative error, so f32 suffices (libref uses double). */
+ * relative error, so f32 suffices (libref uses double). Without `params` every row is written. */
 AVX_KERNEL(sample_logprobs) {
-    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    if (a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1], *st = &a->t[2];
     const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
     const int64_t k = p_int(a, "k", 0);
@@ -697,11 +697,11 @@ AVX_KERNEL(sample_logprobs) {
     const int64_t w = 2 + 2 * k;
     if (M <= 0 || numel(st) < M * w) return RAD_E_SHAPE;
     Rows R;
-    AVX_TRY(rows_of_params(pr, M, &R));
+    if (pr->data) AVX_TRY(rows_of_params(pr, M, &R));
 
     AVX_PARALLEL_FOR_IF(M * n_vocab >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
-        if (!(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
+        if (pr->data && !(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
         float* buf = scratch_f32((size_t)n_vocab + 2 * (size_t)k);
         const float* v = in_row(lg, rowoff(lg, m, n_vocab), n_vocab, buf);
         float* tv = buf + n_vocab;                 /* the set's values, descending */
@@ -924,6 +924,83 @@ AVX_KERNEL(dflash_select) {
     }
     return RAD_OK;
 }
+
+/* ================================================================== dflash_markov_greedy
+ *
+ * DSpark's walk over the whole vocabulary (libref ref_quant.cpp, ref_markov_greedy): at each step
+ * every token scores its draft logit plus sum_r pred[pid][r] * succ[token][r], the greatest wins
+ * (ties to the lower id) and becomes the next predecessor. The winners of each 64-token tile are
+ * written too, as the device row's decomposition. Scalar and in libref's order (the bf16 form starts
+ * the sum at the logit, the f32 form adds it last), so the argmax ties the same way. */
+static int markov_greedy(const RadArgs* a, uint32_t logits_dtype) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *anc = &a->t[1], *pred = &a->t[2], *succ = &a->t[3];
+    const RadTensor *tsc = &a->t[4], *ttok = &a->t[5], *out = &a->t[6];
+    if (!logits->data || !anc->data || !pred->data || !succ->data || !tsc->data || !ttok->data ||
+        !out->data)
+        return RAD_E_INVAL;
+    if (logits->dtype != logits_dtype || pred->dtype != RAD_BF16 || succ->dtype != RAD_BF16 ||
+        tsc->dtype != RAD_F32 || ttok->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (anc->dtype != RAD_I32) return RAD_E_SHAPE;
+
+    const int64_t steps = p_int(a, "steps", 0);
+    const int64_t R     = p_int(a, "rank", 0);
+    const int64_t V     = p_int(a, "n_vocab", 0);
+    const int64_t astr  = p_int(a, "anchor_stride", 1);
+    const int64_t M     = steps > 0 && V > 0
+                        ? band_rows(numel(logits) / (steps * V), p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr <= 0) return RAD_E_SHAPE;
+    if (numel(logits) < M * steps * V || numel(anc) < (M - 1) * astr + 1 ||
+        numel(pred) < V * R || numel(succ) < V * R || numel(out) < M * steps)
+        return RAD_E_SHAPE;
+    const int64_t n_tiles = (V + 63) / 64;
+    if (numel(tsc) < M * n_tiles || numel(ttok) < M * n_tiles) return RAD_E_SHAPE;
+
+    const int64_t ls = laststride(logits), os = laststride(out);
+    const int64_t tss = laststride(tsc), tis = laststride(ttok);
+    AVX_PARALLEL_FOR_IF(M * steps * V * R >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* prev = scratch_f32((size_t)R);
+        float* sv   = scratch_f32_b((size_t)R);
+        int64_t pid = ldi(anc, offlin(anc, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t row = m * steps + l;
+            const bool ok = pid >= 0 && pid < V;
+            if (ok) {
+                const float* pv = in_row(pred, rowoff(pred, pid, R), R, prev);
+                if (pv != prev) std::memcpy(prev, pv, (size_t)R * sizeof(float));
+            } else {
+                for (int64_t r = 0; r < R; ++r) prev[r] = 0.0f;
+            }
+            const int64_t lb = rowoff(logits, row, V);
+            float   gbest = -INFINITY;
+            int64_t gtok  = 0;
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64, end = std::min<int64_t>(first + 64, V);
+                float   best = -INFINITY;
+                int64_t btok = first;
+                for (int64_t tok = first; tok < end; ++tok) {
+                    const float base = ldt(logits, lb + tok * ls);
+                    const float* su = in_row(succ, rowoff(succ, tok, R), R, sv);
+                    float s = logits_dtype == RAD_F32 ? 0.0f : base;
+                    for (int64_t r = 0; r < R; ++r) s += prev[r] * su[r];
+                    if (logits_dtype == RAD_F32) s += base;
+                    if (s > best || (s == best && tok < btok)) { best = s; btok = tok; }
+                }
+                stt(tsc, rowoff(tsc, m, n_tiles) + tile * tss, best);
+                st_int_dt(ttok->dtype, ttok->data, rowoff(ttok, m, n_tiles) + tile * tis, btok);
+                if (best > gbest || (best == gbest && btok < gtok)) { gbest = best; gtok = btok; }
+            }
+            st_int_dt(out->dtype, out->data, rowoff(out, m, steps) + l * os, gtok);
+            pid = gtok;
+        }
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(dflash_markov_greedy) { return markov_greedy(a, RAD_BF16); }
+AVX_KERNEL(dflash_markov_greedy_f32) { return markov_greedy(a, RAD_F32); }
 
 /* ================================================================== dflash_tree
  *

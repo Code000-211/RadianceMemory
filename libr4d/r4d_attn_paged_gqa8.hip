@@ -72,7 +72,11 @@ using std::max;
 #ifndef G8_BLOCK_SIZE
 #define G8_BLOCK_SIZE 16
 #endif
-#define G8_MAX_DECODE_ROWS 64       // q_len * gqa a single decode workgroup can hold: q_len <= 8
+/* q_len * gqa a single decode workgroup can hold: q_len <= 8 here. An including unit may raise it
+ * to 128 (eight waves): gqa 16 then verifies 7 drafts in the decode kernel, as gqa 8 does. */
+#ifndef G8_MAX_DECODE_ROWS
+#define G8_MAX_DECODE_ROWS 64
+#endif
 
 #define G8_P_NWARPS 24
 #define G8_P_TILE   48
@@ -152,6 +156,11 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
                            dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
     else if (nw == 2) G8_LAUNCH(2);
     else if (nw == 3) G8_LAUNCH(3);
+#if G8_MAX_DECODE_ROWS > 64
+    /* Five to eight waves take eight; a wave past the last query row computes a copy of it and
+     * stores nothing. */
+    else if (nw > 4)  G8_LAUNCH(8);
+#endif
     else              G8_LAUNCH(4);
 #undef G8_LAUNCH
     if (emit_rc != RAD_OK) return -5;
@@ -446,7 +455,11 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, Rad
 #if R4D_ATTN_H256 && R4D_ATTN_V4
 /* ---- the fp8_v4 cache (a token's row 25 * 256 / 16 = 400 bytes: E4M3 K, int4 V, f16 scales) and
  * the k6_v4 cache (352 bytes: int6 K, int4 V), prefill, decode and decode with the gate and
- * quantiser in the merge. */
+ * quantiser in the merge; the k4h_v4 cache (288 bytes: int4 K and V, stored rotated), prefill and
+ * decode only, since a rotated layer rotates its output back before the gate and so never folds
+ * the gate into the merge (arch/common/rad_block_attn_gated_fp8.h); the k4h_v2h cache (224
+ * bytes: int4 K, KVarN-normalised int2 V, stored rotated), likewise; and the i8h cache (516 bytes:
+ * int8 K and V, one f16 scale a token and head each, stored rotated), likewise. */
 #define G8_V4_ENTRIES(TAG, ROWB, XOPT)                                                        \
 extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG##_scratch)(const RadArgs* a) { \
     return g8_prefill_scratch(a, ROWB);                                                        \
@@ -467,7 +480,8 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h256_gqa, _##TAG)(const RadArgs* a,   
     const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
     if (rc != RAD_OK) return rc;                                                               \
     return g8_decode_launch<256, 0, (XOPT)>(&r, stream);                                       \
-}                                                                                              \
+}
+#define G8_V4_GQ_ENTRY(TAG, ROWB, XOPT)                                                       \
 extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a,               \
                                                                RadStream stream) {             \
     R4DArgs r;                                                                                 \
@@ -479,6 +493,20 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a,
     return g8_decode_launch<256, 0, (XOPT)>(&r, stream, &gq);                                  \
 }
 G8_V4_ENTRIES(fp8v4, 400, O_V4)
+G8_V4_GQ_ENTRY(fp8v4, 400, O_V4)
 G8_V4_ENTRIES(k6v4, 352, O_V4 | O_K6)
+G8_V4_GQ_ENTRY(k6v4, 352, O_V4 | O_K6)
+G8_V4_ENTRIES(k4hv4, 288, O_V4 | O_K4)
+G8_V4_ENTRIES(k4hv2h, 224, O_V4 | O_K4 | O_V2)
+G8_V4_ENTRIES(i8h, 516, O_V4 | O_K4 | O_I8)
+/* The k5_v4 cache (320 bytes: int5 K, int4 V; rotated or not as the layer says), prefill and
+ * decode: k6_v4's kernels with one high bit a K dim. No gated-merge entry: an unrotated k5_v4
+ * layer takes the separate gate (the gq op does not resolve at its kv_dtype). */
+G8_V4_ENTRIES(k5v4, 320, O_V4 | O_K6 | O_K5)
+/* P K-hat over the k4h_v4 and k4h_v2h caches (kv_dtype k4h_v4_pk / k4h_v2h_pk): the same kernels
+ * with V's tile read from K's codes and scales (O_PK), a `vpred` layer's second attention. */
+G8_V4_ENTRIES(k4hv4pk, 288, O_V4 | O_K4 | O_PK)
+G8_V4_ENTRIES(k4hv2hpk, 224, O_V4 | O_K4 | O_V2 | O_PK)
 #undef G8_V4_ENTRIES
+#undef G8_V4_GQ_ENTRY
 #endif

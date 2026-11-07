@@ -133,6 +133,7 @@ static inline float act_of(int act, float g, uint32_t dt) {
     if (act == 0) return g / (1.0f + sc_exp(-g));
     if (act == 1) return 0.5f * g * (1.0f + sc_erf(g * 0.70710678118654752f));
     if (act == 3) return 1.0f / (1.0f + sc_exp(-g));
+    if (act == 5) return g > 0.0f ? g : 0.0f;
     if (act == 4)   // quick_gelu: sigmoid of the 1.702*g the unfused mul would have stored
         return 1.0f / (1.0f + sc_exp(-round1(dt, g * round1(RAD_BF16, 1.702f))));
     const float k0 = 0.7978845608028654f, k1 = 0.044715f;
@@ -169,8 +170,8 @@ AVX_KERNEL(act_mul) {
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(A) < rows * n || numel(B) < rows * n) return RAD_E_SHAPE;
-    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" };
-    const int act = p_enum(a, "act", kActs, 5, -1);
+    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu", "relu" };
+    const int act = p_enum(a, "act", kActs, 6, -1);
     if (act < 0) return RAD_E_INVAL;
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
@@ -630,6 +631,40 @@ AVX_KERNEL(pool_cols) {
         roundtrip(Y->dtype, acc, nw, sx);
         for (int64_t c = 0; c < nw; ++c) acc[c] *= mult;
         out_row(Y, rowoff(Y, r, nw), nw, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ point_fourier */
+/* As libref: [x | sin(x_i 2^j) | cos(x_i 2^j)] (times pi with `pi` 1), the products, sines and
+ * cosines f32 and rounded once into y. Parallel over rows. */
+AVX_KERNEL(point_fourier) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), F = p_int(a, "freqs", 0);
+    const bool pi = p_int(a, "pi", 0) != 0;
+    if (n <= 0 || F <= 0 || F > 30) return RAD_E_SHAPE;
+    const int64_t w = n * (2 * F + 1);
+    const int64_t M = rows_of(X, n);
+    if (M <= 0 || numel(Y) < M * w) return RAD_E_SHAPE;
+    float f[30];
+    for (int64_t j = 0; j < F; ++j)
+        f[j] = pi ? (float)std::ldexp(3.14159265358979323846, (int)j) : std::ldexp(1.0f, (int)j);
+
+    AVX_PARALLEL_FOR_IF(M * w >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < M; ++r) {
+        float* acc = scratch_f32((size_t)w);
+        float* sx = scratch_f32_b((size_t)n);
+        const float* v = in_row(X, rowoff(X, r, n), n, sx);
+        for (int64_t i = 0; i < n; ++i) {
+            acc[i] = v[i];
+            for (int64_t j = 0; j < F; ++j) {
+                const float t = v[i] * f[j];
+                acc[n + i * F + j] = std::sin(t);
+                acc[n + n * F + i * F + j] = std::cos(t);
+            }
+        }
+        out_row(Y, rowoff(Y, r, w), w, acc);
     }
     return RAD_OK;
 }

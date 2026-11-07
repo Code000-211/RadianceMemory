@@ -19,6 +19,9 @@
 #include "ngram.h"
 
 #include <chrono>
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+#include <functional>
+#endif
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -42,6 +45,9 @@ struct SchedReq {
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
     int64_t  first_tok_us = 0;   /* 0 until the first output token: this request's TTFT */
+    int64_t  admitted_us = 0;    /* 0 until the first admission: where the queue ends, so a
+                                  * prefill rate can divide by the prefill alone. ttft covers
+                                  * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
 
@@ -274,6 +280,7 @@ public:
         int32_t  slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
+        double   prefill_s = -1;       /* first token minus admission; negative until both */
         double   decode_tps = 0;       /* this request's own, since its first token */
     };
     /* Oldest first, since the oldest is the one most likely stuck. Returns how many were
@@ -463,7 +470,15 @@ public:
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
     int64_t plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
-                       int64_t* checkpoint_pos, int64_t keep_at = 0) const;
+                       int64_t* checkpoint_pos, int64_t keep_at = 0,
+                       const Request* r = nullptr) const;
+    /* Visible for tests: `want` tokens of `r` from `n_computed` cut so the chunk ends inside no run
+     * the language model reads both ways (RadEncoderDecl::bidirectional): before the run on a
+     * quantum, or at its end when the chunk starts in it and `budget` holds that, else 0. A run
+     * longer than any step keeps the cut where it falls. `want` unchanged for a program with no
+     * such runs. */
+    int64_t bidi_fit(const Request& r, int64_t n_computed, int64_t n_target, int64_t want,
+                     int64_t budget) const;
 
     /* The smallest step the prefill stager overlaps, in tokens (0 = no stager), set once by the
      * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap).
@@ -474,6 +489,40 @@ public:
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
      * saves (Engine::serve). */
     void    set_span_min(int64_t tokens);
+
+    /* Window residency (spec §7.3), the scheduler's half. The manager names which blocks move; the
+     * engine owns the streams, so it supplies the two calls below. Without a mover nothing is ever
+     * demoted or promoted, which is every server that does not pass --kv-residency-mib.
+     *
+     *   move    runs `moves` (all one group) -- VRAM -> host when `to_host`, else host -> VRAM --
+     *           and returns RAD_OK once they are issued. A demotion is ordered after the step that
+     *           wrote the blocks; a promotion is a dependency of the compute stream, so the step
+     *           that reads the blocks waits (TierExec::issue_moves).
+     *   landed  whether every move issued so far has landed. Polled, never waited on: held pool
+     *           blocks and store slots are given back at the first step after it says yes.
+     *
+     * After every committed step the sequences that are not prefilling lose what lies outside
+     * sink + tail window, at most `sweep_blocks` blocks between them (the copy a step pays is
+     * bounded, TierExec::sweep_blocks); before a prefill or
+     * mixed step its prefill rows are promoted whole, and its decode rows too when the step may
+     * be dense (res_dense_rows), so no dense read meets a cold entry; a sparse step's decode
+     * rows page as a decode step's do. */
+    struct ResidencyMover {
+        std::function<int(const std::vector<BlockMove>&, bool to_host)> move;
+        /* 1: every move issued so far has landed; 0: some are still in flight; < 0: a transfer
+         * failed. A failure is never landed: the blocks and slots of what was in flight are
+         * quarantined and every sequence naming what the moves wrote fails (res_reap). */
+        std::function<int()> landed;
+        /* RADIANCE_DEBUG_KV_TIER (sync or emulate): a step that would poll for the last sweep's
+         * landing waits for it instead, so a sweep follows every decode step and which step first
+         * reads a block demoted does not depend on the transfer's timing -- what a tiered
+         * residency run and its emulation must share to be compared byte for byte. */
+        bool sync = false;
+        /* The KL mode's emulation: unbounded, and every sequence after every step, mid-prefill
+         * too, since the KL mode scores prefill chunks and runs no decode step. */
+        bool every_step = false;
+    };
+    void    set_residency_mover(ResidencyMover m, int64_t sweep_blocks);
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
@@ -489,8 +538,21 @@ public:
      * multi-token chunk past the floor would overwrite keys its own earlier rows still read, while
      * one token a step attends as its decode step did. Otherwise `n_target`. */
     int64_t chunk_end(const Request& r, int64_t n_target) const;
+    /* --prefill-interleave: the decode-only steps that follow a chunk run beside decoding
+     * sequences. N as configured; under auto, from the measured step costs (see the definition).
+     * Visible for tests, as is note_step_cost, which feeds auto a step's wall time as
+     * step_finished does: `chunk` for a step that carried a prefill chunk, else a decode step. */
+    int64_t interleave_steps() const;
+    void    note_step_cost(bool chunk, double seconds);
 
 private:
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    friend class Engine;
+    /* Test-build-only observer at the concrete rollback operation. */
+    void set_kv_rollback_test_hook(std::function<void(uint64_t, int, int, int64_t, bool)> hook) {
+        kv_rollback_test_hook_ = std::move(hook);
+    }
+#endif
     Program*      prog_ = nullptr;
     Config        cfg_{};
     ChunkGeometry geo_{};
@@ -501,13 +563,41 @@ private:
     int64_t       stage_rows_ = 0;
     /* set_span_min: the shortest prefill a span is taken for, 0 for any. */
     int64_t       span_min_ = 0;
+    /* set_residency_mover, and whether moves it ran have not been reported landed yet. */
+    ResidencyMover res_mover_;
+    int64_t        res_sweep_blocks_ = 0;
+    bool           res_inflight_ = false;
+    /* A move failed: no more demotions (whatever is resident stays so). Promotions still run, so a
+     * conversation already cold can still be made dense, or fail on its own if that fails too. */
+    bool           res_sweep_off_ = false;
+    std::vector<BlockMove> res_moves_;
+    /* Sequences a failed promotion left cold: they cannot run a dense step, and fail at the start
+     * of the next step (the abandoned step still names them). */
+    std::vector<uint64_t> res_lost_;
+    /* Runs res_moves_ through the mover one group at a time, then clears it. A failure puts back
+     * every entry res_moves_ re-pointed (IKVManager::residency_abort) and appends the sequences
+     * put back to `undone`; RAD_OK means every move was queued and is now in flight. */
+    int res_issue(bool to_host, std::vector<uint64_t>* undone = nullptr);
+    /* Fails the live requests among `ids` as kv_residency_move_failed, unpublished. */
+    void res_fail(const std::vector<uint64_t>& ids, int status, const char* why);
+    /* Gives back the blocks and slots of moves that have landed. */
+    void res_reap();
+    /* After a committed step: demote what falls outside sink + tail, within the bound. */
+    void res_sweep();
+    /* Whether step `p` may read its decode rows' tables densely, so they too must be promoted;
+     * false when every residency group's consumer reads them sparsely, through the pager. */
+    bool res_dense_rows(const StepPlan& p) const;
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
+    bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
     IKVManager*   kv_ = nullptr;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
+#endif
     IPrefixCache* pc_ = nullptr;
 
     /* Does a prefix-cache hit leave a hole in a block drafter's own KV? Only if some paged group
@@ -748,6 +838,13 @@ private:
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
+    /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
+     * the running means of a step that carried a chunk and of a decode step, in seconds, fed by
+     * step_finished. */
+    static constexpr double  kInterleaveEma = 0.25;
+    static constexpr int64_t kInterleaveAutoMax = 64;
+    double  ema_chunk_s_ = 0.0, ema_decode_s_ = 0.0;
+    void    step_cost_locked(bool chunk, double seconds);
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
@@ -796,7 +893,8 @@ private:
     const Request* serial_req(const SerialSeq& m) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
-    void preempt_back();
+    bool preempt_back();                                      /* true: the victim published its prefix */
+    bool publish_prefix(SchedReq& s);
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets

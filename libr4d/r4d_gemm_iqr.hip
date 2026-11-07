@@ -1,18 +1,20 @@
 // gemm_nt_q over the IQR weights (r4d_iqr.h), decoded from their codes where they are read; VRAM
 // holds a B-bit weight in B bits. Two rows, as the int8 family's (r4d_gemm_fp8a8.hip):
 //
-//   gemm_iqr_nt_m64   M <= 64 (decode and speculative verify). At M <= 8 a GEMV: a wave a 16-row
-//                     tile, its lanes across K, each lane's decoded values one sudot4 against the
-//                     activation. Above, the i8a8 narrow tile with each 128-K block's weight decoded
-//                     and transposed into fragment order through LDS just before its WMMA steps.
+//   gemm_iqr_nt_m64   M <= 64 (decode and speculative verify). At one token (a computed trellis;
+//                     M <= 8 for the other forms) a GEMV: a block a 16-row tile, its waves across
+//                     K, each lane's decoded values one sudot4 against the activation. To 16 tokens
+//                     a WMMA tile of the same shape, each 128-K unit decoded and transposed into
+//                     fragment order through the wave's LDS just before its WMMA steps. Above, the
+//                     i8a8 narrow tile with the same per-unit decode.
 //   gemm_iqr_tiled    any M (prefill). The i8a8 prefill tile over the int8 fragment plane in the
 //                     caller's scratch, which the tile's blocks decode as they arrive, each value
 //                     once.
 //
-// The narrow and prefill tiles compute what the int8 tiles compute over the same int8 values (their
-// split, staging, accumulation order and fold), so a weight decoded here and the same weight's int8
-// values in the int8 kernels give the same output bytes. The GEMV folds per lane and then sums
-// across lanes: the product within f32 rounding.
+// The narrow tile above 16 tokens and the prefill tile compute what the int8 tiles compute over the
+// same int8 values (their split, staging, accumulation order and fold), so a weight decoded here
+// and the same weight's int8 values in the int8 kernels give the same output bytes. The GEMV and
+// the 16-token tile sum per wave and then across waves: the product within f32 rounding.
 
 #include "r4d.h"
 #include "r4d_args.h"
@@ -20,6 +22,8 @@
 #include "r4d_fp8_wmma.h"
 #include "r4d_iqr.h"
 #include "r4d_iqr_dec.h"
+#include "r4d_fwht.h"
+#include "r4d_q8.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -48,37 +52,97 @@ constexpr uint32_t kIqrSplitWaves = 512;
 
 #include "r4d_gemm_8a8_prefill.h"
 
+/* ---- the gated fold (gemm_nt_q_gated at i8a8h) ----------------------------------------------
+ *
+ * gate_up's GEMM with gated_had_quant_i8g's pass in its epilogue. A block computes one 16-column
+ * tile of the gated output: the gate rows' tile and the up rows' tile, each with the waves and K
+ * order of the plain kernel at the full weight's N, so their bf16 values are the plain kernel's.
+ * It writes silu(gate) * up, rounded as gated_quant_fp8_kernel rounds it, into the op's scratch
+ * (and `out_bf16`), and the last of a 128-column group's eight blocks to arrive rotates and
+ * quantises the group, a wave a token, as that kernel does: so the codes and scales are the
+ * pair's bytes. */
+struct GatedOut {
+    uint16_t* H;            /* [M][n] the bf16 product, scratch */
+    int8_t* Q;              /* [M][q_ld] int8 codes */
+    float* S;               /* [M][s_ld] a scale per (token, 128 columns) */
+    uint16_t* Yb;           /* [M][y_ld] the unrotated bf16 product, or null */
+    unsigned int* cnt;      /* an arrival counter per 128-column group */
+    uint32_t n, q_ld, s_ld, y_ld;
+};
+
+/* Token m's gated value at column `col` from the gate and up rows' f32 sums (row scale applied). */
+__device__ __forceinline__ void gated_put(const GatedOut& go, uint32_t m, uint32_t col, float vg,
+                                          float vu) {
+    const float gv = bf16_to_f32(f32_to_bf16(vg));
+    const float a = gv / (1.0f + expf(-gv));
+    const uint16_t h = f32_to_bf16(a * bf16_to_f32(f32_to_bf16(vu)));
+    go.H[(size_t)m * go.n + col] = h;
+    if (go.Yb) go.Yb[(size_t)m * go.y_ld + col] = h;
+}
+
+/* After every thread's gated_put: the group's last arriver quantises it, `nw` waves. */
+__device__ __forceinline__ void gated_tail(const GatedOut& go, uint32_t M, uint32_t nw) {
+    __shared__ unsigned int s_last;
+    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const uint32_t g = blockIdx.x / 8u;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0)
+        s_last = __hip_atomic_fetch_add(&go.cnt[g], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    if (s_last != 7u) return;
+    if (tid == 0) __hip_atomic_store(&go.cnt[g], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __threadfence();
+    for (uint32_t m = wave; m < M; m += nw) {
+        const uint32_t c0 = g * 128u + lane * 4u;
+        float v[4];
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) v[j] = bf16_to_f32(go.H[(size_t)m * go.n + c0 + j]);
+        r4d_fwht_wave<128>(v, (int)lane);
+        const float mx = r4d_wave_max(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))));
+        const float sc = mx > 0.0f ? mx * (1.0f / q8_top<true>()) : 1.0f;
+        if (lane == 0) go.S[(size_t)m * go.s_ld + g] = sc;
+        *(uint32_t*)(go.Q + (size_t)m * go.q_ld + c0) = q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / sc);
+    }
+}
+
 /* ---- the GEMV: M <= 8 ----------------------------------------------------------------------
  *
- * A wave a 16-row tile, its lanes across K: lane l takes columns 4l .. 4l + 3 of each 128-K block,
- * so its decoded values of a row are one sudot4 against the activation's four bytes there, and a
- * row's sum is folded into f32 with the (row, block) and (token, block) scales a block at a time,
- * in each lane, then summed across the wave once at the end. The weight stream is the codes' own
+ * A block a 16-row tile, its KW waves across K: wave w takes the tile's 128-K blocks w, w + KW, ..,
+ * so at any time a block's waves read KW consecutive units of one tile. Within a wave lane l takes
+ * columns 4l .. 4l + 3 of each block, so its decoded values of a row are one sudot4 against the
+ * activation's four bytes there, and a row's sum is folded into f32 with the (row, block) and
+ * (token, block) scales a block at a time, in each lane. At the end each wave sums its lanes and
+ * the block sums its waves through LDS in ascending order. The weight stream is the codes' own
  * bytes, fetched a block ahead; the work a value is its decode, a quarter sudot4 a token and half
- * an f32 fold. Split over K into partial planes when the tiles alone leave the card idle; the last
- * z block of a column of blocks sums them in ascending z.
+ * an f32 fold.
  *
- * The fold order differs from the WMMA tile's (per lane, then across lanes), so the output is the
- * product within f32 rounding rather than the int8 tile's bytes. */
-constexpr uint32_t kGW = 8;   /* waves a block */
-template <class F, uint32_t MT>
-__global__ __launch_bounds__(kGW * kWave) R4D_WAVES(6)
+ * A block lives for 1 / KW of a tile's K, so the card balances over N / 16 short blocks and no
+ * weight needs a split across blocks. A wave a tile over all of K (the previous form) left a
+ * partial last round of long waves on every shape: at 102 VGPRs a SIMD holds 15 waves, and N / 16
+ * tiles (gate_up 2176, down split 7 ways 2240) never divide that.
+ *
+ * The fold order differs from the WMMA tile's (per lane, then across lanes and waves), so the
+ * output is the product within f32 rounding rather than the int8 tile's bytes. */
+template <class F, uint32_t MT, uint32_t KW, bool GATED = false>
+__global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
-                     float* __restrict__ part, uint16_t* __restrict__ Y,
-                     unsigned int* __restrict__ Ctr, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
-                     uint32_t kbs) {
+                     uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
+                     GatedOut go) {
     using D = Dec<F, true>;
+    constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
     __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
+    __shared__ float s_red[NW][16 * MT];
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
-    const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
     Ctx c = c0;
     c.tab = s_tab;
-    D::stage(s_tab, c, tid, kGW * kWave);
+    D::stage(s_tab, c, tid, NW * kWave);
     __syncthreads();
 
-    const uint32_t rt = blockIdx.x * kGW + wave;
-    const bool alive = rt * 16u < N;
-    const uint32_t kb0 = blockIdx.z * kbs, kb1 = min(c.nkb, kb0 + kbs);
+    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
+    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
+    const uint32_t rt = blockIdx.x + half * (N / 32u);
     const uint32_t myrow = rt * 16u + (lane & 15u);
 
     float acc[16][MT];
@@ -86,10 +150,14 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
     for (uint32_t q = 0; q < 16; ++q)
 #pragma unroll
         for (uint32_t m = 0; m < MT; ++m) acc[q][m] = 0.0f;
+    float fsum[MT];   /* the biased path's fold factors since its last flush (wave-uniform) */
+#pragma unroll
+    for (uint32_t m = 0; m < MT; ++m) fsum[m] = 0.0f;
+    uint32_t nflush = 0;
 
-    typename D::Raw cur = D::fetch(c, rt, kb0, lane, alive && kb0 < kb1), nxt;
-    for (uint32_t kb = kb0; kb < kb1; ++kb) {
-        if (kb + 1u < kb1) nxt = D::fetch(c, rt, kb + 1u, lane, alive);
+    typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
+    for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
+        if (kb + KW < c.nkb) nxt = D::fetch(c, rt, kb + KW, lane, true);
         uint32_t xv[MT];
         float as[MT];
 #pragma unroll
@@ -98,8 +166,25 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
             as[m] = XS[(size_t)m * xs_ld + kb];
         }
         /* Row (lane & 15)'s fold scale and ratio, read by every lane through readlane. */
-        const float fs = alive ? fold_f32<F>(c, myrow, kb) : 0.0f;
-        const float ratio = alive ? rb_ratio<F>(c, myrow, kb) : 0.0f;
+        /* A bf16 scale a (row, 128): the tile's sixteen rows' scales of this block are 32
+         * consecutive bytes at a wave-uniform address, read through the constant address space
+         * into scalar registers, so no row's scale is broadcast by readlane. */
+        constexpr bool SROW = F::SC == kBf16 && F::LRB == 0;
+        [[maybe_unused]] uint32_t sw[8];
+        if constexpr (SROW) {
+            typedef const __attribute__((address_space(4))) uint32_t cu32;
+            cu32* sp = (cu32*)((const uint16_t*)c.S + ((size_t)rt * c.nkb + kb) * 16u);
+#pragma unroll
+            for (uint32_t i = 0; i < 8; ++i) sw[i] = sp[i];
+        }
+        auto row_fold = [&](uint32_t q, float fs_) {
+            if constexpr (SROW)
+                return __uint_as_float(q & 1u ? sw[q / 2u] & 0xFFFF0000u : sw[q / 2u] << 16);
+            else
+                return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__float_as_int(fs_), q));
+        };
+        const float fs = SROW ? 0.0f : fold_f32<F>(c, myrow, kb);
+        const float ratio = rb_ratio<F>(c, myrow, kb);
         uint32_t w[16];
         /* A computed trellis off the tcq_rb grid decodes each value as its byte sum, the value
          * plus 126: one sudot4 of the unsigned sums less 126 times the lane's activation sum. */
@@ -108,19 +193,54 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
         if constexpr (UNS) {
 #pragma unroll
             for (uint32_t m = 0; m < MT; ++m)
-                xsum[m] = 126 * __builtin_amdgcn_sudot4(true, (int)xv[m], false, 0x01010101, 0, false);
+                xsum[m] = __builtin_amdgcn_sudot4(true, (int)xv[m], false, 0x7E7E7E7E, 0, false);
         }
-        if constexpr (UNS && MT == 1) {
+        if constexpr (UNS && MT <= 4 && F::SC == kRowF32) {
             /* One token: each value's hash dotted with its activation byte in every byte lane
-             * sums the value's bytes and multiplies in one instruction, nothing packed. */
+             * sums the value's bytes and multiplies in one instruction, nothing packed. Under one
+             * f32 scale a row the block's fold is one factor for all rows, so a row's dot starts
+             * at 0x4B400000 less the lane's bias sum: read as an f32 it is exactly 12582912 plus
+             * the sum (|sum| < 2^22), one fma folds it, and 12582912 times the block's factors
+             * leaves each row once at the end. */
+            uint32_t h[16][4];
+            D::hashes(cur, c, h);
+#pragma unroll
+            for (uint32_t m = 0; m < MT; ++m) {
+                uint32_t xs[4];
+#pragma unroll
+                for (uint32_t e = 0; e < 4; ++e) xs[e] = __builtin_amdgcn_perm(0u, xv[m], e * 0x01010101u);
+                const float s = fs * as[m];
+                fsum[m] += s;
+                const int b0 = kRbBias - __builtin_amdgcn_sudot4(true, (int)xv[m], false, 0x7E7E7E7E, 0, false);
+#pragma unroll
+                for (uint32_t q = 0; q < 16; ++q) {
+                    int d = b0;
+#pragma unroll
+                    for (uint32_t e = 0; e < 4; ++e)
+                        d = __builtin_amdgcn_sudot4(false, (int)h[q][e], true, (int)xs[e], d, false);
+                    acc[q][m] = fmaf(__int_as_float(d), s, acc[q][m]);
+                }
+            }
+            /* the bias out every kRbFlush blocks, so a row's sum stays within a few bias terms
+             * of its value (the prefill tile's bound) */
+            if (++nflush == kRbFlush) {
+#pragma unroll
+                for (uint32_t m = 0; m < MT; ++m) {
+#pragma unroll
+                    for (uint32_t q = 0; q < 16; ++q) acc[q][m] = fmaf(-kRbBiasF, fsum[m], acc[q][m]);
+                    fsum[m] = 0.0f;
+                }
+                nflush = 0;
+            }
+        } else if constexpr (UNS && MT == 1) {
             uint32_t h[16][4];
             D::hashes(cur, c, h);
             uint32_t xs[4];
 #pragma unroll
-            for (uint32_t e = 0; e < 4; ++e) xs[e] = ((xv[0] >> (8u * e)) & 0xFFu) * 0x01010101u;
+            for (uint32_t e = 0; e < 4; ++e) xs[e] = __builtin_amdgcn_perm(0u, xv[0], e * 0x01010101u);
 #pragma unroll
             for (uint32_t q = 0; q < 16; ++q) {
-                const float wsq = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__float_as_int(fs), q));
+                const float wsq = row_fold(q, fs);
                 int d = -xsum[0];
 #pragma unroll
                 for (uint32_t e = 0; e < 4; ++e)
@@ -132,7 +252,7 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
             D::unzero(c, rt, kb, w);
 #pragma unroll
             for (uint32_t q = 0; q < 16; ++q) {
-                const float wsq = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__float_as_int(fs), q));
+                const float wsq = row_fold(q, fs);
 #pragma unroll
                 for (uint32_t m = 0; m < MT; ++m) {
                     int d = __builtin_amdgcn_sudot4(!UNS, (int)w[q], true, (int)xv[m], 0, false);
@@ -143,58 +263,192 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
         }
         cur = nxt;
     }
+    /* every lane's rows carry 12582912 times the factors once for each of its blocks */
 #pragma unroll
     for (uint32_t q = 0; q < 16; ++q)
 #pragma unroll
-        for (uint32_t m = 0; m < MT; ++m) acc[q][m] = r4d_wave_sum(acc[q][m]);
-    if constexpr (F::SC == kRowF32) {
-        /* each row's own scale, after its blocks' sums (lane q's row q; a split's partials are
-         * linear in it) */
-        const float rs = alive ? row_scale<F>(c, rt * 16u + (lane & 15u)) : 0.0f;
-#pragma unroll
-        for (uint32_t q = 0; q < 16; ++q) {
-            const float rq = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__float_as_int(rs), q));
-#pragma unroll
-            for (uint32_t m = 0; m < MT; ++m) acc[q][m] *= rq;
-        }
-    }
-    if (lane < 16u && alive) {
-        /* lane q stores row q: the sums are wave-uniform, picked by a constant index */
+        for (uint32_t m = 0; m < MT; ++m) acc[q][m] = r4d_wave_sum(fmaf(-kRbBiasF, fsum[m], acc[q][m]));
+    if (lane == 0) {
 #pragma unroll
         for (uint32_t q = 0; q < 16; ++q)
-            if (lane == q) {
 #pragma unroll
-                for (uint32_t m = 0; m < MT; ++m) {
-                    const size_t o = (size_t)m * N + rt * 16u + q;
-                    if (gridDim.z > 1u) part[(size_t)blockIdx.z * MT * N + o] = acc[q][m];
-                    else Y[o] = f32_to_bf16(acc[q][m]);
-                }
-            }
+            for (uint32_t m = 0; m < MT; ++m) s_red[wave0][q * MT + m] = acc[q][m];
     }
-    if (gridDim.z > 1u) {
-        __threadfence();
-        __syncthreads();
-        __shared__ unsigned int s_arrived;
-        if (tid == 0)
-            s_arrived = __hip_atomic_fetch_add(&Ctr[blockIdx.x], 1u, __ATOMIC_ACQ_REL,
-                                               __HIP_MEMORY_SCOPE_AGENT);
-        __syncthreads();
-        if (s_arrived + 1u == gridDim.z) {
-            if (tid == 0)
-                __hip_atomic_store(&Ctr[blockIdx.x], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-            __threadfence();
-            const uint32_t r0 = blockIdx.x * kGW * 16u, nr = min(kGW * 16u, N - r0);
-            for (uint32_t i = tid; i < nr * MT; i += kGW * kWave) {
-                const size_t o = (size_t)(i / nr) * N + r0 + i % nr;
-                float v = 0.0f;
-                for (uint32_t z = 0; z < gridDim.z; ++z) v += part[(size_t)z * MT * N + o];
-                Y[o] = f32_to_bf16(v);
-            }
+    __syncthreads();
+    if constexpr (GATED) {
+        if (tid < 16u * MT) {
+            const uint32_t q = tid / MT, m = tid % MT;
+            float vg = 0.0f, vu = 0.0f;
+#pragma unroll
+            for (uint32_t w = 0; w < KW; ++w) vg += s_red[w][tid];
+#pragma unroll
+            for (uint32_t w = 0; w < KW; ++w) vu += s_red[KW + w][tid];
+            vg *= row_scale<F>(c, blockIdx.x * 16u + q);
+            vu *= row_scale<F>(c, (blockIdx.x + N / 32u) * 16u + q);
+            gated_put(go, m, blockIdx.x * 16u + q, vg, vu);
+        }
+        gated_tail(go, MT, NW);
+    } else {
+        if (tid < 16u * MT) {
+            const uint32_t q = tid / MT, m = tid % MT;
+            float v = 0.0f;
+#pragma unroll
+            for (uint32_t w = 0; w < KW; ++w) v += s_red[w][tid];
+            /* each row's own scale, after its blocks' sums */
+            v *= row_scale<F>(c, rt * 16u + q);
+            Y[(size_t)m * N + rt * 16u + q] = f32_to_bf16(v);
         }
     }
 }
 
-/* ---- the narrow tile: 8 < M <= 64 -----------------------------------------------------------
+/* ---- the narrow tile at M <= 16 -------------------------------------------------------------
+ *
+ * One 16-token tile: a block a 16-row weight tile, its KW waves across K as the GEMV's (wave w
+ * the tile's 128-K blocks w, w + KW, ..). A wave decodes each unit and transposes it into
+ * fragment order through its own LDS tile (frag), then runs the unit's eight WMMA steps against
+ * the activation's fragments read straight from global memory, where the M x K activation sits
+ * in L2, so the loop has no block barrier and no shared staging. Rows of the token tile past M
+ * read token M - 1; their outputs are not stored.
+ *
+ * Under one f32 scale a row each unit's int32 sums start at 0x4B400000, so a slot read as an f32
+ * is 12582912 plus its sum and one fma folds it (the prefill tile's RB 32 fold), flushed every
+ * kRbFlush units; other scale forms fold the converted sum with their (row, block) scales. The
+ * waves' partials are summed through LDS in ascending wave order, so the output is the product
+ * within f32 rounding, not the int8 tile's bytes. */
+template <class F, uint32_t KW, bool GATED = false>
+__global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
+void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
+                    uint16_t* __restrict__ Y, uint32_t N, uint32_t M, uint32_t x_ld, uint32_t xs_ld,
+                    GatedOut go) {
+    using D = Dec<F>;
+    constexpr bool BIAS = F::SC == kRowF32;
+    constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
+    __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
+    /* the waves' transpose tiles, then their partials (8 x 32 floats a wave, in its own tile) */
+    __shared__ __attribute__((aligned(16))) uint8_t s_tr[NW * kTrBytes];
+    static_assert(8u * kWave * 4u <= kTrBytes, "a wave's partials in its transpose tile");
+    auto red = [&](uint32_t w) { return (float*)(s_tr + w * kTrBytes); };
+    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
+    const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
+    Ctx c = c0;
+    c.tab = s_tab;
+    uint8_t* const tr = s_tr + wave0 * kTrBytes;
+    D::stage(s_tab, c, tid, NW * kWave);
+    __syncthreads();
+
+    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
+    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
+    const uint32_t rt = blockIdx.x + half * (N / 32u), row0 = rt * 16u;
+    const uint32_t tok = min(frag_c(lane), M - 1u);
+    const int8_t* const xrow = X + (size_t)tok * x_ld + frag_k0(lane);
+
+    f8v out = acc_zero();
+    float corr = 0.0f;   /* BIAS: the units' fold factors since the last flush */
+    uint32_t nflush = 0;
+    auto bload = [&](uint32_t kb, i2v (&b)[8], bool live) {
+#pragma unroll
+        for (uint32_t ks = 0; ks < 8; ++ks) {
+            const uint2 v = live ? *(const uint2*)(xrow + kb * kBlock + ks * kK) : make_uint2(0u, 0u);
+            b[ks][0] = (int)v.x;
+            b[ks][1] = (int)v.y;
+        }
+    };
+    typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
+    i2v bc[8], bn[8];
+    bload(wave, bc, wave < c.nkb);
+    for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
+        if (kb + KW < c.nkb) {
+            nxt = D::fetch(c, rt, kb + KW, lane, true);
+            bload(kb + KW, bn, true);
+        }
+        uint32_t w[16];
+        D::rows(cur, c, rb_ratio<F>(c, row0 + (lane & 15u), kb), w);
+        D::unzero(c, rt, kb, w);
+        Stage8 a8[2];
+        frag(w, tr, lane, a8);
+        /* two chains of four steps, so a step does not wait on the one before it */
+        f8v raw = rb_first<BIAS ? 32 : 0>();
+#pragma unroll
+        for (uint32_t ks = 0; ks < kBlock / kK; ++ks)
+            raw = mma8<true>(frag_of(a8[ks / 4u], ks % 4u), bc[ks], raw);
+        const float as = XS[(size_t)tok * xs_ld + kb];
+        if constexpr (BIAS) {
+            const float sb = fold_f32<F>(c, row0, kb) * as;
+            corr += sb;
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) out[t] = __builtin_fmaf(raw[t], sb, out[t]);
+            if (++nflush == kRbFlush) {
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) out[t] = __builtin_fmaf(-kRbBiasF, corr, out[t]);
+                corr = 0.0f;
+                nflush = 0;
+            }
+        } else {
+            float wsr[8];
+            if constexpr (F::SC == kBf16 && F::LRB == 0) {
+                /* A bf16 scale a (row, 128): the lane's eight rows are consecutive in the tile's
+                 * scale run (own_scale's order), 16 aligned bytes, one load. */
+                const uint4 q4 = *(const uint4*)((const uint16_t*)c.S + ((size_t)rt * c.nkb + kb) * 16u +
+                                                 acc_row(lane, 0));
+                const uint32_t qd[4] = { q4.x, q4.y, q4.z, q4.w };
+#pragma unroll
+                for (uint32_t t = 0; t < 4; ++t) {
+                    wsr[2 * t] = __uint_as_float(qd[t] << 16);
+                    wsr[2 * t + 1] = __uint_as_float(qd[t] & 0xFFFF0000u);
+                }
+            } else {
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) wsr[t] = fold_f32<F>(c, row0 + acc_row(lane, t), kb);
+            }
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t)
+                out[t] = __builtin_fmaf(acc_val<true>(raw[t]), wsr[t] * as, out[t]);
+        }
+        cur = nxt;
+#pragma unroll
+        for (uint32_t ks = 0; ks < 8; ++ks) bc[ks] = bn[ks];
+    }
+    /* each wave's partials in its own tile, behind its last transpose's reads */
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (uint32_t t = 0; t < 8; ++t) red(wave0)[t * kWave + lane] = BIAS ? __builtin_fmaf(-kRbBiasF, corr, out[t]) : out[t];
+    __syncthreads();
+    if constexpr (GATED) {
+        if (wave0 == 0) {
+            const uint32_t col = frag_c(lane);
+            const uint32_t r0 = acc_row(lane, 0);
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) {
+                float ag = 0.0f, au = 0.0f;
+#pragma unroll
+                for (uint32_t w = 0; w < KW; ++w) ag += red(w)[t * kWave + lane];
+#pragma unroll
+                for (uint32_t w = 0; w < KW; ++w) au += red(KW + w)[t * kWave + lane];
+                ag *= row_scale<F>(c, blockIdx.x * 16u + r0 + t);
+                au *= row_scale<F>(c, (blockIdx.x + N / 32u) * 16u + r0 + t);
+                if (col < M) gated_put(go, col, blockIdx.x * 16u + r0 + t, ag, au);
+            }
+        }
+        gated_tail(go, M, NW);
+    } else if (wave == 0) {
+        const uint32_t col = frag_c(lane);
+        const uint32_t r0 = row0 + acc_row(lane, 0);
+        float v[8];
+#pragma unroll
+        for (uint32_t t = 0; t < 8; ++t) {
+            float a = 0.0f;
+#pragma unroll
+            for (uint32_t w = 0; w < KW; ++w) a += red(w)[t * kWave + lane];
+            v[t] = a * row_scale<F>(c, r0 + t);
+        }
+        if (col < M)
+            *(uint4*)(Y + (size_t)col * N + r0) = make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
+                                                              bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
+    }
+}
+
+/* ---- the narrow tile: 16 < M <= 64 -----------------------------------------------------------
  *
  * r4d_gemm_fp8a8.hip's gemm_fp8a8_body at I8, unfused: MW waves a block, a wave one 16-row weight
  * tile against NT 16-token tiles staged through LDS, split-K over the caller's scratch with the
@@ -305,6 +559,20 @@ void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restr
                     const float f = alive ? fold_f32<F>(c, wrow0, kb) : 0.0f;
 #pragma unroll
                     for (uint32_t t = 0; t < 8; ++t) wsr[t] = f;
+                } else if constexpr (F::SC == kBf16 && F::LRB == 0) {
+                    /* A bf16 scale a (row, 128): the lane's eight rows are consecutive in the
+                     * tile's scale run (own_scale's order), 16 aligned bytes, one load. Every row
+                     * of a live tile is live (rows is a multiple of 16). */
+                    uint4 q = make_uint4(0u, 0u, 0u, 0u);
+                    if (alive)
+                        q = *(const uint4*)((const uint16_t*)c.S +
+                                            ((size_t)(wrow0 / 16u) * c.nkb + kb) * 16u + acc_row(lane, 0));
+                    const uint32_t qd[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+                    for (uint32_t t = 0; t < 4; ++t) {
+                        wsr[2 * t] = __uint_as_float(qd[t] << 16);
+                        wsr[2 * t + 1] = __uint_as_float(qd[t] & 0xFFFF0000u);
+                    }
                 } else {
 #pragma unroll
                     for (uint32_t t = 0; t < 8; ++t)
@@ -568,55 +836,82 @@ Ctx ctx_of(const Operands& g) {
     return c;
 }
 
-/* The GEMV's K split: enough waves to keep the card's memory busy (2048 tiles' worth), each split at
- * least four blocks. A function of N and K alone. */
 constexpr uint32_t kGemvMaxM = 8;
-uint32_t gemv_ksplit(uint32_t N, uint32_t nkb) {
-    const uint32_t tiles = N / 16u;
-    uint32_t ks = std::min((2048u + tiles - 1u) / tiles, std::max(1u, nkb / 4u));
-    const uint32_t kbs = (nkb + ks - 1u) / ks;
-    return (nkb + kbs - 1u) / kbs;
-}
 
+/* The GEMV, plain into `g.y`, or with `go` the gated fold (a block a gated tile, twice the waves). */
 template <class F>
-int gemv_launch(const Operands& g, void* scratch, long long scratch_bytes, RadStream stream) {
-    const uint32_t N = (uint32_t)g.N, M = (uint32_t)g.M, nkb = (uint32_t)g.nkb;
-    uint32_t ks = gemv_ksplit(N, nkb);
-    const uint32_t gx = (N / 16u + kGW - 1u) / kGW;
-    unsigned int* ctr = nullptr;
-    if (ks > 1u) {
-        ctr = gx <= 8192u ? r4d_8a8_split_ctr(stream, g.y->data) : nullptr;
-        if (!ctr || !scratch || scratch_bytes < (long long)ks * kGemvMaxM * N * 4) ks = 1u;
-    }
-    const uint32_t kbs = (nkb + ks - 1u) / ks;
+int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullptr) {
+    const uint32_t N = (uint32_t)g.N, M = (uint32_t)g.M;
     const Ctx c = ctx_of(g);
-    const dim3 grid(gx, 1, ks);
+    /* Four waves a tile where the tiles alone nearly fill the card, eight on narrow weights (M = 1,
+     * 4 bits: gate_up 146.6 / 147.1 us, down 76.0 / 78.4, the 5120 x 6144 outputs 31.4 / 31.9,
+     * attn_k 9.5 / 8.8). */
+    const uint32_t kw = N >= 4096u ? 4u : 8u;
+    const GatedOut gz = go ? *go : GatedOut{};
+    uint16_t* const y = go ? nullptr : (uint16_t*)g.y->data;
     int rc = RAD_E_SHAPE;
-#define R4D_IQR_GV(mt_)                                                                              rc = R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_>), grid, dim3(kGW * kWave), 0, c,                                (const int8_t*)g.a->data, (const float*)g.as->data, (float*)scratch,                              (uint16_t*)g.y->data, ctr, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, kbs)
+#define R4D_IQR_GV(mt_, kw_)                                                                     \
+    rc = go ? R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, true>), dim3(N / 32u),              \
+                       dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
+                       (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)   \
+            : R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_>), dim3(N / 16u), dim3(kw_ * kWave), \
+                       0, c, (const int8_t*)g.a->data, (const float*)g.as->data, y, N,           \
+                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+#define R4D_IQR_GVK(mt_) do { if (kw == 4u) R4D_IQR_GV(mt_, 4u); else R4D_IQR_GV(mt_, 8u); } while (0)
     switch (M) {
-        case 1u: R4D_IQR_GV(1u); break;
-        case 2u: R4D_IQR_GV(2u); break;
-        case 3u: R4D_IQR_GV(3u); break;
-        case 4u: R4D_IQR_GV(4u); break;
-        case 5u: R4D_IQR_GV(5u); break;
-        case 6u: R4D_IQR_GV(6u); break;
-        case 7u: R4D_IQR_GV(7u); break;
-        case 8u: R4D_IQR_GV(8u); break;
+        case 1u: R4D_IQR_GVK(1u); break;
+        case 2u: R4D_IQR_GVK(2u); break;
+        case 3u: R4D_IQR_GVK(3u); break;
+        case 4u: R4D_IQR_GVK(4u); break;
+        case 5u: R4D_IQR_GVK(5u); break;
+        case 6u: R4D_IQR_GVK(6u); break;
+        case 7u: R4D_IQR_GVK(7u); break;
+        case 8u: R4D_IQR_GVK(8u); break;
         default: return R4D_NO(RAD_E_SHAPE);
     }
+#undef R4D_IQR_GVK
 #undef R4D_IQR_GV
     return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}
+
+/* The 16-token tile, plain into `g.y` or gated as gemv_launch. */
+template <class F>
+int m16_launch(const Operands& g, RadStream stream, const GatedOut* go = nullptr) {
+    const uint32_t N = (uint32_t)g.N, M = (uint32_t)g.M;
+    const Ctx c = ctx_of(g);
+    const GatedOut gz = go ? *go : GatedOut{};
+    uint16_t* const y = go ? nullptr : (uint16_t*)g.y->data;
+    int rc;
+#define R4D_IQR_M16(kw_)                                                                         \
+    rc = go ? R4D_EMIT(stream, (iqr_m16_kernel<F, kw_, true>), dim3(N / 32u),                    \
+                       dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
+                       (const float*)g.as->data, y, N, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz) \
+            : R4D_EMIT(stream, (iqr_m16_kernel<F, kw_>), dim3(N / 16u), dim3(kw_ * kWave), 0, c,  \
+                       (const int8_t*)g.a->data, (const float*)g.as->data, y, N, M,               \
+                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+    if (N >= 4096u) R4D_IQR_M16(4u);
+    else R4D_IQR_M16(8u);
+#undef R4D_IQR_M16
+    return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}
+
+/* A computed trellis's GEMV pays its decode in VALU work beside every token's dot and fold, the
+ * tiles decode a unit once for all tokens. Measured on gate_up (34816 x 5120): at one token the
+ * GEMV wins at every width (2 / 4 / 6 bits 92.6 / 145.2 / 214.6 us, the 16-token tile at 4 / 6 bits
+ * 150.0 / 215.7); at two only on 2- and 3-bit codes under one f32 scale a row, its values dotted
+ * straight from their hashes (128.4 / 132.4 against the tile's 137.7 / 138.5; 4 bits 152.8 against
+ * 150.1); from three tokens the tile. */
+template <class F>
+constexpr uint32_t gemv_max() {
+    return F::KIND != kTrellisMad ? kGemvMaxM : F::B <= 3u && F::SC == kRowF32 ? 2u : 1u;
 }
 
 template <class F>
 int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int split_n,
                RadStream stream) {
     const uint32_t N = (uint32_t)g.N, K = (uint32_t)g.K, M = (uint32_t)g.M;
-    /* A computed trellis's GEMV pays its decode in VALU work beside every token's dot and fold;
-     * from five tokens the narrow tile, which decodes a unit once for all of them, is faster
-     * (gate_up at 4 bits: GEMV 120 / 136 / 186 us at 3 / 4 / 8 tokens, the tile 151 / 154 / 157). */
-    constexpr uint32_t gemv_max = F::KIND == kTrellisMad ? 4u : kGemvMaxM;
-    if (M <= gemv_max) return gemv_launch<F>(g, scratch, scratch_bytes, stream);
+    if (M <= gemv_max<F>()) return gemv_launch<F>(g, stream);
+    if (M <= 16u && ((uintptr_t)g.y->data & 15u) == 0u) return m16_launch<F>(g, stream);
     /* At most eight waves a block: each has its own transpose tile in LDS. The wave count changes
      * no output bit (r4d_gemm_fp8a8.hip's narrow_mw). */
     const uint32_t mw = std::min(r4d_8a8_narrow_mw(N, M), 8u);
@@ -701,11 +996,7 @@ extern "C" int64_t r4d_rad_gemm_iqr_m64_scratch(const RadArgs* a) {
     uint32_t ck = 0;
     const uint32_t k2 = r4d_8a8_narrow_ksplit((uint32_t)(sn > 0 ? sn : N), (uint32_t)K,
                                               (uint32_t)M, &ck, kIqrSplitWaves);
-    /* The band's bound covers the GEMV's split at M <= 4 too. */
-    const int64_t tile = k2 > 1 ? (int64_t)k2 * M * N * 4 : 0;
-    const uint32_t kg = gemv_ksplit((uint32_t)N, (uint32_t)(K / kBlock));
-    const int64_t gemv = kg > 1 ? (int64_t)kg * kGemvMaxM * N * 4 : 0;
-    return std::max(tile, gemv);
+    return k2 > 1 ? (int64_t)k2 * M * N * 4 : 0;
 }
 
 extern "C" int r4d_rad_gemm_iqr_m64(const RadArgs* a, RadStream s) {
@@ -718,6 +1009,89 @@ extern "C" int r4d_rad_gemm_iqr_m64(const RadArgs* a, RadStream s) {
 #define R4D_IQR_GO(...)                                                                          \
     if (kw == R4D_IQR_T(__VA_ARGS__)::word())                                                    \
         return m64_launch<R4D_IQR_T(__VA_ARGS__)>(g, a->scratch, (long long)a->scratch_bytes, sn, s);
+    R4D_IQR_FORMS(R4D_IQR_GO)
+#undef R4D_IQR_GO
+    return R4D_NO(RAD_E_UNSUPPORTED);
+}
+
+namespace {
+
+/* gemm_nt_q_gated's operands at i8a8h: [0] a [1] a_scale [2] b [3] b_scale [4] q [5] scale
+ * [6] out_bf16. The weight is one [N, K] IQR plane, gate rows then up rows. */
+int gated_operands(const RadArgs* a, Operands* g, GatedOut* go) {
+    g->a = r4d_opt(a, 0);
+    g->as = r4d_opt(a, 1);
+    g->b = r4d_opt(a, 2);
+    g->bs = r4d_opt(a, 3);
+    g->y = nullptr;
+    const RadTensor* q = r4d_opt(a, 4);
+    const RadTensor* sc = r4d_opt(a, 5);
+    const RadTensor* yb = r4d_opt(a, 6);
+    if (!g->a || !g->as || !g->b || !g->bs || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (!is_weight_dtype(g->b->dtype) || !is_scale_dtype(g->bs->dtype)) return R4D_NO(RAD_E_DTYPE);
+    g->word = g->b->dtype & kWordMask;
+    if ((g->bs->dtype & kWordMask) != g->word) return R4D_NO(RAD_E_DTYPE);
+    if (g->a->dtype != RAD_I8 || g->as->dtype != RAD_F32 || q->dtype != RAD_I8 ||
+        sc->dtype != RAD_F32 || (yb && yb->dtype != RAD_BF16))
+        return R4D_NO(RAD_E_DTYPE);
+    if (g->b->rank != 2 || g->a->rank < 2 || g->as->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    g->M = g->a->shape[0];
+    g->N = g->b->shape[0];
+    g->K = g->b->shape[1];
+    const long long n = g->N / 2;
+    if (g->M < 1 || g->M > 16 || g->N % 256 || g->K % kFK) return R4D_NO(RAD_E_SHAPE);
+    g->nkb = g->K / kBlock;
+    if (r4d_numel(g->a) != g->M * g->K || g->as->shape[0] != g->M || g->as->shape[1] != g->nkb)
+        return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(q) != g->M * n || r4d_numel(sc) != g->M * (n / kBlock) ||
+        (yb && r4d_numel(yb) != g->M * n))
+        return R4D_NO(RAD_E_SHAPE);
+    g->a_ld = r4d_row_pitch(g->a);
+    g->sa_ld = r4d_row_pitch(g->as);
+    const long long q_ld = r4d_row_pitch(q), s_ld = r4d_row_pitch(sc), y_ld = yb ? r4d_row_pitch(yb) : 0;
+    if (g->a_ld < 0 || g->sa_ld < 0 || q_ld < 0 || s_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_aligned(g->a->data, 16) || !r4d_aligned(g->b->data, 256) || !r4d_aligned(q->data, 4) ||
+        q_ld % 4)
+        return R4D_NO(RAD_E_ALIGN);
+    const Form f = form(g->word);
+    if (is_trellis(f.kind) && g->N % ((long long)1 << f.lrun)) return R4D_NO(RAD_E_SHAPE);
+    go->Q = (int8_t*)q->data;
+    go->S = (float*)sc->data;
+    go->Yb = yb ? (uint16_t*)yb->data : nullptr;
+    go->n = (uint32_t)n;
+    go->q_ld = (uint32_t)q_ld;
+    go->s_ld = (uint32_t)s_ld;
+    go->y_ld = (uint32_t)y_ld;
+    return RAD_OK;
+}
+
+template <class F>
+int gated_launch(const Operands& g, const GatedOut& go, RadStream stream) {
+    if (g.M <= gemv_max<F>()) return gemv_launch<F>(g, stream, &go);
+    return m16_launch<F>(g, stream, &go);
+}
+
+}  // namespace
+
+extern "C" int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs* a) {
+    const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0);
+    if (M < 1 || N < 2) return 0;
+    return (int64_t)align256(M * (N / 2) * 2);
+}
+
+extern "C" int r4d_rad_gemm_iqr_gated(const RadArgs* a, RadStream s) {
+    Operands g;
+    GatedOut go;
+    const int rc = gated_operands(a, &g, &go);
+    if (rc != RAD_OK) return rc;
+    if (!a->scratch || (long long)a->scratch_bytes < align256(g.M * (g.N / 2) * 2))
+        return R4D_NO(RAD_E_SCRATCH);
+    go.H = (uint16_t*)a->scratch;
+    go.cnt = r4d_8a8_split_ctr(s, go.Q);
+    if (!go.cnt || go.n / 128u > 8192u) return R4D_NO(RAD_E_DEVICE);
+    const uint32_t kw = kernel_word(g.word);
+#define R4D_IQR_GO(...)                                                                          \
+    if (kw == R4D_IQR_T(__VA_ARGS__)::word()) return gated_launch<R4D_IQR_T(__VA_ARGS__)>(g, go, s);
     R4D_IQR_FORMS(R4D_IQR_GO)
 #undef R4D_IQR_GO
     return R4D_NO(RAD_E_UNSUPPORTED);

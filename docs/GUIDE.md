@@ -316,6 +316,7 @@ and runs.
 | `fishomni` | Fish Audio drama-3, speech from text with speaker tags and inline direction (§5.15) |
 | `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
 | `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
+| `hunyuan3d2` | Hunyuan3D-2's shape model, an untextured 3-D mesh from one picture (§5.17) |
 
 **4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
 refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
@@ -708,7 +709,8 @@ radiance --model m.rad --debug-placement    # the placement plan only
 
 The card is split into resident weights and the paged KV pool. The engine derives the split from the
 card and the model; no flag states either pool. Its inputs: `--gpu-headroom-mib` leaves card space
-alone, `--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
+alone, `--gpu-memory-mib` claims a size (headroom is the card less that; give one of the two),
+`--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
 experts must stay on the card. The startup receipt prints every term. With no visible card (the host
 backend) half of RAM stands in for the card and is split the same way; the weights pool is then host
 memory, holding the weights a host kernel cannot read where the container stores them.
@@ -766,7 +768,8 @@ it) by the context you serve and by the sessions you want live at once, and comp
 the receipt reports. The cache already has everything the experts can spare; a larger
 `--host-pool-mib` (RAM permitting) or `--kv-cache-dtype fp8` gives it more. For example, on
 Qwen3.8-Flash-Next two paged groups share one token axis, `kv_attn` at 26.00 KiB and `kv_qsa_bkey` at
-3.25 KiB per 4-token block, so a token costs 7.32 KiB and a 200K-token sequence 1.43 GiB. A
+3.25 KiB per 4-token block (1.73 KiB with `--qsa-bkey-dtype i8`), so a token costs 7.32 KiB and a
+200K-token sequence 1.43 GiB. A
 prefix-cached session occupies about 1.8x its context in pool tokens, so two live 184K sessions need
 ~662K pool tokens.
 
@@ -784,6 +787,7 @@ Related flags:
 
 ```sh
 --gpu-headroom-mib 96         # VRAM left unclaimed on every card
+# --gpu-memory-mib 28000      # the same knob as a claim; not with --gpu-headroom-mib
 --kv-cache-dtype fp8          # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192          # pinned host tier for weights
 --embedding-placement vram    # keep the token embedding on the card (below)
@@ -859,15 +863,35 @@ the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap
 and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
 cgroup of the engine that filled them.
 
+`--ngram-placement disk=DIR` reads the table from its own file, `DIR/ngram-<id>.bin`, instead of from
+the container: a table on a faster or separate drive (an Optane beside a model on a large NVMe, or a
+model on a hard disk with its table on an SSD) at no host memory. The first start fills the file from
+the container (the table's size free in `DIR`, written under `.part` and renamed, so the real name is
+always complete); later starts check samples of it against the container and reuse it. The `<id>` is
+`ram=DIR`'s, so a file never serves another model; remove the file to have it filled again. Reads go
+to it as `disk` reads the container, through the row cache with direct I/O, so `DIR`'s filesystem must
+support `O_DIRECT` (tmpfs since Linux 6.6 does, but a tmpfs is what `ram` is for).
+
 **`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
-routed layer's first expert op, on every pass, the engine reads all that layer's on-disk experts into
-one of two VRAM buffers (a router's picks are not known on the host, and a prefill chunk routes to
-nearly all of them). The buffers come out of the weight budget (the plan's `file buffers` line), and
-the reads go through four 32 MiB pinned windows out of `--host-pool-mib`, as long runs that skip
-resident experts. It is meant for running a checkpoint as shipped, to calibrate or compare against.
-The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two cards at about 28 s a step, the same at one token as
-at 32K, so use large prefill steps:
+routed layer's first expert op, on every pass, the engine reads the layer's on-disk experts that its
+rows route to into one of two VRAM buffers: the layer's router has run by then, and its counts are
+copied back first (one wait on the card per routed layer), so an expert no row routes stays on the
+drive. A step whose rows route nearly every expert, 64 rows an expert on average (3277 tokens for
+Qwen3.8-Flash-Next's 512 experts at top-10), reads its layers whole instead, each one while the card
+computes the one before, with no wait on the card. The buffers come out of the weight budget (the
+plan's `file buffers` line), and the reads go through four 32 MiB pinned windows out of
+`--host-pool-mib`, as long runs that skip resident experts. Without `--deterministic` the host pool
+is also a cache of the drive: an expert read from it is kept in a free pool slot, and a full pool
+gives its coldest expert back to the drive for a warmer one. It is meant for running a checkpoint
+as shipped, to calibrate or compare against. The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two
+cards at about 28 s a 32K-token step, so use large prefill steps:
+
+GLM-5.3-Flash lays its routed experts out by what the deployment needs. At four and eight cards each
+MXFP4 expert is split by width across every card, the shape its kernels are tuned for, and every expert
+must then fit in VRAM and the host pool. A container with any expert in another format stays whole. `--weights-disk-tier` keeps them whole on one card each, so they
+can stay on the drive, at about a third of the prefill speed and two thirds of the decode speed on 4 x
+R9700. Two cards always keep them whole.
 
 ```sh
 rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o flashnext-bf16.rad --max-ctx 4096   # no recipe: bf16
@@ -884,9 +908,10 @@ plane grows into what it releases, so a model whose experts do not fit never str
 for unused cache.
 
 **Headroom.** `--gpu-headroom-mib` is kept for allocations the engine does not make, chiefly a
-kernel's code object, which HIP loads at the kernel's first launch. With too little left, the first
-kernel that has never run (a draft head's, a sampler chain's) fails its load and faults inside the
-HIP runtime: a segfault in a correct kernel on a server that had been serving.
+kernel's code object, which HIP loads at the kernel's first launch. `--gpu-memory-mib N` is the same
+knob written as a claim: headroom is the card less N. The two flags cannot be combined. With too
+little left, the first kernel that has never run (a draft head's, a sampler chain's) fails its load
+and faults inside the HIP runtime: a segfault in a correct kernel on a server that had been serving.
 
 Once everything is allocated, startup logs `card N settled at ... free`. Memory taken after the budget
 read the card (another process such as a desktop, or a driver allocation) comes out of the headroom,
@@ -911,8 +936,9 @@ takes the model's training context.
 `--kv-cache-dtype fp8` is an E4M3 cache with per-(sequence, head) descales. It halves what a token of
 context costs, which at a production context is most of the pool. It is a real quantisation that
 changes the output slightly, so it is only ever set explicitly. Every architecture serves both
-widths except GLM-5.3-Flash (`glm5next`), whose latent-attention cache is bf16 only and which refuses
-`fp8` at startup. The flag sets every attention cache of the deployment, a drafter's (DSpark,
+widths. On GLM-5.3-Flash (`glm5next`) `fp8` narrows the latent-attention cache alone, to E4M3 at a
+descale of 1 (half its bf16 size); the DSA index, its key tail and the KDA caches keep their own
+widths. The flag sets every attention cache of the deployment, a drafter's (DSpark,
 DFlash2) included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
 widths.
 
@@ -934,6 +960,271 @@ engine, against the bf16 model on 17 long log-analysis documents (60 368 scored 
 
 The decode spread is run to run; the three are the same speed there. Each layout's row and the
 kernels that read it are in [OPS.md](OPS.md#the-kv-cache-operand).
+
+**A layout per layer.** `--kv-recipe FILE` (with `--kv-cache-dtype fp8`) chooses the layout of
+each trunk attention layer from the same set, so a layer that tolerates fewer bits takes `k6_v4`
+while a sensitive one keeps `fp8`. The file has one line per attention layer, the layer numbered
+as the checkpoint numbers it (`blk.N`, `model.layers.N`); `#` starts a comment:
+
+```
+# Qwen3.8-27B: full attention every fourth layer from 3
+layer 3  fp8
+layer 7  k6_v4
+layer 11 fp8_v4
+...
+layer 63 k6_v4
+```
+
+The file is read at argument parsing and refused, with its line, on a word that is not `layer`, a
+line that is not three words, a layer number that is not one, a layout outside `bf16`, `fp8`, `fp8_v4`,
+`k6_v4`, `k5_v4`, `k4h_v4`, `k4h_v2h` and `i8h`, `rotated` or `vmean` on a `bf16` line, a layer named twice, or no layer at all. At startup the server refuses the flag,
+naming the plugin, where the architecture does not declare its cache per layer (`qwen35_fp8`, its
+MoE and W8A8 builds, and `qwen4exp_fp8` do), and names the first layer asking for a
+layout the plugin has no kernels for at this model's geometry. The plugin then refuses an entry
+for a layer that keeps no attention cache (a delta-net layer, or one past the trunk) and an
+attention layer the file leaves out, naming the layer. The MTP head is not a recipe layer: it
+shares the last attention layer's cache and layout, and a drafter's own cache stays fp8. On
+Qwen3.8-Flash-Next only the attention cache takes a recipe; the QSA indexer's block keys keep
+their own cache, and each layer's pager (`--kv-residency-mib`) moves its own layout's fragment.
+`--qsa-bkey-dtype i8` stores the block keys in int8 (one f16 scale a key, `kv_qsa_bkey` at a
+1.73 KiB page instead of 3.25), for every QSA layer and the MTP head at once; startup says so, and
+an architecture that does not serve it is refused by name. Measured against the bf16-cache
+reference, it leaves the KL of an fp8 or i8h cache within noise (docs/QSA.md, "Block-key
+storage").
+
+Layers of one layout share a KV group (`kv_attn_fp8`, `kv_attn_fp8_v4`, `kv_attn_k6_v4`,
+`kv_attn_k4h_v4`, `kv_attn_k4h_v2h`, `kv_attn_i8h`, `kv_attn_bf16`), and the
+pool is split so every group holds the same tokens, each paying its own page. Startup logs the
+groups beside the rest of the pool (`kv:`) and then the recipe and what it buys:
+
+```
+kv recipe q38.kvrecipe: fp8 at layers 3, 7; k6_v4 at layers 11, 15, ...; the pool holds N tokens
+```
+
+A recipe that gives every attention layer one layout is that layout's `--kv-cache-dtype`: one
+group under the flag's name, the same program and the same bytes.
+
+**A rotated layer.** A line may end in `rotated` (`layer 11 k6_v4 rotated`): that layer stores its
+K and V rotated by the normalised Hadamard transform over head_dim, rotates its query the same way
+before the attention and the attention output back after it (`had_rotate`, OPS.md). The transform
+is its own inverse, so the layer computes the same attention, to the rounding of the four extra
+passes; what changes is what the cache holds, with an outlier channel spread over the whole head,
+which a narrow integer layout holds better. Any layout may be rotated, the layout's cache and
+kernels are unchanged, and the layer gives up the fused prologue-and-store (and, on Flash-Next's
+sparse decode, the gate folded into the attention), since each would skip a rotation. Startup's
+summary lists rotated layers apart (`k6_v4 rotated at layer 11`). What rotation buys a layout in
+KL has not been measured yet.
+
+**Four-bit keys: `k4h_v4`.** A recipe layout of its own, not a `--kv-cache-dtype`: K and V both as
+int4 in groups of 32 with an f16 scale, 288 bytes a token and head at head_dim 256 (18/32 of
+`fp8`), always rotated. Unrotated keys carry outlier channels that four bits cannot hold beside
+the rest of their group, so `layer 7 k4h_v4` is read as `layer 7 k4h_v4 rotated` (the `h` is the
+Hadamard; writing `rotated` is allowed and changes nothing), and the summary says `k4h_v4 rotated`.
+Implied rather than demanded, so the recipe `rad-autoquant` writes from the layout table is the
+rotated deployment. Only `qwen4exp_fp8` serves it, at Flash-Next's QSA geometry (head_dim 256, 4-token
+pages, gqa 12 at one and two ranks, gqa 6 at four); anywhere else startup refuses the layer by
+name. When the last attention layer is `k4h_v4` the MTP head, which shares its cache, rotates too.
+Its KL, its speed and whether rotation and four bits pay at long context are not measured yet.
+
+**Two-bit values: `k4h_v2h`.** `k4h_v4` with V in two bits: 224 bytes a token and head at
+head_dim 256 (14/32 of `fp8`), also recipe-only and always rotated (`layer 7 k4h_v2h` loads
+rotated), on the same plugin and geometry, the MTP head rotating behind it likewise. Two bits hold
+V only with a normalisation in front of the rounding, after KVarN (Muller et al., *KVarN:
+Variance-Normalized KV-Cache Quantization Mitigates Error Accumulation in Reasoning Tasks*,
+[arXiv 2606.03458](https://arxiv.org/abs/2606.03458)): its finding is that the quantisation errors
+that move a model are the largest ones, and that those are a token's magnitude coming out of the
+rounding wrong. Each group of 32 values of a token is divided by its own root mean square, rounded
+to the nearest of the four odd levels -3, -1, 1 and 3, and given the scale that keeps the group's
+sum of squares, so no token's magnitude moves; plain absmax rounding at two bits moves it by a
+tenth or more. This is the paper's method cut down to a cache written a token at a time: KVarN also
+balances each 128-token chunk across its channels, a scale that does not exist yet when a token
+is stored (and after the rotation the channels are near even anyway), and keeps a zero point that
+rotated values do not need. The exact rule is libref's `kv_store` (OPS.md). Its KL, its speed, and
+whether the per-channel half of KVarN would pay here, are not measured yet.
+
+**V predicted from K: `vpred`.** On Flash-Next an affine map from a layer's K to its V, fitted
+on calibration, explains about half of centred V's variance out of sample. A k4h_v4 or k4h_v2h line
+ending in `vpred` (`layer 7 k4h_v2h vpred`) stores V less K-hat A + b, K-hat being the key as the
+cache holds it, and its attention runs once more over the same cache with the keys as values
+(P K-hat) and adds (P K-hat) A + b to the output: exact but for roundings, at no extra bits. It
+costs a second attention pass and two head_dim x head_dim maps a token on the layer. The maps come
+from the file a `vpred FILE` line names (beside the recipe unless absolute):
+
+```
+vpred flashnext.kvpred
+layer 3  k4h_v4 vpred
+layer 7  k4h_v2h vpred
+```
+
+Fit them with the calibration mode and `RADIANCE_CALIB_VPRED=1` (off by default: the sums cost
+head_dim^2 a token and head on the host), over long documents and a bf16 cache; it writes
+`DIR/kv_vpred.txt` beside `kv_vmean.txt`:
+
+```
+RADIANCE_CALIB_VPRED=1 radiance --model M.rad <serve flags> --kv-cache-dtype bf16 \
+    --calib-corpus LONG.jsonl --calib-dir DIR          # writes DIR/kv_vpred.txt
+```
+
+The file is text, unrotated (the engine rotates it at load): a header `kv_vpred 1 head_dim D
+kv_heads H rows R`, then per layer and KV head `layer L head h bias b_0 ... b_{D-1}` and D lines
+`layer L head h row i a_i0 ... a_i(D-1)`. The fit is ridge least squares on K as computed (lambda
+1e-4 times the mean K variance). Refused, named: `vpred` on any other layout, beside `vmean` (the
+bias takes the mean's place) or a `demote`, a `vpred` word without its file line or the reverse,
+and in the file what the `vmean` file is refused for plus a row outside 0..D-1 and a head missing
+its bias or a row. Only `qwen4exp_fp8` serves it; the MTP head behind a `vpred` last layer takes
+that layer's maps. Not measured yet.
+
+**A V mean per layer: `vmean`.** On Flash-Next V carries a large per-channel offset (the norm of
+its mean is 0.53 to 0.89 of V's RMS, layer by layer), and a symmetric group scale spends its range
+on it. A line ending in `vmean` (`layer 7 k4h_v4 vmean`, `layer 11 fp8_v4 rotated vmean`) makes
+that layer subtract a static mean of V, per KV head, before its store and add it back to the
+attention output before the output's rotation. Each row of attention weights sums to one, so
+`P (V - mu) + mu = P V`: the layer computes the same attention but for the rounding of the two
+adds, while the cache quantises a centred V. K, the layout, its pages and its kernels do not change.
+The means come from the file a `vmean FILE` line of the recipe names (beside the recipe unless the
+path is absolute), so a recipe and its means travel together:
+
+```
+vmean flashnext.kvmean
+layer 3  k6_v4 vmean
+layer 7  k4h_v4 vmean
+layer 11 fp8          # fp8's V is E4M3, with no group scale to spare: no vmean
+...
+```
+
+Only a layout with integer V takes it (`fp8_v4`, `k6_v4`, `k4h_v4`, `k4h_v2h`, `i8h`). A mean from other
+documents is nearly as good as a document's own, so one calibration serves every request; record
+it with the calibration mode (TOOLS.md), over long documents and a bf16 cache:
+
+```
+radiance --model M.rad <serve flags> --kv-cache-dtype bf16 \
+    --calib-corpus LONG.jsonl --calib-dir DIR          # writes DIR/kv_vmean.txt
+```
+
+The file is text, one line a layer and KV head, the mean as the V projection writes it, so one
+file serves rotated and unrotated recipes alike (the engine rotates it for a rotated layer at
+load):
+
+```
+kv_vmean 1 head_dim 256 kv_heads 2 rows 126945
+layer 3 head 0  0.257125914 0.17772831 ...           # head_dim values
+```
+
+The recipe is refused, the file and line named, for `vmean` on `fp8`, a `vmean` word with no
+`vmean FILE` line or the other way round, and in the file a wrong header, a line of other than
+head_dim values, a value that is not a finite number, a head outside the header's or twice, a layer
+missing a head, a `vmean` layer the file lacks, or a layer the recipe does not name; startup refuses
+a file whose head_dim or KV heads are not the model's. Only `qwen4exp_fp8` serves it (`qwen35_fp8`
+refuses the line naming the layer), and the MTP head behind a `vmean` last layer takes that
+layer's mean. A centred layer gives up the gate folded into the sparse attention's merge, as a
+rotated one does. Measured on Flash-Next at `--tp 2` against the bf16-cache reference (the KL
+mode over 4 documents of 32K tokens, 16380 scored positions; the means calibrated on four other
+documents of 127K tokens; `fp8` scores 0.0262, 0.267, 94.4 %):
+
+| every attention layer | bits | mean KL | with vmean | p99 KL | with vmean | top-1 | with vmean |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `fp8_v4` | 6.25 | 0.0368 | 0.0342 | 0.397 | 0.340 | 93.4 % | 93.4 % |
+| `fp8_v4 rotated` | 6.25 | 0.0364 | 0.0320 | 0.379 | 0.356 | 93.4 % | 94.0 % |
+| `k6_v4` | 5.5 | 0.0344 | 0.0321 | 0.338 | 0.331 | 93.7 % | 93.6 % |
+| `k4h_v4` | 4.5 | 0.0437 | 0.0394 | 0.432 | 0.395 | 93.1 % | 93.2 % |
+| `k4h_v2h` | 3.5 | 0.1372 | 0.0833 | 1.276 | 0.793 | 87.7 % | 89.9 % |
+
+The KL above `fp8`'s falls by a quarter to a half; `k4h_v2h`'s halves. Speed is not measured (two
+elementwise adds a layer, and the sparse decode's gate as its own op).
+
+**Eight bits with a resolution: `i8h`.** K and V as int8, rotated as the k4h layouts are, with one
+f16 scale for a token's whole head (absmax / 127): 516 bytes a token and head at head_dim 256,
+258/256 of `fp8`, recipe-only and always rotated (`layer 7 i8h` loads rotated; `vmean` allowed), on
+the same plugin and geometry, the MTP head rotating behind it. E4M3 keeps three mantissa bits, int8
+seven; once the rotation has spread a head's outlier channels one scale holds the head, and on the
+card's real q/k/v the attention output's error is about a quarter of the E4M3 cache's (0.0036
+against 0.0152). The rows are 4-byte aligned only, so its kernels read codes a word at a time.
+
+**Five-bit keys: `k5_v4`.** K as int5 and V as int4, groups of 32 with an f16 scale each (absmax /
+15 and / 7): 320 bytes a token and head at head_dim 256, 5.0 bits an element, between `k6_v4` (5.5)
+and `k4h_v4` (4.5). A recipe word only (no `--kv-cache-dtype`), Flash-Next's geometry only; like
+`k6_v4` it is rotated only where the line says `rotated`, and takes `vmean` (`layer 7 k5_v4 rotated
+vmean`). It cannot be a tiered layer's resident or demote layout. rad-autoquant measures it only
+where `--layouts` or `--variants` names it. KL on the card: not measured yet.
+
+Where `fp8`'s KL comes from was measured with an experiment, not a layout:
+`RADIANCE_DEBUG_KV_E4M3R=1` with `--kv-cache-dtype bf16` stores every K and V value of the bf16
+cache rounded through E4M3 exactly as the fp8 store rounds it (same clamp, same descale of 1),
+and the bf16 attention reads it. Its KL is the storage rounding alone; `fp8`'s above it would be
+the fp8 attention path's. Startup says so on stderr, and the layer stores with plain `kv_store`
+(the prologue's fold has no such row; a streamed group fails the step). Measured as the `vmean`
+table above (Flash-Next `--tp 2`, 4 documents of 32K tokens, 16380 positions; means from
+`kv_vmean.txt` of the calibration above); the pool holds the same tokens throughout because 2
+sequences at 36864 is its worst case, and a page of the 12 attention layers costs 24.00 KiB at
+`fp8`, 24.19 KiB at `i8h` and 48 KiB at bf16:
+
+| cache | bits | mean KL | p99 KL | top-1 | pool tokens |
+|---|--:|--:|--:|--:|--:|
+| bf16 (the reference itself) | 16 | 0 | 0 | 100 % | 73768 |
+| `fp8` | 8 | 0.0262 | 0.267 | 94.35 % | 73804 |
+| bf16, values rounded through E4M3 | 16 | 0.0262 | 0.267 | 94.35 % | 73768 |
+| `i8h` every layer | 8.06 | 0.0236 | 0.236 | 94.77 % | 73744 |
+| `i8h` every layer, `vmean` | 8.06 | 0.0243 | 0.240 | 94.36 % | 73744 |
+
+The E4M3-rounded bf16 cache scores `fp8`'s KL position for position (the per-position records are
+byte-identical): all of `fp8`'s KL is the rounding of the stored values, none of it the fp8
+attention, whose kernels widen E4M3 to the same f16 the bf16 ones widen bf16 to. `i8h` moves the
+output a tenth less than `fp8` for 0.8 % more bytes (paired by position, a bootstrap over blocks of
+256 positions puts the difference at -0.0037 to -0.0018); the V mean, which pays at four and two
+bits, does not at eight (+0.0008, -0.0002 to +0.0017: no gain this corpus can see). Speed is not
+measured.
+
+**Unquantised for one layer: `bf16`.** `layer 7 bf16` keeps that layer's cache exactly as
+`--kv-cache-dtype bf16` keeps every layer's: a `kv_attn_bf16` group at head_dim 256 and bf16, the
+bf16 store and attention kernels (prologue fold, streamed store and the sparse decode's
+gate-in-merge included), 1024 bytes a token and head, 16 bits an element; the recipe's other layers
+keep their layouts. The MTP head behind a `bf16` last layer is the bf16 head, and the residency
+pager moves that layer's fragment at its own width (the store's slot is then a `bf16` block). It
+takes neither `rotated` nor `vmean`. `qwen4exp_fp8` serves it at every geometry; `--kv-cache-dtype
+fp8` stays the recipe's flag (a drafter's cache is fp8 whatever the recipe says), and a recipe of
+`bf16` alone is `--kv-cache-dtype bf16`'s attention cache byte for byte. It is what a KL limit
+under every 8-bit layout's is met with: keep the sensitive layers unquantised.
+
+**A measured recipe.** `rad-autoquant` writes the recipe from the KL mode, against a bf16-cache
+reference over long documents. `--max-kl 0.035` asks for the fewest bits whose *measured* mean KL
+stays within 0.035 (`--min-top1` adds a floor on top-1 agreement, `--strict` checks both at the
+95 % bound from the per-position rows, each document a stratum). Every layout above is a
+candidate, plain, `rotated` and, given the `--vmean` file, `vmean`, given the `--vpred` file,
+`vpred` (`k4h_v4`, `k4h_v2h`): 23 variants on `qwen4exp_fp8` with both (`k5_v4` among them). It measures each variant on every layer, takes the most accurate (`bf16`, whose
+KL against the bf16 reference is about zero, so limits down to that are met) as
+the base, measures each layer alone in each variant not beaten outright by one of no more bits,
+solves for the fewest bits from those costs, and measures what it solved, tightening while the
+mixed recipe measures over the limit (the costs do not add up exactly). It writes the cheapest
+recipe measured within the limit, uniform ones included, so it is never worse than the best
+uniform layout. The per-layer costs are measured from `bf16`, and one quantised early layer costs
+about what every layer does, so that answer sits at the extremes (`--max-kl 0.0262`: every layer
+`i8h`, 8.06 bits, where `i8h` on layers 3-23 and `k6_v4 rotated vmean` on 27-47 measures 0.0260 at
+6.78). A second pass therefore starts from the best recipe within the limit, moves each layer alone
+one step narrower (the next variant with fewer bits on the lower hull of the uniform runs' KL over
+bits, which skips `fp8` beside `i8h`), and solves and measures again from there. C + L (K - 1)
+runs, the noise run, at most six solved ones, at most L + 6 for the second pass and three knob
+runs, for C variants, K kept and L layers: about 100 to 130 on Flash-Next. `--bits 6` instead picks the least
+predicted KL within an average budget, unmeasured. On a model whose plugin does not serve `bf16`, `i8h`, the `k4h` layouts or the V mean
+(`qwen35_fp8`), pass `--layouts fp8,fp8_v4,k6_v4` or the first such run stops the calibration. A
+reference whose documents are shorter than 32768 tokens is refused unless the bound is lowered.
+The flags, the cost of the runs, the noise, the exact limit rules and what is not yet searched (a
+demoted layout) are in [TOOLS.md](TOOLS.md#rad-autoquant).
+
+**The noise floor.** The floor is the KL of recomputing the unquantised model in another order: on
+Flash-Next a bf16 run with prefill chunk 64 measures 0.0243 mean KL against the bf16 reference. It
+perturbs every op (GEMMs, MoE routing), not only the KV cache, so it is a scale for how much a
+recipe's KL means, not a lower bound for KV-only changes. On the card (`--tp 2`) every layer `i8h`
+measures 0.0236 and every layer `bf16` 4.9e-8, but layers 3-23 `bf16` with 27-47 `i8h` measure
+**0.0061**, far under the floor, and the reverse split 0.0239: a recipe can sit well under the floor,
+and an absolute `--max-kl` under it is an ordinary search. `rad-autoquant` measures the floor
+itself (the base once more with `--noise-flags`, default `--max-num-batched-tokens 64`), states
+every recipe's KL against it, and anchors the relative limit there (the per-layer costs are
+measured above the base, not the floor): `--max-dkl 0.01` is a mean KL of at most floor + 0.01; `--max-dnll 0.005` bounds the
+mean NLL change against the reference (nats a token), whether the model gets worse on the text.
+Then it tries the global knobs on the answer (`--qsa-bkey-dtype i8`, `--state-cache-dtype f16`)
+and keeps the setting of fewest bytes a token still within every limit; at `--tp 2` it adds the
+block-key split (`--qsa-bkey-split on`), which is exact and so never run, its block keys counted
+halved. The recipe's `# serve with:` comment names the flags it needs.
 
 **Prefill attention in e4m3.** `--attn-prefill-fp8 qk`, `pv` or `both` runs the prefill
 attention's Q·Kᵀ (the query rounded to E4M3 after the softmax scale), its P·V (the probabilities
@@ -981,13 +1272,19 @@ wht6`, a decode step above the row count startup names is all-reduced lossily li
 at 8 sequences and depth 3, Flash-Next's decode steps are above it.
 
 **The delta-net state at f16** (`--state-cache-dtype f16`). The `qwen35` plugins (`qwen35_fp8`,
-and `qwen35moe_fp8` and `qwen35_w8a8`, built from it) declare the recurrent state cache f32. With
-`--state-cache-dtype f16` they declare it f16; startup and the declare log say so (`GDN state cache
-f16`), and a plugin that does not serve it is refused at startup by name. **It is lossy**: the
-state is rounded wherever it is stored, so the generated text changes. It halves the state pool and
-its host checkpoints, and the state's traffic, which grows with the number of decoding sequences.
-Measured on `qwen35_fp8` only, Qwen3.8-27B MXFP4 at `--tp 2` on two R9700s (PCIe Gen5 x8, 265 W),
-against the bf16 model:
+and `qwen35moe_fp8` and `qwen35_w8a8`, built from it) and `qwen4exp_fp8` (Qwen3.8-Flash-Next)
+declare the recurrent state cache f32. With `--state-cache-dtype f16` they declare it f16; startup
+and the declare log say so (`GDN state cache f16`), and a plugin that does not serve it is refused
+at startup by name. On Flash-Next at `--tp 2` a sequence's 36 delta-net layers hold 54 MiB of
+state on each card at f32 and 27 MiB at f16 (a speculating deployment keeps two copies, the
+anchor and its replay factors, so 108 and 54 MiB); its MTP head has no delta net, and the QSA
+indexer's key tail keeps its own width. The kernels read the width off the cache: at f16 each
+computes exactly what it computes over the f32 cache, rounded where the state is stored
+(`r4d_selftest`'s `gdn_f16_state` cases, `tests/r4d_emu/test_gdn.cpp`, `rad-avx-check`).
+**It is lossy**: the state is rounded wherever it is stored, so the generated text changes. It
+halves the state pool and its host checkpoints, and the state's traffic, which grows with the
+number of decoding sequences. Measured on `qwen35_fp8` only (Flash-Next's KL is not measured
+yet), Qwen3.8-27B MXFP4 at `--tp 2` on two R9700s (PCIe Gen5 x8, 265 W), against the bf16 model:
 
 | state | mean KL, 2048 chunk | mean KL, 64 chunk | top-1, 64 chunk |
 |---|---|---|---|
@@ -1129,6 +1426,51 @@ the next two steps carry decode rows only and admit nothing, then the next chunk
 decoders keep their cadence. A lone prefill is not held, nor is the step after a prompt's last
 chunk. `0` (the default) schedules as before. `/stats` counts the decode-only steps the hold
 inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
+
+Served default: `--prefill-interleave auto:1` (below), so decoding sessions keep about half their rate
+while prompts prefill; `--deterministic`, KL mode and generators keep 0. Measured on Flash-Next (8
+decoders beside a 64K prefill, MTP on): 12 -> 41 tokens/s a decoder, prefill 3.7K -> 1.8K tokens/s;
+with `--decode-headroom auto` 4.5K and 2.2K. `--prefill-interleave 0` restores the old schedule.
+
+`--prefill-interleave auto` sizes the hold from measured step times instead: after each such chunk,
+as many decode-only steps as fit in a quarter of a chunk step's time at a decode step's (running
+means of both, at most 64 steps; one until a decode step has been timed). `auto:SHARE` uses SHARE
+of the chunk step's time instead of a quarter (0 < SHARE <= 4; `auto:1` gives decode as much time
+as prefill). With the quarter the prefill gives up at most a fifth of its rate however many sequences decode, and the decoders get several steps where a
+decode step is cheap beside a chunk, none where one costs more than that quarter (they still ride
+every chunk). In the scheduler's host simulation of 32 prompts of 128K tokens sent at once, each
+then decoding 512 tokens (2048-token chunks, MTP 3, step costs fitted to a lone prefill and to
+decode alone), auto raised the decode rate of the sequences decoding while prompts still waited
+from 6.5 to 31 tokens/s each and delayed the last first token by 6 %. Because the hold follows the
+device's timing, which steps carry a chunk differs from run to run; a number schedules the same
+steps every time.
+
+**Room for the decode rows: `--decode-headroom auto|N|0`.** A step carrying a chunk is planned at
+the prefill budget (`--max-num-batched-tokens`), which the chunk keeps whole, and the decode rows
+riding along take up to `N` rows on top of it; only rows past that come out of the budget. Without
+it, every interval beside decoding sequences is two steps: a chunk short by the decode rows
+(rounded down to the quantum) and a remainder of one quantum up to the checkpoint boundary. On
+Qwen3.8-Flash-Next at TP2 with 8 sessions decoding (MTP 3) beside a 64K prompt that remainder ran
+31 times at ~86 ms beside ~477 ms chunks. `auto` (the default) is a row per verified position of
+every other sequence, `(max-num-seqs - 1) x (1 + drafts)`, rounded up to 64 and at most 256 (the
+activation arena's smallest level, an eighth of the default budget); `0` plans as before, step for
+step, and is what `auto` resolves to under `--deterministic`, for a generator and in KL mode.
+Everything that holds a whole step (the activation arena, the batch staging, the KV manager's
+per-step blocks) is sized for budget + headroom; startup prints the headroom and what it adds to
+the arena:
+
+```
+decode headroom: 256 rows on a 2048-token budget, steps of up to 2304 tokens; the activation arena
+is ... a rank, ... more than at the budget alone (--decode-headroom 0)
+```
+
+The chunks stay where they were (on the checkpoint interval and, under `--prefix-resume exact`,
+on the grid an idle server cuts), so a prompt's checkpoints do not move; which decode tokens share a
+step does, as any change in load moves them. In the host simulation (`RAD_SCHED_SIM=1 SIM_N=1
+SIM_LEN=65536 SIM_DECODERS=8 sched_test sim_burst`) the 64K prompt took 2.00 steps with a chunk
+per interval at `SIM_HEADROOM=0` and 1.00 at auto, its modelled prefill rate going from 3.8K to
+4.9K tokens/s; the decoders lose the cheap remainder steps they used to get a token from, which
+`--prefill-interleave auto` gives back.
 
 **A prefill alone in its step can carry several intervals** (`--prefill-span N`, default 1). A
 chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
@@ -1659,6 +2001,53 @@ window per rank.
 
 Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
 
+**Window residency, for a model that does not read all of its history.** The tiers above move a
+conversation that has *finished*. A sparse-attention model needs something else: while a turn is
+running, its attention reads a selected part of the history (QSA reads the best 512 blocks plus the
+tail, `docs/QSA.md`), so most of its cache is VRAM nothing touches. A KV group declares that reach
+(`RadKVGroupDecl::residency_window`, set by `arch/common/rad_qsa.h` on the attention group and never
+on the block-key group, which the scorer reads whole), and `--kv-residency-mib N` opens a host-mapped
+store (the card reads it; a host without SVM refuses the flag, and the scratch pages the pager
+needs are reserved out of the KV budget and logged at startup) for the blocks the reach does not cover: one block a slot, up to N MiB. A demoted block's
+copy lands in its slot, then its pool block goes back to the free list -- that is the VRAM the
+window saves -- and its table entry becomes a cold entry naming the slot (`-2 - slot`, spec §7.3).
+The sequence's context is the same table; only where one entry's bytes live has changed.
+
+```sh
+radiance --model flashnext.rad --kv-residency-mib 2048 --kv-residency-sink-tokens 512
+```
+
+- `--kv-residency-mib N` (default 0, off): the store's size. Off is what a server with the VRAM
+  should do; on, blocks between the sink region and the tail leave the card.
+- `--kv-residency-sink-tokens N` (default 512): how much of the *start* of a conversation stays
+  resident. A sparse selection is not positional, so a positional window is the wrong shape, but
+  the first blocks are the attention sinks every step scores: demoting them would promote them
+  again every step.
+- A sweep skips a block another live sequence also holds (a forked child, or two requests that hit
+  the same cached prefix) and the last (partial) block an append writes into; `/stats`
+  `kv_residency.skipped` counts those. A block the prefix cache shares with one sequence moves,
+  and the cache entry follows it into the store; a conversation waiting for its next turn (held by
+  the cache alone) leaves the card whole, with whatever of the sweep's budget the running
+  sequences left.
+- A store slot holds one block of one group, and each residency group has its own store of slots
+  its block's size (every rank's, under `--tp`). Under a mixed `--kv-recipe` each layout's group
+  pages on its own, at its own block's bytes, and `--kv-residency-mib` is split so every group's
+  store holds the same tokens; the startup line `kv residency: store ...` names the blocks the
+  stores hold and each group's slots, block and layers' fragments.
+
+**Status.** Live. With the store open the engine installs the scheduler's mover: after each decode
+step a sweep of at most 64 blocks (between all sequences) leaves the pool for the store, a prefill
+promotes its sequence whole first, and `qsa_page` pages a cold block the selection names into a
+scratch page between the selection and the attention. Startup says `kv residency: window enforced`.
+`/stats` `kv_residency.freed_bytes` is the VRAM given back; `paged_in` is how many cold entries the
+pager rewrote (summed over QSA layers and decode rows, from a counter on the card, rank 0), and is
+the number that tells you the window is doing something; `paged_hits` is how many of those the
+pager's page cache served from a scratch page still holding the block, with no copy over the link
+(`RADIANCE_QSA_PAGE_CACHE=0` turns the cache off for an A/B). A model that declares no window warns that
+the flag does nothing and moves nothing. Not yet measured on a card: see `docs/qsa-residency-bench.md`.
+Under tensor parallelism every rank moves its own shard, but that path has only been tested through
+the host-side seam.
+
 On a hybrid model the recurrent state matters as much as the attention blocks: restoring the blocks
 alone re-runs every linear layer over the whole transcript, which hit-rate counters still report as a
 hit. Snapshots never take VRAM: each is copied to host memory after the step that produced it and
@@ -2045,8 +2434,9 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
-| `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
-| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step |
+| `--decode-headroom MODE` | auto | rows a step carries for decode rows on top of the budget, so a chunk beside decoders fills its interval in one step (§4.5): `auto` is (max-num-seqs - 1) x (1 + drafts), at most 256; `0` is the budget alone |
+| `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time |
+| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
@@ -2057,14 +2447,18 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
+| `--gpu-memory-mib N` | 0 (use `--gpu-headroom-mib`) | VRAM claimed on every card; inverse of `--gpu-headroom-mib`. Give one (§4.3) |
 | `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
-| `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
+| `--kv-recipe FILE` | none | each trunk attention layer's layout from `fp8`, `fp8_v4`, `k6_v4`, `k5_v4`, `k4h_v4`, `k4h_v2h`, `i8h`, `bf16` (`qwen4exp_fp8`), one `layer N LAYOUT` line a layer, `rotated` after it for a rotated layer, `vmean` last for a layer that subtracts the V mean a `vmean FILE` line names; needs `--kv-cache-dtype fp8`; `qwen35_fp8`, `qwen4exp_fp8` (`vmean`: `qwen4exp_fp8` only) (§4.4) |
+| `--qsa-bkey-dtype T` | bf16 | `bf16` or `i8`: the QSA indexer's block keys; i8 is int8 with one f16 scale a key, 1.73 instead of 3.25 KiB a 4-token block on Qwen3.8-Flash-Next (the part window residency never demotes), and moves the selection about as much as an fp8 attention cache does; `qwen4exp_fp8` only (§4.4) |
+| `--qsa-bkey-split on\|off` | off | `on` stores and scores each QSA block key on one --tp rank only (block b on rank b % tp) and merges the ranks' top-k lists into the same selection byte for byte: block keys per card / tp, one gather a QSA layer a step; needs --tp 2 or more; `qwen4exp_fp8` only (docs/QSA.md) |
+| `--state-cache-dtype T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins and `qwen4exp_fp8` (§4.4) |
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`--checkpoint-slots`, §4.8) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
-| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
+| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
@@ -2084,6 +2478,8 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory, up to N MiB (§4.8) |
 | `--prefix-cache-ttl S` | 3600 | seconds an unused conversation is kept, in VRAM or host memory; `0` never expires |
+| `--kv-residency-mib N` | 0 (off) | pinned host store for the KV blocks a sparse consumer's window does not cover (§4.8, spec §7.3) |
+| `--kv-residency-sink-tokens N` | 512 | tokens at the start of a conversation kept resident when `--kv-residency-mib` is on |
 
 **Placement and state**
 
@@ -2132,7 +2528,7 @@ by 0.002-0.003 nats.
 | `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
 | `--trusted-proxy CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
-| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
+| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.18) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
 | `--http-threads N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
@@ -2188,8 +2584,8 @@ flags are refused on it, and so are the pixel bands.
 | `--kld-record DIR` | run `--kld-corpus` through prefill and write this model's log-probabilities at every scored position to `DIR`: the reference a quantised model is measured against |
 | `--kld-ref DIR` | score this model against the reference in `DIR`: mean, median, 99/99.9/99.99th percentile KL divergence and top-1 agreement |
 | `--kld-corpus FILE` | JSONL, one `{"prompt", "score_from"?, "source"?}` a line; `--kld-record` only |
-| `--calib-corpus FILE` | instead of serving, run a JSONL corpus (`{"prompt"}` a line) through prefill once, every token, and record the calibration statistics the model keeps: the whole Hessian of each linear's input (docs/TOOLS.md) |
-| `--calib-dir DIR` | where `--calib-corpus` writes them, one safetensors file per input; beside `--kld-record`, that run records them over the KL corpus too |
+| `--calib-corpus FILE` | instead of serving, run a JSONL corpus (`{"prompt"}` a line) through prefill once, every token, and record the calibration statistics the model keeps: the whole Hessian of each linear's input, and on `qwen4exp_fp8` each attention layer's V mean (docs/TOOLS.md) |
+| `--calib-dir DIR` | where `--calib-corpus` writes them, one safetensors file per input (the V means: `kv_vmean.txt`); beside `--kld-record`, that run records them over the KL corpus too |
 | `--calib-layers LO:HI` | record layers `LO`..`HI-1` only (default every layer), for a model whose statistics do not fit in host memory in one run |
 | `--kld-top N` | `--kld-record` keeps each position's `N` most likely tokens exactly and the mass of the rest instead of the whole vocabulary, for a corpus too large for full rows; 0 (default) keeps the whole vocabulary |
 | `--kld-out FILE` | the `--kld-ref` report as JSON, and every position's numbers in `FILE.rows` |
@@ -2229,6 +2625,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
 | `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
 | `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
+| `POST /generate`, `POST /send`, `GET /status/:uid` | Hunyuan3D-2's API server's routes: a 3-D mesh (GLB, OBJ, PLY or STL) from a picture, at once or in the background; needs a shape model (Hunyuan3D-2), else 501 (§5.17) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
@@ -2638,7 +3035,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 |---|---|
 | `model` | accepted and not enforced: one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.17) |
+| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.18) |
 | `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused (§5.8) |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
@@ -2856,6 +3253,7 @@ each field is read, taken without effect, or refused by name.
 | `role: "system"` in `messages` | after the head of the conversation, its text joins a user message at its position, since templates read a system message only at the head: as a text block ahead of the user message right after it, else after the one right before it, else as a user message of its own, so no two user turns follow each other. `clear_at: "next_user_message"` stops rendering it once a later user message (a `tool_result`-only one included) exists. An effort-only message (no text, `output_config: {"effort": ...}`) sets the effort from the next user message on. Blocks other than text (`tool_addition`, ...) are refused |
 | `tools`, `tool_choice` | client tools; server tools (`web_search_…`, `code_execution_…`) are refused. `tool_choice` as an object (`auto`, `any`, `tool`, `none`, `disable_parallel_tool_use`) or a string (`"auto"`, `"none"`, `"any"`); `any` is the chat path's `required` (§5.4) |
 | `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `stream` | as on the chat path; `max_tokens` is optional there too |
+| `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `repeat_last_n` | not Anthropic's: the chat path's fields with its ranges and meaning (§5.7), for clients that speak only this format. The penalties count a token's occurrences in the last `repeat_last_n` tokens of prompt and reply (64 by default, `--repeat-last-n`), as llama.cpp does |
 | `thinking` | `enabled` (its `budget_tokens` is the chat request's `thinking_token_budget`), `adaptive`, `disabled`, `between_tools` (off). `display` and `block_binding` are taken: the reasoning comes back whole, with an empty `signature` |
 | `output_config` | `effort` (`low`, `medium`, `high`, `xhigh`, `max`) is the chat request's `reasoning_effort`, which the template reads in its own level names: a level it does not take is refused with the ones it does, and `--reasoning-effort-map` renames them (§4.9). `format` (`{"type": "json_schema", "schema": ...}`, or the older top-level `output_format`) is a `response_format` (§5.5). `task_budget` is taken |
 | `context_management` | validated; the conversation is served as sent, and the answer says so: `"context_management": {"applied_edits": []}`, on `message_delta` in a stream |
@@ -3526,7 +3924,53 @@ The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 
 Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
 `--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
 
-### 5.17 Documents: Unlimited-OCR
+### 5.17 3-D shapes: `/generate`
+
+A shape generation model (Hunyuan3D-2) makes an untextured 3-D mesh from one picture of an object.
+It answers Hunyuan3D-2's own API server's routes, so that server's clients (its Blender add-on,
+scripts written against it) work unchanged: `POST /generate` makes the shape while the request
+waits and answers with the file; `POST /send` makes it in the background and answers at once with
+`{"uid": ...}`; `GET /status/{uid}` reports `{"status": "processing"}` (with `steps_done` of
+`steps`), then `"completed"` with the file as base64 in `model_base64`, or `"error"` with its
+`message`.
+
+```sh
+# The shape model is tencent/Hunyuan3D-2's hunyuan3d-dit-v2-0 folder: config.yaml and
+# model.fp16.safetensors. Its weights ship in fp16 and are cast to bf16 at conversion.
+rad-convert Hunyuan3D-2/hunyuan3d-dit-v2-0 --recipe data/recipes/hunyuan3d-2-bf16.recipe \
+    -o hunyuan3d-2-bf16.rad
+radiance --model hunyuan3d-2-bf16.rad
+
+curl -s http://localhost:8000/generate -H 'Content-Type: application/json' \
+    -d "{\"image\": \"$(base64 -w0 penguin.png)\"}" -o penguin.glb
+```
+
+- **`image`** is the picture as base64 (a data URL is taken too). Give it an alpha channel that cuts
+  the object out: the reference removes an opaque picture's background with rembg first, which this
+  server does not, so an opaque picture is taken whole, background and all. The picture is prepared
+  as the reference prepares it: the alpha's bounding box scaled to 85% of the square that holds the
+  picture, centred on white, 512 x 512, then the image encoder's 518 x 518.
+- **`num_inference_steps`** counts sigma grid points (50, so 49 evaluations, by default; 2 to
+  200); **`guidance_scale`** is the classifier-free guidance against the unconditioned branch (5
+  by default); **`seed`** makes a shape repeatable (1234 when absent, as the reference).
+- **`octree_resolution`** is the grid's cells a side the field is sampled on (256 by default, 16
+  to 512). The grid is sampled coarse to fine, as FlashVDM's hierarchical decoding does: the whole
+  grid at the coarsest level (the resolution halved while it stays at least 63), then only the
+  points near the surface at each finer level; with `"volume_decoding": "dense"` every point of
+  the finest grid is sampled instead, as the reference's default decoder does (slower, the same
+  field). The surface is marching cubes over the finest grid at level 0.
+- **`type`** is the file: `glb` (the default; positions, smooth normals and faces), `obj`, `ply`
+  (binary) or `stl` (binary). The mesh is the raw surface, as the reference's `/generate` returns
+  it without texturing: no floater removal or face reduction.
+- **`texture`** true (Hunyuan3D-Paint) is refused: this server makes the untextured shape. So are
+  the reference's `text` (its text-to-image front end) and `mesh` (re-texturing) inputs.
+
+A shape is about 3 TFLOP of conditioning, 18 TFLOP a denoising step (both branches) and 34 MFLOP
+a sampled grid point. The model runs on one card (2.2B parameters, 4.4 GiB in bf16); `--tp` above 1
+is refused. The licence (Tencent Hunyuan 3D 2.0 Community License) does not cover the European
+Union, the United Kingdom or South Korea.
+
+### 5.18 Documents: Unlimited-OCR
 
 `unlimited-ocr` (baidu/Unlimited-OCR, bf16; the converted container is
 [Aijuus/unlimited-ocr-bf16](https://huggingface.co/Aijuus/unlimited-ocr-bf16), with its recipe;
@@ -3608,7 +4052,7 @@ completions entry point), so prompt parity with the reference is a chat-endpoint
 
 ### 6.1 The dashboard
 
-Open `http://<host>:<port>/` in a browser. It has three tabs.
+Open `http://<host>:<port>/` in a browser. It has four tabs.
 
 **Dashboard**: the live strip across the top (decode step time, decode and prefill throughput,
 requests in flight, KV cache in VRAM, draft acceptance), then cards for the batch, memory and
@@ -3619,7 +4063,7 @@ The KV cache meter splits what it holds into two segments:
 ```
 KV cache   3.3 / 4.5 GiB  ·  75.5%
 ▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-20.8k tok read by running requests  ·  369.3k kept for reuse
+20.8k tok read by running requests  |  369.3k kept for reuse
 ```
 
 The full-strength segment is context running requests are reading; the dim segment is prefix cache,
@@ -3630,7 +4074,7 @@ from the total fill, since a full pool causes preemption.
 The decode step tile carries two figures and a percentage under the big number:
 
 ```
-best 14.79ms · recent 15.21ms · now 97% of best
+best 14.79ms | recent 15.21ms | now 97% of best
 ```
 
 Both are window means of single-sequence decode steps, measured by the engine:
@@ -3674,14 +4118,17 @@ The decode, prefill, requests-in-flight and draft-acceptance tiles carry a line 
 which the page computes from its own polls:
 
 ```
-best 58 · recent 54 · now 93% of best@c4
+best 58.0 | recent 54.0 | now 93% of best@c4
 ```
 
 `best` (`highest` on requests in flight and acceptance) is the extreme this page has seen at the
-current concurrency, `recent` the mean of its last 30 samples there (15 s at one poll every 500 ms;
-5 s for prefill), and `now` the current value as a share of the extreme. Past one sequence the line
+current concurrency, `recent` the mean of the last 15 s there (5 s for prefill), and `now` the
+current value as a share of the extreme. The windows are kept by elapsed time rather than sample
+count, so a span means the same span whatever rate is set on Advanced. Past one sequence the line
 names its concurrency (`@c4`); requests in flight keeps a single set. Reloading the page resets these
-figures, a server restart does not. While nothing runs, the big figure reads 0 and the line keeps its
+figures, and so does a server restart: the page notices the engine's new start time and
+inherits nothing from the run before it. While nothing runs, the big figure reads 0 and the line
+keeps its
 last figures without `now`.
 
 Draft acceptance is reported as two ratios with different denominators. A draft position is
@@ -3689,8 +4136,8 @@ verified only when every earlier one passed, so:
 
 - **accepted / reached** (conditional): of the drafts verified at a position, the share that passed.
   The acceptance tile, the Speculation panel's large "conditionally accepted" figure and the
-  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the last 30
-  polls that drafted as a ratio of sums.
+  per-position bars show it. The headline is the last poll's; the tile's `recent` pools the polls
+  that drafted in the last 15 s as a ratio of sums.
 - **accepted / drafted**: of every drafted token, the share that became text, since the process
   started. The Speculation panel's "Accepted of drafted", `draft_accept` on `/stats` and
   `radiance:draft_acceptance_ratio` on `/metrics` show it.
@@ -3700,6 +4147,30 @@ passing 56%, 75% and 77% of the time they are reached, a step reaches 1 + 0.56 +
 positions on average and accepts 0.56 + 0.42 + 0.32 = 1.30 tokens: 66% accepted / reached against
 1.30 / 3 = 43% accepted / drafted.
 
+Under the live request table, **history** keeps every finished request a poll saw. A request is in
+`/stats` only while it exists -- a finished row leaves the payload within about 20 ms to half a
+second -- so without this the numbers would be gone before they could be read. The last 200 are
+kept in this browser's `localStorage`, not on the server, and rows are keyed by the engine's start
+and the request id, so a second tab or a reload keys a request alike rather than counting it twice.
+A request that began and finished between two polls cannot be sampled at all; those are counted in
+a grey row so the total still adds up. **clear** empties it, and the marker it leaves is a
+timestamp every tab honours, so a clear in one window is a clear in all of them.
+
+The line above the table summarises those rows: how many are done, then decode rate, prefill rate
+and time to first token. The first two carry their mean over all the rows and, where enough
+rows exist, the same mean over the last 20 and the last 5; time to first token is a median
+over all the rows, with no windows. A window appears only once enough rows
+exist for it to be a different question: with 12 rows stored, the mean over the last 20 would just
+be the mean over all 12, so only *last 5* shows. At exactly 20 rows *last 20* repeats the overall
+mean; from 21 up the three figures are three different questions.
+These are means of per-request rates, not the pooled rate the tiles above show: one long request
+does not get to decide the headline. On this line a dot separates one category from the next and a
+pipe separates the windows within a category.
+
+The download icon beside the **Requests** heading saves those stored rows as
+`radiance-history.json`, indented, from the browser -- it is the same data **clear** would discard,
+so a run worth keeping can be written out before it is cleared.
+
 **Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
 linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
 prompt share its blocks.
@@ -3708,6 +4179,14 @@ On a hybrid model, a session with blocks but no reachable snapshot reuses zero t
 scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's headline.
 
 **Model**: the resolved graph: every op, which library serves it, and what did not resolve.
+
+**Advanced**: two editable poll intervals -- *Idle interval* while nothing runs and *Busy interval*
+while a request is in flight, each clamped to 100-5000 ms. Set them equal for one fixed rate; the
+summary beside the panel title names what is set. The values live in the browser, not on the
+server, so they
+survive a restart and apply to this browser only. Polling pauses on every view but Dashboard, so
+the figures hold while you are reading another page -- for about a minute. Past 60 s the
+next poll drops the windows, since there is nothing left to compare them against.
 
 ### 6.2 The JSON behind it
 
@@ -3778,7 +4257,9 @@ Two pitfalls:
 - Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
 
-`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
+`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics. Its first screen shows
+totals over the selected time range (prompt tokens in, prompt tokens read from cache, prompt tokens
+computed, tokens out, requests) and the live status; the detail panels are below.
 
 ### 6.4 The live terminal view
 
@@ -3895,7 +4376,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.15.1
+I STARTUP REPORT -- radiance 1.17.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

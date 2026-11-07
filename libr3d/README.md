@@ -8,7 +8,10 @@ the kernel-plugin rows the engine selects from (`r3d_rows.cpp`); `libr3d/CMakeLi
 every unit and its flags.
 
 It claims `^gfx11` where [`libr4d`](../libr4d/README.md) claims `^gfx12`; a card gets one device
-library, chosen by the rows, not the name. The kernels are not ports of libr4d's: gfx11 has no
+library, chosen by the rows, not the name. `rad_plugin_open` declines a machine whose KFD
+topology lists no gfx11 card (a process without `/dev/kfd` sees none), so in an installation that
+also carries libr4d the tools, which resolve kernels without the engine's code-object check, never
+lay an RDNA4 container's weights out for libr3d. The kernels are not ports of libr4d's: gfx11 has no
 bf16 pack and no VOPD, and a different integer instruction set, so every arithmetic path is its
 own. The matrix work splits by dtype: the bf16/f16 GEMM rows (the m64 band and the prefill-tiled
 form) and every MoE GEMM row run on the 16x16x16 wave-matrix (WMMA) builtins retiled onto a 16x128
@@ -61,11 +64,11 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `vocab` | `logits_gemm_bf16`: the head, read once per token, as bf16 or as E4M3 codes with a bf16 scale per 128x128 block; the `impl` axis picks the decode (the LDS table, the per-byte ALU formula) |
 | `quant` | `quant_act_fp8_bf16`, `quant_act_i8_bf16`, `quant_act_i8g_bf16`, `had_quant_act_{i8,fp8}_bf16` and `had_quant_act_i8g_bf16` (the same with a block Walsh-Hadamard rotation), `gated_had_quant_{i8,i8g,fp8}_bf16`, `gelu_mul_quant_i8_bf16`, `quant_cols_fp8_bf16`, `rmsnorm_quant_{fp8,i8}_bf16` (norm and quantiser in one pass), `gated_quant_fp8_bf16`, `dequant_fp8`, `dequant_e5m2`, `dequant_i8` |
 | `sample` | pre-filters `sample_{penalties,dry,ngram_ban,mask,logprobs}_f32`; spine `sample_{argmax,temp,topk,pick,topp,minp,typical,xtc}_f32` — f32 logits in and out, the draw the reference's in its order, the top-R scan single-pass (the plane read once) |
-| `moe` | `expert_scale_bf16` (the renormalised top-k weight times the expert's per-expert scale, in place), `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`), `moe_router_topk_scatter` (the top-k and the counting sort as one op), `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the kept weights scaled by `route_scale`), `moe_scatter_small` (the routed slots' stable counting sort; histogram in LDS, T ≤ 1024), `moe_gather` (fold the expert outputs back to the token, with the optional shared arm), `moe_gemm_q_e4m3` (grouped E4M3 GEMM; the `impl` axis: 16x16 table decode, 16x16 ALU decode, 16x128 block with the F32 scales folded), `moe_gemm_bf16` (unquantised experts, wave matrix), `moe_gemm_mxfp4a8` (canonical MXFP4 experts), `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too). `r3d_rad_moe_gemm_w4a8` is an exported WIP launcher (packed int4 weights, the i32 wave matrix) that is not a row: no `r3d_rows.cpp` entry, no selftest, per its kernel header |
-| `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update) |
+| `moe` | `expert_scale_bf16` (the renormalised top-k weight times the expert's per-expert scale, in place), `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`), `moe_router_topk_scatter` (the top-k and the counting sort as one op), `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the kept weights scaled by `route_scale`), `moe_scatter_small` (the routed slots' stable counting sort: one workgroup up to 1024 slots, three passes over 256-slot tiles above), `moe_gather` (fold the expert outputs back to the token, with the optional shared arm), `moe_gemm_q_e4m3` (grouped E4M3 GEMM; the `impl` axis: 16x16 table decode, 16x16 ALU decode, 16x128 block with the F32 scales folded), `moe_gemm_bf16` (unquantised experts, wave matrix), `moe_gemm_mxfp4a8` (canonical MXFP4 experts), `moe_gemm_w4a8` (int8 activation, packed two's-complement int4 experts: the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `moe_gemm_w4a4` (int4 activation, packed two's-complement int4 experts: both widen to int8 on the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too) |
+| `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk; libhalo's kernel), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel; libhalo's), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update, per_candidate or anchor; libhalo's), `gdn_conv_recurrent_update_k128_v128` (the convolution and the recurrent update as one decode kernel, q/k/v never materialised; libhalo's) |
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
 
-The table holds 109 rows over 70 schemas; `r3d_selftest` checks every schema slot for slot against
+The table holds 111 rows over 72 schemas; `r3d_selftest` checks every schema slot for slot against
 the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
 [Tunable params](#tunable-params)); the rest are single-implementation.
 
@@ -300,22 +303,29 @@ The grouped GEMM rows share the run-walk / gather structure: the block walks the
 weights, rows the run does not own are padding and their output is dropped, and a dropped slot
 (sorted token < 0) writes zero. `y` is in sorted order.
 
+The experts arrive as weight tables (`RAD_OPD_WTAB`, `r3d_moe_tab.h`): a device array of one
+pointer per expert, or a stacked plane, read on the device. `a_order` "token" (gate_up) gathers row
+`i` from `a[sorted_tok[i] / top_k]`, "sorted" (down) reads `a[i]`. `moe_gemm_q`'s odd class must
+match the even one (`N_odd = N`, `K_odd = K`, as on one card); an uneven class is refused by name,
+and `parts` is then the identity. `r3d_selftest` checks each row's values against the reference's
+arithmetic on routed batches with dropped slots, an N tail block and both orders.
+
 * `moe_gemm_bf16` — unquantised experts: the bf16 operands stage straight into the bf16 wave-matrix
-  fragments, f32 accumulate over the whole of K, no scales, `y` bf16. The weight is the checkpoint's
-  own bytes ([n_expert, N, K] row-major, no layout hook). Tunable over `mrows` (the block's row
+  fragments, f32 accumulate over the whole of K, no scales, `y` bf16. Each expert is the
+  checkpoint's own [N, K] row-major plane (no layout hook). Tunable over `mrows` (the block's row
   count), `vgpr` and `acc`; the compiled points are the legal ones (the `moe_bf16_tune_valid`
   table), the rest refuse.
 * `moe_gemm_q_e4m3` — canonical E4M3 experts with F32 block scales, on the `moe_gemm_q`
-  contract: the even experts in `w` / `w_scale`, the odd in `w_odd` / `w_odd_scale`, at index e/2;
-  the scales fold in f32 per (grid_rows columns, 128 of K); `y` is f32. The `impl` axis: 0 = the
+  contract (`dtype` fp8a8f32): expert e is entry e/2 of the even (`w` / `w_scale`) or odd
+  (`w_odd` / `w_odd_scale`) tables; the scales fold in f32 per 128x128 tile; `y` is bf16. The
+  `impl` axis (the row's tune, dispatched by `r3d_rad_moe_gemm_q`): 0 = the
   16x16 tile with the 512-byte LDS decode table, 1 = the same tile with the per-byte ALU formula
   (no LDS table), 2 = the 16x128 block with the F32 scales folded in f32 (the `vgpr` and `acc`
   axes are arm 2's). The E4M3 operands widen exactly to f16, the f16 wave matrix (f32 accumulate)
-  runs the multiply. The `grid_rows` parameter takes 1 (w4a8's per-row) or 128 (fp8a8's
-  per-128x128).
+  runs the multiply.
 * `moe_gemm_mxfp4a8` — canonical MXFP4 experts: the E4M3 activation and the E2M1 weight (decoded
   exactly to E4M3) upcast to f16, the f16 wave matrix (f32 accumulate), the E8M0 weight scales fold
-  in f32 per 32 of K; the even/odd split as above, `y` bf16.
+  in f32 per (row, 32 of K); the even/odd tables as above, `y` bf16.
 
 On the prefill geometry (T = N = K = 4096, 8 experts, best / median of nine launches) the
 `mrows`/`vgpr` points of `moe_gemm_bf16` run 41.67 ms at (16, 512), 26.19 ms at (32, 128) and
@@ -324,12 +334,50 @@ is the default's best point. The `moe_gemm_q_e4m3` 16x128 arm (vgpr 128) is 215 
 bytes: decode-bound on the E4M3 widen, which is why that row's tile is 16 rows and its arm 2 is
 the one the prefill geometry reaches for.
 
-`r3d_rad_moe_gemm_w4a8` is the WIP int4-weights / int8-activation launcher behind the same run-walk
-structure: a 16x128 block (the eight waves do unique 16-column sub-tiles), the int8 activation and
-the packed int4 weight (decoded exactly to int8, the native i32 wave matrix) with the f32 scales
-folded per 128 of K; a single weight plane, no even/odd split; `y` f32. It is exported and
-value-probed, not a row: the remaining weight forms (the nl64/nl32 magnitude-table nibbles), the
-prefill run map and the SK/UW/RS passes are outstanding, per its kernel header.
+`moe_gemm_w4a8` — the `moe_gemm_q` row at `dtype=w4a8`: int8 activation, packed two's-complement
+int4 experts. The same run-walk structure as the siblings, a 16x128 block (the eight waves do
+unique 16-column sub-tiles), the int8 activation and the packed int4 weight (decoded exactly to
+int8, the native i32 wave matrix) with the scales folded per 128 of K — an f32 a-scale and a bf16
+w-scale. The experts are two tables by parity (even `w`/`w_scale`, odd `w_odd`/`w_odd_scale`), as
+every other `moe_gemm_q` dtype; `y` is bf16. Both token- and sorted-order `a`; the int8 arm folds
+each 128-block's exact i32 product sum as `(sub * a_scale) * w_scale` in ascending block order, so
+it is bit-exact against the libref reference, and the e4m3 arm is the half-precision wave matrix.
+The remaining weight forms (the nl64/nl32 magnitude-table nibbles), the prefill run map and the
+SK/UW/RS passes are outstanding, per its kernel header.
+
+`moe_gemm_w4a4` — the `moe_gemm_q` row at `dtype=w4a4`: int4 activation (packed two per byte),
+packed two's-complement int4 experts. Both operands widen exactly to int8 and run the native i32
+wave matrix (no f16 rounding anywhere in the chain); the scales fold per 128 of K — an f32 a-scale
+and a bf16 w-scale. The experts are two tables by parity (even `w`/`w_scale`, odd
+`w_odd`/`w_odd_scale`); `y` is bf16. Both token- and sorted-order `a`; each 128-block's exact i32
+product sum folds as `(sub * a_scale) * w_scale` in ascending block order, so it is bit-exact
+against the libref reference (verified 4/4 on gfx1102).
+
+`dequant_w4` — the packed 4-bit weight back to a plain row-major bf16 `[N, K]`, for the prefill
+path where W4A8 gains nothing. One thread per packed dword scatters its eight nibbles; the scale
+dword holds the f16 scale low and `-(1024+zero)` high, so one routine serves the symmetric
+(`twos=1`) and asymmetric (`twos=0`) grids. Verified 2048/2048 on gfx1102.
+
+`row_topk_merge` — the R largest of the all-gathered per-rank candidate sets, the other half of a
+vocab-parallel top-R. One wave per row over `world_size * R` (id, value) pairs; a 32-slot top-R
+heap per lane with a 5-step xor-butterfly extract. Ties break on the lower id. R <= 32. Verified
+16/16 on gfx1102.
+
+`ngram_ids` — the hashed row ids of the Per-Layer Embedding: `mixed(k) = XOR of t_s * mult[s]`
+(64-bit wrapping), `ids[h] = mixed % vocab_sizes[h] + offsets[h]`. One thread a token, looping its
+heads; n-gram shifts with an EOS walk; ngram <= 8. Verified 24/24 on gfx1102.
+
+`gemm_nt_q_bias` — the narrow fp8 GEMM with a per-column bias epilogue: `y = a @ b^T + bias`.
+M <= 16, fp8a8 codes and scales, bf16 bias and output. The bias is fused into the GEMM kernel's
+store (no second pass). Verified 64/64 on gfx1102.
+
+`gemm_nt_q_short` — the narrow fp8 GEMM with the short-prompt split rule: unsplit (sk=1) at
+N <= 512, K <= 5120, 41..64 rows, where the split's per-slice floors dominate. M <= 64, fp8a8
+codes and scales, bf16 output. Verified 256/256 on gfx1102.
+
+`moe_gemm_q_mod4` — the grouped quantised GEMM with 4 expert classes: experts route to class
+e%4 (entry e/4 within the class). Same E4M3 wave-matrix core as `moe_gemm_q_e4m3`, 8 individual
+`R3dTab` parameters (4 weight + 4 scale tables). Verified 2048/2048 on gfx1102.
 
 ### Stored weights: the layout hooks
 
@@ -364,6 +412,12 @@ arithmetic is the reference's in the reference's order.
 
 ## The GDN, QSA, and MoE plumbing rows
 
+The chunk preamble, the chunked scan and the recurrent update are libhalo's kernels (`r3dh_*.hip`,
+the `halo_` -> `r3dh_` rename): libr4d's ported to the gfx11 wave matrix, they compile for
+`gfx11-generic` unchanged and pass `rad-kbench` against libref on gfx1151 (the kkt solve to
+8e-5, the scan to 4e-3, the update to 6e-5, both state forms). They replace the first wave-matrix
+ports of the same kernels, which disagreed with libref and whose scan wrote past its output.
+
 `gdn_kkt_solve_c64` runs the gated-delta-net's chunk preamble: the gram
 `A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk, the gram and the blocked
 triangular inverse in one kernel, the fp32 gram never reaching memory. `gdn_chunk_scan_k128_v128_c64`
@@ -374,11 +428,10 @@ touch HBM. `gdn_gated_rmsnorm_h128` is the layer's own output norm, and
 per-row int8 quantiser. `gdn_conv_prep_w4_h128` is the causal conv width 4 + silu, the q/k/v split,
 the qk l2norm, the gating and the per-chunk gate cumsum in one prefill kernel, and
 `gdn_conv_update_w4_h128` / `gdn_recurrent_update_k128_v128` are the same convolution and the
-recurrent state update at decode, over a rolling conv-state buffer and a paged fp32 state cache.
-The decode half (`gdn_recurrent_update_k128_v128`) and the single-chunk case of the scan are
-value-verified against a CPU reference; the scan's multi-chunk state carry carries a small
-documented residual on the development card (its kernel header states the band and the suspected
-cause), so the gate there is bounded, not exact.
+recurrent state update at decode, over a rolling conv-state buffer and a paged f32 or f16 state
+cache, per candidate token or as one committed state with a replay scratch slot (`anchor`).
+`gdn_conv_recurrent_update_k128_v128` is the two as one kernel: the fold holds q, k and v in
+registers, so they are never written and the step is one launch instead of two.
 
 The QSA rows are the indexer's tail: `kv_len_trim_i32` trims each sequence's context lengths by
 `trim` (the slice's own last row), and `qsa_tail_store_bf16` writes the QSA indexer's tail into a
@@ -386,8 +439,10 @@ per-layer linear KV state, ring addressed by position. The MoE plumbing rows are
 the sort: `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`),
 `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the
 kept weights scaled by `route_scale`), `moe_router_topk_scatter` (the top-k and the counting sort
-as one op), `moe_scatter_small` (the routed slots' stable counting sort; histogram in LDS,
-T ≤ 1024) and `moe_gather` (fold the expert outputs back to the token,
+as one op), `moe_scatter_small` (the routed slots' stable counting sort: up to 1024 slots one
+workgroup, histogram in LDS; above, libhalo's three passes, a histogram per 256-slot tile into
+scratch, the per-expert scan across tiles and the placement) and `moe_gather` (fold the expert
+outputs back to the token,
 `y[t,c] = sum_j expert_w[t,j] * y_expert[slot(t,j),c]`, with the optional shared arm; top_k ≤ 64).
 `expert_scale_bf16` scales the renormalised top-k weights by the expert's per-expert scale in
 place, and `dflash_select_bf16` is the drafter's accept step, a walk over the draft block's
@@ -547,11 +602,10 @@ recorded seed, over the parameter rows a real request sends. The sampler's draw 
 construction (the reference's order, the reference's `exp`/`log`), but a recording is the proof,
 and there is no recording harness for the plugin's parameter rows.
 
-**`w4a8` as a row.** `r3d_rad_moe_gemm_w4a8` is a WIP launcher (the i32 wave-matrix core, the
-gather and the run structure are verified bit-exact against a CPU reference); the other weight
-forms (w4nl64a8h / w4nl32a8h / w5nl64a8h, whose nibbles decode through a magnitude table and a
-per-64/32 E4M3 scale), the prefill run map and the SK/UW/RS optimisations are outstanding, per its
-kernel header.
+**The other `w4a8` weight forms.** The `w4a8` form is now a row (`moe_gemm_w4a8`, bit-exact
+against the libref reference); the remaining forms (w4nl64a8h / w4nl32a8h / w5nl64a8h, whose
+nibbles decode through a magnitude table and a per-64/32 E4M3 scale), the prefill run map and the
+SK/UW/RS optimisations are outstanding, per the kernel header.
 
 **A chunked logits path.** The head is the largest read in a decode step, and the sampler reads
 f32, so the store is typed, not narrowed, and a 2048-row prefill band writes 1.07 GB. Nothing

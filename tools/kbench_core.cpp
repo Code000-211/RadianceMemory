@@ -103,6 +103,9 @@ const std::vector<TolRow> g_tol = {
     { "row_topk",     "*",        0.0  },
     { "pair_argmax",  "*",        0.0  },
     { "all_gather",   "*",        0.0  },
+    /* The normalised Hadamard alone: libr4d keeps libref's butterflies, its one multiply and its
+     * rounding, so a differing byte is a bug (r4d_had_rotate.hip). */
+    { "had_rotate",   "*",        0.0  },
     /* Rotation tables in f32, and the rotation itself on bf16 rows. */
     { "rope_table",   "*",        1e-5 },
     { "rope",         "*",        2e-3 },

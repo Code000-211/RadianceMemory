@@ -183,6 +183,93 @@ __device__ __forceinline__ int router_sigmoid_row(const float* logits, const flo
     }
     return e;
 }
+// router_sigmoid_group_topk in one wave per row: router_sigmoid_row's keys, but only the experts of
+// the `kg` best of `ng` equal groups are selectable. A group ranks by the sum of its two highest
+// ranks; lane g holds group g's sum (ng <= 32), and the groups are taken as the experts are, the
+// largest first, equal sums to the lower group, a group with no finite pair never. Then the
+// selection, the weights and the stores are router_sigmoid_row's.
+template <int OWN>
+__global__ void __launch_bounds__(128)
+    router_group_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
+                             long lp, long bp, long ip, long wp, int m, int ne, int k, int ng,
+                             int kg, int norm, float factor) {
+    const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (r >= m) return;
+    const int gs = ne / ng;
+    float p[OWN], rank[OWN];
+#pragma unroll
+    for (int i = 0; i < OWN; ++i) {
+        const int e = lane + 32 * i, s = e < ne ? e : 0;
+        p[i] = 1.0f / (1.0f + expf(-logits[(long)r * lp + s]));
+        rank[i] = e < ne ? p[i] + bias[(long)s * bp] : -INFINITY;
+    }
+    float group = -INFINITY;
+    for (int g = 0; g < ng; ++g) {
+        float t0 = -INFINITY, t1 = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < OWN; ++i) {
+            const int e = lane + 32 * i;
+            if (e < ne && e / gs == g) {
+                const float v = rank[i];
+                if (v > t0) {
+                    t1 = t0;
+                    t0 = v;
+                } else if (v > t1)
+                    t1 = v;
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float o0 = __shfl_xor(t0, mask, 32), o1 = __shfl_xor(t1, mask, 32);
+            const float hi = fmaxf(t0, o0), lo = fmaxf(fminf(t0, o0), fmaxf(t1, o1));
+            t0 = hi;
+            t1 = lo;
+        }
+        if (lane == g) group = t0 + t1;
+    }
+    unsigned long long gkey = lane < ng && group > -INFINITY ? router_rank_key(group, lane) : 0ull;
+    unsigned kept = 0;   // bit g: group g is kept
+    unsigned long long below = ~0ull;
+    for (int j = 0; j < kg; ++j) {
+        const unsigned long long best = router_wave_max(gkey < below ? gkey : 0ull);
+        if (best) kept |= 1u << (int)~(uint32_t)best;
+        below = best;
+    }
+    unsigned long long key[OWN];
+#pragma unroll
+    for (int i = 0; i < OWN; ++i) {
+        const int e = lane + 32 * i;
+        key[i] = e < ne && ((kept >> (e / gs)) & 1u) ? router_rank_key(rank[i], e) : 0ull;
+    }
+    unsigned long long mine = 0;
+    below = ~0ull;
+    for (int j = 0; j < k; ++j) {
+        unsigned long long best = 0;
+#pragma unroll
+        for (int i = 0; i < OWN; ++i) {
+            const unsigned long long c = key[i] < below ? key[i] : 0ull;
+            best = c > best ? c : best;
+        }
+        best = router_wave_max(best);
+        if (lane == j) mine = best;
+        below = best;
+    }
+    const int e = mine ? (int)~(uint32_t)mine : 0;
+    float chosen = 0;
+#pragma unroll
+    for (int i = 0; i < OWN; ++i) {
+        const float v = __shfl(p[i], e & 31, 32);
+        if ((e >> 5) == i) chosen = v;
+    }
+    float total = 0;
+    for (int j = 0; j < k; ++j)
+        total += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(chosen), j));
+    const float mult = norm ? factor / (total + 1e-20f) : factor;
+    if (lane < k) {
+        ids[(long)r * ip + lane] = e;
+        weights[(long)r * wp + lane] = chosen * mult;
+    }
+}
 template <int OWN>
 __global__ void __launch_bounds__(128)
     router_sigmoid_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
@@ -247,6 +334,35 @@ int router_body(const RadArgs* a, RadStream stream) {
                     (const float*)lg.data, (const float*)bias.data, (int*)ids.data, (float*)w.data,
                     lg.stride[0], bias.stride[0], ids.stride[0], w.stride[0], (int)lg.shape[0],
                     (int)ne, (int)k, norm, factor);
+}
+int router_group_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 4) return RAD_E_INVAL;
+    const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
+    const long ne = r4d_geti_or(a, "n_expert", 0), k = r4d_geti_or(a, "top_k", 0),
+               ng = r4d_geti_or(a, "n_group", 0), kg = r4d_geti_or(a, "topk_group", 0);
+    const float factor = (float)r4d_getf(a, "route_scale", 0);
+    if (lg.dtype != RAD_F32 || bias.dtype != RAD_F32 || ids.dtype != RAD_I32 || w.dtype != RAD_F32)
+        return RAD_E_DTYPE;
+    if (ne < 1 || ne > 512 || k < 1 || k > 32 || ng < 1 || ng > 32 || ne % ng || ne / ng < 2 ||
+        kg < 1 || kg > ng || k > kg * (ne / ng) || !std::isfinite(factor) || factor <= 0 ||
+        !lg.data || !bias.data || !ids.data || !w.data || lg.rank != 2 || lg.shape[0] < 1 ||
+        lg.shape[0] > 65535 || lg.shape[1] != ne || bias.rank != 1 || bias.shape[0] != ne ||
+        ids.rank != 2 || w.rank != 2 || ids.shape[0] != lg.shape[0] || w.shape[0] != lg.shape[0] ||
+        ids.shape[1] != k || w.shape[1] != k || lg.stride[1] != 1 || ids.stride[1] != 1 ||
+        w.stride[1] != 1 || lg.stride[0] < ne || ids.stride[0] < k || w.stride[0] < k ||
+        bias.stride[0] < 1)
+        return RAD_E_SHAPE;
+    const int norm = (int)(r4d_geti_or(a, "norm", 0) != 0);
+    const dim3 grid((unsigned)((lg.shape[0] + 3) / 4));
+    if (ne <= 9 * 32)
+        return R4D_EMIT(stream, router_group_wave_kernel<9>, grid, dim3(128), 0,
+                        (const float*)lg.data, (const float*)bias.data, (int*)ids.data,
+                        (float*)w.data, lg.stride[0], bias.stride[0], ids.stride[0], w.stride[0],
+                        (int)lg.shape[0], (int)ne, (int)k, (int)ng, (int)kg, norm, factor);
+    return R4D_EMIT(stream, router_group_wave_kernel<16>, grid, dim3(128), 0,
+                    (const float*)lg.data, (const float*)bias.data, (int*)ids.data, (float*)w.data,
+                    lg.stride[0], bias.stride[0], ids.stride[0], w.stride[0], (int)lg.shape[0],
+                    (int)ne, (int)k, (int)ng, (int)kg, norm, factor);
 }
 /* Operands: router_sigmoid_topk's four, moe_scatter's three outputs, then the optional gate and the
  * optional inverse. The sort is the single-workgroup form, so M * top_k must fit it; a larger pass
@@ -321,7 +437,18 @@ __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long gp, 
     const float u = fminf(fmaxf(bf16_to_f32(gu[r * gp + n + i]), -limit), limit);
     y[r * yp + i] = f32_to_bf16((g / (1.0f + expf(-g))) * u);
 }
-int clamped_body(const RadArgs* a, RadStream stream) {
+// swiglu_step: the SiLU first, its value clipped above (Ling-3.0; vLLM's SwigluStepAndMul).
+__global__ void swiglu_step_kernel(const uint16_t* gu, uint16_t* y, long gp, long yp, int n,
+                                   float limit) {
+    const long r = blockIdx.x;
+    const int i = blockIdx.y * 256 + threadIdx.x;
+    if (i >= n) return;
+    const float x = bf16_to_f32(gu[r * gp + i]);
+    const float g = fminf(x / (1.0f + expf(-x)), limit);
+    const float u = fminf(fmaxf(bf16_to_f32(gu[r * gp + n + i]), -limit), limit);
+    y[r * yp + i] = f32_to_bf16(g * u);
+}
+int clamped_body(const RadArgs* a, RadStream stream, bool step = false) {
     if (!a || a->n_t < 2) return RAD_E_INVAL;
     const auto &gu = a->t[0], &y = a->t[1];
     const long n = r4d_geti_or(a, "n", 0);
@@ -332,6 +459,10 @@ int clamped_body(const RadArgs* a, RadStream stream) {
         gu.shape[0] != y.shape[0] || gu.shape[1] != 2 * n || y.shape[1] != n || gu.stride[1] != 1 ||
         y.stride[1] != 1 || gu.stride[0] < 2 * n || y.stride[0] < n)
         return RAD_E_SHAPE;
+    if (step)
+        return R4D_EMIT(stream, swiglu_step_kernel, dim3(y.shape[0], (n + 255) / 256), dim3(256), 0,
+                        (const uint16_t*)gu.data, (uint16_t*)y.data, gu.stride[0], y.stride[0],
+                        (int)n, limit);
     return R4D_EMIT(stream, swiglu_clamped_kernel, dim3(y.shape[0], (n + 255) / 256), dim3(256), 0,
                     (const uint16_t*)gu.data, (uint16_t*)y.data, gu.stride[0], y.stride[0], (int)n,
                     limit);
@@ -404,6 +535,12 @@ int clamped_quant_body(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_swiglu_clamped(const RadArgs* a, RadStream stream) {
     return clamped_body(a, stream);
+}
+extern "C" int r4d_rad_swiglu_step(const RadArgs* a, RadStream stream) {
+    return clamped_body(a, stream, true);
+}
+extern "C" int r4d_rad_router_sigmoid_group_topk(const RadArgs* a, RadStream stream) {
+    return router_group_body(a, stream);
 }
 extern "C" int r4d_rad_swiglu_clamped_quant_fp8(const RadArgs* a, RadStream stream) {
     return clamped_quant_body(a, stream);

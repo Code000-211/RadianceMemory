@@ -56,7 +56,8 @@ recomputes block keys inside the per-query loop; the engine computes each once, 
 
 12 QSA layers x 64 B = 768 B per token, about 3% of the main KV cache's 24 KiB per token
 (2 heads x 256 x 2 (K and V) x 2 bytes x 12 at bf16): 192 MiB per sequence at 262144 tokens,
-24 MiB at 32768.
+24 MiB at 32768. In int8 (`--qsa-bkey-dtype i8`, below) a block key is 136 bytes, 34 a token a
+layer.
 
 ## Exactness bound
 
@@ -113,6 +114,70 @@ one block key of `n` values (`2 * head_dim * ratio == n` is asserted). A group's
 from the first later-declared op with a `block_size` (`Builder::find_kv_consumer`), so the group is
 declared immediately before `qsa_block_key`, whose `block_size` sizes it.
 
+**In int8** (`--qsa-bkey-dtype i8`, RadBuildCtx::qsa_bkey_dtype RAD_I8) a page holds the key's `n`
+int8 codes, one f16 scale and zero padding: `n + 2` bytes rounded up to the `2 * ratio` a page of
+this geometry comes in, so the group is declared RAD_I8 with `head_dim = ceil((n + 2) / (2 * ratio))`,
+136 bytes at `n` 128 and `ratio` 4 (8.5 bits a value, 6 bytes of padding). Everything that sizes a
+page from the declaration -- the pool, the prefix cache, the residency store -- follows unchanged;
+every QSA layer and the MTP head share the group, so all store int8 together. `qsa_block_key` and
+`qsa_score` take `key_dtype` i8 (docs/OPS.md), only then, so the bf16 program is the one before the
+flag existed, parameter for parameter.
+
+- **The scale rule** is i8h's for a head: `scale = f16(fmin(amax / 127, 512))` over the key as the
+  bf16 store would hold it, codes `clamp(rint(x / scale), -127, 127)`, 0 at a zero scale; a NaN is
+  dropped from the max and stored as -127, an all-NaN key takes the cap. One scale a key, not a
+  32-group: g32 bought 0.0008 of top-512 overlap for 0.37 more bits (prep/aq/m8/bkey/decision.md).
+- **The score folds the scale out of the dot**: `relu(scale * (q . codes))` per head. A bf16 query
+  times a code is exact in f32, so the products are the bf16 path's kind and the scale is one
+  multiply a block and head; the matrix form widens codes to bf16 (exact) for the same WMMA.
+- **Measured** on two R9700s (Flash-Next `--tp 2`, a 30 210-token prefill, layer 47's own
+  selection, ovl.sh): top-512 overlap 0.932 mean against bf16 keys, the same as an fp8 attention
+  cache's against bf16 (0.928); block keys rebuilt in isolation keep 0.996 (the rest is the drift
+  of the earlier layers). KL against the bf16-cache reference, 4 long documents: fp8 0.0262 ->
+  0.0256, i8h 0.0236 -> 0.0243, both differences inside their 95% paired bootstrap interval;
+  window residency byte-identical off against on.
+
+## Block keys split across ranks
+
+Under tensor parallelism every rank runs the whole indexer, so every rank holds every block key:
+under window residency they are the only VRAM item that grows with the context (84 MiB a
+200K-token sequence in int8, against ~17 MiB of sink and tail). `--qsa-bkey-split on`
+(RadBuildCtx::qsa_bkey_split; refused at one rank and by a plugin without
+RadArchProbe::qsa_bkey_split_ok) stores and scores block `b` only on rank `b % R` of `R`:
+
+- **Storage.** The `kv_qsa_bkey` group is paged at `R * ratio` tokens with `head_dim`
+  `n / (2 * R * ratio)` (int8: `ceil((n + 2) / (2 * R * ratio))`), so a page still holds one key
+  (rank r's block of that span) and a rank allocates one page per `R` blocks. Pool, prefix cache
+  (entries at the lcm of the block sizes, 8 tokens instead of 4), residency store and checkpoints
+  size pages from the declaration as before. At bf16 a 2-rank page is 256 bytes, in int8 144 (two
+  blocks' worth of keys is 128 + 16 bytes of padding per rank instead of 136 per block), so a
+  token's block keys cost 32 instead of 64 bytes a layer a card in bf16 and 18 instead of 34 in
+  int8.
+- **Store.** `qsa_work` takes `ranks` and `rank`: block `b` goes to page `bt[b / R]` on its own
+  rank and to page `-1` elsewhere, which `qsa_block_key` skips. `qsa_block_key` takes the group's
+  `block_size` (`R * ratio`). The tail is unchanged: every rank keeps the raw keys of the open
+  block, because whichever rank owns it pools them.
+- **Score.** `qsa_score` is unchanged and issued with the block-key table and the whole `nc`: its
+  column `j` is block `j * R + rank`, and the caller narrows the plane to `ceil(live / R)`
+  columns, so a rank scores its share only. A column past the share's complete blocks may hold a
+  stale key's score; the selection never reads it (its bound is the query's `n`).
+- **Selection.** `qsa_select_part` takes the rank's own top-k as `(order key, global block)` in
+  block order with a flag for "more than topk live here"; a row-interleaved `all_gather`
+  (`dtype` f32 moves the i32 bits, `row` = 1028 words at topk 512, 4 KiB a query row a rank) puts
+  the ranks' lists side by side; `qsa_select_join` merges them into `sel`, `nsel` and `seqused`.
+  The merge is exact, and the table is `qsa_select`'s **byte for byte** (docs/OPS.md,
+  `qsa_select_part` and `qsa_select_join`, has the argument): every rank computes the same bytes
+  from the same gathered lists, so `sel` stays replicated, and the attention, the pager and the
+  MTP head read it as before.
+- **What it costs.** One gather a QSA layer a step (13 at decode with the MTP head, 4 KiB a row a
+  rank) and two launches in place of one. libr4d's part is one workgroup a query over the share
+  (cached in LDS up to 64 rows and 8192 keys); unsplit decode splits the list across the device
+  instead (the chunked path), which the part does not yet, so the selection itself may be slower
+  than unsplit at long context.
+
+Off, the indexer declares exactly the ops and parameters it did before the flag.
+
+## The tail
 ## The tail
 
 A block key needs `ratio` consecutive raw keys; at decode three come from earlier steps. The tail

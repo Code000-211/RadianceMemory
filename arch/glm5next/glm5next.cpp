@@ -50,6 +50,12 @@ struct Model {
      * form declares none of the row form's full-width weights (1.29 GiB a card at eight ranks);
      * the row form is opt-in because it is not bit-identical to it (docs/ARCHITECTURES.md). */
     GlmMla::Form form = GlmMla::Form::heads;
+    /* Routed experts whole on their rank (288/world of them) instead of split by width across
+     * every rank. Whole experts can be read from the drive, which two cards need; at four and
+     * eight the width split is the shape the MXFP4 kernels are tuned for (prefill runs about three
+     * times faster), so all-MXFP4 experts take it unless --weights-disk-tier asks for the drive.
+     * Anything else stays whole: a plain bf16 expert cannot be sliced at all. */
+    bool whole_experts = false;
     std::vector<Layer> layers;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
@@ -75,6 +81,23 @@ struct Model {
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 static thread_local std::unique_ptr<Model> probe_model;
+
+/* Whether every routed expert is MXFP4, asked before any buffer is sized and of the same experts on
+ * every rank, so all ranks reach the same layout. It reads the container's entries and declares no
+ * name map, so it leaves the graph as it was. One expert in another format settles it: a protected
+ * bf16 expert is served only whole. No answer means no container entry, and what is not known to
+ * be MXFP4 stays whole. */
+static bool experts_are_mxfp4(RadBuilder* b, Names& nm) {
+    for (int l = 3; l < 45; ++l)
+        for (int ge = 0; ge < 288; ++ge)
+            for (const char* fmt : { "blk.%d.ffn_gate_up_exps.%d.weight",
+                                     "blk.%d.ffn_down_exps.%d.weight" }) {
+                RadEncoding e{};
+                if (!weight_enc(b, nm.f(fmt, l, ge), &e) || MoeFP8::format_of(e) != 8)
+                    return false;
+            }
+    return true;
+}
 
 static int64_t cfg(const RadModelMeta* m, const char* key, int64_t fallback) {
     char nested[160];
@@ -211,6 +234,7 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
      * at 64k of context the whole step's plane would be 256 MiB. */
     const int64_t scored = g.world > 1 ? std::min(T, std::max(part, GlmTp::kSplitRows)) : T;
     c.score = decl_b(b, nm.f("index_scores"), RAD_F32, { scored, blocks });
+    c.unscored = decl_b(b, nm.f("index_unscored"), RAD_F32, { T, std::min<int64_t>(513, blocks) });
     c.selected = m.aw.core.selected;
     c.length = m.aw.core.length;
     c.nsel = decl_b(b, nm.f("selected_count"), RAD_I32, { T });
@@ -243,13 +267,18 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     mw.ids = decl_b(b, nm.f("expert_ids"), RAD_I32, { T, 8 });
     mw.ew = decl_b(b, nm.f("expert_weights"), RAD_F32, { T, 8 });
     mw.eoff = decl_b(b, nm.f("expert_offsets"), RAD_I32, { 289 });
-    mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 });
+    /* PERSIST, as every other MoE here declares it: the router writes the counts and no declared
+     * op reads them (rad_route_report is a handoff), so as a transient a later buffer could share
+     * their bytes and an arena level would move them, while the core copies them at the block's
+     * end and the file stager reads them, through the address the last pass reported, at the
+     * layer's first expert op. */
+    mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { T * 8 });
     mw.inv = decl_b(b, nm.f("expert_inverse"), RAD_I32, { T * 8 });
-    // FE: the routed experts' WHOLE intermediate (2048). Under expert parallelism a rank owns
-    // whole experts, so the routed arm's buffers are full-width at every world size; the SHARED
-    // expert stays width-sharded (F). The two coincide at world 1.
-    const int64_t FE = 2048;
+    // FE: the routed experts' intermediate. Under expert parallelism a rank owns whole experts,
+    // so the routed arm's buffers are full-width (2048); split by width they are F. The SHARED
+    // expert stays width-sharded (F) either way. The two coincide at world 1.
+    const int64_t FE = m.whole_experts ? 2048 : F;
     mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * FE });
     mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, FE });
     RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", FE, T * 8));
@@ -266,7 +295,8 @@ static int kv_groups(RadBuilder* b, Model& m) {
     auto& nm = m.nm;
     RadKVGroupDecl d{};
     d.kind = RAD_KV_FULL;
-    d.dtype = RAD_BF16;
+    // bf16, or E4M3 under --kv-cache-dtype fp8 (geometry); the other groups keep their own.
+    d.dtype = rad_dtype_parse(g.kv_dtype);
     d.n_head_kv = 1;
     d.head_dim = 256;
     m.latent = rad_decl_kv_group(b, nm.f("kv_latent"), &d);
@@ -373,14 +403,19 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
         s.cfg.n_expert_all = 288;
         s.cfg.top_k = 8;
-        s.cfg.n_expert = 288 / g.world;
-        // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
-        // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
-        const int ep_rank = g.rank < g.world ? g.rank : 0;
-        s.cfg.expert_base = ep_rank * (288 / g.world);
-        s.cfg.probed_expert = s.cfg.expert_base;      // probe this rank's first owned expert
-        s.cfg.n_ff_exp = 2048;                        // whole: whole experts' intermediate
-        s.cfg.n_ff_shared = 2048 / g.world;
+        s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
+        if (m.whole_experts) {
+            s.cfg.n_expert = 288 / g.world;
+            // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
+            // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
+            const int ep_rank = g.rank < g.world ? g.rank : 0;
+            s.cfg.expert_base = ep_rank * (288 / g.world);
+            s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
+            s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
+        } else {
+            s.cfg.n_expert = 288;
+            s.cfg.n_ff_exp = GlmTp::expert_width(g.world);
+        }
         s.cfg.rows = g.max_tok;
         s.cfg.sigmoid_router = 1;
         s.cfg.route_scale = 2.5;
@@ -389,12 +424,12 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.cfg.router_fuse = 1;
         s.cfg.swiglu_quant = 1;
         // At world 1 the width-slice declaration IS the whole model: keep the spans so the
-        // graph stays the pinned one. At world > 1 expert parallelism is in force and whole
-        // experts need no width spans (split && ep is refused by the helper).
-        if (g.world == 1) {
+        // graph stays the pinned one. Whole experts need no width spans (split && ep is refused
+        // by the helper).
+        if (!m.whole_experts) {
             for (int q = 0; q < 2; ++q) {
-                s.cfg.ff_lo[q] = g.rank * (2048 / g.world);
-                s.cfg.ff_hi[q] = (g.rank + 1) * (2048 / g.world);
+                s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
+                s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
             }
         }
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
@@ -430,6 +465,9 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     g.max_logit_rows = std::min<int64_t>(g.max_tok, g.max_seqs * (g.max_spec + 1));
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
+    /* --kv-cache-dtype names the latent cache's dtype only (kv_groups); declare refuses all but
+     * bf16 and fp8. */
+    g.kv_dtype = rad_dtype_name(rad_kv_cache_dtype(ctx, RAD_BF16));
     g.wire_exact = !ctx->tp_wire_lossy;
     g.wire_min_bytes = ctx->tp_wire_min_bytes;
     return g.max_tok < 1 || g.max_ctx < 1 || g.max_seqs < 1 || g.eps <= 0 ? RAD_E_INVAL : RAD_OK;
@@ -468,11 +506,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ctx->max_spec);
         return RAD_E_UNSUPPORTED;
     }
-    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16) {
-        fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin keeps its latent "
-                        "attention, index tail and KDA caches in bf16 and has no fp8 cache, so "
-                        "run it with --kv-cache-dtype bf16\n",
-                ctx->kv_dtype == RAD_F8E4M3 ? "fp8" : rad_dtype_name(ctx->kv_dtype));
+    /* fp8 narrows the latent attention cache to E4M3 at a descale of 1 (kv_groups); the index
+     * tail, the DSA index and the KDA caches keep their dtypes. */
+    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_F8E4M3) {
+        fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin serves its latent "
+                        "attention cache in bf16 or fp8 only\n",
+                rad_dtype_name(ctx->kv_dtype));
         return RAD_E_UNSUPPORTED;
     }
     auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
@@ -483,6 +522,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& nm = m.nm;
     m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
+    m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
+                                                   !experts_are_mxfp4(b, nm)));
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
     RAD_ARCH_TRY(mla_buffers(b, m));

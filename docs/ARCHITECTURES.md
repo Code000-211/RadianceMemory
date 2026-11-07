@@ -18,11 +18,14 @@ plugin claims.
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert, or Qwen's FP8 release as it ships |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
+| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
+| `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them (`data/recipes/nemotron74-fp8.recipe`, `nemotron74-w4nl64-gptq.recipe`); pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
+| `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
-| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
+| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, the E2B/E4B form at one rank, and the 12B (`gemma4_unified`, its image and audio embedders in place of a tower), with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
@@ -35,6 +38,7 @@ plugin claims.
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
 | `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
+| `arch/hunyuan3d2` | `hunyuan3d2` | *(empty)* | Hunyuan3D-2's shape model (hunyuan3d-dit-v2-0), an untextured 3-D shape from one picture: DINOv2-giant over the picture, a FLUX-shaped flow-matching DiT (16 double-stream and 32 single-stream blocks of 1024) over a set of 3072 latents, and the shape VAE's geometry decoder, whose occupancy field the core samples on a grid and meshes; from the release folder (config.yaml and one safetensors), its fp16 weights cast to bf16 (`data/recipes/hunyuan3d-2-bf16.recipe`) |
 | `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`), or the DiT's per-token linears int8, served w8a8 (`minimax-h3-w8a8.recipe`); a curve-form checkpoint, whose timestep embeddings ship as a table, by the `minimax-h3-curve-*` recipes |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
@@ -65,6 +69,164 @@ comes first in one and second in the other. The tables, by plugin:
 | `ltx2` | the checkpoint's names | |
 | `anima` | the checkpoint's names behind `diffusion_model.` / `lora_unet_`; the text encoder as `lora_te_layers_N_...` | DiT under `net.` or `model.diffusion_model.`, Qwen3 under `model.layers.` |
 | `sdxl` | kohya's `lora_unet_` over the single-file UNet paths (convolutions included), `lora_te1_` / `lora_te2_` over the CLIPs' transformers names | UNet under `model.diffusion_model.`, CLIP-L and bigG under `conditioner.embedders.{0,1}.transformer.` |
+
+---
+
+# `spark25`: Spark X2.6
+
+`model_type: spark2_5` / `Spark2_5ForCausalLM`. The 4B checkpoint has 36 layers, hidden size
+2560, 16 query heads and 4 KV heads at head dimension 256, a 10240-wide gated MLP and a tied
+131072-token embedding. It has no q/k norms or projection biases. The residual is accumulated in
+f32; norms write bf16 before the projections.
+
+The checkpoint's fused Q/K/V matrix is split by rows in that order at conversion; gate and up are
+joined in that order. The MLP uses **exact erf GELU**, not `gelu_mul`'s tanh approximation. Each
+attention head's output is multiplied by its own sigmoid gate before the output projection.
+`layer_types` is authoritative: sliding layers use window 512 and full-head NeoX rotary at theta
+10000; full layers use 64 rotary dimensions at theta 5000000. Both use the full KV group, with the
+window applied by the local attention op, so prefix caching remains valid.
+
+## Tensor parallelism
+
+A rank's attention slice is whole GQA groups, so a world that does not divide 4 KV heads still
+shards cleanly: the three ranks of a 3-rank world take 2, 1 and 1 KV heads with the query heads
+that belong to them. Above the KV-head count the KV heads are replicated and one group's query
+heads are split between the ranks sharing its KV head, so every query head still attends the KV
+head the checkpoint gave it -- a rank's own `gqa` can then be smaller than the checkpoint's, while
+the KV cache it stores is a replica of its peer's. The gate and output projections take the
+matching row and column spans, and the tied embedding and lm_head take the contiguous vocabulary
+shard `rad_arch.h`'s `shard_begin` describes, because that is the split the sampler's candidate
+merge assumes.
+
+The FFN splits by channels, whole 128-column blocks where the width has them, and a rank's
+`[gate | up]` keeps both parts the same width. Every split dimension is covered exactly once at
+every world from 1 to 8, asserted in `spark25_arch_test`.
+
+Column-sharded projection outputs are partial sums. Each layer issues two exact bf16
+`all_reduce`s on the projection buffer, rounding the merged output to bf16 **before** widening it
+and adding it to the f32 residual. This preserves the reference's BF16 projection-output boundary
+without rounding away the residual's low bits. Sharding still changes the dot-product reduction
+order, so it does not promise bitwise parity with one card. The embedding uses one exact f32
+`all_reduce` over its widened, disjoint token rows. TP1 declares no collectives. At TP>1, declaration
+requires the exact fp32 embedding reduction and every exact bf16 projection reduction to resolve;
+otherwise it fails with `RAD_E_UNSUPPORTED` rather than running rank-local partial outputs. libr4d
+serves these collectives at 2, 3, 4 and 8 ranks; other widths resolve only on a library with a
+general `all_reduce` (libref), so a card deployment is limited to those worlds.
+
+Both plugins reject multi-rank declarations if a required exact collective cannot be resolved;
+otherwise a missing reduction would silently leave rank-local projections in the residual.
+
+The tokenizer and its template come from the checkpoint; the architecture declares the
+`<think>`/`</think>` reasoning markers and the `<tool_call>name<arg_key>...` tool-call format.
+Other gate activations and rotary-scaling overrides are not implemented.
+
+## Rotated int8 (IQ8R)
+
+`arch/spark25_w8a8` serves a trunk whose linears use the fwht128-rotated int8 grid: per-128 int8
+activation codes feed `i8a8h` GEMMs, while the embedding and small per-head gate remain BF16 and
+normalisation gains remain FP32. Exact GELU runs before the down projection's separate Hadamard
+quantiser. The output head may be BF16 or a separately quantised int8 table. The descriptor is
+`w8a8_fwht128`; the container must set `quantization_config.quant_method=w8a8` and
+`quantization_config.fmt=fwht128`.
+
+The full recipe, `data/recipes/spark-x26-4b-iq8r.recipe`, is an explicit speed/size tradeoff, not a
+quality-preferred default. `data/recipes/spark-x26-4b-iq8r-keep12.recipe` leaves layers 0–11 in
+BF16 and is the tested quality-preferred allocation (6.09 GB / 5.67 GiB). The full IQ8R container
+is 4.52 GiB; BF16 is 8.29 GiB. The measured comparison used top-128-plus-tail KL, with the full
+variant's maximum 11.883 and keep12's maximum 0.247 over 31,391 held-out positions. These are
+coarsened distribution-parity measurements, not full-vocabulary KL or task-benchmark scores. The
+source revision and replay commands, tail details, hashes, calibration/evaluation provenance, and
+limits are in [`SPARK25-IQ8R.md`](SPARK25-IQ8R.md). The cited numbers require the shared prefill
+softmax fix #362 (`7480da3d46b0475d9d77966e31284cc19072759`); they are not evidence for standalone
+#363 without that prerequisite.
+
+The BF16 plugin records the calibration Grams with `RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS`,
+and `RADIANCE_SPARK_CALIB_LAYERS=lo:hi`; use TP=1 to retain off-diagonal cross-rank terms. Drive
+a representative corpus through prefill with prefix caching and speculation disabled. Each layer
+slice writes six RADGRAM2 files. The published calibration manifest and dataset revision are
+recorded in [`SPARK25-IQ8R.md`](SPARK25-IQ8R.md); calibration completeness is not a measure of
+quality.
+
+A column-sharded input must have a 128-column-aligned offset and width. When possible, FFN sharding
+partitions whole 128-channel groups with a ragged remainder-first split. Spark's 10,240-channel FFN
+has 80 groups, so TP=3 gets 27/27/26 groups and is aligned; TP=3 is not inherently refused. The
+architecture rejects a particular computed span only if it is not group-aligned. Actual serving
+also requires the selected kernels and collectives to support the world size. `tests/spark25_iq8r.py`
+compares a deterministic quantised fixture with the Transformers reference, including top-10
+probabilities across cached decoding; `--wide-tp --tp N` checks aligned attention/FFN shards for
+N=1..8. Use a GPU-denying device cgroup for this CPU fixture on shared machines.
+
+## DSpark drafting
+
+Both Spark plugins declare a DSpark graph when the container already carries `draft.*` tensors
+(the presence of `draft.markov_w1.weight` is the switch). Building that container from XHToken's
+standalone GGUF is not in this change.
+
+The container's `draft.target_layer_ids` are the ids of the layers that *consume* each tap, so they
+are one above the taps `arch/spark25_bf16` and `arch/spark25_w8a8` copy out of the residual stream:
+3, 11, 19, 26 and 34 become the taps after layers 2, 10, 18, 25 and 33. The drafter's five
+`fc_norm` rows -- one gain per tap -- are the `fc_norm_t0` ... `fc_norm_t4` vectors the graph
+declares.
+
+`arch/common/rad_block_dspark_bf16.h` is the drafter's graph, declared by both Spark plugins after
+the trunk when the container carries `draft.markov_w1.weight`. It is its own block: the MiniCPM5
+DSpark block (`rad_block_dspark.h`) has Q/K norms, SiLU and an fp8 activation grid, and Spark's has
+none of those. Per pass it encodes the taps the trunk copied into `dflash_src` (each tap RMS-normed
+by its own `fc_norm_t<i>`, concatenated, projected by `fc`, normed by `output_norm_enc`), embeds the
+anchor token, runs the five bf16 sliding-window layers over the drafter's own KV group, then scores
+the vocabulary through the trunk's tied table. At each position, the rank-256 Markov head adds
+`sum_r w1[previous,r] * w2[token,r]` to the draft-head logit for **every** vocabulary token and
+greedily selects the greatest biased score (ties to the lower token id); that selected token is the
+next position's predecessor. This follows the pinned reference's serial greedy walk, not a top-K
+walk or joint-path heap. The head writes F32 logits before the walk, but numerical identity is not
+established: the reference CPU chooses the last equal maximum, its GPU reduction has backend-specific
+tie ordering, and this graph chooses the lower token id. Reduction order can also change near-tie
+results; real reference proposal parity remains unvalidated. A
+retained confidence projection is not used: it neither rescales logits nor changes proposals;
+adaptive depth is not implemented by this fixed-depth graph.
+
+Sliding attention uses a separate `attn_paged_anchor_window` operation because ordinary
+`attn_paged` measures its window from each query row. For a configured 512-token history, the
+reference uses `n_swa = 513`: every draft query shares the anchor's exact inclusive key range,
+`[anchor - 512, anchor]` for causal attention, or the anchor's lower cutoff and the staged context's
+upper end for non-causal attention. The same 513-token width is declared for attention, the drafter
+KV group and scheduler staging; cache recycling and rollback boundaries still require independent
+runtime validation. Both new operations have distinct names, so an older device library that
+does not implement these semantics refuses the graph rather than resolving a similar-looking op.
+
+The drafter is declared only at one rank: its `fc` is unsharded and its head scores the full
+vocabulary, so a `--tp` above 1 is refused at declaration rather than served half-sharded.
+
+DSpark's acceptance, latency and throughput on this exact graph are not measured yet (figures taken
+with an approximate window and a candidate-pruned walk do not carry over); run the QoS harness below
+before quoting any. The W8A8 caller shares the bf16 drafter graph. Verification against the target
+does not by itself show that drafting keeps acceptance, latency or the generated text under every
+serving schedule.
+
+`scripts/dspark_qos_regression.py` is an unvalidated two-server QoS harness, not evidence that
+runtime gates pass. In particular, it treats missing metrics as zero, aggregate proposed versus
+accepted counts cannot prove a partial rejection, and a stop finish reason does not prove an
+explicit stop sequence was encountered. `--prefix-cache-mib 0` does not disable the VRAM prefix
+cache; use `--no-prefix-cache` for that. See `docs/DSPARK-370-DEVICE-FOLLOWUP.md` for the
+limitations and serial diagnostic receipts. Controlled KV rollback/eviction, acceptance quality,
+and QoS measurements remain open; CPU tests and matching sample text cannot establish them.
+
+For a CPU differential against the reference implementation's `configuration_spark.py` and
+`modeling_spark.py`, with Python's torch, transformers and safetensors installed:
+
+```sh
+python3 tests/spark25_reference.py --reference /path/to/XHToken-Spark-X2.6-4B --build build
+python3 tests/spark25_reference.py --reference /path/to/XHToken-Spark-X2.6-4B --build build --tp 3
+SPARK25_REFERENCE_TEMPLATE=/path/to/XHToken-Spark-X2.6-4B/chat_template.jinja \
+  build/tests/spark25_chat_test
+```
+
+The first builds a small deterministic checkpoint and compares prefill, chunked prefill and cached
+decode against the reference with GPUs hidden; `--tp` runs the same fixture over that many fake host
+ranks, which is how the sharding and the collectives are checked without cards. ROCm may still open
+GPU device nodes while probing even with visibility masks; on a shared machine run the CPU
+comparison in a device cgroup that denies access to `/dev/kfd` and the GPU render nodes. The last
+also exercises the checkpoint's actual chat template, which is not redistributed in this tree.
 
 ---
 
@@ -226,7 +388,7 @@ Three groups, which is why hybrid KV groups are first-class:
 
 | group | kind | geometry |
 |---|---|---|
-| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md) |
+| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md). `--kv-recipe` (`qwen35_fp8`, `qwen4exp_fp8`) declares one such group per layout it names, `kv_attn_fp8` / `_fp8_v4` / `_k6_v4` (and on `qwen4exp_fp8` `_k4h_v4`, `_k4h_v2h` and `_i8h`, head_dim 144, 112 and 258, always rotated, `_k5_v4`, head_dim 160, rotated or not, and `_bf16`, the `--kv-cache-dtype bf16` group), each layer bound to its own and the MTP head to the last attention layer's; a `rotated` layer's group is its layout's, holding K and V rotated by `had_rotate` (GUIDE §4.4) |
 | GDN recurrent state | `RAD_KV_LINEAR` | 48 layers, 48 states of 128 x 128 |
 | GDN conv state | `RAD_KV_CONV` | 48 layers, 2*16 + 48 = 80 heads x 128 = 10240 channels, a rolling `conv_width - 1 + n_spec` window |
 
@@ -236,8 +398,9 @@ snapshots. Its reads and writes dominate the two GDN kernels. libr4d also compil
 (elements are O(0.1); the f16 round trip is about 5e-4 relative) that would halve that traffic,
 but the plugins declare f32 because f16 changes the generated text; `--state-cache-dtype f16`
 declares f16 for a deployment that accepts the loss (GUIDE §4.4: on Qwen3.8-27B MXFP4, mean KL
-+0.9..+2.2 %, decode +10 % at sixteen streams without speculation). How a speculative step keeps a
-state it can roll back is `docs/OPS.md`'s `state_form`.
++0.9..+2.2 %, decode +10 % at sixteen streams without speculation). `qwen4exp_fp8` declares its
+36 layers' state the same way (54 MiB a sequence at `--tp 2` on each card, 27 at f16). How a
+speculative step keeps a state it can roll back is `docs/OPS.md`'s `state_form`.
 
 ## FP8
 
@@ -437,7 +600,10 @@ to it as to the bf16 checkpoint, with each FP8 weight read through its scales.
 **The attention cache takes `--kv-cache-dtype fp8_v4` or `k6_v4`.** The QSA layers' cache (and the
 MTP head's layer, which shares it) is then declared at head_dim 200 or 176, a token's quantised row
 over two, and read by the gqa12 rows (gqa6 with 4-token pages at four ranks) of those layouts
-(docs/OPS.md). The indexer's key cache and tail keep their widths.
+(docs/OPS.md). The indexer's key cache and tail keep their widths. A `--kv-recipe` may also name
+`k4h_v4` (rotated int4 K and V, head_dim 144, the same rows' geometry) or `k4h_v2h` (rotated
+int4 K, int2 V under KVarN's variance normalisation, head_dim 112) or `i8h` (rotated int8 K and
+V, one f16 scale a token and head, head_dim 258), recipe-only layouts that are always rotated; when the last attention layer takes one, the MTP head rotates with it.
 
 `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe` is the served choice: four-bit codebook experts with
 ten protected experts left bf16, int8 block linears and lm_head, E4M3 mixing and MTP fc matrices,
@@ -593,12 +759,14 @@ Traps:
 - **MTP concatenates the normalized embedding first,** the normalized previous hidden second.
 - **No RoPE anywhere** (`qk_rope_head_dim` 0); the indexer's only rotation is the Hadamard.
 
-**KV groups.** Five, all bf16 or wider; a `--kv-cache-dtype` other than bf16 is refused at
-declare.
+**KV groups.** Five. `--kv-cache-dtype fp8` narrows `kv_latent` alone to E4M3, stored at
+`kv_store`'s default descale of 1 and read by the `mla_attn` fp8kv rows (docs/OPS.md); the other
+four keep the dtypes below whatever the flag, and a cache dtype other than bf16 or fp8 is refused
+at declare.
 
 | group | kind | per layer | layers |
 |---|---|---|---|
-| `kv_latent` | `RAD_KV_FULL`, bf16, 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
+| `kv_latent` | `RAD_KV_FULL`, bf16 (E4M3 under fp8), 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
 | `kv_dsa_index` | `RAD_KV_FULL`, u8, block 4 | one page a pooled key: 128 E4M3 codes and their f32 scale (`dsa_pool`'s cache form) | 11 MLA + MTP |
 | `kv_index_tail` | `RAD_KV_LINEAR`, bf16, `[4 + spec, 256]` | the key and gate rows not yet pooled; the ring is wider by the draft depth so a rejected draft rolls back | 11 MLA + MTP |
 | `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 64 / tp heads a rank | 34 KDA |
@@ -608,7 +776,7 @@ The latent and the index are replicated: every rank keeps the whole latent cache
 declares both so (`rad_kv_group_replicated`), which lets the host tier (`--prefix-cache-mib`) hold
 each once a slot: 49.59 KiB a 4-token block at any rank count (`kv_latent` 48.00 KiB over its 12
 layers, `kv_dsa_index` 1.59 KiB), 12.4 KiB a token, where a copy per rank would make a slot
-396.75 KiB at eight. The model is a hybrid, so a prefix-cache hit is usable only from a state
+396.75 KiB at eight. Under fp8 `kv_latent` is 24.00 KiB a block, 6.4 KiB a token in all. The model is a hybrid, so a prefix-cache hit is usable only from a state
 checkpoint at or below it, and `--checkpoint-interval` decides how much of a shared system prompt
 is reused.
 
@@ -809,6 +977,82 @@ prefix cache, and a load generator of agent turns (3.3k-token prompts, 400 token
 A second agent run at eight streams after the same restart gave 482. The links count: with three
 of the x8 links fallen back to Gen4, the same build prefilled 3368 / 3664 / 3610 / 3512 tok/s at
 the four depths above.
+
+---
+
+# `bailing_hybrid`: Ling-3.0-flash
+
+`arch/bailing_hybrid` serves Ling-3.0-flash (`model_type: bailing_hybrid`, BailingMoeV3ForCausalLM)
+and its fine-tunes from the bf16 checkpoint. The reference is vLLM's `bailing_moe_v3.py` and
+SGLang's; the HF `modeling_bailing_moe_v3.py` agrees except for the SwiGLU clamp (below). The plugin
+reuses GLM-5.3's KDA core (`KdaState`), sigmoid router (`GlmRouter`, with groups) and draft head
+(`GlmMtp`), and `MoeFP8`; its KDA and MLA blocks are in the plugin file.
+
+```
+42 layers, hidden 2560, vocab 157184 (embedding and lm_head separate), rope_theta 6e6
+layers 5, 11, ..., 41 ((l + 1) % 6 == 0): dense MLA
+  q 2560 -> 32 x (128 nope + 64 rope), no q LoRA; kv_a 2560 -> 512 + 64: the latent (RMS-normed)
+    and the rotary key, both cached; kv_b 512 -> 32 x (128 + 128)
+  rotary over 64 dims, interleaved pairs (HF de-interleaves, then rotates by halves): `gptj`
+  scores scaled by 1/sqrt(192); a sigmoid gate per head (2560 -> 32); o 4096 -> 2560 (`dense`)
+the other 35 layers: KDA, 32 heads of 128
+  q, k, v 2560 -> 3 x 4096, each with a causal depthwise conv of width 4 + SiLU
+  forget gate per channel, full rank (`f_proj` 2560 -> 4096, no_kda_lora), lower bound -5
+    (safe gate); beta per head (2560 -> 32); output gate full rank (`g_proj`), sigmoid-gated
+    RMS norm per head
+feed-forward: layers 0-1 dense SwiGLU 2 x 6144; layers 2-41 MoE
+  512 routed experts of 768 at top-8, sigmoid scores, correction bias (`expert_bias`), 8 groups of
+    64 ranked by the sum of their two best biased scores, 4 kept (noaux_tc); weights normalized
+    and scaled by 2.5; one shared expert of 768 without a gate
+  SwiGLU clamped where `expert_swiglu_limit_list` / `share_expert_swiglu_limit_list` say: the
+    routed experts at 4 in layers 35-41, the shared one at 5 (34-39) and 7 (40-41)
+MTP: checkpoint layer 42 -- enorm, hnorm, eh_proj 5120 -> 2560, one MLA layer with the full MoE,
+  final_layernorm; the trunk's embedding and lm_head
+```
+
+Traps:
+
+- **The clamp is taken after the SiLU.** vLLM (`SwigluStepAndMul`) and SGLang compute
+  `min(silu(gate), L) * clamp(up, -L, L)`; GLM-5.3's `swiglu_clamped` clips the gate before the
+  SiLU, which at L = 4 caps a large gate at `silu(4) = 3.93` instead of 4. The plugin issues
+  `swiglu_step`. HF's reference model ignores the lists entirely; the served form is the one the
+  checkpoint is evaluated with. The routed and the shared arm clamp at different values, often in
+  different layers (`MoeFP8::Config::shared_swiglu_limit`).
+- **Routing is group-limited.** `router_sigmoid_group_topk`: a group's rank is the sum of its two
+  highest `p + bias`, only the experts of the four best groups are candidates. A single-group
+  top-8 picks other experts with every shape valid.
+- **The query is two projections.** The checkpoint's q rows are per head [nope 128 | rope 64]; the
+  plugin maps them as two weights (row maps over `q_proj`) into two plain planes, `[T, 32 * 64]`
+  for `rope` and `[T, 32 * 128]` for the absorption. A single `[T, 32, 192]` plane with column
+  views turns the wrong rows on libavx, whose `rope` reads a rank-3 operand's head stride as its
+  row stride.
+- **The cache row is [latent | rotary key].** One KV head of 288, the row's first half in the K
+  slot and the second in the V slot, so `kv_store` writes the 576-wide row contiguously and
+  `mla_attn_paged` reads it as `[pages, 1, block, 576]`. Scores are taken in the latent; the head
+  gate multiplies the attention's latent output before the expansion, a reordering of HF's gate on
+  the expanded values that only rounding tells apart.
+- **The pre-tokeniser's pattern has possessive quantifiers** (`[^\r\n\p{L}\p{N}]?+\p{L}+`,
+  ` ?[^\s\p{L}\p{N}]++[\r\n]*`). Both are one class followed by classes that share no codepoint
+  with it, which the tokenizer compiles as greedy (core/text/tokenizer_regex.cpp); the ids match
+  HuggingFace's.
+
+**KV groups.**
+
+| group | kind | per layer | layers |
+|---|---|---|---|
+| `kv_latent` | `RAD_KV_FULL`, bf16, 1 head of 288, block 16 | the 512-wide normed latent and the 64-wide rotated key | 7 MLA + MTP |
+| `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 32 / tp heads a rank | 35 KDA |
+| `kv_kda_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, 3 x 4096 / tp channels a rank | 35 KDA |
+
+The latent is replicated: every rank computes and stores the whole row.
+
+**Tensor parallelism.** At 1, 2 or 4 ranks. KDA and MLA split their 32 heads (with them the q/k/v
+rows, the convolution taps and the state; the MLA's q, kv_b and gate rows and o's columns); kv_a
+and the latent are replicated. The dense feed-forward splits its 6144 columns. A routed expert's
+768 columns are six 128-column blocks: halves at two ranks, and at four 2, 2, 1, 1 blocks rotated
+by the expert's number mod 4 (`moe_gemm_q_mod4`), so every rank carries six blocks per four
+experts. The shared expert splits the same way, unrotated. A calibration run
+(`RADIANCE_CALIB_DIR`) and bf16 experts give every rank whole experts instead.
 
 ---
 
@@ -1304,6 +1548,31 @@ gemma-4-E2B-it) at one rank:
   `num_global_key_value_heads` null; it then takes `num_key_value_heads`.
 - The vision tower's clipped linears (`use_clipped_linears`) clamp each projection's input and
   output to the bounds the checkpoint stores (`rad_block_gemma4_vision.h`).
+
+**The 12B form.** Gemma 4 12B (`gemma4_unified`, served through the arch id's alias) has no vision
+tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces them:
+- A picture's patch is a whole 48 x 48 pooling window, its values u / 255 (the processor's Gemma 4
+  family with merge 1). The embedder is a LayerNorm over the patch, a linear with its bias, a
+  LayerNorm, the column's and the row's learned rows, a LayerNorm, the weightless RMS norm and a
+  projection. The LayerNorms take nn.LayerNorm's eps of 1e-5, which no config states. The position
+  table `[1120, 2, width]` is read as its two taps of dimension 1, computed at convert, so a
+  container needs a recipe rule to store them (`gemma4-12b-bf16`, `gemma4-12b-i8g`). One patch is
+  one row: `--mm-max-patches` counts rows here, and 1120 holds the largest picture.
+- An audio clip is frames of 640 samples (40 ms at 16 kHz) as they are, the last zero-padded, one
+  token each: a weightless RMS norm and a 640 -> width projection. A clip is cut at
+  `audio_seq_length` (750 frames, 30 s).
+- **A picture's rows read both ways.** With `use_bidirectional_attention: "vision"` (the 12B and the
+  31B) a picture's or video frame's placeholders attend to each other both ways on the sliding
+  layers; the global layers stay causal. That is transformers' Gemma 4 mask
+  (`create_masks_for_vision_model`), KerasHub's and vLLM's; transformers' `gemma4_unified` forward
+  overlays every layer, which differs little on most pictures. The scheduler ends no prefill chunk
+  inside such a run (`Scheduler::bidi_fit`), the trunk pass names its runs (`RadBatch::n_bidi`), and
+  each sliding layer attends a run's rows a second time with `attn_paged` at `causal` 0 over the
+  cache up to the run's end, written over their causal result. The window stays, as in
+  transformers' mask (the window AND (causal OR the same picture)): it bounds the keys behind a row.
+  A run longer than the window (1120 soft tokens against 1024) is read with `attn_paged_ahead`, whose
+  window bounds the keys behind only, so its first rows see the run's far end. Read causally, the 12B answers pictures differently and often wrongly (on DocVQA, "The image does not
+  provide information" for an answer it reads off the page).
 
 NVIDIA's DFlash drafter states `dflash_config.causal: false`, with every layer sliding; that flag
 sets the sliding layers' causality. The recipes are `gemma4-e4b-bf16-df`, `-w8a8-df`, `-w4a8` and
@@ -1804,6 +2073,79 @@ the one clip where they differed by 5%, the reference itself was 5.3% from a flo
 same model and this engine 0.8%. The transcripts match word for word.
 
 ---
+
+# `nemotronh`: Nemotron-3.5-Bolt-74B-A9B
+
+`arch/nemotronh` serves the language model of Nemotron-3.5-Bolt-74B-A9B (`model_type:
+nemotron_h_omni`, NemotronH_Omni_Reasoning_V3; the text model is `llm_config`, `nemotron_h_puzzle`)
+from the bf16 checkpoint. The reference is vLLM's `nemotron_h.py` and `mamba_mixer2.py`; NVIDIA's HF
+`modeling_nemotron_h.py` agrees except for the CPU scan (below). The plugin reuses `MoeFP8` for the
+routed arm and `AttnFP8` for attention; its Mamba-2 block and the latent feed-forward around
+`MoeFP8` are in the plugin file.
+
+```
+88 blocks, hidden 4096, vocab 131072 (embedding and lm_head separate), RMS eps 1e-5; each block one
+  mixer behind its own norm and a residual add, the type from `layers_block_type`
+40 Mamba-2: 128 heads of 64 in 8 groups, state 128
+  in_proj 4096 -> z 8192 | x 8192 | B 1024 | C 1024 | dt 128, no bias
+  x|B|C through a causal depthwise conv of width 4 with bias, then SiLU
+  dt' = softplus(dt + dt_bias), unclamped; A = -exp(A_log); a D skip per head
+  y = scan(x, B, C, dt'); RMSNormGated: norm over groups of 1024 of y * silu(z), times 8192 gains
+  out_proj 8192 -> 4096
+40 latent MoE: router on the normed hidden state (sigmoid, a correction bias for the selection
+  only, one group, top-9, normalized, x5)
+  fc1_latent_proj 4096 -> 1024; routed experts in the latent, ungated: down(relu(up(x))^2);
+  per layer (`block_configs`) 240 to 496 experts of 1536 to 2560; fc2_latent_proj 1024 -> 4096
+  one shared expert on the hidden state, 4096 -> 5376 -> 4096, relu^2
+8 attention: 32 query heads, 2 KV heads of 128, no position encoding
+```
+
+Traps:
+
+- **The layer count is not stated.** `llm_config` has no `num_hidden_layers`; HF derives it from
+  `block_configs`. The checkpoint reader counts `layers_block_type` when the key is absent, and
+  flattens the array of objects `block_configs` into `block_configs.<l>.<field>`, from which the
+  plugin reads each routed layer's experts, width and top-k.
+- **dt is not clamped.** `time_step_limit` is (0, inf), and vLLM passes exactly that to its scan.
+  HF's CPU path `torch_forward` clamps dt' below at `time_step_min` (0.001), which in the first
+  layers moves 13 % of the (token, head) steps, and it is also wrong past its first 128-token chunk
+  (the state handoff between chunks): HF on the CPU is no reference beyond 128 tokens.
+- **The gated norm normalises the product, per group.** `norm(y * silu(z)) * w` with the RMS over
+  1024 channels (8 groups of the 8192), not `norm(y) * w * silu(z)` (the delta net's
+  `gdn_gated_rmsnorm`). Served as `act_mul` (silu), a gainless `rmsnorm` over rows of 1024 and
+  `mul_weight`; a rank's heads are whole groups.
+- **The router reads the hidden state, the experts the latent.** `MoeFP8` runs at the latent width
+  (`Config::router_k` sizes the router, `Wire::route` feeds it); fc2 is linear and has no bias, so
+  each rank applies it to its partial latent sum and one all-reduce over the hidden width sums the
+  routed and shared arms (`Config::no_reduce`).
+- **relu^2 is `act_mul`'s relu over one operand twice:** relu(x) * x, rounded once, which is
+  torch's `relu(x) ** 2` in bf16 bit for bit.
+- **The bf16 checkpoint has no BOS in its template.** Its chat template sets none, as llama.cpp
+  does for the MoE form.
+
+**KV groups.**
+
+| group | kind | per layer | layers |
+|---|---|---|---|
+| `kv_attn` | `RAD_KV_FULL`, bf16, 2 / tp heads of 128 (1 at four ranks, replicated over a pair), block 16 | keys and values | 8 attention |
+| `kv_ssm` | `RAD_KV_LINEAR`, f32, 64 x 128 a head | the recurrent state, 128 / tp heads a rank | 40 Mamba-2 |
+| `kv_ssm_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, (8192 + 2048) / tp channels a rank | 40 Mamba-2 |
+| `kv_draft` | `RAD_KV_WINDOW` (1024), bf16, 2 / tp heads of 128 (1 at four ranks, replicated over a pair), block 16 | the LiLiCorr drafter's keys and values | its 5 layers, past the trunk |
+
+**Speculation.** With drafts the scan keeps `ssd_update`'s anchor form (the committed state and a
+scratch of per-token records: decay, `dt' x`, B), at most 31 drafts a step. NVIDIA's LiLiCorr block
+drafter proposes 7: 32 query heads over 2 KV heads of 128, which four ranks replicate as the trunk's
+attention does (`drafter_geom`'s `kv_repl_ok`: each rank reads its head's k and v rows at `kv_off`,
+and `attn_paged_sink` runs at gqa 8 instead of 16). A verify's 8 query rows run the trunk's
+attention in the split-KV decode kernel a plain decode runs, at gqa 16 (one and two ranks) in eight
+waves as at gqa 8 (four) in four, so each row is the single-row decode at its position bit for bit
+while each of the split law's segments holds one 16-key tile (a context up to 2048 tokens: 256
+segments at a decode, 128 at a verify). Past that the partition differs and a near-tie can flip
+greedy text, as `ident.sh` allows ([TOOLS](TOOLS.md)).
+
+**Vision.** `arch/nemotronh/radio.h` serves the C-RADIO (v4-H) tower and its `mlp1` projector when
+the container holds them (`vision_config.model_type` `radio`): pictures, and video in tubelets of
+two frames, through `core/mm`'s `Radio` family.
 
 # `minimaxmusic3`: MiniMax-Music3, songs
 
@@ -2337,3 +2679,43 @@ with and without a first frame; diffusers on CUDA and on the CPU differ from eac
 On an R9700 (libr4d) the same five renders land within 0.15% of diffusers' CUDA rows, every op
 agreeing with its host reference under the op oracle. Block fp8 moves the random model's rows by
 0.2 to 0.4% (the card's fp8a8 GEMMs, the CPU's fp8 codes widened to bf16).
+
+# `hunyuan3d2`: Hunyuan3D-2, a 3-D shape from a picture
+
+`arch/hunyuan3d2` declares a shape generator (`rad_declare_shape_generator`), which makes the
+program one the engine drives through `core/gen/shape_driver.h`: SCOND runs the image encoder over
+the picture and `cond_in` over its rows and over the unconditioned branch's zeros, into the lane;
+SSTEP is one denoising step of both branches together; SLATENT runs the shape VAE's latent network
+and leaves the geometry decoder's keys and values in the lane; each SQUERY pass is the geometry
+decoder at up to 32768 points the core chose. The core samples the grid coarse to fine (FlashVDM's
+hierarchical decoding with full attention) and meshes the finest level with marching cubes. A
+request is a lane; two hold state at once. It is served on Hunyuan3D-2's own routes, `/generate`,
+`/send` and `/status/{uid}` ([GUIDE §5.17](GUIDE.md)), bf16 on one card. The checkpoint is the
+release's hunyuan3d-dit-v2-0 folder: config.yaml (its keys under their dotted paths) and one
+safetensors holding `model.`, `conditioner.` and `vae.`.
+
+```
+picture   the alpha's box at 85% of the picture's square, centred on white (OpenCV's INTER_AREA),
+          512 x 512 (INTER_CUBIC), then 518 x 518 (bilinear) normalised by ImageNet's statistics,
+          in 37 x 37 patches of 14 x 14, f32 into the patch projection
+encoder   DINOv2-giant: 40 layers of 1536 (24 heads of 64), LayerNorm eps 1e-6, SwiGLU 4096 with
+          biases, layer scales on both branches, the class token and a learned position table;
+          the last hidden state after the final LayerNorm, 1370 rows. The unconditioned branch is
+          zeros, so its rows after cond_in are cond_in's bias
+DiT       FLUX's layout without a rotary: 16 double-stream blocks (the conditioning and the latent
+          each with their own weights, one joint attention) and 32 single-stream blocks
+          (linear1 = [qkv | mlp], linear2 over [attn | gelu_tanh(mlp)]), width 1024, 16 heads of
+          64, q and k RMS-normed per head (eps 1e-6), LayerNorms without affine modulated as
+          (1 + scale) LN(x) + shift with gates and no tanh. The timestep embedding is the sinusoid
+          of 1000 sigma at a period of 1000 (the reference passes its time factor where
+          timestep_embedding takes max_period), then time_in. Rows a step: [cond | latent] for
+          the picture's branch and [latent | cond] for the unconditioned one, so each branch is
+          one attention run and the two latents one run for the latent stream's ops
+sampler   flow matching from sigma 0 (noise) to 1: Euler on numpy's linspace(0, 1, steps), the
+          last grid point's evaluation (a zero step in the reference) skipped; guidance 5
+VAE       latent / scale_factor, post_kl 64 -> 1024, 16 self-attention blocks (q, k, v and the
+          geometry decoder's k, v are head-interleaved in the checkpoint and gathered per head at
+          conversion; per-head LayerNorms on q and k, exact GELU MLP 4096)
+geometry  a point's [x | sin | cos] at 8 octaves (51 values, f32, point_fourier), query_proj, one
+          cross-attention block over the latent rows (its own MLP), ln_post (eps 1e-5), a logit
+```

@@ -85,9 +85,12 @@ std::vector<std::string> serving_argv(const std::string& model,
 }
 
 /* The shape the preemption cases run in: four sequences of at most 512 tokens, 256 a step. Their
- * small KV pool comes from a small device, whose size small_device() finds. */
+ * small KV pool comes from a small device, whose size small_device() finds. --prefill-interleave 0
+ * pins the schedule these cases are sized for: the bring-up default auto:1 follows measured step
+ * times, so on a loaded host the four sequences may never overlap enough to preempt. */
 std::vector<std::string> small_pool_args() {
-    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512" };
+    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512",
+             "--prefill-interleave", "0" };
 }
 std::vector<std::string> device_env(int device_mib) {
     return { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(device_mib) };
@@ -796,6 +799,29 @@ TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
                            { "RADIANCE_HOST_DEVICES=2" }, 120);
     const bool named = has(r.log, "--tp-attn-split rows: the '") &&
                        has(r.log, "plugin does not split attention by rows");
+    if (r.status == 0 || r.status == 124 || !named)
+        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
+    CHECK(r.status != 0);
+    CHECK(r.status != 124);
+    CHECK(named);
+}
+
+/* --kv-recipe at startup: the tiny qwen35 checkpoint's plugin declares one cache layout for every
+ * layer (RadArchProbe::kv_recipe_ok is 0), so a recipe it would quietly store as plain E4M3 is
+ * refused, naming the file and the plugin, before anything is declared. */
+TEST(a_kv_recipe_the_plugin_cannot_declare_per_layer_is_refused_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir dir{ "kvrecipe" };
+    const std::string recipe = dir / "r.kvrecipe";
+    FILE* fp = std::fopen(recipe.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    std::fputs("layer 3 fp8\n", fp);
+    std::fclose(fp);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0",
+                                       "--kv-cache-dtype", "fp8", "--kv-recipe", recipe }, {}, 120);
+    const bool named = has(r.log, "--kv-recipe " + recipe + ": the '") &&
+                       has(r.log, "plugin does not declare its KV cache per layer");
     if (r.status == 0 || r.status == 124 || !named)
         fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
     CHECK(r.status != 0);
@@ -1714,6 +1740,36 @@ TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
         CHECK_EQ(plain.stop(), 0);
         CHECK_EQ(spec.stop(), 0);
     }
+}
+
+/* --kv-residency-mib on a model whose cache declares no window is accepted and changes nothing: no
+ * store, no mover, no sweep. The server says so at startup, decodes the tokens the plain server
+ * does, and /stats shows nothing moved and nothing was paged. (A window needs a sparse consumer,
+ * which no tiny checkpoint is; the mover's installation with a store is held at the seam it plugs
+ * into, in mem_test and sched_test.) */
+TEST(a_residency_flag_on_a_model_without_a_window_changes_no_token_and_moves_nothing) {
+    REQUIRE(world().ok);
+    Server plain, flagged;
+    REQUIRE(plain.start(world().qwen35, kPlain));
+    std::vector<std::string> args = kPlain;
+    args.insert(args.end(), { "--kv-residency-mib", "64" });
+    REQUIRE(flagged.start(world().qwen35, args));
+    const json a = post(plain.port, "/completion", completion(repetitive_prompt(), 32));
+    const json b = post(flagged.port, "/completion", completion(repetitive_prompt(), 32));
+    CHECK_EQ(tokens_of(a).size(), (size_t)32);
+    CHECK(tokens_of(a) == tokens_of(b));
+    Call c;
+    std::string out;
+    REQUIRE(c.send(flagged.port, "GET", "/stats", ""));
+    CHECK_EQ(c.read(&out), 200);
+    const json st = json::parse(out, nullptr, false);
+    REQUIRE(st.is_object() && st.contains("kv_residency"));
+    for (const char* k : { "demoted", "promoted", "skipped", "misses", "host_bytes", "paged_in", "paged_hits" })
+        CHECK_EQ(st["kv_residency"].value(k, (int64_t)-1), (int64_t)0);
+    CHECK_EQ(plain.stop(), 0);
+    CHECK_EQ(flagged.stop(), 0);
+    CHECK(has(flagged.output(), "does nothing here"));
+    CHECK(!has(flagged.output(), "window enforced"));
 }
 
 /* Sampling draws each position's random number from (seed, position), so a seeded request repeats

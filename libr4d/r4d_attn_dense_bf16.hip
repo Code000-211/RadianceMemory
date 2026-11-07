@@ -2,7 +2,7 @@
 // an optional two-sided window, i - j < window behind and j - i < wright ahead (wright is
 // `window_right`, or `window` for the symmetric |i - j| < window), or causal with an optional
 // window behind (a codec's sliding layers, a text encoder's prompt). bf16 in and out, f16
-// operands, f32 accumulate. Head widths 64, 256 and 512 are compiled; each (head_dim, gqa) pair
+// operands, f32 accumulate. Head widths 64, 80, 256 and 512 are compiled; each (head_dim, gqa) pair
 // is a row.
 //
 // Core from the vision kernel (r4d_attn_vit_h72_bf16.hip): S^T = K.Q^T, so the wave32
@@ -304,6 +304,7 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
 // ---- launch ----------------------------------------------------------------------------------
 // One instantiation per (head_dim, gqa), at a workgroup shape picked for it:
 //   h64  gqa1: 8 query blocks of 16, K/V tiles of 64 keys          (the vision towers' heads)
+//   h80  gqa1: the same shape, five 16-wide k-tiles a head          (C-RADIO's heads)
 //   h256 gqa1: 8 query blocks of 16, tiles of 32 (LDS: 37 KiB)
 //   h256 gqa2, 4, 8: 8, 4, 2 query blocks x the heads, tiles of 32 (LDS: 37 KiB)
 //   h512 gqa2, 4, 8: 4, 2, 1 query blocks x the heads x 2 head halves, tiles of 16 (LDS: 57 KiB)
@@ -351,6 +352,10 @@ extern "C" int r4d_attn_dense_bf16(const void* q, const void* k, const void* v, 
     hipStream_t s = (hipStream_t)stream;
     if (head_dim == 64 && gqa == 1)
         return r4d_attn_dense_launch<64, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
+                                                      n_head_kv, scale, window, wright, block,
+                                                      cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
+    if (head_dim == 80 && gqa == 1)
+        return r4d_attn_dense_launch<80, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
                                                       n_head_kv, scale, window, wright, block,
                                                       cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
 #define R4D_DENSE(HD, G, NQB, DS, T)                                                              \

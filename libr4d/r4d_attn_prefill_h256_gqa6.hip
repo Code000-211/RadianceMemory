@@ -74,9 +74,20 @@
 // queries, r4d_selftest --perfpaged) and fp8 24.6 -> 22.7; the gain is largest once the KV no
 // longer fits the 64 MB Infinity Cache.
 #define O_KLATE 4194304
-// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
+// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache, O_V4 | O_K4 the k4h_v4 cache, with O_V2
+// the k4h_v2h cache and with O_I8 the i8h cache, O_V4 | O_K6 | O_K5 the k5_v4 cache (see
+// r4d_attn_decode_h256_gqa6.hip).
+#define O_V2      4
+#define O_K5    256
+#define O_I8   8192
 #define O_V4    33554432
 #define O_K6    67108864
+#define O_K4    1073741824
+// O_PK with O_K4 (k4h_v4) or O_K4 | O_V2 (k4h_v2h): the attention's values are the keys, read
+// from K's int4 codes and scales with V's int4 widening, so the output is P K-hat (attn_paged at
+// kv_dtype k4h_v4_pk / k4h_v2h_pk, a `vpred` layer's second attention; docs/OPS.md "kv_vpred").
+// The scores, the softmax and the row layout are the layout's own.
+#define O_PK    131072
 // O_PSPLIT: a KV split for launches with too few workgroups to fill the card (r4d_prefill_splits
 // in r4d_attn_prefill_split.h). blockIdx.x is qtile * a.splits + split, and the workgroup walks
 // only its segment of the sequence's tiles, cut as r4d_attn_tps cuts them (the partition the
@@ -147,17 +158,39 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int BTS   = (OPT & O_BTS)   ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // k5_v4: k6_v4's staging with K's fifth bits a word a group of 32 (RAD_KVQ_K5V4); the word,
+    // shifted to the chunk's half, takes k6_v4's high-bit slot in kreg.
+    constexpr int K5    = ((OPT & O_K5) && K6) ? 1 : 0;
+    // k4h_v4: K's int4 codes where k6_v4 keeps its low nibbles, no high-bit words, K's scales
+    // after V's codes (RAD_KVQ_K4H). It takes k6_v4's staging with V's nibble widening on K.
+    constexpr int K4    = ((OPT & O_K4) && V4 && !K6) ? 1 : 0;
+    constexpr int KQ    = K6 || K4;                        // K int, widened from codes and scales
+    // k4h_v2h: k4h_v4 with V's codes two bits (v_codes_nm in r4d_dt16.h), K's scales after them.
+    constexpr int V2    = ((OPT & O_V2) && K4) ? 1 : 0;
+    // i8h: int8 codes, a byte a dim, and one scale a token for K and one for V (RAD_KVQ_I8H). It
+    // takes k4h_v4's staging with the codes widened from bytes (r4d_dt16.h); the row (2 * HEAD_DIM
+    // + 4) is 4-byte aligned only, so codes are read a dword at a time.
+    constexpr int I8    = ((OPT & O_I8) && K4 && !V2) ? 1 : 0;
+    // P K-hat (O_PK): V's tile is K's codes and scales, int4 even on k4h_v2h (VV2 is V's width).
+    constexpr int PK    = ((OPT & O_PK) && K4 && !I8) ? 1 : 0;
+    constexpr int VV2   = V2 && !PK;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int ROWB  = K5 ? HEAD_DIM * 20 / 16 : K6 ? HEAD_DIM * 22 / 16 : V2 ? HEAD_DIM * 14 / 16
+                        : I8 ? 2 * HEAD_DIM + 4
+                        : K4 ? HEAD_DIM * 18 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int KSOFF = K5 ? HEAD_DIM * 9 / 8 : V2 ? HEAD_DIM * 3 / 4 : I8 ? 2 * HEAD_DIM
+                        : K4 ? HEAD_DIM : HEAD_DIM * 5 / 4;
+    constexpr int VOFF  = PK ? 0 : K5 ? HEAD_DIM * 5 / 8 : K6 ? HEAD_DIM * 3 / 4 : I8 ? HEAD_DIM
+                        : K4 ? HEAD_DIM / 2 : HEAD_DIM;
+    constexpr int VSOFF = PK ? KSOFF : K5 ? HEAD_DIM * 19 / 16 : K6 ? HEAD_DIM * 21 / 16
+                        : V2 ? HEAD_DIM * 13 / 16 : I8 ? 2 * HEAD_DIM + 2 : K4 ? HEAD_DIM * 17 / 16
+                        : HEAD_DIM * 3 / 2;
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
     // fp8_v4 takes none of the three (KLATE, the assume, the scale pack): they gain at 100k but lose
     // 3-7 % at 25k and 50k.
-    constexpr int OLDV4 = V4 && !K6;
+    constexpr int OLDV4 = V4 && !KQ;
     constexpr int KLATE = ((OPT & O_KLATE) && KWIDE && !KVP && !OLDV4) ? 1 : 0;
     constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
     constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
@@ -186,7 +219,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = PV8 ? 8.0f : D::GROW;   // e4m3 max is 448 = 2^8.8
     static_assert(!KWIDE || KPASS == 1, "the wide K fetch is one straight-line pass");
-    static_assert(!K6 || KWIDE, "k6_v4 K is staged sixteen dims a thread");
+    static_assert(!KQ || KWIDE, "k6_v4 and k4h_v4 K are staged sixteen dims a thread");
     static_assert((!QK8 && !PV8) || CTG, "the 8-bit fragment maps are written for CONTIG");
 
     constexpr int KSTR8 = HEAD_DIM + 8, VSTR8 = TILE + 8;
@@ -294,6 +327,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     // The split lets GPREV move the fetch out from between the barriers.
     const int vg = lane >> 3, vj = lane & 7;
     uint4 kreg[KREGS], vreg[VREGS];
+    // i8h: a staged K chunk's sixteen codes fill kreg, so its token's scale waits here.
+    uint32_t ksc[I8 ? KREGS : 1];
 
     // ---- fp8_v4 / k6_v4: V is int4 in groups of 32 with an f16 scale (absmax / 7): 16 bytes of
     // codes a group at VOFF (dim d at bits 4*(d%8) of word d/8), the group scales at VSOFF. A thread stages one key pair's 8 dims: two code words and the pair's scale,
@@ -307,7 +342,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
     // The pair's two scales stay apart until storeV4 packs them: packed here, the prefetch a tile
     // ahead would be waited on right after it is issued (fp8_v4 packs here, see KLATE).
-    uint32_t v4c[U4][2], v4s[U4][2];
+    // i8h: a key's eight V codes are two words, the second in v8c.
+    uint32_t v4c[U4][2], v4s[U4][2], v8c[I8 ? U4 : 1][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
@@ -321,7 +357,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
                                         + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
-                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                    if constexpr (I8) {
+                        v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 8);
+                        v8c[r][j] = *(const uint32_t*)(base + VOFF + o * 8 + 4);
+                        sc[j]     = *(const uint16_t*)(base + VSOFF);
+                        continue;
+                    }
+                    v4c[r][j] = VV2 ? *(const uint16_t*)(base + VOFF + o * 2)
+                                    : *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
@@ -336,13 +379,20 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             const int u = tid + r * NTHR;
             if (NP4 % NTHR == 0 || u < NP4) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
-                // Codes are two's complement nibbles; ^ 8 makes them offset binary (value + 8).
-                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                // Each key's codes as offset bytes, even dims in n, odd in m (v_codes_nm in
+                // r4d_dt16.h: int4 nibbles ^ 8 against 1032, or k4h_v2h's int2 doubled against 1027).
+                // i8h: bytes ^ 0x80 against 1152 (v8_codes_nm).
+                uint32_t n0, m0, n1, m1;
+                if constexpr (I8) {
+                    v8_codes_nm(v4c[r][0], v8c[r][0], n0, m0);
+                    v8_codes_nm(v4c[r][1], v8c[r][1], n1, m1);
+                } else {
+                    v_codes_nm<VV2>(v4c[r][0], n0, m0);
+                    v_codes_nm<VV2>(v4c[r][1], n1, m1);
+                }
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                constexpr float VB = I8 ? kI8Bias : VBias<VV2>::v;
+                const h2 bias = { (_Float16)VB, (_Float16)VB };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
                 uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
                 #pragma unroll
@@ -389,7 +439,22 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     // k6_v4: the chunk's sixteen low nibbles, its high-bit word, its group's scale.
                     const uint8_t* rp = (const uint8_t*)a.kv + o;
                     const uint2 lo = *(const uint2*)(rp + ch * 8);
-                    kreg[p] = make_uint4(lo.x, lo.y, *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4),
+                    const uint32_t hb = K5 ? *(const uint32_t*)(rp + HEAD_DIM / 2 + (ch >> 1) * 4)
+                                                 >> (4 * (ch & 1))
+                                           : *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4);
+                    kreg[p] = make_uint4(lo.x, lo.y, hb,
+                                         *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
+                } else if (I8) {
+                    // i8h: the chunk's sixteen codes in four dwords, the token's scale apart.
+                    const uint8_t* rp = (const uint8_t*)a.kv + o;
+                    const uint32_t* cw = (const uint32_t*)(rp + ch * 16);
+                    kreg[p] = make_uint4(cw[0], cw[1], cw[2], cw[3]);
+                    ksc[I8 ? p : 0] = *(const uint16_t*)(rp + KSOFF);
+                } else if (K4) {
+                    // k4h_v4: the chunk's sixteen codes and its group's scale; no high bits.
+                    const uint8_t* rp = (const uint8_t*)a.kv + o;
+                    const uint2 lo = *(const uint2*)(rp + ch * 8);
+                    kreg[p] = make_uint4(lo.x, lo.y, 0u,
                                          *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
                 } else if (KWIDE) {
                     kreg[p] = *(const uint4*)((const uint8_t*)a.kv + o + ch * 16);
@@ -429,13 +494,17 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
                 const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
                 if (KWIDE && key >= TILE) continue;
-                if constexpr (QK8 && K6) {
-                    // k6_v4: widen to f16 as below, then round each value once to e4m3
+                if constexpr (QK8 && KQ) {
+                    // k6_v4, k4h_v4: widen to f16 as below, then round each value once to e4m3
                     const uint4 r = kreg[p];
                     #pragma unroll
                     for (int q = 0; q < 2; ++q) {
                         uint32_t w4[4];
-                        k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        if constexpr (I8) k8x8_to_f16x4w(q ? r.z : r.x, q ? r.w : r.y,
+                                                         ksc[I8 ? p : 0] | (ksc[I8 ? p : 0] << 16), w4);
+                        else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
+                        else if constexpr (K5) k5x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        else k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                         *(uint2*)(&sK8[key * KSTR8 + ch * KEL + 8 * q]) =
                             make_uint2(pk_fp8x4_h(w4[0], w4[1]), pk_fp8x4_h(w4[2], w4[3]));
                     }
@@ -454,7 +523,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                         w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
                     } else {
                         const uint4 r = kreg[p];
-                        if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        if constexpr (K5) k5x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        else if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        else if constexpr (I8) k8x8_to_f16x4w(q ? r.z : r.x, q ? r.w : r.y,
+                                                              ksc[I8 ? p : 0] | (ksc[I8 ? p : 0] << 16), w4);
+                        else if constexpr (K4) k4x8_to_f16x4w(q ? r.y : r.x, r.w | (r.w << 16), w4);
                         else fp8x8_to_16x4w<D>(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y), w4);
                     }
                     *(uint2*)(kd + 8 * q)     = make_uint2(w4[0], w4[1]);

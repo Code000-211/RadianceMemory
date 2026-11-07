@@ -50,7 +50,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
-namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
+namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
 namespace server { class Sink; }
 struct TierPump;
 struct TierJob;
@@ -169,6 +169,7 @@ private:
     std::vector<const char*> meta_kv_kp_, meta_kv_vp_;
 
     void (*arch_step_)(RadCtx*, const RadBatch*) = nullptr;
+    uint64_t (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
 
     int load_plugins();
     int read_metadata();
@@ -254,6 +255,11 @@ private:
      * copies are freed, because the holder that leaves last deletes the file. */
     std::vector<TableShare> table_shares_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
+    /* --ngram-placement disk=DIR: the table's own file, mapped read-only in place of the
+     * container's range (table_file_map); unmapped in ~Engine. */
+    std::vector<TableCopy> table_files_;
+    std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
+    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
@@ -431,14 +437,16 @@ private:
     int  collect_pooled_issue(const RadBatch* b, StepOut& so);
     int  collect_pooled(const RadBatch* b, StepOut& so);
     /* A generator (rad_declare_generator, rad_declare_audio_generator,
-     * rad_declare_video_generator): the driver that turns requests into passes and the loop that
-     * runs them, replacing the scheduler and step loop (engine_gen.cpp). Null for every other
-     * program. `img_gen_`, `aud_gen_` and `vid_gen_` are the same driver by its kind, for the
-     * endpoints; one of them is set when `gen_` is. */
+     * rad_declare_video_generator, rad_declare_shape_generator): the driver that turns requests
+     * into passes and the loop that runs them, replacing the scheduler and step loop
+     * (engine_gen.cpp). Null for every other program. `img_gen_`, `aud_gen_`, `vid_gen_` and
+     * `shp_gen_` are the same driver by its kind, for the endpoints; one of them is set when
+     * `gen_` is. */
     std::unique_ptr<gen::IPassDriver> gen_;
     gen::Driver*                      img_gen_ = nullptr;
     gen::AudioDriver*                 aud_gen_ = nullptr;
     gen::VideoDriver*                 vid_gen_ = nullptr;
+    gen::ShapeDriver*                 shp_gen_ = nullptr;
     int  gen_loop();
     /* Zeroes the state slots the KV manager granted since the last step, on every rank's stream,
      * before the step or pass that first reads them. */
@@ -586,6 +594,11 @@ private:
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
+    /* Window residency stores (spec §7.3, KVManager::set_residency_store): host-mapped memory,
+     * one per residency group (by group index, null for another), a slot one block of that group,
+     * holding the blocks a sparse consumer's window does not cover. Empty unless a KV group
+     * declared a residency window and --kv-residency-mib gave them a size. */
+    std::vector<std::unique_ptr<HostArena>> res_stores_;
     int  run_server();
     /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
@@ -636,6 +649,19 @@ private:
      * POST /admin/control-vector). Atomic: the server's admin thread writes it while
      * request threads read it; nothing about the graph changes with it. */
     std::atomic<bool>              cvec_default_{false};
+    /* ---- the recipe's V means (--kv-recipe `vmean`). `kv_vmean_table_` is the RadKvVMean table
+     * (bf16 bits, abi/rad_builder.h) built at bringup, empty without a `vmean` layer;
+     * `kv_vmean_views_` is, per rank, its copy on the rank's card, uploaded at the rank's first
+     * declare and freed with the engine (the view's `table` is the allocation). */
+    std::vector<uint16_t>          kv_vmean_table_;
+    std::vector<RadKvVMean>        kv_vmean_views_;
+    /* ---- the recipe's maps from K to V (--kv-recipe `vpred`), the same way: `kv_vpred_table_` the
+     * RadKvVPred table (f32, rotated) and `kv_vpred_entry_` each layer's entry in it, built at
+     * bringup and empty without a `vpred` layer; `kv_vpred_views_` per rank, `table` its card's
+     * copy (the allocation, freed with the engine) and `entry` kv_vpred_entry_'s data. */
+    std::vector<float>             kv_vpred_table_;
+    std::vector<int32_t>           kv_vpred_entry_;
+    std::vector<RadKvVPred>        kv_vpred_views_;
     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
     bool        report_printed_ = false;
     /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in

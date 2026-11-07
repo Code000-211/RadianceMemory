@@ -56,6 +56,9 @@ struct Gemma4Vision {
         rad_op     op_c[C_N] = {};
     };
     bool on = false, standardize = false, clip = false;
+    /* The language model reads a picture's rows both ways (RadEncoderDecl::bidirectional); the
+     * plugin sets it before declare. */
+    bool bidirectional = false;
     int64_t P = 0, R = 0, width = 0, heads = 0, hd = 0, ff = 0, patch_dim = 0, pool = 0;
     int64_t npos = 0, n_embd = 0;
     rad_weight w_in = 0, w_px = 0, w_py = 0, w_proj = 0, w_sbias = 0, w_sscale = 0;
@@ -321,6 +324,7 @@ struct Gemma4Vision {
         e.max_patches = P;
         e.n_embd      = n_embd;
         e.out         = b_out;
+        e.bidirectional = bidirectional ? 1 : 0;
         RAD_ARCH_TRY(rad_declare_encoder(b, &e));
         rad_note(b, "vision tower: %lld layers of %lld (%lld heads x %lld), ff %lld, patch %lld, "
                     "pooled %lldx%lld%s%s; %lld patches a pass -> %lld rows of %lld",

@@ -82,6 +82,7 @@ struct Plugin {
     std::string arch_quant;
     int  (*arch_declare)(RadBuilder*, const RadModelMeta*, const RadBuildCtx*) = nullptr;
     void (*arch_step)(RadCtx*, const RadBatch*) = nullptr;
+    uint64_t (*arch_pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
     /* Optional (rad_builder.h); null means every question answers zero. Asked before declare, so
      * model facts that are inputs to declaration are still read by the plugin, not the core. */
     int  (*arch_probe)(const RadModelMeta*, RadArchProbe*) = nullptr;

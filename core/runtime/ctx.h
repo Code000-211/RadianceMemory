@@ -40,10 +40,6 @@ class Registry;
 struct XpState;
 struct XpLayer;
 
-/* The widest conventional op is gdn_conv_prep at sixteen operands (docs/OPS.md). Thirty-two leaves
- * room for an architecture plugin's private ops without a variable-length array on the hot path. */
-constexpr int MAX_OPERANDS = 32;
-
 typedef void (*ArchStepFn)(RadCtx*, const RadBatch*);
 
 /* "[shape]/[stride]" of a tensor's live dimensions, for diagnostics. */
@@ -196,6 +192,7 @@ struct CtxDesc {
     RadStream       stream      = nullptr;  /* null: the Ctx creates its own compute stream */
     ResidencyTable* residency   = nullptr;  /* null in the all-in-VRAM case */
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
+    uint64_t        (*arch_pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
@@ -260,6 +257,7 @@ public:
     }
     /* This rank's device ordinal, for the calls that name a card rather than a stream. */
     int             device()     const { return device_; }
+    int             wgp_count() const { return wgp_count_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
     Program*        program()    const { return program_; }
@@ -334,10 +332,11 @@ public:
     /* Called by the drain, so the ring knows which banks are still unread. */
     void              mark_credited(int layer, int bank);
     const RadRouting* last_routing(int layer) const;
-    /* The device pointer of `layer`'s expert counts for the current step, with `n_expert` set,
-     * or null when the layer has not reported this step (a routing-aware file stager then
-     * reads the layer whole). The pointer is stream-ordered behind the router: a copy on the
-     * compute stream at the stager's trigger sees this pass's counts. */
+    /* The device pointer of the buffer `layer`'s router writes its expert counts to, as the
+     * layer last reported it, with `n_expert` set; null when the layer has not reported yet, or
+     * when the buffer is a transient one (a routing-aware file stager then reads the layer
+     * whole). The router rewrites it every pass before the layer's first expert op, so a copy on
+     * the compute stream at the stager's trigger sees the counts of the rows about to run. */
     const int32_t*    route_counts_device(int layer, int64_t* n_expert) const;
 
     /* ---------------------------------------------------------- the placement seam */
@@ -657,6 +656,8 @@ private:
     bool            staging_ = false;     /* the stager armed for the pass being issued */
     int issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     ArchStepFn      arch_step_ = nullptr;
+    uint64_t        (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
+    int             wgp_count_ = 32;
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;
@@ -778,6 +779,8 @@ private:
 
     std::vector<RouteSlot> route_;
     int64_t                route_n_expert_ = 0;
+    /* route_counts_device has said once that a layer's counts are a transient buffer. */
+    mutable bool           route_transient_noted_ = false;
     /* A bank is one step's histograms for every layer: [kRouteBanks][n_layer][n_expert] in pinned
      * host memory. A report copies a layer's counts into its row of the card-side
      * [n_layer][n_expert] (an on-card copy that orders nothing else); the end of the pass copies

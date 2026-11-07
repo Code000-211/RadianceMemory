@@ -24,10 +24,14 @@
 #include "mem/hostarena.h"
 #include "mem/pools.h"
 #include "rad_core.h"
+#include "rad_runtime.h"   /* rad_kv_cold_entry: the cold block-table entry */
 
+#include <deque>
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -141,6 +145,39 @@ struct KVGroupPlan {
      * rewritten `layer_slot`, which is also the host mirror's row (docs/KV-STREAMING.md §3.5.1). Set
      * by carve() when the ring is smaller than the context. */
     int64_t     depth = 0;
+
+    /* Window residency (RadKVGroupDecl::residency_window, spec §7.3): the tokens of a sequence's
+     * history this group's consumer reads, and the same window in table entries. 0 is no window:
+     * every block stays in VRAM. The manager moves no bytes; it names the moves (BlockMove) and
+     * the engine runs them, so a window is inert until a residency store is set. */
+    int64_t     residency_window = 0;
+    int64_t     residency_blocks = 0;
+    bool        residency() const { return residency_blocks > 0; }
+    /* A tiered group (--kv-recipe `demote LAYOUT`, RAD_KVQ_DEMOTE): its layers' blocks sit in the
+     * pool in layout `res_from` and in a store slot in layout `res_to` (RAD_KVQ_* ids), at head_dim
+     * `res_head_dim`; a store slot holds `res_frag` bytes of each layer instead of the pool's
+     * fragment. The transfers requantise and expand on the card (TierExec::issue_moves, the op
+     * `kv_transcode`) and the pager expands (`qsa_page`). res_to -1: untiered, the bytes move as
+     * they are. Set by plan_groups() from the recipe; every layer of the group shares the pair,
+     * since the plugin keys its groups by it. */
+    int         res_from = -1, res_to = -1;
+    int64_t     res_head_dim = 0;
+    int64_t     res_frag = 0;
+    bool        tiered() const { return res_to >= 0; }
+    /* One layer's bytes of a block in a store slot, and the whole block's. */
+    int64_t     residency_frag() const { return tiered() ? res_frag : layer_bytes_per_block(); }
+    int64_t     residency_bytes() const { return n_layers * residency_frag(); }
+    /* The pager's scratch pages (spec §7.3): ordinary pool blocks the engine owns, ids
+     * [0, scratch_blocks) of the group, never on its free list. A row of the step's decode batch
+     * gets `scratch_pitch` = residency_blocks + 1 of them (the selection's topk plus the tail's
+     * block), and a step can carry max_seqs x (1 + n_spec) rows. Both stay 0 unless a store is to
+     * be opened (--kv-residency-mib), so a window that is declared and not paged costs nothing.
+     * They are part of n_blocks (they are carved) and of fixed_ (they are charged before the
+     * split), but not of total_blocks(): no sequence can hold them. */
+    int64_t     scratch_pitch = 0;
+    int64_t     scratch_blocks = 0;
+    std::vector<int> layers;           /* model layers bound to the group, as rad_bind_layer_kv */
+
     /* rad_kv_group_zero: this rank keeps no cache for the group. The plan keeps its position and
      * block count (one block table serves every rank); its costs are zero and nothing is carved.
      * No op on this rank names it (issue refuses a group with no pool bound). */
@@ -203,6 +240,15 @@ struct BlockCopy {
     int32_t dst_block = -1;
 };
 
+/* One block of a residency group moving between VRAM and host memory (see the residency block in
+ * KVManager). Named by the manager and run by the engine, as with BlockCopy: the manager owns the
+ * state machine, the engine owns the stream. */
+struct BlockMove {
+    int32_t group = -1;
+    int32_t block = -1;
+    int32_t host_slot = -1;   /* the arena slot holding (or about to hold) this block */
+};
+
 /* A state slot that still holds the previous tenant's state and must be zeroed before first use.
  * The manager names the work and the engine issues it, as with BlockCopy.
  *
@@ -216,8 +262,261 @@ struct StateClear {
 };
 
 /* ------------------------------------------------------------------ manager */
+/* The window-residency store's budget split (the engine's bring-up): one store per residency
+ * group, of slots `slot_bytes` wide (a block of that group, every rank's shard), a group's blocks
+ * `block_size` tokens. The groups demote the same tokens, so each store holds the same tokens and
+ * the budget goes in proportion to a group's slot bytes a token. Returns those tokens, the most
+ * whose blocks -- floor(tokens / block_size) slots a group -- fit `cap_bytes` together; group g's
+ * store is then (tokens / block_size) slots. 0 for no group or a budget too small. */
+struct ResidencySplit { int64_t slot_bytes = 0, block_size = 0; };
+int64_t residency_split_tokens(int64_t cap_bytes, const std::vector<ResidencySplit>& groups);
+
 class KVManager {
 public:
+    /* ---------------- window residency (spec §7.3) ----------------
+     *
+     * A paged group whose consumer reads only part of the history declares a window
+     * (RadKVGroupDecl::residency_window). Blocks outside the window may leave VRAM for host memory
+     * and give their VRAM back: the pool block returns to the free list and the table entry
+     * becomes the cold encoding, rad_kv_cold_entry(slot) (abi/rad_runtime.h), naming the store slot
+     * that holds the bytes. A cold block is therefore no pool block at all: it has no block
+     * refcount; its slot is reference-counted instead (retain_entry), since the prefix cache
+     * indexes cold entries and follows a demotion of a block it holds (set_residency_cache), and
+     * the slot is freed when its last holder -- a table entry, a cache entry, an origin -- goes or
+     * when a promotion's copy has landed. A fork refuses a sequence with cold entries.
+     *
+     * Every reader of a block table must therefore treat an entry < 0 as not-a-block-id: it is
+     * empty (-1) or cold (<= -2). block_table() returns the raw entries, which is the ABI contract
+     * the pager kernels read; a caller that wants pool ids (a fork, a prefix-cache publish)
+     * promotes first or stops at the first non-id entry.
+     *
+     * The manager cannot decide the resident set by itself: what a step reads is device data (QSA
+     * picks its blocks in qsa_select). The caller supplies it -- `keep_blocks` for a positional
+     * consumer, a list of table entries for a selected one -- and this class owns the state, the
+     * arena slots and the accounting.
+     *
+     * The store is a HostArena per residency group, of that group's `residency_slot_bytes(g)`
+     * slots, opened by the engine like the snapshot store, one slot per cold block: a slot holds one
+     * block of one group, so a group's own arena sizes it to that group's (layout's) block and a
+     * mixed recipe's narrow layouts waste no host bytes. A cold entry's slot id is an index into its
+     * group's arena. Under tensor parallelism a slot holds every rank's shard at its own offset
+     * (set_residency_store's rank_off), and rank 0 hands out slot ids.
+     * The two-argument form puts every residency group in one arena (slots as wide as the widest
+     * group's block); the engine opens one per group (the three-argument form). */
+    /* RAD_E_STATE if this manager still holds cold entries (or in-flight transfers) of a group in
+     * the store it has: their slots would name bytes in a store that is gone. RAD_E_INVAL for a
+     * store whose slot cannot hold this rank's part past `rank_off`, or a group with no window. */
+    int    set_residency_store(HostArena* store, int64_t rank_off);
+    int    set_residency_store(int32_t group, HostArena* store, int64_t rank_off);
+    bool   residency_enabled() const {
+        for (HostArena* a : res_arena_) if (a) return true;
+        return false;
+    }
+    /* The pager's counter on this rank's card (RadKVGroupBatch::residency_paged), owned by the
+     * engine (TierExec::paged_counter); the manager only carries the address to the batch. */
+    void     set_residency_paged(int64_t* dev) { res_paged_ = dev; }
+    int64_t* residency_paged() const { return res_paged_; }
+    /* The page cache (RadKVGroupBatch::residency_tags), owned by the engine like the counter:
+     * `hits` its counter, `tags` one zeroed device region of `bytes` that residency_tags(g) carves
+     * per group in group order (residency_tags_bytes() is what every group needs; a region
+     * smaller than that gives every group none, and the pager copies as before). */
+    void     set_residency_hits(int64_t* dev) { res_hits_ = dev; }
+    int64_t* residency_hits() const { return res_hits_; }
+    void     set_residency_tags(int32_t* dev, int64_t bytes) { res_tags_ = dev; res_tags_cap_ = bytes; }
+    int64_t  residency_tags_bytes(int32_t group) const;   /* one group's planes */
+    int64_t  residency_tags_bytes() const;                /* every group's */
+    int32_t* residency_tags(int32_t group) const;
+    /* Counts the events after which a page-cache tag may name the wrong bytes: a store slot freed
+     * (it may next hold another block), a store set or released, the pool carved anew. The batch
+     * zeroes the tags on the card whenever it moved since the last build (BatchBuilder). */
+    int64_t  residency_epoch() const { return res_epoch_; }
+    /* RADIANCE_DEBUG_KV_TIER=emulate (Engine): the emulation the residency-on output is held to.
+     * residency_demote() then names every block the sweep would demote -- outside sink and tail,
+     * not shared, not already done -- with host_slot -1 and leaves its table entry and pool block
+     * alone; the mover runs the demote -> expand round trip on the block in place
+     * (TierExec::issue_moves). A block is round-tripped once in its life, as under residency a
+     * tiered block is requantised once (its promotion keeps its origin slot, see res_origin_): the
+     * mark goes only when the block is freed. No store slot is taken, so the two agree only while
+     * residency's store has room (a full store leaves blocks resident there). */
+    void residency_emulate(bool on) { res_emulate_ = on; }
+    bool residency_emulating() const { return res_emulate_; }
+    bool residency_emulated(int32_t group, int32_t block) const;
+    /* Bytes one block of `group` occupies in its slot; the widest of them (what one arena shared
+     * by every group needs a rank); and a group's slot's whole size (every rank's part: the open
+     * store's slot once one is set, else this rank's offset plus its block, in 256-byte units).
+     * The argumentless residency_slot_bytes() is the widest group's, a shared arena's slot. Under a
+     * per-layer recipe (--kv-recipe) the groups are layouts, so a block's bytes, and its layers'
+     * fragments, are its layout's -- the demote layout's for a tiered group
+     * (KVGroupPlan::residency_bytes). */
+    int64_t residency_block_bytes(int32_t group) const;
+    int64_t residency_shard_bytes() const;
+    int64_t residency_slot_bytes(int32_t group) const;
+    int64_t residency_slot_bytes() const;
+    /* A group's store as the card addresses it, null when none is open (HostArena::open_mapped),
+     * and its capacity in slots. */
+    void*   residency_device_base(int32_t group) const {
+        const HostArena* a = res_store(group);
+        return a ? a->device_base() : nullptr;
+    }
+    int64_t residency_slots(int32_t group) const {
+        const HostArena* a = res_store(group);
+        return a ? a->capacity() : 0;
+    }
+    /* What the pager (`qsa_page`) reads for a group, host side. scratch_table() is
+     * [scratch_rows(), scratch_pitch] pool ids, row-major: the same every step; a page keeps the
+     * block the pager last wrote into it, which the page cache (residency_tags) reuses.
+     * residency_layer_off() is indexed by model layer: the byte offset of that layer's fragment
+     * inside a slot of the group's store (this rank's shard included), -1 for a layer the group
+     * does not own.
+     * All empty for a group with no window or no scratch reserved. */
+    int64_t scratch_rows() const { return max_seqs_ * (1 + (n_spec_ > 0 ? n_spec_ : 0)); }
+    const std::vector<int32_t>& scratch_table(int32_t group) const;
+    const std::vector<int64_t>& residency_layer_off(int32_t group) const;
+
+    /* Demote every block of `group` in `seq`'s table that the window does not cover: the first
+     * `keep_head` table entries and the last `keep_tail` stay resident, everything between them
+     * moves. Two counts and not one, because a sparse consumer reads two ends of a history and
+     * neither is positional: QSA's indexer selects from everywhere, but the first blocks of a
+     * conversation are the attention sinks every step scores, and the last are the tail it always
+     * attends. A single positional window would demote the sinks and promote them again every
+     * step, which is the one thing this must not do.
+     *
+     * Appends the moves for a caller to run on its copy stream, VRAM -> host, and encodes the table
+     * entries cold at once (the sequence's context is untouched: the same positions, the same
+     * token count). The pool block is NOT yet free: it is held until the caller reports the copy
+     * landed with residency_demote_landed(), because the pool must not hand it to another sequence
+     * while the gather still reads it. Marks the table changed from the first demoted entry.
+     *
+     * A block another live sequence also holds (a forked child, or a second sequence that hit the
+     * same cache entry) is skipped: that sequence's step may read it, and dropping one table's
+     * reference would free nothing. So is the sequence's last block, which is partial and the one
+     * an append writes. `demote_skipped` counts both. A block only this sequence and the prefix
+     * cache hold does move once a cache is attached (set_residency_cache): the cache's entry is
+     * re-pointed at the same slot with a reference of its own, as if it had been published cold,
+     * so a later hit adopts it cold and promotes it into a block of its own.
+     *
+     * RAD_E_INVAL on a group with no window or a sequence that does not hold its blocks. A full
+     * store leaves the rest resident and reports `skipped`: the caller retries after a sweep.
+     *
+     * `max_blocks` bounds how many entries this call turns cold, so a scheduler's sweep costs a
+     * bounded copy per step; the rest wait for the next sweep. */
+    int residency_demote(uint64_t seq, int32_t group, int64_t keep_head, int64_t keep_tail,
+                         std::vector<BlockMove>* out, int64_t max_blocks = INT64_MAX);
+
+    /* The copies residency_demote() named have landed: the held pool blocks return to the free
+     * list (the VRAM freed) and a later ensure() may hand them to another sequence. */
+    void residency_demote_landed();
+
+    /* The prefix cache's side of a demotion: `block` of `group`, which the cache holds, now reads
+     * as `cold` (rad_kv_cold_entry(slot)) and the cache's entry must name that instead. Returns
+     * false, and nothing changes, when no entry of the cache names the block. PrefixCache::
+     * configure installs it; without it a block the cache holds is never demoted. */
+    using ResidencyCacheRepoint = std::function<bool(int32_t group, int32_t block, int32_t cold)>;
+    void set_residency_cache(ResidencyCacheRepoint f) { res_cache_ = std::move(f); }
+    /* The reverse, for a demotion whose copy failed (residency_abort): the entry naming `cold` of
+     * `group` names `block` again. False when no entry names `cold`. */
+    using ResidencyCacheRestore = std::function<bool(int32_t group, int32_t cold, int32_t block)>;
+    void set_residency_cache_restore(ResidencyCacheRestore f) { res_cache_restore_ = std::move(f); }
+    /* Demote blocks ONLY the prefix cache holds (an idle conversation waiting for its next turn,
+     * or a prefix whose readers all finished), oldest first, at most `max_blocks` copies. The
+     * cache's reference becomes the slot's: the entry reads cold, a lookup still hits it and the
+     * next turn's dense step promotes it (residency_promote_all). No sink or tail is kept: the
+     * next turn's prefill promotes the whole chain anyway (a prefill row cannot page). A block
+     * with an origin slot re-points without a copy, as in residency_demote(). Moves are appended
+     * like residency_demote()'s and land with residency_demote_landed(). Returns the moves made. */
+    int64_t residency_demote_cached(std::vector<BlockMove>* out, int64_t max_blocks = INT64_MAX);
+
+    /* Promote the named table entries of `group` back before the step that reads them. Each takes
+     * a fresh pool block, which becomes the table entry; appends the moves (block = the fresh
+     * block, host_slot = the slot to read), host -> VRAM, for the caller to run and make the
+     * compute stream wait on. An entry already resident is skipped, so a caller may pass a
+     * superset of what it needs. RAD_E_INVAL names an index outside this sequence's table: another
+     * sequence's bytes would be served. RAD_E_FULL when the pool has no block for one; the entries
+     * promoted before it stay promoted and their moves are in `out`. */
+    int residency_promote(uint64_t seq, int32_t group, const std::vector<int64_t>& table_idx,
+                          std::vector<BlockMove>* out);
+
+    /* Promote every cold entry of `seq`, in every residency group, as a dense step needs. All or
+     * nothing on room: RAD_E_FULL with nothing changed when the pool cannot take them all. */
+    int residency_promote_all(uint64_t seq, std::vector<BlockMove>* out);
+
+    /* A table ENTRY (not a block id) is cold: its bytes are in host memory and must be promoted
+     * before a kernel reads them. residency_slot() is its store slot, -1 for a pool id or empty. */
+    bool    residency_cold(int32_t group, int32_t entry) const;
+    int32_t residency_slot(int32_t group, int32_t entry) const;
+    /* ---- cold entries held by more than one owner ----
+     * A store slot is reference-counted: a cold entry may sit in several sequence tables and in
+     * prefix-cache entries at once, and the slot goes back to the store when the last reference
+     * does. retain_entry()/release_entry() are retain_block()/release_block() for a table ENTRY --
+     * a pool id's block reference, or a cold entry's slot reference -- and are what the prefix
+     * cache uses for everything it holds (RAD_E_INVAL for an empty entry). entry_refs() is the
+     * count behind an entry (block refcount or slot references; 0 for an empty one), so "does a
+     * sequence also hold this" is `entry_refs() > 1` for either kind. */
+    int     retain_entry(int32_t group, int32_t entry);
+    void    release_entry(int32_t group, int32_t entry);
+    int32_t entry_refs(int32_t group, int32_t entry) const;
+    /* The entry's bytes in host memory, or null when it is not cold. */
+    void*   residency_ptr(int32_t group, int32_t entry) const;
+    /* A move residency_demote()/residency_promote() handed out and its landing has not been
+     * reported; the transfer path asserts a caller runs exactly what the manager named. */
+    bool    residency_move_pending(const BlockMove& m, bool to_host) const;
+    /* A store slot's bytes for `group`, for a transfer that already holds the slot id (a promotion
+     * clears the block's state before the bytes are back, so residency_ptr() no longer names it). */
+    void*   residency_slot_ptr(int32_t group, int32_t slot) const;
+    /* The caller ran the moves residency_promote() named. A promotion marks the block resident at
+     * once -- a step may issue the restore and then read the block -- and holds the slot until this
+     * call gives it back, so a slot is never freed while its bytes are still being read. Called
+     * once per batch, after the transfer landed. (Demotions have their own landing call.) */
+    void    residency_complete();
+    /* The caller could not run `moves` (the mover failed before they were all queued, and has
+     * drained what it did queue): every table and cache entry those moves re-pointed is put back
+     * as it was before residency_demote*() / residency_promote() named them, so nothing reads a
+     * slot or a block the copy never filled -- bytes another sequence left there. A demotion's
+     * entry names its pool block again (its bytes were never touched: the gather only reads) and
+     * the slot is freed; a promotion's entry is cold again on its slot and the fresh block goes
+     * back to the pool. Valid only for moves not yet reported landed and with nothing run on the
+     * tables since they were named; anything else is refused and counted, never guessed at.
+     * Appends the sequences whose entries were put back to `seqs` (deduplicated; never the
+     * cache's). Returns how many moves were undone. */
+    int64_t residency_abort(const std::vector<BlockMove>& moves, bool to_host,
+                            std::vector<uint64_t>* seqs = nullptr);
+    /* Moves issued earlier whose landing the transfer reported as failed: their bytes cannot be
+     * trusted, and steps have run since, so nothing is put back. Appends every sequence whose
+     * table names an entry those moves wrote (a demotion's slot, a promotion's block; forks and
+     * adopters included) to `seqs`, and quarantines the moves: their
+     * held pool blocks and slot references are never given back, since a transfer still queued
+     * on a broken stream may write them. Returns how many moves were quarantined. */
+    int64_t residency_fail_inflight(std::vector<uint64_t>* seqs);
+    /* Entries of `group` in `seq`'s table that are cold, as table indices. A caller that hands a
+     * table to a kernel asserts this is empty for the part the step reads. */
+    std::vector<int64_t> residency_cold_entries(uint64_t seq, int32_t group) const;
+
+    struct ResidencyStats {
+        int64_t demoted = 0, promoted = 0;         /* blocks, over the manager's life */
+        int64_t demoted_bytes = 0, promoted_bytes = 0;
+        int64_t demote_skipped = 0;                /* shared (once per decision) or the store was full (each try) */
+        int64_t freed_blocks = 0, freed_bytes = 0; /* pool blocks given back by landed demotions: VRAM freed */
+        int64_t promoted_misses = 0;               /* a promotion a step needed: the link traffic */
+        int64_t repointed = 0;                     /* demotions that moved no bytes: the entry went back to its origin slot */
+        int64_t aborted = 0;                       /* moves the mover failed to queue, put back (residency_abort) */
+        int64_t quarantined = 0;                   /* moves whose landing failed: never given back */
+    };
+    const ResidencyStats& residency_stats() const { return res_stats_; }
+    /* The same counters per sequence (= per session: the scheduler keys both by request id). A
+     * sequence's entry outlives free_sequence(), since a session is listed after its request
+     * ends; it exists only once something moved or was skipped for it. Blocks shared with a fork
+     * or the prefix cache are never demoted, but a fork that diverged afterwards may have been
+     * counted under its parent, so per-sequence numbers can overlap a server total's parts. */
+    struct SeqResidency { int64_t demoted = 0, promoted = 0, skipped = 0, link_bytes = 0, freed_bytes = 0; };
+    const std::map<uint64_t, SeqResidency>& residency_by_seq() const { return res_seq_; }
+    /* The most sessions kept: a server pages for every long request it serves, and an entry per
+     * request ever would grow without bound and be copied into every metrics snapshot. Request ids
+     * are monotonic, so the oldest go first -- the ones the session view has long dropped. */
+    static constexpr size_t kResidencySessions = 4096;
+    int64_t residency_scratch_bytes() const;   /* VRAM the pager's scratch pages hold, all groups */
+    int64_t residency_host_bytes() const;      /* bytes of the stores in use, every group's */
+    int64_t residency_host_cap_bytes() const;  /* the stores' capacity, 0 when unset */
+
     /* Sizes every group out of one pool, refusing by name and shortfall if the fixed costs alone
      * do not fit. The paged groups are sized to run out at the same total token count; any other
      * split strands memory in whichever group outlasts the others.
@@ -366,7 +665,9 @@ public:
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
      * block size: a partial block is never shared, because the next token written into it would
-     * corrupt the cache entry. Bumps each block's refcount. */
+     * corrupt the cache entry. Bumps each block's refcount. A residency group also accepts cold
+     * entries (the cache indexes them): the slot's reference is bumped, and the next dense step
+     * promotes them (residency_promote_all). Checked whole before anything is bumped. */
     int  adopt(uint64_t seq, int32_t group, const std::vector<int32_t>& blocks, int64_t n_tokens);
 
     /* The child shares every whole block of the parent and copies the partial one on first write
@@ -653,10 +954,27 @@ private:
          * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
          * zero; kNoDirty is unchanged. Mutable because take_table_changes() clears it. */
         mutable std::vector<int64_t> dirty_from;
+        /* Per group, where the residency sweep resumes: every entry in [head, from) was decided
+         * by an earlier residency_demote() with that keep_head -- cold, emulated, or kept because
+         * shared -- under the skip epoch `epoch` (res_skip_epoch_). `from` is lowered with
+         * dirty_from by every table change (table_changed), so a sweep is O(new entries) a step,
+         * not O(context). */
+        struct ResCursor { int64_t from = 0, head = -1; uint64_t epoch = 0; };
+        std::vector<ResCursor> res;
     };
+    /* A table entry of `s` in group `g` from `from` on changed: for the batch builder's upload
+     * (dirty_from) and the residency sweep's resume point (res_from). */
+    void table_changed(Seq* s, size_t g, int64_t from) {
+        s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], from);
+        s->res[g].from   = std::min<int64_t>(s->res[g].from, from);
+    }
 
     int  grab_block(int32_t g, int32_t* out);
     void drop_block(int32_t g, int32_t b);
+    /* Where each residency group's bytes sit in its store's slot, and how wide that slot is. Depends
+     * on the plans (the carve) and on the store's rank offset, so it is redone when either is set:
+     * set_residency_store() may arrive after carve(), which is the engine's order. */
+    void size_residency();
     /* Increments a held block's refcount and keeps the cache-only count in step. */
     void add_ref(size_t g, int32_t b);
     int  grab_state(int32_t g, int32_t* out);
@@ -686,12 +1004,106 @@ private:
     int64_t   checkpoint_bytes_ = 0;
     int64_t   window_ck_bytes_ = 0;   /* the window section of checkpoint_bytes_ */
     std::vector<StateClear> clears_;                  /* grabbed slots the engine must zero */
+
+    /* ---- window residency (see the public block) ----
+     *
+     * The cold state lives in the table entry itself (rad_kv_cold_entry(slot)), so there is no
+     * per-block array to keep in step with it. A cold entry owns its store slot; drop_entry() is
+     * the one place a table entry goes away, and it returns the slot (cold) or the block
+     * reference (resident), so a preempt, a rollback and a free_sequence leak neither. */
+    /* Per group (by group index; a set store survives a re-plan, as the engine owns it): the
+     * group's store, this rank's offset in its slot, and the slot's whole width. */
+    std::vector<HostArena*> res_arena_;
+    std::vector<int64_t>    res_rank_off_;
+    std::vector<int64_t>    res_slot_bytes_;
+    HostArena* res_store(int32_t g) const {
+        return g >= 0 && (size_t)g < res_arena_.size() && res_arena_[(size_t)g] &&
+                       res_arena_[(size_t)g]->enabled() ? res_arena_[(size_t)g] : nullptr;
+    }
+    /* RAD_OK when `store` may become group g's at `rank_off` (see set_residency_store). */
+    int     res_store_check(int32_t g, const HostArena* store, int64_t rank_off) const;
+    int64_t*   res_paged_ = nullptr;
+    int64_t*   res_hits_ = nullptr;
+    int32_t*   res_tags_ = nullptr;
+    int64_t    res_tags_cap_ = 0;
+    int64_t    res_epoch_ = 0;
+    int64_t    res_cold_ = 0;                         /* cold entries held across all tables */
+    /* Blocks a demotion encoded cold whose copy has not been reported landed: still referenced
+     * (refcount 1, in no table) so the pool cannot reuse them under the gather. */
+    /* `idx` is the table entry the demotion made cold (-1 for the cache's); `cache` says the
+     * prefix cache's entry followed it into the slot (cache_follows), so an abort re-points both. */
+    struct Demoting { int32_t group, block, slot; uint64_t seq; int64_t idx = -1; bool cache = false; };
+    static constexpr uint64_t kCacheSeq = UINT64_MAX;   /* Demoting::seq of a cache-only block */
+    ResidencyCacheRepoint res_cache_;
+    ResidencyCacheRestore res_cache_restore_;
+    /* Per group: blocks that became cache-only (marked, refcount one), oldest first, for
+     * residency_demote_cached(). Lazy: an entry is checked when it is taken, so a block that was
+     * adopted or released since is skipped there. Filled only while a cache and a store are set. */
+    std::vector<std::deque<int32_t>> res_idle_;
+    void note_cache_only(size_t g, int32_t b);
+    /* The cache no longer holds resident block b: the mark is cleared and the cache-only count
+     * kept in step. The reference itself is the caller's to move (to a landing, or dropped). */
+    void uncache(size_t g, int32_t b);
+    std::vector<Demoting> res_demoting_;
+    /* Drops one table entry: a pool id's reference, or a cold entry's slot. */
+    void drop_entry(int32_t g, int32_t entry);
+    /* Slot references (see retain_entry): per group, indexed by slot id in the group's store,
+     * grown on demand. res_slots_ counts, per group, the slots with a reference, which is what
+     * set_residency_store() looks at, since the cache holds slots no table does. */
+    std::vector<std::vector<int32_t>> res_refs_;
+    std::vector<int64_t>              res_slots_;
+    int32_t slot_new(int32_t g);              /* a store slot at one reference, -1 when full */
+    void    slot_ref(int32_t g, int32_t slot);
+    void    slot_drop(int32_t g, int32_t slot);
+    int32_t slot_refs(int32_t g, int32_t slot) const {
+        return g >= 0 && (size_t)g < res_refs_.size() && slot >= 0 &&
+                       (size_t)slot < res_refs_[(size_t)g].size()
+                   ? res_refs_[(size_t)g][(size_t)slot] : 0;
+    }
+    /* Where a promoted block's bytes came from, per group: block -> slot, while the slot may still
+     * hold identical bytes. Each entry owns a slot reference, so the slot cannot be reused under
+     * it. Set when the slot has another holder (the cache), or the group is tiered: re-demoting a
+     * tiered block from its expanded bytes would requantise it a second time, so its slot stays
+     * until the block is written or freed and a re-demotion points back at it. An untiered slot
+     * this table alone held is freed at once, as before. Ended by a write into the block (ensure, rollback), by the block
+     * going free, or by a re-demotion, which turns the reference into the table entry's. */
+    std::vector<std::unordered_map<int32_t, int32_t>> res_origin_;
+    /* The emulation's blocks already round-tripped, per group (residency_emulate). */
+    bool res_emulate_ = false;
+    std::vector<std::unordered_set<int32_t>> res_emul_;
+    void forget_origin(int32_t g, int32_t b);
+    /* Gives back every slot this manager holds in the store (a re-plan, which keeps the store). */
+    void release_residency();
+    /* Slots a promotion released from a block and no transfer has finished reading yet, as
+     * (group, slot). residency_complete() frees them. */
+    struct Promoting {
+        int32_t group, slot;
+        int32_t block;        /* the fresh pool block the entry names until the copy lands */
+        uint64_t seq;
+        int64_t idx;          /* the table entry promoted */
+        bool origin;          /* res_origin_ took a slot reference of its own for `block` */
+    };
+    std::vector<Promoting> res_pending_;
+    /* Moves whose landing failed (residency_fail_inflight): held for ever, never reused. */
+    std::vector<Demoting>  res_quarantine_demote_;
+    std::vector<Promoting> res_quarantine_promote_;
+    ResidencyStats res_stats_;
+    /* Bumped when a block stops being shared (drop_block leaves it one holder and no cache
+     * mark): an entry the sweep kept because it was shared may now move, so every resume point
+     * decided under an older epoch is void. */
+    uint64_t res_skip_epoch_ = 0;
+    /* Per-session counters, oldest request id first, at most kResidencySessions (seq_res()). */
+    std::map<uint64_t, SeqResidency> res_seq_;
+    SeqResidency& seq_res(uint64_t id);
     void*     pool_base_ = nullptr;
     BundleComparison bundling_;
     std::string report_;
     int64_t   max_seqs_ = 0;
+    int64_t   n_spec_ = 0;
+    std::vector<std::vector<int32_t>> scratch_;       /* per group, see scratch_table() */
+    std::vector<std::vector<int64_t>> res_layer_off_; /* per group, see residency_layer_off() */
     int64_t   max_ctx_ = 0;
-    int64_t   max_tok_ = 0;      /* --max-num-batched-tokens; the buffer floor is one of these */
+    int64_t   max_tok_ = 0;      /* one step's tokens (step_tok); the buffer floor is one of these */
     bool    snap_drafter_ = false;   /* set_drafter_window_snapshot */
     /* plan_groups() computes these; carve() spends against them and ceiling() reports on them. */
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */

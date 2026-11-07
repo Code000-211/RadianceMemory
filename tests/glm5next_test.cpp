@@ -611,8 +611,12 @@ TEST(
             CHECK_EQ(std::count(ops.begin(), ops.end(), "mhc_pre"), 90);
             CHECK_EQ(std::count(ops.begin(), ops.end(), "kda_update"), 34);
             CHECK_EQ(std::count(ops.begin(), ops.end(), "mla_attn"), 11);
-            // Two rows stay under the split threshold: 42 routers and 11 index heads, replicated.
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt_f32"), 53);
+            // Two rows stay under the split threshold, and their history fits the selection
+            // (DsaCache::takes_all): the 42 routers run, the 11 index heads and scorers do not.
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt_f32"), 42);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "dsa_query"), 0);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "dsa_score"), 0);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "qsa_select"), 11);
             CHECK_EQ(std::count(ops.begin(), ops.end(), "all_gather"), 0);
             // The split is declared on every rank whatever its step size; only rank 0 issues it here.
             const bool split = world > 1;
@@ -661,6 +665,21 @@ TEST(
                 batch.out_ids = &last;
                 batch.draft_pass = 0;
                 batch.max_q_len = 512;
+                {
+                    // 512 rows whose history fits the selection: the indexer takes every
+                    // block and does not split, so no index head runs and nothing of its is
+                    // gathered, while the routers, mHC reads and MLA still split.
+                    ctx.issues.clear();
+                    glm5next::step(&ctx, &batch);
+                    CHECK(ctx.step_fail.empty());
+                    const auto fit_ops = issued_ops(b, ctx);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "gemm_nt_f32"), 42);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "dsa_score"), 0);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "qsa_select"), 11);
+                    CHECK_EQ(std::count(fit_ops.begin(), fit_ops.end(), "all_gather"),
+                             world > 1 ? 42 + 90 + 11 : 0);
+                }
+                batch.max_ctx_len = 3000;   // live blocks past the top-k: the indexer scores
                 ctx.issues.clear();
                 glm5next::step(&ctx, &batch);
                 CHECK(ctx.step_fail.empty());
@@ -668,7 +687,7 @@ TEST(
                     // 512 rows reach the split: each router runs on its column slice, each mHC
                     // read on its chunks, each indexer, its head gates included, on its run
                     // of query rows, and each MLA on its run of rows, all gathered but the
-                    // gates; at TP1 nothing changes.
+                    // gates. At TP1 the step does not split, and the indexer scores whole.
                     const auto long_ops = issued_ops(b, ctx);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"), 53);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_gather"),
@@ -801,8 +820,39 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
             CHECK_EQ(b.bufs[w.selected - 1].d.shape[0], world * most);
             CHECK_EQ(b.bufs[w.codes - 1].d.shape[0], world * most * 32);
             CHECK_EQ(b.bufs[w.sel_part - 1].d.shape[0], most);
-            // Two decode rows beside a 498-row chunk: 500 rows, runs of R.
-            auto k = kit(b, { 1, 1 }, { 498 }, 100);
+            // Wide page tables, so that live blocks follow the history past the selection.
+            auto widen = [](Kit& kt) {
+                const int64_t pitch = 1024;
+                kt.table.resize((size_t)(kt.b.n_seq * pitch));
+                for (int64_t i = 0; i < kt.b.n_seq * pitch; ++i) kt.table[(size_t)i] = (int32_t)i;
+                for (auto& g : kt.kv) {
+                    g.block_table = kt.table.data();
+                    g.block_table_pitch = g.max_blocks = pitch;
+                }
+            };
+            {
+                // 500 rows whose history fits the selection take every block without splitting:
+                // each rank selects the whole step from the unscored plane, and nothing gathers.
+                auto fit = kit(b, { 1, 1 }, { 498 }, 100);
+                widen(*fit);
+                auto fits = run_passes(b, glm5next::step, { fit.get() }, rank, world);
+                CHECK_PASSES(b, fits);
+                int all = 0;
+                for (const auto& issue : fits[0]->issues) {
+                    CHECK(issue.op != cache.op_score_part && issue.op != cache.op_gather_sel &&
+                          issue.op != cache.op_score);
+                    if (issue.op == cache.op_select_all) {
+                        ++all;
+                        CHECK_EQ(issue.n, 500);
+                        CHECK_EQ(issue.opd[0].handle, w.unscored);
+                    }
+                }
+                CHECK_EQ(all, 1);
+            }
+            // Two decode rows beside a 498-row chunk of 3000 tokens of history: 500 rows that
+            // score, in runs of R.
+            auto k = kit(b, { 1, 1 }, { 498 }, 3000);
+            widen(*k);
             const int64_t T = 500, R = DsaCache::part_rows(T, world), r0 = rank * R,
                           have = std::min(R, T - r0);
             auto passes = run_passes(b, glm5next::step, { k.get() }, rank, world);
@@ -859,8 +909,19 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
             CHECK_EQ(gathered, 1);
             CHECK_EQ(replicated, 0);
             CHECK_EQ(fronts, 4);
-            // Under the threshold every rank scores and selects the whole step.
-            auto small = kit(b, {}, { 255 });
+            // Under the threshold every rank scores and selects the whole step. 3000 tokens of
+            // history reach 815 blocks, past the selection, and 255 rows of them stay under
+            // kSplitWork.
+            auto small = kit(b, {}, { 255 }, 3000);
+            {
+                const int64_t pitch = 1024;
+                small->table.resize((size_t)pitch);
+                for (int64_t i = 0; i < pitch; ++i) small->table[(size_t)i] = (int32_t)i;
+                for (auto& g : small->kv) {
+                    g.block_table = small->table.data();
+                    g.block_table_pitch = g.max_blocks = pitch;
+                }
+            }
             auto under = run_passes(b, glm5next::step, { small.get() }, rank, world);
             CHECK_PASSES(b, under);
             int whole = 0;
@@ -874,6 +935,27 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
                 if (issue.op == index.op_head) CHECK_EQ(issue.n, 255);
             }
             CHECK_EQ(whole, 1);
+            // Without that history every row selects all its blocks: no rank runs the query side
+            // or scores, and the selection reads zeros over the selection's width.
+            auto fits = kit(b, {}, { 255 });
+            auto all = run_passes(b, glm5next::step, { fits.get() }, rank, world);
+            CHECK_PASSES(b, all);
+            int unscored = 0, picks = 0;
+            for (const auto& issue : all[0]->issues) {
+                CHECK(issue.op != cache.op_score && issue.op != cache.op_score_part &&
+                      issue.op != cache.op_query && issue.op != index.op_query_copy &&
+                      issue.op != index.op_head && issue.op != index.query.op);
+                if (issue.op == cache.op_unscored) {
+                    ++unscored;
+                    CHECK_EQ(issue.n, 255);
+                    CHECK_EQ(issue.opd[0].handle, w.unscored);
+                    CHECK_EQ(b.bufs[w.unscored - 1].d.shape[1], cache.unscored_cols());
+                }
+                CHECK(issue.op != cache.op_select);
+                picks += issue.op == cache.op_select_all;
+            }
+            CHECK_EQ(unscored, 1);
+            CHECK_EQ(picks, 1);
             // A verify of eight sequences at 32k of context (48 rows x 8014 blocks) splits too, a
             // single sequence's six rows do not; a rank whose run lies past the step still writes
             // the runs it gathers.
@@ -1024,8 +1106,8 @@ TEST(glm53_refusals_name_what_was_refused) {
         return err;
     };
     RadBuildCtx c = ok;
-    c.kv_dtype = RAD_F8E4M3;
-    CHECK(has(refusal(meta, c), "--kv-cache-dtype fp8"));
+    c.kv_dtype = RAD_F16;
+    CHECK(has(refusal(meta, c), "--kv-cache-dtype f16"));
     c = ok;
     c.max_spec = 32;
     CHECK(has(refusal(meta, c), "--num-speculative-tokens 32"));
@@ -1052,6 +1134,70 @@ TEST(glm53_refusals_name_what_was_refused) {
         CHECK(rc < 0);
         CHECK(has(err, "blk.1.attn_beta.weight"));
         CHECK(has(err, "plain bf16"));
+    }
+}
+
+/* --kv-cache-dtype fp8 narrows the latent attention cache alone to E4M3: its group, every latent
+ * store (plain and streamed) and every latent attention (head form, row form, the MTP layer's)
+ * name fp8_e4m3, and the index tail, DSA index and KDA groups keep their dtypes. Under bf16 the
+ * attention states no kv_dtype, the op it always declared. */
+TEST(glm53_fp8_kv_cache_narrows_the_latent_group_only) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    for (int kv_dtype : { (int)RAD_DT_INVALID, (int)RAD_BF16, (int)RAD_F8E4M3 }) {
+        const bool narrow = kv_dtype == RAD_F8E4M3;
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                   { "mtp.blk.45.ffn_down_exps", fp8 },
+                   { "ffn_gate_up_exps", mx },
+                   { "ffn_down_exps", mx },
+                   { "ffn_gate_up_shexp", mx },
+                   { "ffn_down_shexp", mx },
+                   { "ffn_gate_up.weight", fp8 },
+                   { "ffn_down.weight", fp8 } };
+        RadBuildCtx build{};
+        build.rank = 0;
+        build.world_size = 4;
+        build.max_tok = 512;
+        build.max_seqs = 4;
+        build.max_ctx = 4096;
+        build.max_spec = 3;
+        build.tp_attn_rows = 1;
+        build.kv_dtype = kv_dtype;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+        std::map<std::string, uint32_t> dtypes;
+        for (const auto& g : b.kv_groups) dtypes[g.name] = g.d.dtype;
+        CHECK_EQ(dtypes["kv_latent"], narrow ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16);
+        CHECK_EQ(dtypes["kv_index_tail"], (uint32_t)RAD_BF16);
+        CHECK_EQ(dtypes["kv_dsa_index"], (uint32_t)RAD_U8);
+        CHECK_EQ(dtypes["kv_kda"], (uint32_t)RAD_F32);
+        CHECK_EQ(dtypes["kv_kda_conv"], (uint32_t)RAD_BF16);
+        int stores = 0, attns = 0;
+        for (const auto& o : b.ops) {
+            if (o.op == "kv_store" || o.op == "kv_store_streamed") {
+                ++stores;
+                CHECK_EQ(pstr(&o, "kv_dtype"), narrow ? "fp8_e4m3" : "bf16");
+            }
+            if (o.op == "mla_attn") {
+                ++attns;
+                CHECK_EQ(pstr(&o, "kv_dtype"), narrow ? "fp8_e4m3" : "<absent>");
+            }
+        }
+        // 11 MLA layers and the MTP layer, each a store and a head-form attention; 11 row forms.
+        CHECK(stores >= 12);
+        CHECK_EQ(attns, 12 + 11);
     }
 }
 
@@ -1230,6 +1376,7 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
         w.pooled = decl_b(&b, "pooled", RAD_F8E4M3, { 12, 128 });
         w.pool_scale = decl_b(&b, "pool_scale", RAD_F32, { 12, 1 });
         w.score = decl_b(&b, "score", RAD_F32, { 32, 1024 });
+        w.unscored = decl_b(&b, "unscored", RAD_F32, { 32, 513 });
         w.selected = decl_b(&b, "sel", RAD_I32, { 32, 513 });
         w.nsel = decl_b(&b, "nsel", RAD_I32, { 32 });
         w.length = decl_b(&b, "len", RAD_I32, { 32 });
@@ -1258,54 +1405,85 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
                        RAD_OK);
         CHECK_EQ(b.kv_groups[index - 1].d.dtype, RAD_U8);
         CHECK_EQ(b.kv_groups[index - 1].d.head_dim, 17);
-        int32_t ibt[16]{}, abt[16]{}, sidx[12]{}, cu[] = { 0, 3, 8 }, pos[8]{};
-        RadKVGroupBatch kv[3]{};
-        kv[0].group = index;
-        kv[0].block_table = ibt;
-        kv[0].block_table_pitch = 8;
-        kv[1].group = tail;
-        kv[1].state_index = sidx;
-        kv[1].state_index_pitch = 6;
-        kv[2].group = attn;
-        kv[2].block_table = abt;
-        kv[2].block_table_pitch = 8;
-        RadBatch batch{};
-        batch.n_tok = 8;
-        batch.n_seq = 2;
-        batch.n_spec = 2;
-        batch.kv = kv;
-        batch.n_kv_groups = 3;
-        batch.positions = pos;
-        batch.cu_seqlens = cu;
-        batch.max_ctx_len = 64;   // Mixed-row bound exceeds the eight physical table columns.
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.batch = &batch;
-        if (front) {
-            indexer.step(&ctx, &batch);
-            REQUIRE_EQ(ctx.issues.size(), (size_t)12);
-            CHECK_EQ(ctx.issues[1].op, indexer.op_query_copy);
-            CHECK_EQ(ctx.issues[1].opd[1].rows, 256);
-            CHECK_EQ(ctx.issues[3].op, indexer.op_norm);
-            CHECK_EQ(ctx.issues[4].opd[0].offset, 128);
-            CHECK_EQ(ctx.issues[5].op, indexer.op_head);
-            ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 6);
-        } else
-            block.step(&ctx, &batch);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)6);
-        CHECK_EQ(ctx.issues[0].n, 256);
-        CHECK(ctx.issues[1].opd[5].raw == ibt);
-        CHECK_EQ(ctx.issues[1].opd[4].cols, 6);
-        CHECK_EQ(ctx.issues[2].op, block.op_pool);
-        CHECK_EQ(ctx.issues[2].opd[5].handle, index);
-        CHECK_EQ(ctx.issues[3].op, block.op_tail);
-        CHECK_EQ(ctx.issues[4].opd[0].rows, 256);
-        CHECK_EQ(ctx.issues[4].opd[3].handle, index);
-        CHECK_EQ(ctx.issues[4].opd[4].kind, RAD_OPK_NONE);
-        CHECK(ctx.issues[4].opd[5].raw == ibt);
-        CHECK_EQ(ctx.issues[4].opd[8].cols, 8);
-        CHECK_EQ(ctx.issues[5].opd[0].cols, 8);
-        CHECK(ctx.issues[5].opd[1].raw == abt);
+        /* Eight table columns cap the live reach below the selection, so every row takes all its
+         * blocks (DsaCache::takes_all); 4000 tokens of history over 1024 columns reach 1004 blocks,
+         * past it, and score. */
+        for (const int64_t pitch : { 8, 1024 }) {
+            const bool scores = pitch > 8;
+            std::vector<int32_t> ibt((size_t)(2 * pitch)), abt((size_t)(2 * pitch));
+            int32_t sidx[12]{}, cu[] = { 0, 3, 8 }, pos[8]{};
+            RadKVGroupBatch kv[3]{};
+            kv[0].group = index;
+            kv[0].block_table = ibt.data();
+            kv[0].block_table_pitch = pitch;
+            kv[1].group = tail;
+            kv[1].state_index = sidx;
+            kv[1].state_index_pitch = 6;
+            kv[2].group = attn;
+            kv[2].block_table = abt.data();
+            kv[2].block_table_pitch = pitch;
+            RadBatch batch{};
+            batch.n_tok = 8;
+            batch.n_seq = 2;
+            batch.n_spec = 2;
+            batch.kv = kv;
+            batch.n_kv_groups = 3;
+            batch.positions = pos;
+            batch.cu_seqlens = cu;
+            // At eight columns the mixed-row bound exceeds the physical table.
+            batch.max_ctx_len = scores ? 4000 : 64;
+            const int64_t live = scores ? 1004 : 8;
+            CHECK_EQ(block.live_blocks(&batch), live);
+            CHECK_EQ(block.takes_all(&batch), !scores);
+            RadCtx ctx;
+            ctx.b = &b;
+            ctx.batch = &batch;
+            if (front) {
+                indexer.step(&ctx, &batch);
+                if (scores) {
+                    REQUIRE_EQ(ctx.issues.size(), (size_t)12);
+                    CHECK_EQ(ctx.issues[1].op, indexer.op_query_copy);
+                    CHECK_EQ(ctx.issues[1].opd[1].rows, 256);
+                    CHECK_EQ(ctx.issues[3].op, indexer.op_norm);
+                    CHECK_EQ(ctx.issues[4].opd[0].offset, 128);
+                    CHECK_EQ(ctx.issues[5].op, indexer.op_head);
+                    ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 6);
+                } else {
+                    // The key side alone: key and gate projection, norm, gate copy.
+                    REQUIRE_EQ(ctx.issues.size(), (size_t)8);
+                    CHECK_EQ(ctx.issues[1].op, indexer.op_norm);
+                    CHECK_EQ(ctx.issues[2].op, indexer.op_gate_copy);
+                    ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 3);
+                }
+            } else
+                block.step(&ctx, &batch);
+            const size_t q = scores ? 1 : 0;   // the query quantiser leads a scored step
+            REQUIRE_EQ(ctx.issues.size(), 5 + q);
+            if (scores) CHECK_EQ(ctx.issues[0].n, 256);
+            CHECK(ctx.issues[q].opd[5].raw == ibt.data());
+            CHECK_EQ(ctx.issues[q].opd[4].cols, 6);
+            CHECK_EQ(ctx.issues[q + 1].op, block.op_pool);
+            CHECK_EQ(ctx.issues[q + 1].opd[5].handle, index);
+            CHECK_EQ(ctx.issues[q + 2].op, block.op_tail);
+            const auto& fill = ctx.issues[q + 3];
+            if (scores) {
+                CHECK_EQ(fill.op, block.op_score);
+                CHECK_EQ(fill.opd[0].rows, 256);
+                CHECK_EQ(fill.opd[3].handle, index);
+                CHECK_EQ(fill.opd[4].kind, RAD_OPK_NONE);
+                CHECK(fill.opd[5].raw == ibt.data());
+                CHECK_EQ(fill.opd[8].cols, live);
+            } else {
+                CHECK_EQ(fill.op, block.op_unscored);
+                CHECK_EQ(fill.n, 8);
+                CHECK_EQ(fill.opd[0].handle, w.unscored);
+                CHECK_EQ(fill.opd[0].rows, 8);
+            }
+            CHECK_EQ(ctx.issues[q + 4].op, scores ? block.op_select : block.op_select_all);
+            CHECK_EQ(ctx.issues[q + 4].opd[0].handle, scores ? w.score : w.unscored);
+            CHECK_EQ(ctx.issues[q + 4].opd[0].cols, live);
+            CHECK(ctx.issues[q + 4].opd[1].raw == abt.data());
+        }
     }
 }
 
@@ -1610,16 +1788,23 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         int world;
         uint64_t graph, steps;
         bool heads_only = false;   /* the default: the graph before the row form */
+        bool file_tier = false;    /* --weights-disk-tier: whole experts at four ranks and up */
     };
     /* Pins from this test's own `pin:` printout: the head form (heads_only, which declares the
      * streamed ops) and the row form, at one and eight ranks. Re-recorded after every graph
      * change -- the merge re-recorded them for main's builder plus this branch's file-direct
-     * expert ops. */
-    const Case cases[] = { { 1, 0x8e12725b3ed3548dull, 0x68ffc03d2b640d51ull },
-                           /* World 8 is this branch's expert-parallel graph (288/world whole
-                            * experts, file-direct), so its pins differ from main's. */
-                           { 8, 0x6232b56d6f971d61ull, 0x1b80576ba8f1ecc7ull },
-                           { 8, 0x3e4b89352f01b57bull, 0xed8cc595e8eeb593ull, true } };
+     * expert ops, and the graphs again when the routing counts became RAD_BUF_PERSIST (the
+     * steps did not change). */
+    const Case cases[] = { { 1, 0xce4368c09bfdbbeeull, 0x19679d4fcc0321ebull },
+                           /* Two ranks keep whole experts; four and eight split them by width. */
+                           { 2, 0xab04b95724840abeull, 0x76865603b1390635ull },
+                           { 4, 0xfdee91cd1c985b0aull, 0xde7ebe5b604c3cd2ull },
+                           { 8, 0x59112e7ad7d77fdeull, 0xb9c29d30003a6df7ull },
+                           { 8, 0xf1bb904ab21d8813ull, 0xfb28d3dcd8ec5ae1ull, true },
+                           /* The file tier's whole experts, file-direct, at four and eight. */
+                           { 4, 0x1918906f91fad4e7ull, 0x07d518b9a0f32986ull, false, true },
+                           { 8, 0x553f81a93cec76bfull, 0x17f0a90d3bed9713ull, false, true },
+                           { 8, 0x9685be82c8d55813ull, 0x75e775f0568636b5ull, true, true } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
@@ -1636,14 +1821,75 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         ctx.max_seqs = 8;
         ctx.max_ctx = 200000;
         ctx.tp_attn_rows = cs.heads_only ? 0 : 1;
+        ctx.expert_file_tier = cs.file_tier;
         REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
         const uint64_t g = graph_hash(b);
         const uint64_t s = pinned_steps(b, glm5next::step, 0, cs.world);
-        fprintf(stderr, "    pin: glm5next world %d%s: graph 0x%016llxull, steps 0x%016llxull\n",
-                cs.world, cs.heads_only ? " heads only" : "",
+        fprintf(stderr, "    pin: glm5next world %d%s%s: graph 0x%016llxull, steps 0x%016llxull\n",
+                cs.world, cs.heads_only ? " heads only" : "", cs.file_tier ? " file tier" : "",
                 (unsigned long long)g, (unsigned long long)s);
         CHECK_EQ(g, cs.graph);
         CHECK_EQ(s, cs.steps);
+    }
+}
+
+/* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
+ * and up, because a plain bf16 expert, even one protected among MXFP4 ones, cannot be sliced. */
+TEST(glm53_lays_out_its_experts_by_their_format) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    const auto bf = rad_enc_plain(RAD_BF16);
+    const auto declare = [&](const RadEncoding& first, const RadEncoding& rest, bool tier,
+                             int world, uint64_t* graph) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                   { "mtp.blk.45.ffn_down_exps", fp8 },
+                   { "blk.3.ffn_gate_up_exps.0.", first },
+                   { "blk.3.ffn_down_exps.0.", first },
+                   { "blk.3.ffn_gate_up_exps.1.", first },
+                   { "blk.3.ffn_down_exps.1.", first },
+                   { "ffn_gate_up_exps", rest },
+                   { "ffn_down_exps", rest },
+                   { "ffn_gate_up_shexp", rest },
+                   { "ffn_down_shexp", rest },
+                   { "ffn_gate_up.weight", fp8 },
+                   { "ffn_down.weight", fp8 } };
+        RadBuildCtx ctx = spec_ctx(0, world, 3);
+        ctx.max_tok = 4096;
+        ctx.max_seqs = 8;
+        ctx.max_ctx = 200000;
+        ctx.expert_file_tier = tier;
+        const int rc = glm5next::declare(&b, &meta, &ctx);
+        if (rc == RAD_OK) *graph = graph_hash(b);
+        return rc;
+    };
+    for (const int world : { 4, 8 }) {
+        uint64_t whole = 0, g = 0;
+        REQUIRE_EQ(declare(bf, bf, true, world, &whole), RAD_OK);
+        REQUIRE_EQ(declare(bf, bf, false, world, &g), RAD_OK);  /* was refused: slices every expert */
+        CHECK_EQ(g, whole);
+        REQUIRE_EQ(declare(fp8, fp8, true, world, &whole), RAD_OK);
+        REQUIRE_EQ(declare(fp8, fp8, false, world, &g), RAD_OK);
+        CHECK_EQ(g, whole);
+        REQUIRE_EQ(declare(mx, mx, true, world, &whole), RAD_OK);
+        uint64_t width = 0;
+        REQUIRE_EQ(declare(mx, mx, false, world, &width), RAD_OK);
+        CHECK(width != whole);
+        REQUIRE_EQ(declare(bf, mx, true, world, &whole), RAD_OK);
+        REQUIRE_EQ(declare(bf, mx, false, world, &g), RAD_OK);  /* a protected pair */
+        CHECK_EQ(g, whole);
     }
 }
 
@@ -2166,7 +2412,9 @@ TEST(glm53_streamed_decode_resolves_after_select_and_before_attention_with_the_e
     };
     auto check_layer_order = [&](const glm5next::Layer& l) {
         const size_t store = find_issue(l.mla.op_store_stream);
-        const size_t sel   = find_issue(l.index.cache.op_select);
+        // A short history takes every block (DsaCache::takes_all), a long one scores.
+        const size_t sel   = std::min(find_issue(l.index.cache.op_select),
+                                      find_issue(l.index.cache.op_select_all));
         const size_t res_i = find_issue(l.mla.op_resolve);
         const size_t attn  = find_issue(l.mla.core.op_attn);
         REQUIRE(store != SIZE_MAX);

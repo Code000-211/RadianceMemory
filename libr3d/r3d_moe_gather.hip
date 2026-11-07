@@ -12,7 +12,7 @@
  *   - moe_gather_inv: `slot` is the `inverse` table moe_scatter_inv wrote (read straight).
  *
  * An optional shared arm adds `shared[t, c] * act(gate[t])` (two narrows, matching the unfused
- * scale_rows pair). `act` is "sigmoid" (the only form we take; "none" is refused, absent = the
+ * scale_rows pair). `act` is "sigmoid" or "none" (the gate as it is; absent = the
  * identity).
  *
  * The wide-prefill form (a wave per token, 8 cols/lane) is not implemented; this is the decode and
@@ -120,9 +120,10 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
     if (M <= 0 || n <= 0 || top_k <= 0) return R3D_NO(RAD_E_SHAPE);
     if (top_k > kGatherSlots) return R3D_NO(RAD_E_SHAPE);   // the LDS-cached form only
 
-    const uint32_t ye_ld = (uint32_t)(ye->rank >= 2 ? ye->shape[1] : ye->stride[0]);
-    const uint32_t ew_ld = (uint32_t)(ew->rank >= 2 ? ew->shape[1] : ew->stride[0]);
-    const uint32_t y_ld = (uint32_t)(y->rank >= 2 ? y->shape[1] : y->stride[0]);
+    // Row pitches are the tensors' own strides: a view's rows can be wider than its shape.
+    const uint32_t ye_ld = (uint32_t)ye->stride[0];
+    const uint32_t ew_ld = (uint32_t)ew->stride[0];
+    const uint32_t y_ld = (uint32_t)y->stride[0];
     const uint32_t T = (uint32_t)r3d_numel(sorted);
     if (T < M * top_k) return R3D_NO(RAD_E_SHAPE);
 
@@ -131,12 +132,13 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
     const uint16_t* shp = sh ? (const uint16_t*)r3d_p(sh) : nullptr;
     const uint16_t* sgp = sg ? (const uint16_t*)r3d_p(sg) : nullptr;
     if (sh && !sg) return R3D_NO(RAD_E_INVAL);
-    const uint32_t sh_ld = sh ? (uint32_t)(sh->rank >= 2 ? sh->shape[1] : sh->stride[0]) : 0;
-    const uint32_t sg_ld = sg ? (uint32_t)(sg->rank >= 1 ? sg->shape[0] : sg->stride[0]) : 1;
+    // The gate is one value a token ([M] or [M, 1]): its pitch is stride[0], not a shape.
+    const uint32_t sh_ld = sh ? (uint32_t)sh->stride[0] : 0;
+    const uint32_t sg_ld = sg ? (uint32_t)sg->stride[0] : 1;
     int sig = 0;
     if (const char* act = r3d_gets(a, "act")) {
         if (std::string(act) == "sigmoid") sig = 1;
-        else if (std::string(act) == "none") return R3D_NO(RAD_E_INVAL);
+        else if (std::string(act) != "none") return R3D_NO(RAD_E_INVAL);
     }
 
     const bool f32w = (ew->dtype == RAD_F32);
@@ -169,9 +171,10 @@ int r3d_rad_moe_gather_inv(const RadArgs* a, RadStream s)
     if (M <= 0 || n <= 0 || top_k <= 0) return R3D_NO(RAD_E_SHAPE);
     if (top_k > kGatherSlots) return R3D_NO(RAD_E_SHAPE);   // the LDS-cached form only
 
-    const uint32_t ye_ld = (uint32_t)(ye->rank >= 2 ? ye->shape[1] : ye->stride[0]);
-    const uint32_t ew_ld = (uint32_t)(ew->rank >= 2 ? ew->shape[1] : ew->stride[0]);
-    const uint32_t y_ld = (uint32_t)(y->rank >= 2 ? y->shape[1] : y->stride[0]);
+    // Row pitches are the tensors' own strides: a view's rows can be wider than its shape.
+    const uint32_t ye_ld = (uint32_t)ye->stride[0];
+    const uint32_t ew_ld = (uint32_t)ew->stride[0];
+    const uint32_t y_ld = (uint32_t)y->stride[0];
     const uint32_t T = (uint32_t)r3d_numel(inv);
     if (T < M * top_k) return R3D_NO(RAD_E_SHAPE);
 
@@ -179,12 +182,13 @@ int r3d_rad_moe_gather_inv(const RadArgs* a, RadStream s)
     const uint16_t* shp = sh ? (const uint16_t*)r3d_p(sh) : nullptr;
     const uint16_t* sgp = sg ? (const uint16_t*)r3d_p(sg) : nullptr;
     if (sh && !sg) return R3D_NO(RAD_E_INVAL);
-    const uint32_t sh_ld = sh ? (uint32_t)(sh->rank >= 2 ? sh->shape[1] : sh->stride[0]) : 0;
-    const uint32_t sg_ld = sg ? (uint32_t)(sg->rank >= 1 ? sg->shape[0] : sg->stride[0]) : 1;
+    // The gate is one value a token ([M] or [M, 1]): its pitch is stride[0], not a shape.
+    const uint32_t sh_ld = sh ? (uint32_t)sh->stride[0] : 0;
+    const uint32_t sg_ld = sg ? (uint32_t)sg->stride[0] : 1;
     int sig = 0;
     if (const char* act = r3d_gets(a, "act")) {
         if (std::string(act) == "sigmoid") sig = 1;
-        else if (std::string(act) == "none") return R3D_NO(RAD_E_INVAL);
+        else if (std::string(act) != "none") return R3D_NO(RAD_E_INVAL);
     }
 
     const bool f32w = (ew->dtype == RAD_F32);

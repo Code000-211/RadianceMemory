@@ -1,0 +1,7 @@
+if(NOT COMMAND rad_add_plugin)
+  cmake_minimum_required(VERSION 3.21)
+  project(nemotronh LANGUAGES CXX)
+  find_package(radiance REQUIRED)
+  rad_plugin_defaults()
+endif()
+rad_add_plugin(nemotronh architectures SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/nemotronh.cpp)

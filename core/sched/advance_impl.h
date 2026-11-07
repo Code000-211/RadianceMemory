@@ -153,6 +153,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
             S.ctx = head + 1;
             S.n_acc = acc + 1;
             S.tok[0] = y[acc == 0 ? 0 : S.path[acc - 1]];
+            S.hrow = rtok + (acc == 0 ? 0 : S.path[acc - 1]);   /* rows are nodes, in order */
             S.npath = acc;
             return;
         }
@@ -167,6 +168,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         const int32_t head = ctx[i] + (rtok - k) + acc;
         S.acc = acc;
         S.head = head;
+        S.hrow = rtok + acc;
         S.ctx = head + 1;
         S.n_acc = acc + 1;
         S.tok[0] = y[acc];
@@ -296,6 +298,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         for (int32_t j = 1; j < n; ++j) tok[k + j] = aux;
         for (int32_t j = 0; j < n; ++j) adv_pos(a, pos, k + j, base + j);
         ctx[i] = base;
+        if (a.arow_off >= 0) adv_i32(a, a.arow_off)[i] = S.hrow;
         adv_groups(a, i, k, base, n);
         return;
     }

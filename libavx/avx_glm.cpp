@@ -140,6 +140,87 @@ AVX_KERNEL(swiglu_clamped) {
     return RAD_OK;
 }
 
+AVX_KERNEL(swiglu_step) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const auto &gu = a->t[0], &y = a->t[1];
+    const int64_t n = p_int(a, "n", 0);
+    const float limit = p_f32(a, "limit", 0);
+    if (n < 1 || !std::isfinite(limit) || limit <= 0 || gu.rank != 2 || y.rank != 2 || !gu.data ||
+        !y.data || y.shape[0] < 1 || gu.shape[0] != y.shape[0] || gu.shape[1] != 2 * n ||
+        y.shape[1] != n)
+        return RAD_E_SHAPE;
+    AVX_PARALLEL_FOR_IF(y.shape[0] * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < y.shape[0]; ++r) {
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t b = rowoff(&gu, r, 2 * n), s = laststride(&gu);
+            const float x = ldt(&gu, b + i * s);
+            const float g = std::min(x / (1.0f + std::exp(-x)), limit);
+            const float u = std::clamp(ldt(&gu, b + (n + i) * s), -limit, limit);
+            stt(&y, rowoff(&y, r, n) + i * laststride(&y), g * u);
+        }
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(router_sigmoid_group_topk) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
+    const int64_t ne = p_int(a, "n_expert", 0), k = p_int(a, "top_k", 0),
+                  ng = p_int(a, "n_group", 0), kg = p_int(a, "topk_group", 0);
+    const float factor = p_f32(a, "route_scale", 0);
+    if (ne < 1 || ne > 512 || k < 1 || ng < 1 || ne % ng || ne / ng < 2 || kg < 1 || kg > ng ||
+        k > kg * (ne / ng) || !std::isfinite(factor) || factor <= 0 || lg.rank != 2 ||
+        lg.shape[0] < 1 || lg.shape[1] != ne || bias.rank != 1 || bias.shape[0] != ne ||
+        bias.dtype != RAD_F32 || ids.dtype != RAD_I32 || !matrix(ids, lg.shape[0], k) ||
+        !matrix(w, lg.shape[0], k) || !lg.data || !bias.data)
+        return RAD_E_SHAPE;
+    const int64_t gs = ne / ng;
+    for (int64_t r = 0; r < lg.shape[0]; ++r) {
+        float prob[512], ranked[512], chosen[512], group[512];
+        int index[512];
+        bool kept[512] = {};
+        for (int64_t e = 0; e < ne; ++e) {
+            prob[e] = 1.0f / (1.0f + std::exp(-ldt(&lg, rowoff(&lg, r, ne) + e * laststride(&lg))));
+            ranked[e] = prob[e] + ldt(&bias, e * laststride(&bias));
+        }
+        for (int64_t gi = 0; gi < ng; ++gi) {
+            float t0 = -INFINITY, t1 = -INFINITY;
+            for (int64_t e = gi * gs; e < (gi + 1) * gs; ++e) {
+                if (ranked[e] > t0) { t1 = t0; t0 = ranked[e]; }
+                else if (ranked[e] > t1) t1 = ranked[e];
+            }
+            group[gi] = t0 + t1;
+        }
+        for (int64_t j = 0; j < kg; ++j) {
+            int winner = -1;
+            for (int64_t gi = 0; gi < ng; ++gi)
+                if (group[gi] > -INFINITY && (winner < 0 || group[gi] > group[winner]))
+                    winner = (int)gi;
+            if (winner < 0) return RAD_E_SHAPE;
+            for (int64_t e = winner * gs; e < (winner + 1) * gs; ++e) kept[e] = true;
+            group[winner] = -INFINITY;
+        }
+        float total = 0;
+        for (int64_t j = 0; j < k; ++j) {
+            int winner = -1;
+            for (int64_t e = 0; e < ne; ++e)
+                if (kept[e] && ranked[e] > -INFINITY && (winner < 0 || ranked[e] > ranked[winner]))
+                    winner = (int)e;
+            if (winner < 0) return RAD_E_SHAPE;
+            index[j] = winner;
+            chosen[j] = prob[winner];
+            total += chosen[j];
+            ranked[winner] = -INFINITY;
+        }
+        const float mult = p_int(a, "norm", 0) ? factor / (total + 1e-20f) : factor;
+        for (int64_t j = 0; j < k; ++j) {
+            st_int_dt(ids.dtype, ids.data, rowoff(&ids, r, k) + j * laststride(&ids), index[j]);
+            stt(&w, rowoff(&w, r, k) + j * laststride(&w), chosen[j] * mult);
+        }
+    }
+    return RAD_OK;
+}
+
 namespace {
 int64_t part_stride(int64_t hc) { return (hc * (hc + 2) + 1 + 3) / 4 * 4; }
 bool pre_params(const RadArgs* a, int64_t* n, int64_t* hc, int64_t* iters, float* eps,

@@ -17,6 +17,11 @@
 
 namespace rad {
 
+/* The widest conventional op is gdn_conv_prep at sixteen operands (docs/OPS.md). Thirty-two leaves
+ * room for an architecture plugin's private ops without a variable-length array on the hot path.
+ * The plugin loader refuses a schema with more, so no issue carries more. */
+constexpr int MAX_OPERANDS = 32;
+
 namespace mm { struct Item; struct PromptMedia; }
 
 class Registry;
@@ -451,9 +456,15 @@ public:
         std::vector<int64_t>     decoder_max_area;
     } vgen_str;
     bool is_video_generator() const { return video_gen.max_lanes != 0; }
+    /* The declared shape generator (rad_declare_shape_generator); `max_lanes` 0 when none. Its
+     * name points at `sgen_name`. */
+    RadShapeGenDecl shape_gen{};
+    std::string     sgen_name;
+    bool is_shape_generator() const { return shape_gen.max_lanes != 0; }
     /* Driven by passes, not token steps: any generator. */
     bool is_pass_driven() const {
-        return is_generator() || is_audio_generator() || is_video_generator();
+        return is_generator() || is_audio_generator() || is_video_generator() ||
+               is_shape_generator();
     }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
@@ -671,6 +682,10 @@ struct SamplingParams {
      * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
      * no-whitelist form. */
     std::vector<int32_t> ngram_whitelist;
+    /* Token ids this request never samples (generation_config.json's suppress_tokens: Gemma 4's
+     * end-of-image and end-of-audio markers). Global ids, duplicates ignored; empty is off. The
+     * sampler takes them out of the row as it does a grammar's mask. */
+    std::vector<int32_t> suppress_tokens;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
@@ -783,6 +798,30 @@ struct Request {
 /* --p2p: whether the collectives use the cards' peer access. */
 enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
+/* A KV recipe's V means (--kv-recipe `vmean FILE`, docs/GUIDE.md §4.4): per listed layer the mean
+ * of V over a calibration corpus, KV head by KV head, in the basis the V projection writes
+ * (kv_vmean_parse gives the file format). `layer[l]` is n_head_kv * head_dim floats. */
+struct KvVMean {
+    std::string path;
+    int64_t     head_dim  = 0;
+    int64_t     n_head_kv = 0;
+    long long   rows      = 0;     /* tokens the means were taken over, for provenance */
+    std::map<int, std::vector<float>> layer;
+};
+
+/* A KV recipe's maps from K to V (--kv-recipe `vpred FILE`, docs/GUIDE.md §4.4): per listed layer
+ * and KV head a least-squares affine map from K to V over a calibration corpus, in the basis the
+ * projections write (unrotated; kv_vpred_parse gives the file format). `layer[l]` is n_head_kv *
+ * (head_dim + 1) * head_dim floats: per head A's head_dim rows (row i the weights of K's dim i into
+ * V's dims), then the bias b, so V ~ K A + b. */
+struct KvVPred {
+    std::string path;
+    int64_t     head_dim  = 0;
+    int64_t     n_head_kv = 0;
+    long long   rows      = 0;     /* tokens the maps were fitted over, for provenance */
+    std::map<int, std::vector<float>> layer;
+};
+
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
@@ -824,7 +863,19 @@ struct Config {
      * prefill stager arms for. 0 = off: the chunk takes every token the step has left. N > 0: cap
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
-    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    double  prefill_interleave_share = 0.25;   /* --prefill-interleave auto[:SHARE] */
+    /* Whether --prefill-interleave was given. Not given, engine bring-up serves auto:1 (decode-only
+     * steps for as long as a chunk step took) except under --deterministic, in KL mode and for a
+     * generator; the Config default 0 is what a Scheduler built directly (tests) gets. */
+    bool    prefill_interleave_set = false;
+    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
+                                        * -1 auto (Scheduler::interleave_steps) */
+    /* --decode-headroom: rows a step carries for decode rows on top of the prefill budget
+     * (max_tok), so a chunk beside decoding sequences still fills its whole checkpoint interval
+     * in one step. -1 is auto, which engine bring-up resolves (decode_headroom_auto in
+     * core/sched/geometry.h) before any declare; 0 is the budget alone, the schedule without the
+     * flag. Read through step_tok() and friends, which treat an unresolved auto as 0. */
+    int64_t decode_headroom = -1;
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
@@ -848,6 +899,9 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
+     * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
+    int64_t gpu_memory_mib = 0;
     /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
      * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
      * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),
@@ -855,7 +909,32 @@ struct Config {
      * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
      * another name. */
     std::string kv_cache_dtype = "bf16";
+    /* --kv-recipe FILE: each attention layer's cache layout, from the fp8 set (fp8, fp8_v4,
+     * k6_v4, k5_v4 (a recipe word only), and k4h_v4, k4h_v2h and i8h, always rotated; bf16, the unquantised cache), instead of one for every layer (docs/GUIDE.md §4.4 gives the format). Loaded and
+     * checked at parse, so a malformed file stops the start before the model is opened; the plugin
+     * then checks it against the model's layers (RadBuildCtx::kv_recipe). `kv_recipe` is indexed
+     * by layer, a RAD_KVQ_* (with RAD_KVQ_ROTATED for a `rotated` line or a k4h or i8h layout) or -1 where the file names
+     * no such layer, and empty without a recipe. RAD_KVQ_VMEAN marks a `vmean` layer.
+     * A recipe sets layouts within the fp8 cache (its `bf16` layers excepted, per layer), so it
+     * needs --kv-cache-dtype fp8. */
+    std::string kv_recipe_path;
+    std::vector<int32_t> kv_recipe;
+    /* The recipe's `vmean FILE`, read at parse when a layer says `vmean` (RAD_KVQ_VMEAN): each
+     * listed layer's V mean by KV head, as the projection writes V (unrotated). Empty (no layers)
+     * without one. Checked against the model's heads and head_dim at startup (kv_vmean_table). */
+    KvVMean kv_vmean;
+    /* The recipe's `vpred FILE`, read at parse when a layer says `vpred` (RAD_KVQ_VPRED): each listed
+     * layer's map from K to V by KV head, unrotated. Empty (no layers) without one. Checked against
+     * the model's heads and head_dim at startup (kv_vpred_table). */
+    KvVPred kv_vpred;
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
+    /* --qsa-bkey-dtype bf16 | i8: the QSA indexer's block keys (RadBuildCtx::qsa_bkey_dtype).
+     * bf16 is the plugin's own; i8 is refused at startup by a plugin that does not serve it. */
+    std::string qsa_bkey_dtype = "bf16";
+    /* --qsa-bkey-split on|off: the QSA indexer's block keys split across the --tp ranks
+     * (RadBuildCtx::qsa_bkey_split). Off is the program as before the flag; on is refused at
+     * startup at one rank or by a plugin that does not serve it. */
+    bool qsa_bkey_split = false;
     /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
      * attn_prefill_fp8_name() spells it as the flag does. */
@@ -887,6 +966,10 @@ struct Config {
     /* --ngram-placement ram=DIR: the pinned n-gram copy is the file DIR/ngram-<id>.tab (a tmpfs),
      * mapped shared, so engines on separate cards hold one table. Empty: a private copy. */
     std::string    ngram_share_dir;
+    /* --ngram-placement disk=DIR: the table is read from its own file, DIR/ngram-<id>.bin, filled
+     * from the container at the first start, instead of from the container (a faster drive than
+     * the model's). Empty: from the container. */
+    std::string    ngram_disk_dir;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
@@ -955,6 +1038,25 @@ struct Config {
     /* Seconds an unused conversation is kept in any tier (VRAM, host memory, its snapshots). 0
      * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
+
+    /* ---- window residency (spec §7.3) ----
+     *
+     * A group whose consumer reads a window of its history (RadKVGroupDecl::residency_window,
+     * declared by arch/common/rad_qsa.h) can hold a context whose whole cache does not fit: the
+     * blocks the window does not cover leave VRAM for a pinned host store and are promoted back
+     * before a step reads them.
+     *
+     * `residency_mib` is that store's size. 0 is off, and off means the group keeps every block in
+     * VRAM, which is what a server with the room should do. `residency_sink_tokens` is how much of
+     * the *start* of a conversation stays resident: a sparse consumer's selection is not
+     * positional, but the first blocks are the attention sinks every step scores, and promoting
+     * those once a step would cost more than they save. The tail is the declared window's
+     * remainder.
+     *
+     * The store is opened only when a group declares a window; on a model without one the flags do
+     * nothing and the receipt says so (see the bringup's report line). */
+    int64_t residency_mib = 0;
+    int64_t residency_sink_tokens = 512;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The
@@ -1192,5 +1294,70 @@ struct Config {
  * so `rad-info --model X` and `radiance --model X` agree on what a flag means. */
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
+/* A --kv-recipe file's text into Config::kv_recipe's form: indexed by layer, a RAD_KVQ_* (with
+ * RAD_KVQ_ROTATED where the line ends in `rotated`, and always for k4h_v4, k4h_v2h and i8h, rotated
+ * layouts, RAD_KVQ_VMEAN where it ends in `vmean`, and a RAD_KVQ_DEMOTE layout where it says
+ * `demote LAYOUT`, RAD_KVQ_VPRED where it ends in `vpred`) or -1. `vmean_file` and `vpred_file`,
+ * when given, receive the paths a `vmean FILE` and a `vpred FILE` line name, as written.
+ * `name` is how a refusal names the file. A malformed recipe is refused with its line, and `out`
+ * is then left empty. */
+int  kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out,
+                     std::string* vmean_file = nullptr, std::string* vpred_file = nullptr);
+/* A recipe's V mean file (`vmean FILE`) into KvVMean. The text format, a line a (layer, KV head):
+ *
+ *     kv_vmean 1 head_dim D kv_heads H rows R
+ *     layer L head h  v_0 v_1 ... v_{D-1}
+ *
+ * `#` starts a comment. Refused with the file and the line named: a missing or wrong header, a
+ * line of other than D values, a value that is not a finite number, a head outside 0..H-1, a
+ * (layer, head) twice, or a layer missing one of its heads. */
+int  kv_vmean_parse(const std::string& text, const char* name, KvVMean* out);
+/* The RadKvVMean table (abi/rad_builder.h) for `recipe`'s RAD_KVQ_VMEAN layers, bf16 bits, from
+ * `vm` for a model of `n_head` query heads over `n_head_kv` KV heads of `head_dim`. Refused, the
+ * file named, where its head_dim or KV heads are not the model's or a vmean layer has no entry. */
+int  kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_t head_dim,
+                    int64_t n_head_kv, int64_t n_head, std::vector<uint16_t>* out);
+/* A recipe's map file (`vpred FILE`) into KvVPred. The text format, per (layer, KV head) a bias
+ * line and head_dim row lines in any order:
+ *
+ *     kv_vpred 1 head_dim D kv_heads H rows R
+ *     layer L head h bias  b_0 ... b_{D-1}
+ *     layer L head h row i  a_i0 ... a_i(D-1)        i in 0..D-1: K's dim i into V's dims
+ *
+ * `#` starts a comment. Refused with the file and the line named: a missing or wrong header, a
+ * line of other than D values, a value that is not a finite number, a head outside 0..H-1, a row
+ * outside 0..D-1, a bias or row twice, or a layer missing a head, a head's bias or one of its
+ * rows. */
+int  kv_vpred_parse(const std::string& text, const char* name, KvVPred* out);
+/* The RadKvVPred table (abi/rad_builder.h) for `recipe`'s RAD_KVQ_VPRED layers from `vp`, rotated
+ * into the basis a vpred layer stores (A' = H A H, b' = b H, H the normalised Sylvester Hadamard
+ * over head_dim that had_rotate applies, in f64, then f32), entries in layer order, and `entry` the
+ * recipe's length with each vpred layer's entry index (-1 elsewhere). Refused, the file named, where
+ * its head_dim or KV heads are not the model's, head_dim is not a power of two, or a vpred layer
+ * has no maps. */
+int  kv_vpred_table(const KvVPred& vp, const std::vector<int32_t>& recipe, int64_t head_dim,
+                    int64_t n_head_kv, std::vector<float>* table, std::vector<int32_t>* entry);
+/* A recipe's RAD_KVQ_* by its name in the file (bf16, i8h, fp8, fp8_v4, k6_v4, k5_v4, k4h_v4, k4h_v2h), and back; -1 / null for
+ * anything else. */
+int         kv_layout_of(const char* name);
+const char* kv_layout_name(int kvq);
+/* Every recipe layout's RAD_KVQ_*, widest first, and what a group of 32 K and 32 V elements of
+ * one costs in bits with its scales (bf16 1024, i8h 516 at head_dim 256, fp8 512, fp8_v4 400, k6_v4 352,
+ * k5_v4 320, k4h_v4 288, k4h_v2h 224); -1 for anything else.
+ * Rotation (RAD_KVQ_ROTATED) does not change the bits. */
+std::vector<int> kv_layouts();
+int              kv_layout_group_bits(int kvq);
+/* Whether rad-autoquant calibrates layout `kvq` only where --layouts or --variants names it (a row
+ * of the layout table marked opt-in; none today, k5_v4 was until RadianceMemory #22); false for
+ * every other layout and for anything else. */
+bool             kv_layout_opt_in(int kvq);
+/* A (token, head) row's bytes in layout `kvq` at head_dim `hd` (abi/rad_builder.h's rows: fp8
+ * 2 * hd, i8h 2 * hd + 4, the group layouts their bits a group times hd / 256), and the head_dim
+ * a row of `row` bytes holds in that layout; -1 where there is none. */
+int64_t          kv_layout_row_bytes(int kvq, int64_t hd);
+int64_t          kv_layout_head_dim(int kvq, int64_t row);
+/* The recipe's layers, layout by layout, the rotated ones last, for the startup log: "fp8 at
+ * layers 3, 7; k6_v4 at layer 11; k6_v4 rotated at layer 15". */
+std::string kv_recipe_summary(const std::vector<int32_t>& recipe);
 void config_usage(const char* argv0);
 }

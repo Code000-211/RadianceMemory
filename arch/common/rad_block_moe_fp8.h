@@ -182,8 +182,19 @@ struct MoeFP8 {
         /* Block-fp8 experts whose scale plane is f32 (format 9, dtype fp8a8f32). */
         int     expert_f32_scale = 0;
         double  route_scale = 1.0;
+        /* With `sigmoid_router`: group-limited selection over `n_group` groups, `topk_group` kept
+         * (router_sigmoid_group_topk; Ling-3.0). 1 is GLM's single group. The fused selection and
+         * sort is single-group, so a grouped router runs the separate pair. */
+        int64_t n_group = 1, topk_group = 1;
         /* Clamp of the SwiGLU product (swiglu_clamped); 0 is none. */
         double  swiglu_limit = 0.0;
+        /* The shared arm's clamp where it differs from the routed one (Ling-3.0 clamps its shared
+         * expert at 5 or 7 and its routed ones at 4, in different layers); negative: the routed
+         * arm's. */
+        double  shared_swiglu_limit = -1.0;
+        /* Clip after the SiLU (`swiglu_step`) rather than before it (`swiglu_clamped`), for both
+         * arms. */
+        int     swiglu_step = 0;
         /* With `swiglu_limit`: the clamped product and its quantiser as one launch
          * (GateQuantFP8::fuse_clamped), for the routed and the shared arm. */
         int     swiglu_quant = 0;
@@ -196,6 +207,19 @@ struct MoeFP8 {
          * At TP1 the ungated gather preserves both roundings; TP>1 reduces each arm separately
          * before combining, so its gather cannot fold the shared output. */
         int     shared_fp32_combine = 0;
+        /* Experts without a gate (Nemotron-H): one projection up (`up_proj`), relu(x)^2, and down,
+         * so the first GEMM is n_ff_exp wide rather than 2 * n_ff_exp and the quantiser between
+         * the GEMMs squares rather than gates (GateQuantFP8's "relu2"). The routed arm only: such a
+         * family's shared expert is the caller's. */
+        int     ungated = 0;
+        /* The router's input width when it is not the experts' (Nemotron-H's latent experts: the
+         * router scores the full hidden state, the experts read a narrower projection of it, and
+         * this block's Geom is the experts'). 0 means n_embd. With it the router reads
+         * Wire::route. The sigmoid router only. */
+        int64_t router_k = 0;
+        /* The caller reduces the block's delta across ranks, because it applies more linear work
+         * to it first (Nemotron-H's latent up-projection); no all-reduce is declared. */
+        int     no_reduce = 0;
         /* 4-bit experts (`i4*bf16[1x128]`) rather than E4M3 (`fp8_e4m3*bf16[128x128]`); for
          * Qwen3.8-Flash-Next this decides whether the model fits two cards (see the `moe_gemm_w4a8`
          * registry row). It is the stored encoding: probe() reads it from the first expert's
@@ -267,6 +291,8 @@ struct MoeFP8 {
     struct Wire {
         rad_buf x       = 0;   /* [max_tok, n_embd]  the residual stream */
         ActFP8  h{};           /* [max_tok, n_embd]  normed input, then the block's delta */
+        /* The router's input when Config::router_k is set; `h` otherwise. */
+        rad_buf route   = 0;   /* [max_tok, router_k]  bf16 */
         /* Rotated codes of the same input (only `q` and `s`; `x` is `h`'s). Declared only with
          * `expert_rot`: the routed gate_up reads them, the shared expert reads `h`'s. */
         ActFP8  hr{};          /* [max_tok, n_embd]  q + scale only */
@@ -547,17 +573,19 @@ inline int moe_expert_sources(RadBuilder* b, Names& nm, const char* tag, const c
 /* The gate_up and down name maps of one expert: a dim-0 slice of the stacked tensors, or the
  * checkpoint's per-expert gate and up joined along rows. `gate_up` false maps down alone. */
 inline int moe_map_gate_up(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,
-                           long long ge) {
+                           long long ge, bool ungated = false) {
     if (src.experts_gate_up) return map_slice(b, guw, src.experts_gate_up, (int)ge);
     if (src.experts_gate && src.experts_up)
         return map_slice_concat(b, guw, {src.experts_gate, src.experts_up}, (int)ge);
+    /* Ungated experts (Nemotron-H) have no gate_proj: the first GEMM is up_proj alone. */
+    if (ungated) return map_copy(b, guw, nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge));
     return map_concat(b, guw, {nm.ckpt("%s.%lld.gate_proj.weight", src.experts, ge),
                                 nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge)});
 }
 
 inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,
                           const char* dnw, long long ge, bool gate_up) {
-    if (gate_up) RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge));
+    if (gate_up) RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge, src.cfg.ungated));
     if (src.experts_gate_up || src.experts_gate)
         return map_slice(b, dnw, src.experts_down, (int)ge);
     return map_copy(b, dnw, nm.ckpt("%s.%lld.down_proj.weight", src.experts, ge));
@@ -584,7 +612,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
     int f = 0;
     for (long long ge = g0; ge < gn && ge <= g0 + kMaxProtected; ++ge) {
         const char* guw = nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge);
-        RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge));
+        RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge, cfg->ungated));
         cfg->probed_count = ge - g0 + 1;
         RadEncoding e{};
         f = 0;
@@ -618,6 +646,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                            int ar_in, bool ar_out_) {
     g = geom; c = src.cfg; w = wire; layer = l;
     ar_out = ar_out_;
+    if (c.n_group > 1) c.router_fuse = 0;
+    const double sh_limit = c.shared_swiglu_limit < 0 ? c.swiglu_limit : c.shared_swiglu_limit;
     /* 0 means not expert-parallel: this rank owns every expert. */
     if (c.n_expert_all <= 0) c.n_expert_all = c.n_expert;
     if (c.n_expert <= 0 || c.top_k <= 0 || c.top_k > c.n_expert_all || c.n_ff_exp <= 0)
@@ -637,6 +667,21 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (c.shared_fp32_combine && (!shared || !w.moe || std::strcmp(g.dtype, "bf16"))) {
         fprintf(stderr, "radiance: layer %d requests an FP32 shared/routed combine without its "
                         "BF16 shared arm and routed output\n", l);
+        return RAD_E_INVAL;
+    }
+    /* The first GEMM's rows per intermediate column (gate and up, or up alone) and the activation
+     * between the GEMMs. */
+    const int64_t gu = c.ungated ? 1 : 2;
+    const char* const gact = c.ungated ? "relu2" : "silu";
+    if (c.ungated && (shared || src.experts_gate_up || src.experts_gate ||
+                      c.swiglu_limit > 0)) {
+        fprintf(stderr, "radiance: ungated experts are served one by one (`up_proj`), unclamped and "
+                        "without a shared arm in this block\n");
+        return RAD_E_INVAL;
+    }
+    if (c.router_k && (!c.sigmoid_router || !w.route)) {
+        fprintf(stderr, "radiance: a router over another input than the experts' is the sigmoid "
+                        "router reading Wire::route\n");
         return RAD_E_INVAL;
     }
     /* Whether `w.sgate` is excluded from buffer sharing; set with the shared arm and required by
@@ -764,9 +809,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.rows = c.rows;
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
-        const GlmRouter::Wire wire{ w.h.x, w.logits, w.ids, w.ew };
+        rc.groups = c.n_group;
+        rc.topk_groups = c.topk_group;
+        const GlmRouter::Wire wire{ c.router_k ? w.route : w.h.x, w.logits, w.ids, w.ew };
         const GlmRouter::Src rs{ src.router, src.router_bias };
-        RAD_ARCH_TRY(glm_router.declare(b, nm, g, l, nm.f("blk.%d.glm_router", l), rc, wire, rs));
+        Geom rg = g;
+        if (c.router_k) rg.n_embd = c.router_k;
+        RAD_ARCH_TRY(glm_router.declare(b, nm, rg, l, nm.f("blk.%d.glm_router", l), rc, wire, rs));
         w_router = glm_router.projection;
         op_router = glm_router.op_project;
         op_topk = glm_router.op_select;
@@ -931,7 +980,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     const int  sh_row = ep ? RAD_SHARD_NONE : RAD_SHARD_ROW;
     const int  sh_col = ep ? RAD_SHARD_NONE : RAD_SHARD_COL;
-    const int  n_parts = ep ? 0 : 2;
+    const int  n_parts = ep ? 0 : (int)gu;
     /* The scale grid: one per 128x128 tile for E4M3, one per row per 128 of K for 4-bit (per 32
      * for MXFP4). `sdiv` is how many weight rows or columns one scale covers along the split
      * dimension. */
@@ -969,10 +1018,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             return RAD_E_INVAL;
         }
         for (int64_t e = 0; e < ne; ++e) {
-            const int64_t parts[2] = { c.n_ff_exp, c.n_ff_exp };
+            const int64_t parts[2] = { c.n_ff_exp, c.n_ff_exp };   /* gate, up (up alone: one) */
             w_gu[(size_t)e] = decl_w_n(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
                                                (long long)(c.expert_base + e)),
-                                       RAD_BF16, {2 * c.n_ff_exp, g.n_embd}, RAD_ACCESS_CONDITIONAL,
+                                       RAD_BF16, {gu * c.n_ff_exp, g.n_embd}, RAD_ACCESS_CONDITIONAL,
                                        sh_row, grp_expert_slot(l, (int)e, 0), 0, parts, n_parts);
             if (!w_gu[(size_t)e]) return RAD_E_INVAL;
         }
@@ -986,7 +1035,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* Row orders as for the quantised GEMMs (see `a_order` below): gate_up gathers token rows,
          * down reads sorted rows. */
         op_gu = rw(b, rad_decl_op(b, "moe_gemm",
-                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * c.n_ff_exp),
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", gu * c.n_ff_exp),
                                      RAD_INT("K", g.n_embd), RAD_INT("n_expert", ne),
                                      RAD_INT("top_k", c.top_k), RAD_STR("a_order", "token"),
                                      RAD_STR("dtype", "bf16")),
@@ -996,8 +1045,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * (rad_fp8.h: GateQuantFP8). */
         Geom gx = g;
         gx.w_bf16 = true;
-        RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
-                                    true, false, c.swiglu_limit));
+        RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, gact, c.rows * c.top_k,
+                                    true, false, c.swiglu_limit, c.swiglu_step != 0));
         op_dn = rw(b, rad_decl_op(b, "moe_gemm",
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                      RAD_INT("K", c.n_ff_exp), RAD_INT("n_expert", ne),
@@ -1015,7 +1064,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             rad_weight& h = w_gu[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
                                   (long long)(c.expert_base + e)),
-                          nullptr, ecodes, edt[0], {2 * wq[q], g.n_embd},
+                          nullptr, ecodes, edt[0], {gu * wq[q], g.n_embd},
                           RAD_ACCESS_CONDITIONAL, sh_row, grp_expert_slot(l, (int)s, 0),
                           parts, n_parts);
             if (!h) return RAD_E_INVAL;
@@ -1031,7 +1080,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                           nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
                                (long long)(c.expert_base + e)),
                           escale, sdt,
-                          {(c.expert_w4 || c.expert_mx) ? 2 * wq[q] : fp8_blocks(2 * wq[q]),
+                          {(c.expert_w4 || c.expert_mx) ? gu * wq[q] : fp8_blocks(gu * wq[q]),
                            (c.expert_w4 || c.expert_mx) ? g.n_embd / sgk : fp8_blocks(g.n_embd)},
                           RAD_ACCESS_CONDITIONAL, sh_row, grp_expert_slot(l, (int)s, 0),
                           parts, n_parts);
@@ -1107,22 +1156,22 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const std::vector<rad_weight> tab = tables(w_gu, w_gus);
         rad_op h = ncls == 4
             ? rad_decl_op(b, "moe_gemm_q_mod4",
-                  RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
+                  RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", gu * wq[0]),
                              RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                              RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
                              RAD_STR("a_order", "token"), RAD_STR("dtype", edtype[0]),
-                             RAD_INT("N_1", 2 * wq[1]), RAD_INT("K_1", g.n_embd),
-                             RAD_INT("N_2", 2 * wq[2]), RAD_INT("K_2", g.n_embd),
-                             RAD_INT("N_3", 2 * wq[3]), RAD_INT("K_3", g.n_embd),
-                             RAD_INT("parts", 2)),
+                             RAD_INT("N_1", gu * wq[1]), RAD_INT("K_1", g.n_embd),
+                             RAD_INT("N_2", gu * wq[2]), RAD_INT("K_2", g.n_embd),
+                             RAD_INT("N_3", gu * wq[3]), RAD_INT("K_3", g.n_embd),
+                             RAD_INT("parts", gu)),
                   tab.data(), (int)tab.size())
             : rad_decl_op(b, "moe_gemm_q",
-                       RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
+                       RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", gu * wq[0]),
                                   RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                   RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
                                   RAD_STR("a_order", "token"), RAD_STR("dtype", edtype[0]),
-                                  RAD_INT("N_odd", 2 * wq[1]), RAD_INT("K_odd", g.n_embd),
-                                  RAD_INT("parts", 2)),
+                                  RAD_INT("N_odd", gu * wq[1]), RAD_INT("K_odd", g.n_embd),
+                                  RAD_INT("parts", gu)),
                        tab.data(), (int)tab.size());
         op_gu = rw(b, h, {rot ? w.hr.q : w.h.q, rot ? w.hr.s : w.h.s, w.sorted, w.eoff}, {w.egu});
     }
@@ -1130,8 +1179,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
-    RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
-                                false, rot, c.swiglu_limit));
+    RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, gact, c.rows * c.top_k,
+                                false, rot, c.swiglu_limit, c.swiglu_step != 0));
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         rad_op h = ncls == 4
@@ -1184,7 +1233,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
              * the plain even split with no span. */
             psh_row = RAD_SHARD_ROW;
             psh_col = RAD_SHARD_COL;
-            pparts  = 2;
+            pparts  = (int)gu;
             if (full % g.world == 0 && (full / g.world) % 64 == 0) {
                 wp = full / g.world;
             } else if (full % 64 || full / 64 < g.world) {
@@ -1206,7 +1255,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t parts[2] = { wp, wp };
             w_pgu[(size_t)j] = decl_w_n(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
                                                 (long long)(c.expert_base + prot[(size_t)j])),
-                                        RAD_BF16, {2 * wp, g.n_embd}, RAD_ACCESS_PER_TOKEN,
+                                        RAD_BF16, {gu * wp, g.n_embd}, RAD_ACCESS_PER_TOKEN,
                                         psh_row, grp_layer(l), 0, parts, pparts);
             if (!w_pgu[(size_t)j]) return RAD_E_INVAL;
             if (phi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w_pgu[(size_t)j], plo, phi));
@@ -1221,11 +1270,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
         /* The gate_up and gate outputs, bf16, one sorted row each; regular experts' rows are
          * unused. */
-        b_pgu = decl_b(b, nm.f("blk.%d.moe_prot_gu", l), RAD_BF16, {c.rows * c.top_k, 2 * wp});
+        b_pgu = decl_b(b, nm.f("blk.%d.moe_prot_gu", l), RAD_BF16, {c.rows * c.top_k, gu * wp});
         pff.x = decl_b(b, nm.f("blk.%d.moe_prot_ff", l), RAD_BF16, {c.rows * c.top_k, wp});
         if (!b_pgu || !pff.x) return RAD_E_INVAL;
         op_pgu = rw(b, rad_decl_op(b, "moe_gemm",
-                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wp),
+                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", gu * wp),
                                       RAD_INT("K", g.n_embd), RAD_INT("n_expert", np),
                                       RAD_INT("top_k", c.top_k), RAD_STR("a_order", "token"),
                                       RAD_STR("dtype", "bf16")),
@@ -1233,8 +1282,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                     {w.h.x, w.sorted, w.eoff}, {b_pgu});
         Geom gx = g;
         gx.w_bf16 = true;
-        RAD_ARCH_TRY(gq_prot.declare(b, gx, b_pgu, pff, wp, "silu", c.rows * c.top_k, true,
-                                     false, c.swiglu_limit));
+        RAD_ARCH_TRY(gq_prot.declare(b, gx, b_pgu, pff, wp, gact, c.rows * c.top_k, true,
+                                     false, c.swiglu_limit, c.swiglu_step != 0));
         op_pdn = rw(b, rad_decl_op(b, "moe_gemm",
                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                       RAD_INT("K", wp), RAD_INT("n_expert", np),
@@ -1374,7 +1423,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.q8));
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.s8));
         }
-        if (!w.sff.q || c.swiglu_limit>0 || (sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)))
+        if (!w.sff.q || sh_limit>0 || (sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)))
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.x));
         RAD_ARCH_TRY(rad_buf_concurrent(b, w.sout));
         RAD_ARCH_TRY(rad_buf_concurrent(b, w.sgate));
@@ -1391,7 +1440,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         gq_sh.fuse_clamped = c.swiglu_quant != 0;
         RAD_ARCH_TRY(gq_sh.declare(b, g, w.sgu, w.sff, c.n_ff_shared, "silu", c.rows,
                                    sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8), false,
-                                   c.swiglu_limit));
+                                   sh_limit, c.swiglu_step != 0));
         RAD_ARCH_TRY(sh_down.declare(b, nm, g, down_base,
                                      g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
                                      { shared_down },
@@ -1515,7 +1564,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
     }
 
-    if (g.world > 1) {
+    if (g.world > 1 && !c.no_reduce) {
         const auto all_reduce = [&](const char* dtype, rad_buf buffer) {
             return rw(b, RAD_OP(b, "all_reduce",
                          RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -1536,7 +1585,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     /* The same collective for a caller that runs it beside other work (issue_ar, a pipelined
      * prefill): at `overlap` 1 it gets the rows that hold fewer CUs while waiting on the link. */
-    if (g.world > 1 && ar_overlap > 0)
+    if (g.world > 1 && !c.no_reduce && ar_overlap > 0)
         op_ar_ov = rw(b, RAD_OP(b, "all_reduce",
                           RAD_PARAMS(RAD_INT("world_size", g.world),
                                      RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -1784,6 +1833,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                             (!calib_dne_failed &&
                              calib_dne.write(gram_dn_stem, c.expert_base, gram_domain,
                                              rad_rank(c_)));
+            /* Written: the host sums are done with (a layer's can be gigabytes). */
+            calib_dne.acc = {};
+            calib_dne.rows = {};
             calib_done = true;
             if (layer == 0)
                 std::fprintf(stderr, "radiance: calibration wrote layer Hessians after %lld "

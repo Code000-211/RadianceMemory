@@ -1,0 +1,9 @@
+# gemma4-12b-bf16.recipe -- Gemma 4 12B ("unified": text, images, audio, Google's assistant head) at bf16.
+# Every weight stays as the release holds it. The image embedder's position table, [npos, 2, width], is read
+# as its two taps of dimension 1 (the column's rows and the row's), computed at convert and stored bf16 here.
+#
+#   rad-convert <gemma-4-12B-it> --draft-model <gemma-4-12B-it-assistant> \
+#       --recipe data/recipes/gemma4-12b-bf16.recipe \
+#       --set quantization_config.quant_method=compressed-tensors -o gemma4-12b-bf16.rad
+
+v.pos_*.weight           cast dtype=bf16

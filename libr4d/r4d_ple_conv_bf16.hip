@@ -60,7 +60,8 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,
     const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,
     const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,
-    uint16_t* __restrict__ y, uint32_t n, uint32_t wid, uint32_t dil, uint32_t hist,
+    uint16_t* __restrict__ y, const uint16_t* __restrict__ bias,
+    uint32_t n, uint32_t wid, uint32_t dil, uint32_t hist,
     uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,
     long long cs_slot, long long cs_ch, long long cs_tok, long long state_len) {
 
@@ -92,8 +93,9 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     const uint16_t* __restrict__ hc = warm ? dst + off * cs_tok : nullptr;
     uint16_t* __restrict__ yc = y + (size_t)bos * yld + c;
 
+    const float b0 = bias ? bf16_to_f32(bias[c]) : 0.0f;
     for (int32_t t = t0; t < t1; ++t) {
-        float acc = 0.0f;
+        float acc = b0;
 #pragma unroll
         for (uint32_t j = 0; j < kPcMaxW; ++j) {
             if (j < wid) {
@@ -150,17 +152,21 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
 }
 
 enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y };
+/* ple_conv_bias: ple_conv's operands with `b`, the per-channel bias inside the silu (Mamba-2's
+ * conv1d), before `y`. */
+enum { PB_B = PC_Y, PB_Y };
 /* causal_conv1d's operands: ple_conv's without `resid`. */
 enum { CC_X = 0, CC_W, CC_CS, CC_CU, CC_CIDX, CC_HINIT, CC_NACC, CC_Y };
 
 int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, const RadTensor* w,
                 const RadTensor* cs, const RadTensor* cu, const RadTensor* resid,
                 const RadTensor* cidx, const RadTensor* hini, const RadTensor* nacc,
-                const RadTensor* y) {
+                const RadTensor* y, const RadTensor* b = nullptr) {
     if (!x || !w || !cu || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
     if (resid && resid->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (b && b->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (cs && cs->data && cs->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (cu->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
     if (cidx && cidx->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
@@ -188,6 +194,7 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
      * the band's upper bound and a grid sized by it would run off the arena. */
     if (T <= 0 || ty != T || (resid && tr != T)) return R4D_NO(RAD_E_SHAPE);
     if (wrows < n) return R4D_NO(RAD_E_SHAPE);
+    if (b && (r4d_numel(b) != n || !r4d_contig(b))) return R4D_NO(RAD_E_SHAPE);
 
     const long long N = r4d_numel(cu) - 1;
     if (N <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -218,7 +225,8 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
                        cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,
                        hini ? (const int32_t*)r4d_addr(hini) : nullptr,
                        nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,
-                       (uint16_t*)r4d_addr(y), (uint32_t)n, (uint32_t)wid, (uint32_t)dil,
+                       (uint16_t*)r4d_addr(y), b ? (const uint16_t*)r4d_addr(b) : nullptr,
+                       (uint32_t)n, (uint32_t)wid, (uint32_t)dil,
                        (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld,
                        cs_slot, cs_ch, cs_tok, state_len);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
@@ -230,6 +238,14 @@ extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
     return conv_launch(a, s, true, r4d_opt(a, PC_X), r4d_opt(a, PC_W), r4d_opt(a, PC_CS),
                        r4d_opt(a, PC_CU), r4d_opt(a, PC_RESID), r4d_opt(a, PC_CIDX),
                        r4d_opt(a, PC_HINIT), r4d_opt(a, PC_NACC), r4d_opt(a, PC_Y));
+}
+
+extern "C" int r4d_rad_ple_conv_bias(const RadArgs* a, RadStream s) {
+    const RadTensor* b = r4d_opt(a, PB_B);
+    if (!b) return R4D_NO(RAD_E_INVAL);
+    return conv_launch(a, s, true, r4d_opt(a, PC_X), r4d_opt(a, PC_W), r4d_opt(a, PC_CS),
+                       r4d_opt(a, PC_CU), r4d_opt(a, PC_RESID), r4d_opt(a, PC_CIDX),
+                       r4d_opt(a, PC_HINIT), r4d_opt(a, PC_NACC), r4d_opt(a, PB_Y), b);
 }
 
 extern "C" int r4d_rad_causal_conv1d(const RadArgs* a, RadStream s) {

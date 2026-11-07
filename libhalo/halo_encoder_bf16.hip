@@ -356,6 +356,31 @@ __global__ __launch_bounds__(kThreads) void pool_cols_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- point_fourier
+// ref_point_fourier: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)], f_j = 2^j (times pi), the
+// sines then the cosines each i-major then j; f32 in and out. A thread an output column.
+__global__ __launch_bounds__(kThreads) void point_fourier_kernel(
+    const float* __restrict__ x, float* __restrict__ y, uint32_t n, uint32_t F, uint32_t pi,
+    uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    const uint32_t w = n * (2 * F + 1);
+    const uint32_t c = blockIdx.x * kThreads + threadIdx.x;
+    if (c >= w) return;
+    for (uint32_t r = blockIdx.y; r < M; r += gridDim.y) {
+        float v;
+        if (c < n) {
+            v = x[(size_t)r * x_ld + c];
+        } else {
+            const uint32_t k = c - n, half = n * F;
+            const uint32_t i = (k % half) / F, j = (k % half) % F;
+            const float f = pi ? (float)ldexp(3.14159265358979323846, (int)j)
+                               : ldexpf(1.0f, (int)j);
+            const float t = x[(size_t)r * x_ld + i] * f;
+            v = k < half ? sinf(t) : cosf(t);
+        }
+        y[(size_t)r * y_ld + c] = v;
+    }
+}
+
 // ---------------------------------------------------------------------------- cast bf16 -> f32
 __global__ __launch_bounds__(kThreads) void widen_kernel(
     const uint16_t* __restrict__ x, float* __restrict__ y, uint32_t n, uint32_t x_ld,
@@ -897,6 +922,19 @@ extern "C" int halo_pool_cols_bf16(long x, long y, int rows, int n, int k, float
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+extern "C" int halo_point_fourier_f32(long x, long y, int rows, int n, int freqs, int pi,
+                                     int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (rows <= 0 || n <= 0 || freqs <= 0 || freqs > 30) return -2;
+    const uint32_t w = (uint32_t)(n * (2 * freqs + 1));
+    hipLaunchKernelGGL(point_fourier_kernel,
+                       dim3((w + kThreads - 1) / kThreads, grid_rows(rows)),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const float*)x, (float*)y,
+                       (uint32_t)n, (uint32_t)freqs, (uint32_t)(pi != 0), (uint32_t)x_ld,
+                       (uint32_t)y_ld, (uint32_t)rows);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int halo_widen_bf16_f32(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -1261,6 +1299,24 @@ extern "C" int halo_rad_pool_cols(const RadArgs* a, RadStream s) {
     return enc_status(halo_pool_cols_bf16(halo_addr(X), halo_addr(Y), (int)M, (int)n, (int)k,
                                          (float)halo_getf(a, "mult", 1.0), (int)x_ld, (int)y_ld,
                                          (long)(uintptr_t)s));
+}
+
+/* ------------------------------------------------------------------ point_fourier */
+extern "C" int halo_rad_point_fourier(const RadArgs* a, RadStream s) {
+    const RadTensor* X = halo_opt(a, 0);
+    const RadTensor* Y = halo_opt(a, 1);
+    if (!X || !Y) return HALO_NO(RAD_E_INVAL);
+    if (X->dtype != RAD_F32 || Y->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+    const long long n = halo_geti_or(a, "n", 0), F = halo_geti_or(a, "freqs", 0);
+    if (n <= 0 || F <= 0 || F > 30) return HALO_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = halo_rows_pitch(X, n, &M);
+    const long long y_ld = halo_rows_pitch(Y, n * (2 * F + 1), &My);
+    if (x_ld < 0 || y_ld < 0) return HALO_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return HALO_NO(RAD_E_SHAPE);
+    return enc_status(halo_point_fourier_f32(halo_addr(X), halo_addr(Y), (int)M, (int)n, (int)F,
+                                           (int)halo_geti_or(a, "pi", 0), (int)x_ld, (int)y_ld,
+                                           (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ cast bf16 -> f32 */

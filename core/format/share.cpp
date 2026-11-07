@@ -155,6 +155,20 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
         }
     }
 
+    /* The view's rectangles come from plugin-stated spans and parts, sum-checked only. A single
+     * selected plane takes them as its own rectangles below, with no enc_plane_rect to bound
+     * them, so every one is held to the entry here. */
+    for (int g = 0; !whole && g < w.n_part_spans; ++g)
+        if (w.part_lo[g] < 0 || w.part_lo[g] > w.part_hi[g] || w.part_hi[g] > w.part_total[g])
+            return refuse(fmt("part %d's span [%lld, %lld) is outside its %lld", g,
+                              (long long)w.part_lo[g], (long long)w.part_hi[g],
+                              (long long)w.part_total[g]));
+    for (const VRect& q : view)
+        if (q.r0 < 0 || q.r0 > q.r1 || q.r1 > VR || q.c0 < 0 || q.c0 > q.c1 || q.c1 > VC)
+            return refuse(fmt("the slice [%lld, %lld) x [%lld, %lld) is outside the entry's "
+                              "%lld x %lld", (long long)q.r0, (long long)q.r1, (long long)q.c0,
+                              (long long)q.c1, (long long)VR, (long long)VC));
+
     for (int k = 0; k < w.n_sel; ++k) {
         const RadEncPlane& p = enc.plane[w.sel[k]];
         PlaneShare& s = out[k];
@@ -186,7 +200,10 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
                 return refuse(fmt("columns [%lld, %lld) of the %s '%s' plane do not fall on whole "
                                   "bytes", (long long)pq.col0, (long long)(pq.col0 + pq.cols),
                                   rad_dtype_name(p.dtype), p.role));
-            if (!s.rects.empty() && pq.cols != s.cols)
+            /* A vector's stacked parts lie end to end as one row, so they may differ in width (a
+             * Mamba convolution's bias is [x | B | C]); a matrix's parts stack as rows. */
+            const bool vec = rank == 1 && pq.rows == 1;
+            if (!vec && !s.rects.empty() && pq.cols != s.cols)
                 return refuse("the share's parts differ in width");
             PlaneShare::Rect r;
             r.row0  = pq.row0;
@@ -194,11 +211,16 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
             r.byte0 = pq.col0 * bits / 8;
             r.bytes = rad_enc_row_bytes(p.dtype, pq.cols);
             s.rects.push_back(r);
-            s.rows += pq.rows;
-            s.cols = pq.cols;
+            if (vec) {
+                s.rows = 1;
+                s.cols += pq.cols;
+            } else {
+                s.rows += pq.rows;
+                s.cols = pq.cols;
+            }
         }
-        /* A vector's stacked parts come out as one piece a part, each a row of the share; laid
-         * end to end they are the declared vector, so only the element count has to agree. */
+        /* Laid end to end, a vector's parts are the declared vector, so only the element count
+         * has to agree. */
         const bool fits = rank == 1 ? s.rows * s.cols == w.sel_rows[k] * w.sel_cols[k]
                                     : s.rows == w.sel_rows[k] && s.cols == w.sel_cols[k];
         if (!fits)

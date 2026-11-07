@@ -16,7 +16,7 @@
     "from": "now-1h",
     "to": "now"
   },
-  "description": "radiance: throughput, speculation by draft position, scheduler, latency, prefix cache, HTTP. Prometheus or VictoriaMetrics.",
+  "description": "radiance: totals over the time range, throughput, speculation by draft position, scheduler, latency, prefix cache, HTTP. Prometheus or VictoriaMetrics.",
   "annotations": {
     "list": []
   },
@@ -96,6 +96,322 @@
     },
     {
       "type": "stat",
+      "title": "Prompt tokens in",
+      "id": 44,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Prompt tokens of the requests that finished in the time range, added up. Each prompt counts with its full length, the cached part included. It is the sum of usage.prompt_tokens in the responses.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(vllm:prompt_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Prompt tokens read from cache",
+      "id": 45,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Prompt tokens that were not computed again, over the time range. Two numbers: tokens whose attention KV came from the paged prefix cache, and tokens whose recurrent state came from a linear checkpoint. A hybrid model such as Qwen3.8-Flash-Next uses both. The two numbers count the same tokens from two sides, so do not add them. Compute is saved only up to the checkpoint: the linear number plus Prompt tokens computed equals the prompt tokens admitted. Counted when a request is admitted.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:attn_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "attention cache",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:linear_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "linear checkpoint",
+          "refId": "B",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Prompt tokens computed",
+      "id": 46,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Prompt tokens the engine computed over the time range. Tokens read from the cache are not in it.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 10,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:prefill_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Generated tokens out",
+      "id": 47,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Tokens generated for the requests that finished in the time range, added up. Reasoning tokens are in it. It is the sum of usage.completion_tokens in the responses. A request that is still running is not counted yet: Decode shows the live rate.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 14,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(vllm:generation_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Requests",
+      "id": 48,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Requests that finished in the time range, for all finish reasons. The graph Requests finished, below, splits them by reason.",
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(vllm:request_success_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
       "title": "Running",
       "id": 2,
       "datasource": {
@@ -107,7 +423,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 1
+        "y": 5
       },
       "targets": [
         {
@@ -167,7 +483,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 1
+        "y": 5
       },
       "targets": [
         {
@@ -231,7 +547,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 1
+        "y": 5
       },
       "targets": [
         {
@@ -292,7 +608,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 1
+        "y": 5
       },
       "targets": [
         {
@@ -353,7 +669,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 1
+        "y": 5
       },
       "targets": [
         {
@@ -422,7 +738,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 1
+        "y": 5
       },
       "targets": [
         {
@@ -471,6 +787,19 @@
       }
     },
     {
+      "type": "row",
+      "title": "Ratios over the time range",
+      "id": 49,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      }
+    },
+    {
       "type": "stat",
       "title": "Prompt from attention cache",
       "id": 8,
@@ -481,9 +810,9 @@
       "description": "Share of prompt tokens served from the paged attention prefix cache over the time range (vllm:gpu_prefix_cache_hit_rate is the same ratio since start).",
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 5,
         "x": 0,
-        "y": 5
+        "y": 27
       },
       "targets": [
         {
@@ -542,9 +871,9 @@
       "description": "Share of prompt tokens whose recurrent state came from a checkpoint over the time range (radiance:linear_prefix_cache_hit_rate since start). A prompt can be fully attention-cached and still re-run every recurrent layer.",
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 5
+        "w": 5,
+        "x": 5,
+        "y": 27
       },
       "targets": [
         {
@@ -603,9 +932,9 @@
       "description": "engine_step_seconds_decode_total / engine_steps_decode_total over the time range: decode only. Wall clock over steps would charge idle and prefill to it.",
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 5
+        "w": 5,
+        "x": 10,
+        "y": 27
       },
       "targets": [
         {
@@ -664,9 +993,9 @@
       "description": "Verified draft blocks per decode-only step over the time range. Falls when rows stop drafting, which the acceptance ratio does not show.",
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 5
+        "w": 5,
+        "x": 15,
+        "y": 27
       },
       "targets": [
         {
@@ -726,8 +1055,8 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 16,
-        "y": 5
+        "x": 20,
+        "y": 27
       },
       "targets": [
         {
@@ -801,9 +1130,9 @@
       "description": "Over the time range.",
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 5
+        "w": 3,
+        "x": 21,
+        "y": 1
       },
       "targets": [
         {
@@ -1241,7 +1570,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 31
       }
     },
     {
@@ -1257,7 +1586,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 32
       },
       "targets": [
         {
@@ -1479,7 +1808,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 27
+        "y": 32
       },
       "targets": [
         {
@@ -1536,7 +1865,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 27
+        "y": 32
       },
       "targets": [
         {
@@ -1591,7 +1920,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 35
+        "y": 40
       },
       "targets": [
         {
@@ -1646,7 +1975,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 35
+        "y": 40
       },
       "targets": [
         {
@@ -1701,7 +2030,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 35
+        "y": 40
       },
       "targets": [
         {
@@ -1756,7 +2085,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 48
       },
       "targets": [
         {
@@ -1811,7 +2140,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 43
+        "y": 48
       },
       "targets": [
         {
@@ -1863,7 +2192,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 56
       }
     },
     {
@@ -1879,7 +2208,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 52
+        "y": 57
       },
       "targets": [
         {
@@ -1956,7 +2285,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 52
+        "y": 57
       },
       "targets": [
         {
@@ -2022,7 +2351,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 52
+        "y": 57
       },
       "targets": [
         {
@@ -2087,7 +2416,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 65
       }
     },
     {
@@ -2103,7 +2432,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 61
+        "y": 66
       },
       "targets": [
         {
@@ -2180,7 +2509,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 61
+        "y": 66
       },
       "targets": [
         {
@@ -2257,7 +2586,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 61
+        "y": 66
       },
       "targets": [
         {
@@ -2331,7 +2660,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 74
       }
     },
     {
@@ -2347,7 +2676,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 70
+        "y": 75
       },
       "targets": [
         {
@@ -2404,7 +2733,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 70
+        "y": 75
       },
       "targets": [
         {
@@ -2472,7 +2801,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 70
+        "y": 75
       },
       "targets": [
         {
@@ -2557,7 +2886,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 83
       }
     },
     {
@@ -2573,7 +2902,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 84
       },
       "targets": [
         {
@@ -2628,7 +2957,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 79
+        "y": 84
       },
       "targets": [
         {

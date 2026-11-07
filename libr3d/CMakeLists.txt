@@ -115,16 +115,15 @@ set(R3D_UNITS
   # fragment-order permute is the row's own relayout hook, at load.
   "r3d_gemm_w4a16_nt_m64|"
   "r3d_gemm_w5a16_nt_m64|"
-  # The gated-delta-net chunk preamble: the gram and the blocked inverse of I + the strictly
-  # lower decayed gram, one 64-chunk a workgroup, the gram per k head.
-  "r3d_gdn_kkt_solve_c64|"
-  # The gated-delta-net chunked scan: the chunk's output and its closing state, the recurrent
-  # state in wave-matrix accumulators across the chunk loop.
-  "r3d_gdn_chunk_scan_k128_v128_c64|"
+  # The gated-delta-net chunk preamble, chunked scan and recurrent update: libhalo's kernels
+  # (r3dh_*, the halo_ -> r3dh_ rename), checked against libref on gfx1151 and compiled here for
+  # the whole family. The recurrent update serves both state forms (per_candidate and anchor).
+  "r3dh_gdn_kkt_solve|"
+  "r3dh_gdn_chunk_scan|"
+  "r3dh_gdn_recurrent_update|"
   "r3d_gdn_gated_rmsnorm_h128|"
   "r3d_gdn_gated_norm_had_quant_i8|"
   "r3d_gdn_conv_w4_h128|"
-  "r3d_gdn_recurrent_update_k128_v128|"
   # Mixture of experts: each routing weight times its expert's own scale, in place.
   "r3d_expert_scale_bf16|"
   # The router: softmax over the expert logits, the top_k by value, renormalised if `norm`.
@@ -136,6 +135,15 @@ set(R3D_UNITS
   # The grouped w4a8 GEMM core: int8 activation x two's-complement 4-bit weight, widened to f16 and
   # run on the f16 wave-matrix, a per-(row, 128-of-K) scale fold. Phase 1: dense rows, no gather.
   "r3d_moe_gemm_w4a8|"
+   # The grouped w4a4 GEMM: int4 activation x two-s-complement 4-bit weight, both widened to int8
+   # and run on the exact i32 wave-matrix, a per-(row, 128-of-K) scale fold.
+   "r3d_moe_gemm_w4a4|"
+    "r3d_dequant_w4_bf16|"
+    "r3d_rowtopk_merge|"
+    "r3d_ngram_ids|"
+    "r3d_gemm_fp8a8_bias|"
+    "r3d_gemm_fp8a8_short|"
+    "r3d_moe_gemm_q_mod4|"
   # The grouped E4M3 x E4M3 GEMM (moe_gemm_q): both operands fp8, staged compact and upcast to f16
   # in registers (the FeatherOps bit trick), the f16 wave-matrix, a per-(row, g-of-K) scale fold.
   "r3d_moe_gemm_q|"

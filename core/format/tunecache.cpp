@@ -175,10 +175,15 @@ int TuneCache::load(const std::string& home, const std::string& machine) {
             continue;
         }
         if (tok[0] == "machine") {
-            if (tok.size() >= 2 && std::string(tok[1]) != machine)
-                RAD_WARN("%s: measured on '%.*s' but this machine is '%s' -- the rows may not "
-                         "describe this card", path.c_str(), (int)tok[1].size(), tok[1].data(),
-                         machine.c_str());
+            /* A cache from another card is wrong, not just slow (tunecache.h): a file renamed or
+             * copied to this machine's name is refused, as another format version is. */
+            if (tok.size() >= 2 && std::string(tok[1]) != machine) {
+                RAD_WARN("%s: measured on '%.*s' but this machine is '%s' -- ignoring the cache",
+                         path.c_str(), (int)tok[1].size(), tok[1].data(), machine.c_str());
+                std::free(line);
+                ::fclose(f);
+                return RAD_E_FORMAT;
+            }
             continue;
         }
         if (tok.size() < 5) { ++bad; continue; }

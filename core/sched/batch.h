@@ -175,6 +175,11 @@ private:
         int32_t*    h_used = nullptr;  int32_t* d_used = nullptr;
         int32_t*    h_sidx = nullptr;  int32_t* d_sidx = nullptr;
         int64_t     sidx_pitch = 1;    /* columns per sequence in h_sidx/d_sidx */
+        /* The pager's scratch pages (RadKVGroupBatch::residency_scratch): scratch_rows x
+         * scratch_pitch pool ids, copied from the manager every build; null/0 for a group with no
+         * window. */
+        int64_t     scratch_pitch = 0;
+        int32_t*    h_scr = nullptr;   int32_t* d_scr = nullptr;
     };
 
     /* Layout of a build: every array at the same offset on the card and in host staging, so one
@@ -220,12 +225,19 @@ private:
          * runtime window (advance.h). Per sequence because each prompt has its own floor. */
         int32_t  *h_rpos = nullptr, *d_rpos = nullptr;
         int32_t  *h_tlen = nullptr, *d_tlen = nullptr;
+        /* [max_seqs] a block drafter's query pass: each row's last committed row in the context
+         * pass just run (RadBatch::anchor_rows), written on the card by ADV_BLOCK. */
+        int32_t  *h_arow = nullptr, *d_arow = nullptr;
 
         char*      h_derived = nullptr;   /* derivation staging, byte-addressed */
         /* [3][n_tok] rotary positions and [n_tok] encoder-row targets (RadBatch::rope_pos,
          * mm_rows): carved only when the program declared an encoder, empty otherwise. */
         int32_t   *h_rope = nullptr, *d_rope = nullptr;
         int32_t   *h_mmrow = nullptr, *d_mmrow = nullptr;
+        /* [4][max_tok] the runs read both ways (RadBatch::n_bidi): their key counts (the one plane
+         * the device reads), first rows, rows and sequences; carved only when the program's
+         * encoder asks for them (RadEncoderDecl::bidirectional). */
+        int32_t   *h_bidi = nullptr, *d_bidi = nullptr;
         /* [n_tok] each row's runtime LoRA adapter slot (RadBatch::lora_slot): carved only when the
          * engine serves adapters, empty otherwise. */
         int32_t   *h_lora = nullptr, *d_lora = nullptr;
@@ -265,6 +277,7 @@ private:
         /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
         std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
+        std::vector<int32_t>                      kv_used_max_h;
         /* The build's sequences in row order (step_seqs); none for an encoder pass. */
         std::vector<uint64_t>                     seqs;
         bool                                      has_seqs = false;
@@ -288,6 +301,9 @@ private:
     ChunkGeometry geo_{};
     KVGeom        kvgeom_{};
     std::vector<RankIO> ranks_;
+    /* Per group and rank, the residency epoch (IKVManager::Pager::epoch) the page cache's tags
+     * were last cleared at; -1 never. */
+    std::vector<std::vector<int64_t>> tags_epoch_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
@@ -344,6 +360,7 @@ private:
      * (see RadBatch::mm_embd). The staging is refilled only after its last upload has run
      * (`mm_ev_`). */
     bool                   mm_on_ = false;
+    bool                   bidi_on_ = false;   /* RadEncoderDecl::bidirectional */
     /* The engine serves runtime LoRA adapters (Config::lora): the batch carries each row's slot. */
     bool                   lora_on_ = false;
     /* Program::plugin_words: the words a sequence may carry, 0 for none. */

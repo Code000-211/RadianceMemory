@@ -17,6 +17,7 @@
 #include "rad_yarn.h"
 #include "rad_abi_layout.h"
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +122,36 @@ inline void dbg_resid(RadCtx* c, int layer, const char* site, int64_t n_embd,
 inline const char* calib_dir() {
     static const char* d = std::getenv("RADIANCE_CALIB_DIR");
     return d && *d ? d : nullptr;
+}
+
+/* Whether layer `layer` taps (RADIANCE_CALIB_LAYERS: comma-separated layers and "lo-hi" ranges;
+ * unset, every layer). A model whose per-expert Hessians do not fit the host at once (Nemotron-3.5
+ * Bolt's are 169 GiB) calibrates in several runs over disjoint ranges; each run writes only its
+ * layers' files, so the runs share one directory. */
+inline bool calib_layer_on(int layer) {
+    static const std::vector<std::pair<int, int>> ranges = [] {
+        std::vector<std::pair<int, int>> r;
+        const char* s = std::getenv("RADIANCE_CALIB_LAYERS");
+        while (s && *s) {
+            char* e = nullptr;
+            const long lo = std::strtol(s, &e, 10);
+            if (e == s) break;
+            long hi = lo;
+            if (*e == '-') {
+                const char* h = e + 1;
+                hi = std::strtol(h, &e, 10);
+                if (e == h) break;
+            }
+            r.emplace_back((int)lo, (int)hi);
+            s = *e == ',' ? e + 1 : e;
+            if (*s && *s != ',' && !std::isdigit((unsigned char)*s)) break;
+        }
+        return r;
+    }();
+    if (!std::getenv("RADIANCE_CALIB_LAYERS")) return true;
+    for (const auto& r : ranges)
+        if (layer >= r.first && layer <= r.second) return true;
+    return false;
 }
 
 /* Token count at which the tap dumps and switches itself off (RADIANCE_CALIB_TOKENS, default
@@ -1484,7 +1515,12 @@ inline const char* drafter_layer_prefix(const RadModelMeta* meta) {
         return "draft.transformer_layer_config.";
     return "draft.";
 }
-inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, const char* what) {
+/* `kv_repl_ok`: the drafter block reads its k and v at Geom::kv_off (rad_block_dflash2.h does), so
+ * fewer KV heads than ranks are replicated as geom_from replicates the target's: world a multiple
+ * of the head count, one KV head a rank, `kv_off` its first row in the unsharded k/v projection.
+ * Otherwise such a world is refused, as before. */
+inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, const char* what,
+                        bool kv_repl_ok = false) {
     dg = target;
     const char* pre = drafter_layer_prefix(meta);
     char key[160];
@@ -1509,7 +1545,15 @@ inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, 
     }
     RAD_ARCH_TRY(yarn_from(dg, meta, pre, dg.head_dim));
     RAD_ARCH_TRY(divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head));
-    RAD_ARCH_TRY(divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads", &dg.n_head_kv));
+    /* The target's kv_off is the target's; the drafter's is set here or zero. */
+    dg.kv_off = 0;
+    if (kv_repl_ok && dg.world > dg.n_head_kv_all && dg.world % dg.n_head_kv_all == 0) {
+        dg.n_head_kv = 1;   /* world / n_head_kv_all ranks share each KV head */
+        dg.kv_off    = (dg.rank / (dg.world / dg.n_head_kv_all)) * dg.head_dim;
+    } else {
+        RAD_ARCH_TRY(divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads",
+                                    &dg.n_head_kv));
+    }
     RAD_ARCH_TRY(divide_or_fail(dg.n_ff_all,      dg.world, "draft intermediate_size",   &dg.n_ff));
     const long long dvocab = rad_meta_geti(meta, k("vocab_size"), dg.n_vocab_all);
     if (dvocab != dg.n_vocab_all) {

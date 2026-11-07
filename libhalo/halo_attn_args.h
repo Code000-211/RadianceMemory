@@ -103,6 +103,8 @@ static inline int fill_paged_row(const RadArgs* a, HaloArgs* r, int expect_head_
     if (kv->stride[3] != 1) return HALO_NO(RAD_E_STRIDE);
     if (kv->stride[2] != row) return HALO_NO(RAD_E_STRIDE);
     if (kv->shape[3] != row) return HALO_NO(RAD_E_SHAPE);
+    /* The kernels divide q_heads by kv_heads for the GQA factor. */
+    if (kv->shape[1] <= 0) return HALO_NO(RAD_E_SHAPE);
 
     /* 16-byte alignment for 128-bit loads. */
     if (!halo_aligned(q->data, 16) || !halo_aligned(o->data, 16) || !halo_aligned(kv->data, 16))

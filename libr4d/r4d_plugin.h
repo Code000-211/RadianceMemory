@@ -169,6 +169,11 @@ int64_t r4d_rad_attn_qrow_h128_gqa8_scratch(const RadArgs*);
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
 int     r4d_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h128_gqa1_fp8 (const RadArgs*, RadStream);
+/* The same kernels under attn_paged_sink (a sink logit a query head). */
+int     r4d_rad_attn_window_sink_h128_gqa8_bf16 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_sink_h128_gqa8_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_sink_h128_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_sink_h128_gqa16_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream);
@@ -185,9 +190,22 @@ int     r4d_rad_attn_window_h512_gqa4_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa4_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa16_fp8 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
+#define R4D_ATTN_ANCHOR_DECL(HD, G)                                                              \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_bf16kv(const RadArgs*, RadStream);            \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_fp8kv(const RadArgs*, RadStream);
+R4D_ATTN_ANCHOR_DECL(128, 1)
+R4D_ATTN_ANCHOR_DECL(256, 1) R4D_ATTN_ANCHOR_DECL(256, 2) R4D_ATTN_ANCHOR_DECL(256, 4)
+R4D_ATTN_ANCHOR_DECL(256, 8)
+R4D_ATTN_ANCHOR_DECL(512, 1) R4D_ATTN_ANCHOR_DECL(512, 2) R4D_ATTN_ANCHOR_DECL(512, 4)
+R4D_ATTN_ANCHOR_DECL(512, 8)
+#undef R4D_ATTN_ANCHOR_DECL
+int     r4d_rad_dflash_markov_greedy(const RadArgs*, RadStream);
+int     r4d_rad_dflash_markov_greedy_f32(const RadArgs*, RadStream);
 /* attn_paged_qrow_tree (docs/OPS.md): the h256/gqa2 split-KV decode and the windowed kernels with a
  * tree verify's mask from operand 8, `spec_parent`. */
 int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8 (const RadArgs*, RadStream);
@@ -198,11 +216,23 @@ int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs*, RadStream);
 R4D_WIN_TREE_DECL(256, 1) R4D_WIN_TREE_DECL(256, 2) R4D_WIN_TREE_DECL(256, 4) R4D_WIN_TREE_DECL(256, 8)
 R4D_WIN_TREE_DECL(512, 1) R4D_WIN_TREE_DECL(512, 2) R4D_WIN_TREE_DECL(512, 4) R4D_WIN_TREE_DECL(512, 8)
 #undef R4D_WIN_TREE_DECL
+/* attn_paged_ahead and attn_paged_qrow_ahead (docs/OPS.md): the windowed kernels with a non-causal
+ * window that bounds the keys behind only. */
+#define R4D_WIN_AHEAD_DECL(HD, G)                                                                 \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_bf16(const RadArgs*, RadStream);               \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_fp8 (const RadArgs*, RadStream);
+R4D_WIN_AHEAD_DECL(256, 1) R4D_WIN_AHEAD_DECL(256, 2) R4D_WIN_AHEAD_DECL(256, 4) R4D_WIN_AHEAD_DECL(256, 8)
+#undef R4D_WIN_AHEAD_DECL
 /* dflash_tree (r4d_dflash_tree_bf16.hip): dflash_select's lattice grown best-first into a tree. */
 int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
  * draft head's merge (r4d_pair_argmax_f32.hip). */
 int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);
+/* LiLiCorr's correlator (r4d_lili.hip). */
+int     r4d_rad_lili_cand  (const RadArgs*, RadStream);
+int     r4d_rad_lili_attn  (const RadArgs*, RadStream);
+int     r4d_rad_lili_factor(const RadArgs*, RadStream);
+int     r4d_rad_lili_walk  (const RadArgs*, RadStream);
 /* Gemma 4's two sandwich-norm joins, each one kernel for a chain of rmsnorm / add / mul_weight
  * launches (r4d_norm_join_bf16.hip), and expert_scale, the embed_lookup + mul pair that scales
  * each routing weight by its expert's scale (r4d_expert_scale_bf16.hip). */
@@ -365,6 +395,13 @@ int     r4d_rad_attn_prefill_h128_gqa2_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa2_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa2_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h128_gqa2_scratch(const RadArgs*);
+/* Sixteen queries per KV head at head_dim 128 (Nemotron-H): the gqa8 body at gqa 16
+ * (r4d_attn_paged_h128_gqa16.hip). */
+int     r4d_rad_attn_prefill_h128_gqa16_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h128_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa16_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa16_bf16 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h128_gqa16_scratch(const RadArgs*);
 /* Twelve queries per KV head, head_dim 256 only: Qwen3.8-Flash-Next's QSA layers. Same body,
  * another instantiation (r4d_attn_paged_h256_gqa12.hip). */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8 (const RadArgs*, RadStream);
@@ -411,6 +448,60 @@ int64_t r4d_rad_attn_prefill_h256_gqa6_k6v4_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa6_k6v4(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa6_k6v4(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_k6v4_scratch(const RadArgs*);
+/* The k4h_v4 cache (int4 K and V, stored rotated) on both: prefill and decode, no gated merge. */
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv4_scratch(const RadArgs*);
+/* The k4h_v2h cache (int4 K, variance-normalised int2 V, stored rotated), the same four. */
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv2h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv2h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv2h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv2h_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv2h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv2h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv2h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv2h_scratch(const RadArgs*);
+/* P K-hat over the k4h_v4 / k4h_v2h caches (kv_dtype k4h_v4_pk / k4h_v2h_pk, O_PK), the same four
+ * each: a `vpred` layer's second attention. */
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv4pk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv4pk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k4hv2hpk_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k4hv2hpk(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k4hv2hpk_scratch(const RadArgs*);
+/* The i8h cache (int8 K and V, one f16 scale a token and head, stored rotated), the same four. */
+int     r4d_rad_attn_prefill_h256_gqa12_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_i8h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_i8h_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_i8h_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_i8h(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_i8h_scratch(const RadArgs*);
+/* The k5_v4 cache (int5 K, int4 V, f16 scales a group of 32; rotated or not), the same four. */
+int     r4d_rad_attn_prefill_h256_gqa12_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa12_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa12_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_prefill_h256_gqa6_k5v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_gqa6_k5v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k5v4_scratch(const RadArgs*);
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);
@@ -421,6 +512,7 @@ int r4d_rad_gdn_recurrent_update(const RadArgs*, RadStream);
 /* gdn_conv_update folded into the recurrent update's prologue for the decode shape; q/k/v are
  * never written (r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip). */
 int r4d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
+int r4d_rad_gdn_conv_recurrent_update_had(const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
 int r4d_rad_dflash_conv         (const RadArgs*, RadStream);
 int r4d_rad_dflash_select       (const RadArgs*, RadStream);
@@ -432,6 +524,7 @@ int r4d_rad_mhc_pre(const RadArgs*, RadStream);
 int r4d_rad_mhc_pre_partial(const RadArgs*, RadStream);
 int r4d_rad_mhc_pre_finish(const RadArgs*, RadStream);
 int r4d_rad_kda_update(const RadArgs*, RadStream);
+int r4d_rad_ssd_update(const RadArgs*, RadStream);
 int r4d_rad_moe_mxfp4(const RadArgs*, RadStream);
 int r4d_rad_layout_moe_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                             const RadTensor*, int, RadLayout*);
@@ -602,6 +695,9 @@ int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_iqr(const RadArgs*, RadStream);
+/* `logits_gemm_vocab`: the head as width classes of the vocabulary's rows (r4d_logits_vocab.hip). */
+int r4d_rad_logits_gemm_vocab(const RadArgs*, RadStream);
+int64_t r4d_rad_logits_gemm_vocab_scratch(const RadArgs*);
 int r4d_rad_logit_rerank_iqr(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs*, RadStream);
@@ -609,12 +705,15 @@ int r4d_rad_gemm_i8a8_rb32_tiled(const RadArgs*, RadStream);
 /* The IQR weights, decoded from their codes where they are read (r4d_gemm_iqr.hip). */
 int r4d_rad_gemm_iqr_m64(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_m64_scratch(const RadArgs*);
+int r4d_rad_gemm_iqr_gated(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs*);
 int r4d_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
+int r4d_rad_had_rotate(const RadArgs*, RadStream);
 int r4d_rad_givens_rotate (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_had_quant_i8g(const RadArgs*, RadStream);
@@ -622,6 +721,7 @@ int r4d_rad_gated_quant_fp8 (const RadArgs*, RadStream);
 int r4d_rad_gated_had_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_gated_had_quant_i8g(const RadArgs*, RadStream);
 int r4d_rad_gate_quant_fp8  (const RadArgs*, RadStream);
+int r4d_rad_gate_had_quant_i8g(const RadArgs*, RadStream);
 int r4d_rad_gram_accum      (const RadArgs*, RadStream);
 /* The same accumulator over a plain bf16 activation, no scale operand. */
 int r4d_rad_gram_accum_bf16 (const RadArgs*, RadStream);
@@ -629,10 +729,14 @@ int r4d_rad_qsa_block_key   (const RadArgs*, RadStream);
 int r4d_rad_qsa_score       (const RadArgs*, RadStream);
 int r4d_rad_qsa_select      (const RadArgs*, RadStream);
 int64_t r4d_rad_qsa_select_scratch(const RadArgs*);
+int r4d_rad_qsa_select_part (const RadArgs*, RadStream);
+int r4d_rad_qsa_select_join (const RadArgs*, RadStream);
 int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
 int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
 int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
+int r4d_rad_qsa_page        (const RadArgs*, RadStream);
+int r4d_rad_kv_transcode    (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_fp8 (const RadArgs*, RadStream);
@@ -655,6 +759,7 @@ R4D_HOOKS(fp8_block)
 R4D_HOOKS(i8_block)
 R4D_HOOKS(iqr)
 R4D_HOOKS(iqr_logits)
+R4D_HOOKS(iqr_vocab)
 R4D_HOOKS(fp8_logits)
 R4D_HOOKS(i8_logits)
 R4D_HOOKS(hc_e4m3)
@@ -773,6 +878,7 @@ int r4d_rad_embed_lookup_q  (const RadArgs*, RadStream);
 int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 int r4d_rad_ple_gate        (const RadArgs*, RadStream);
 int r4d_rad_ple_conv        (const RadArgs*, RadStream);
+int r4d_rad_ple_conv_bias   (const RadArgs*, RadStream);
 int r4d_rad_causal_conv1d   (const RadArgs*, RadStream);
 int r4d_rad_cast            (const RadArgs*, RadStream);
 int r4d_rad_gather_rows     (const RadArgs*, RadStream);
@@ -796,6 +902,7 @@ int r4d_rad_cast_f16        (const RadArgs*, RadStream);
 int r4d_rad_cast_bf16       (const RadArgs*, RadStream);
 int r4d_rad_pool_rows       (const RadArgs*, RadStream);
 int r4d_rad_pool_cols       (const RadArgs*, RadStream);
+int r4d_rad_point_fourier   (const RadArgs*, RadStream);
 int r4d_rad_relu            (const RadArgs*, RadStream);
 int r4d_rad_silu            (const RadArgs*, RadStream);
 int r4d_rad_gelu            (const RadArgs*, RadStream);
@@ -811,6 +918,7 @@ int r4d_rad_logit_softcap   (const RadArgs*, RadStream);
 int r4d_rad_scale           (const RadArgs*, RadStream);
 int r4d_rad_silu_mul        (const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped(const RadArgs*, RadStream);
+int r4d_rad_swiglu_step(const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_dsa_pool(const RadArgs*, RadStream);
 int r4d_shape_dsa_pool(const RadParam*, int, int, RadOpdDesc*);
@@ -827,12 +935,20 @@ int r4d_shape_mla_project(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_dsa_score(const RadArgs*, RadStream);
 int r4d_shape_dsa_score(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_mla_attn(const RadArgs*, RadStream);
+int r4d_rad_mla_attn_paged(const RadArgs*, RadStream);
+int r4d_shape_mla_attn_paged(const RadParam*, int, int, RadOpdDesc*);
 int64_t r4d_rad_mla_attn_scratch(const RadArgs*);
+int64_t r4d_rad_mla_attn_paged_scratch(const RadArgs*);
 int r4d_rad_mla_attn_matrix(const RadArgs*, RadStream);
 int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*);
 int r4d_rad_mla_attn_rows(const RadArgs*, RadStream);
+int r4d_rad_mla_attn_fp8kv(const RadArgs*, RadStream);
+int r4d_rad_mla_attn_matrix_fp8kv(const RadArgs*, RadStream);
+int r4d_rad_mla_attn_rows_fp8kv(const RadArgs*, RadStream);
 int r4d_shape_mla_attn(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk(const RadArgs*, RadStream);
+int r4d_rad_router_sigmoid_group_topk(const RadArgs*, RadStream);
+int r4d_shape_router_sigmoid_group_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_moe_scatter_inv(const RadArgs*, RadStream);
@@ -848,6 +964,7 @@ int r4d_rad_rope_rows       (const RadArgs*, RadStream);
 int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);
 int r4d_rad_grid_embed_aa    (const RadArgs*, RadStream);
+int r4d_rad_grid_embed_cpe   (const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_bias    (const RadArgs*, RadStream);
 /* gemm_nt_bias at f32 (r4d_gemm_f32_nt_bias.hip). */
 int r4d_rad_gemm_f32_nt_bias(const RadArgs*, RadStream);
@@ -855,6 +972,13 @@ int r4d_rad_kv_store        (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8    (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8v4  (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k6v4   (const RadArgs*, RadStream);
+int r4d_rad_kv_store_k4hv4  (const RadArgs*, RadStream);
+int r4d_rad_kv_store_k4hv2h (const RadArgs*, RadStream);
+int r4d_rad_kv_store_i8h    (const RadArgs*, RadStream);
+int r4d_rad_kv_store_k5v4   (const RadArgs*, RadStream);
+/* kv_vpred (r4d_model_bf16.hip): a `vpred` layer's V less its prediction from K, and back. */
+int r4d_rad_kv_vpred_bf16   (const RadArgs*, RadStream);
+int r4d_rad_kv_store_bf16_e4m3r(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_cols(const RadArgs*, RadStream);
 
@@ -902,6 +1026,7 @@ int r4d_shape_mhc_pre(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mhc_pre_partial(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mhc_pre_finish(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_kda_update(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_ssd_update(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_moe_mxfp4(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mhc_post(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mhc_contract(const RadParam*, int, int, RadOpdDesc*);
@@ -914,6 +1039,7 @@ int r4d_shape_mul_weight     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_grid_embed_cpe (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gemm_nt_bias   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_unary          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);
@@ -935,6 +1061,7 @@ int r4d_shape_sample_pick      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_chain     (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_attn_paged        (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_attn_paged_sink   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged_gate_quant(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam*, int, int operand, RadOpdDesc*);
@@ -971,6 +1098,10 @@ int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk_merge (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_pair_argmax    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_cand      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_attn      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_factor    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_lili_walk      (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_quant_act_i8       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_had_quant_act_i8   (const RadParam*, int, int operand, RadOpdDesc*);
@@ -979,6 +1110,7 @@ int r4d_shape_gated_had_quant_i8 (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_gdn_gated_norm_had_quant_i8(const RadParam*, int, int operand,
                                           RadOpdDesc*);
 int r4d_shape_quant_act_fp8      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_had_rotate         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gated_quant_fp8    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rmsnorm_had_quant_i8g (const RadParam*, int, int operand, RadOpdDesc*);
@@ -988,12 +1120,19 @@ int r4d_shape_gram_accum         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_qsa_block_key      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_score          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_select_part    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_select_join    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_page           (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_kv_transcode        (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_kv_vpred            (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov_f32(const RadParam*, int, int operand, RadOpdDesc*);
 
 /* -- declared fusions (r4d_fuse.cpp, pure host) --
  *
@@ -1015,6 +1154,7 @@ int r4d_fuse_router_sigmoid_topk_scatter(const RadParam*, int, uint64_t, int, Ra
 int r4d_fuse_gate_quant_fp8      (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_mx  (const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_gemm_nt_q_gated_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);

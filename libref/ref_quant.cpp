@@ -13,6 +13,8 @@
  *                  and carries the 1/sqrt(group) normalisation, as r4d_had_quant_act_i8 does. A
  *                  rotation block may not cross a tensor-parallel shard, so the width must divide
  *                  the per-rank n.
+ *   had_rotate     the rotation width again, and nothing is quantised: the op multiplies by
+ *                  1/sqrt(group) itself, since no scale follows to fold it into.
  *
  * ============================== The rotation ==============================
  *
@@ -273,6 +275,66 @@ int ref_dequant(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ dequant_w4
+ * The packed 4-bit weight back to a plain row-major bf16 [N, K]. The fragment order is
+ * [t][kb][lh][r][s] with eight nibbles along i, where t = n/16, r = n%16, kb = k/64,
+ * s = (k%64)/16, and the k inside the step is 4*lh + _KOFF[i] with _KOFF = {0,8,1,9,2,10,3,11}.
+ * The scale dword at [t][g][r] holds the f16 scale low and -(1024+zero) high. */
+static const int kKOFF[8] = {0, 8, 1, 9, 2, 10, 3, 11};
+static float f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1fu;
+    uint32_t mant = (uint32_t)(h & 0x3ffu);
+    uint32_t f32;
+    if (exp == 0) {
+        if (mant == 0) f32 = sign;
+        else { while (!(mant & 0x400u)) { mant <<= 1; --exp; } f32 = sign | ((exp + 126u) << 23) | ((mant & 0x3ffu) << 13); }
+    } else if (exp == 31) {
+        f32 = sign | 0x7f800000u | (mant << 13);
+    } else {
+        f32 = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f; std::memcpy(&f, &f32, 4); return f;
+}
+
+int ref_dequant_w4(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *wq = &a->t[0], *ws = &a->t[1], *y = &a->t[2];
+    const int64_t N = y->shape[0], K = y->shape[1];
+    const int64_t group = p_int(a, "group", 128);
+    const int64_t twos  = p_int(a, "twos", 1);
+    if (N <= 0 || K <= 0 || N % 16 || K % 64 || group < 1 || K % group) return RAD_E_SHAPE;
+
+    const uint32_t* Wq = (const uint32_t*)wq->data;
+    const uint32_t* Ws = (const uint32_t*)ws->data;
+    const int64_t nkb = K / 64, ng = K / group;
+    const int64_t ys = y->stride[1];
+
+    for (int64_t idx = 0; idx < N * K / 8; ++idx) {
+        const int s  = (int)(idx & 3);
+        const int r  = (int)((idx >> 2) & 15);
+        const int lh = (int)((idx >> 6) & 1);
+        const int kb = (int)((idx >> 7) % nkb);
+        const int t  = (int)((idx >> 7) / nkb);
+        const int row_n = t * 16 + r;
+        const uint32_t w = Wq[idx];
+
+        const int kbase = kb * 64 + s * 16 + 4 * lh;
+        const uint32_t sz = Ws[(size_t)(t * ng + kbase / group) * 16 + r];
+        const float sc   = f16_bits_to_f32((uint16_t)(sz & 0xFFFFu));
+        const float nz   = f16_bits_to_f32((uint16_t)(sz >> 16));
+        const float zero = -nz - 1024.f;
+
+        for (int i = 0; i < 8; i++) {
+            const int n = (int)((w >> (4 * i)) & 0xF);
+            const float q = twos ? (float)((n ^ 8) - 8) : (float)n;
+            const int k = kbase + kKOFF[i];
+            stt(y, (size_t)row_n * K + k, (q - (twos ? 0.f : zero)) * sc);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ quant_act_fp8
  *
  * The oracle for the block-scaled FP8 family, the activation format the production checkpoints
@@ -345,6 +407,39 @@ int ref_quant_cols_fp8(const RadArgs* a, RadStream) {
             stt(y, rowoff(y, r, n) + c * ys, v);
         }
         stt(s, c * ss, sc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ had_rotate */
+/* The normalised rotation on its own: each `group`-wide block of x (in its logical order, rows of
+ * `n`) becomes H x / sqrt(group), rounded to x's dtype in place. H / sqrt(group) is orthogonal and
+ * symmetric, so it is its own inverse: rotating q and k leaves q.k unchanged, and rotating v then
+ * the attention output gives back the output (an attention output is a weighted sum of v rows),
+ * which is how a layer's KV is stored rotated with its attention kernel unchanged (--kv-recipe
+ * `rotated`, docs/OPS.md). In exact arithmetic; here each pass rounds once to x's dtype, so twice
+ * is x within that rounding.
+ *
+ * The butterflies are fwht's (ref_common.h), the order r4d_fwht.h's wave transform keeps, then one
+ * f32 multiply by had_norm(group) and the store's rounding: libr4d's row is held to these bytes. */
+int ref_had_rotate(const RadArgs* a, RadStream) {
+    if (!have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* x = &a->t[0];
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", 0);
+    if (n <= 0 || g < 2 || !pow2(g) || n % g) return RAD_E_SHAPE;
+    if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (x->dtype != RAD_BF16 && x->dtype != RAD_F16 && x->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t nel = numel(x);
+    if (nel <= 0 || nel % n) return RAD_E_SHAPE;
+    const int64_t blocks = nel / g;
+    const float s = had_norm(g);
+
+    REF_PAR_FOR(nel)
+    for (int64_t b = 0; b < blocks; ++b) {
+        float buf[REF_HAD_MAX];
+        for (int64_t i = 0; i < g; ++i) buf[i] = ldt(x, offlin(x, b * g + i));
+        fwht(buf, g);
+        for (int64_t i = 0; i < g; ++i) stt(x, offlin(x, b * g + i), buf[i] * s);
     }
     return RAD_OK;
 }
@@ -822,6 +917,97 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------ dflash_markov_greedy */
+/* `logits`, `anchor`, `pred`w, `succ`w -> tile-local winners and `tokens`.
+ *
+ * The pinned DSpark reference adds the full-vocabulary bilinear bigram bias to each draft-head
+ * score, then takes a vocabulary-wide greedy argmax at every position. This is deliberately not
+ * `dflash_select`: no top-K candidate restriction is applied, and the result at one position is
+ * the predecessor for the next. Scratch is a 64-token tile decomposition used by the device row;
+ * the reference writes the same tile winners before selecting the global winner. */
+static int ref_markov_greedy(const RadArgs* a, uint32_t logits_dtype) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *anchor = &a->t[1], *pred = &a->t[2];
+    const RadTensor *succ = &a->t[3], *tile_scores = &a->t[4], *tile_tokens = &a->t[5];
+    const RadTensor *out = &a->t[6];
+    if (!logits->data || !anchor->data || !pred->data || !succ->data ||
+        !tile_scores->data || !tile_tokens->data || !out->data) return RAD_E_INVAL;
+    if (logits->dtype != logits_dtype || pred->dtype != RAD_BF16 || succ->dtype != RAD_BF16 ||
+        tile_scores->dtype != RAD_F32 || tile_tokens->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    /* The device requires I32 anchors and reports invalid anchor tensors as shape errors. */
+    if (anchor->dtype != RAD_I32) return RAD_E_SHAPE;
+
+    const int64_t steps = p_int(a, "steps", 0);
+    const int64_t R = p_int(a, "rank", 0);
+    const int64_t V = p_int(a, "n_vocab", 0);
+    const int64_t astr = p_int(a, "anchor_stride", 1);
+    const int64_t M = steps > 0 && V > 0
+                    ? band_rows(numel(logits) / (steps * V), p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr <= 0) return RAD_E_SHAPE;
+    if (numel(logits) < M * steps * V || numel(anchor) < (M - 1) * astr + 1 ||
+        numel(pred) < V * R || numel(succ) < V * R || numel(out) < M * steps)
+        return RAD_E_SHAPE;
+    const int64_t n_tiles = (V + 63) / 64;
+    if (numel(tile_scores) < M * n_tiles || numel(tile_tokens) < M * n_tiles)
+        return RAD_E_SHAPE;
+
+    const int64_t ls = laststride(logits), ps = laststride(pred), ss = laststride(succ);
+    const int64_t os = laststride(out), tss = laststride(tile_scores), tis = laststride(tile_tokens);
+    REF_PAR_FOR(M * steps * V * R)
+    for (int64_t m = 0; m < M; ++m) {
+        std::vector<float> previous((size_t)R);
+        int64_t pid = ld_int(anchor->dtype, anchor->data, offlin(anchor, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t row = m * steps + l;
+            const bool pid_ok = pid >= 0 && pid < V;
+            const int64_t pb = pid_ok ? rowoff(pred, pid, R) : 0;
+            for (int64_t r = 0; r < R; ++r)
+                previous[(size_t)r] = pid_ok ? ldt(pred, pb + r * ps) : 0.0f;
+
+            float global_best = -INFINITY;
+            int64_t global_token = 0;
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64;
+                const int64_t end = std::min<int64_t>(first + 64, V);
+                float best = -INFINITY;
+                int64_t best_token = first;
+                const int64_t lb = rowoff(logits, row, V);
+                for (int64_t token = first; token < end; ++token) {
+                    const float base = ldt(logits, lb + token * ls);
+                    float score = logits_dtype == RAD_F32 ? 0.0f : base;
+                    const int64_t sb = rowoff(succ, token, R);
+                    for (int64_t r = 0; r < R; ++r)
+                        score += previous[(size_t)r] * ldt(succ, sb + r * ss);
+                    if (logits_dtype == RAD_F32) score += base;
+                    if (score > best || (score == best && token < best_token)) {
+                        best = score;
+                        best_token = token;
+                    }
+                }
+                stt(tile_scores, rowoff(tile_scores, m, n_tiles) + tile * tss, best);
+                st_int(tile_tokens->dtype, tile_tokens->data,
+                       rowoff(tile_tokens, m, n_tiles) + tile * tis, best_token);
+                if (best > global_best || (best == global_best && best_token < global_token)) {
+                    global_best = best;
+                    global_token = best_token;
+                }
+            }
+            st_int(out->dtype, out->data, rowoff(out, m, steps) + l * os, global_token);
+            pid = global_token;
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
+    return ref_markov_greedy(a, RAD_BF16);
+}
+
+int ref_dflash_markov_greedy_f32(const RadArgs* a, RadStream) {
+    return ref_markov_greedy(a, RAD_F32);
 }
 
 /* ------------------------------------------------------------- dflash_tree */

@@ -50,6 +50,12 @@ add_executable(rad-tokcheck rad_tokcheck.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.c
 target_link_libraries(rad-tokcheck PRIVATE rad_tokref rad_core)
 set_target_properties(rad-tokcheck PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# rad-autoquant runs the engine as a child for every measurement and loads no plugin itself, so like
+# rad-tokcheck it links the core plainly: the recipe parser and the solver (core/kv_autoquant.h).
+add_executable(rad-autoquant rad_autoquant.cpp)
+target_link_libraries(rad-autoquant PRIVATE rad_core)
+set_target_properties(rad-autoquant PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # rad-schemas links no core: it dlopens plugins and reads their static schema tables, so it works on
 # a plugin the engine cannot load.
 add_executable(rad-schemas rad_schemas.cpp)
@@ -81,7 +87,7 @@ set_target_properties(rad-gbnf-check PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE
 
 # rad-schemas matters most in an installed prefix: it needs only the four exports every kernel
 # plugin has, so it can debug an out-of-tree plugin the engine cannot load.
-install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokcheck
+install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokcheck rad-autoquant
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # rad-chatparse: the reply parser's acceptance run against a checkpoint's real tokenizer and chat

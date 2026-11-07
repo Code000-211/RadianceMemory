@@ -10,6 +10,8 @@
  *                        loaded code. The only observed term, printed on its own line so a
  *                        desktop on the card shows up there instead of shrinking a pool.
  *   --gpu-headroom-mib   what the operator leaves alone (default 96 MiB).
+ *   --gpu-memory-mib     the inverse: claim this much of the card; headroom is the rest.
+ *                        Not with --gpu-headroom-mib.
  *   arena                activation arena plus scratch, from arena_plan_bytes() on the buffer
  *                        plan, the same call that later allocates it.
  *
@@ -32,9 +34,9 @@
  * KVManager::ceiling; the experts at the whole plane) and one side's excess goes to the other.
  *
  * No flag states a pool size: unbudgeted VRAM is unusable, and on a model whose experts do not
- * fit every unbudgeted GiB costs decode time. Operators move the inputs instead: --gpu-headroom-mib,
- * --max-model-len and --max-num-seqs (cache bound), --host-pool-mib (which experts must stay on
- * the card).
+ * fit every unbudgeted GiB costs decode time. Operators move the inputs instead: --gpu-headroom-mib
+ * or --gpu-memory-mib, --max-model-len and --max-num-seqs (cache bound), --host-pool-mib (which
+ * experts must stay on the card).
  *
  * The host backend uses half the machine's memory as its capacity (host_vram_bytes) and splits it
  * like a card; its weights pool holds what a host kernel cannot read where the container stores it

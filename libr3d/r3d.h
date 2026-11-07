@@ -196,7 +196,7 @@ int r3d_gemm_nt_bf16_tiled(long a, long b, long y, int M, int N, int K, int a_ld
  * RAD_BF16 reads bf16, anything else (0 included) reads f32. */
 int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, long y, int M, int N, int K,
                          int group, int pb1, int pb2, int a_ld, int y_ld, int sk, int nt,
-                         long scratch, int bs_dt, long stream);
+                         long scratch, int bs_dt, long stream, long bias);
 
 /* ================================================================== r3d_attn_paged_h128.hip
  *

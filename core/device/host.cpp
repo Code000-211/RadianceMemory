@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -723,6 +724,21 @@ constexpr int64_t kVmemGranule = RAD_ALIGN_POOL;
 
 int64_t h_vmem_granularity(void) { return kVmemGranule; }
 
+/* Each reservation's card, recorded at reserve: the thread that later commits into a pool, or
+ * releases it at teardown, may have selected another card, and the pages count against the card
+ * the range was reserved for (as the AQL backend's VRes does). Keyed by base. */
+struct VRange { char* end; int device; };
+std::mutex                   g_vres_mu;
+std::map<const char*, VRange> g_vres;
+
+int vmem_device_of(const void* addr) {
+    std::lock_guard<std::mutex> lk(g_vres_mu);
+    auto it = g_vres.upper_bound((const char*)addr);
+    if (it == g_vres.begin()) return t_device;
+    --it;
+    return (const char*)addr < it->second.end ? it->second.device : t_device;
+}
+
 void* h_vmem_reserve(int64_t bytes, int64_t align) {
     if (bytes <= 0) return nullptr;
     if (align < kVmemGranule) align = kVmemGranule;
@@ -740,11 +756,20 @@ void* h_vmem_reserve(int64_t bytes, int64_t align) {
     if (head) ::munmap(raw, head);
     const size_t tail = raw_len - head - (size_t)bytes;
     if (tail) ::munmap(base + bytes, tail);
+    {
+        std::lock_guard<std::mutex> lk(g_vres_mu);
+        g_vres[base] = VRange{ base + bytes, t_device };
+    }
     return base;
 }
 
 void h_vmem_release(void* base, int64_t bytes) {
-    if (base && bytes > 0) ::munmap(base, (size_t)bytes);
+    if (!base || bytes <= 0) return;
+    {
+        std::lock_guard<std::mutex> lk(g_vres_mu);
+        g_vres.erase((const char*)base);
+    }
+    ::munmap(base, (size_t)bytes);
 }
 
 int h_vmem_commit(void* addr, int64_t bytes) {
@@ -755,7 +780,7 @@ int h_vmem_commit(void* addr, int64_t bytes) {
         device_set_error("vmem_commit(%p, %lld): mmap failed", addr, (long long)bytes);
         return RAD_E_NOMEM;
     }
-    g_used[t_device].fetch_add(bytes, std::memory_order_relaxed);
+    g_used[vmem_device_of(addr)].fetch_add(bytes, std::memory_order_relaxed);
     return RAD_OK;
 }
 
@@ -769,7 +794,7 @@ int h_vmem_decommit(void* addr, int64_t bytes) {
         device_set_error("vmem_decommit(%p, %lld): mmap failed", addr, (long long)bytes);
         return RAD_E_INVAL;
     }
-    g_used[t_device].fetch_sub(bytes, std::memory_order_relaxed);
+    g_used[vmem_device_of(addr)].fetch_sub(bytes, std::memory_order_relaxed);
     return RAD_OK;
 }
 

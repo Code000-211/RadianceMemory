@@ -48,7 +48,7 @@ void RadFile::close() {
 
 int RadFile::read_at(void* dst, int64_t bytes, int64_t off) const {
     if (fd_ < 0) { RAD_ERR("read_at on a closed container"); return RAD_E_STATE; }
-    if (off < 0 || bytes < 0 || off + bytes > size_) {
+    if (off < 0 || bytes < 0 || off > size_ || bytes > size_ - off) {
         RAD_ERR("read_at [%lld, %lld) is outside the %lld-byte container",
                 (long long)off, (long long)(off + bytes), (long long)size_);
         return RAD_E_FORMAT;
@@ -210,6 +210,21 @@ int RadFile::validate() {
         return RAD_E_FORMAT;
     }
 
+    /* The tables are read in place through typed pointers, so each must sit on its element's
+     * alignment (the writer places every one 8-aligned), as the vocab section's arrays must. */
+    auto aligned = [&](uint64_t off, uint64_t count, size_t align, const char* what) {
+        if (count == 0 || off % align == 0) return true;
+        RAD_ERR("%s: %s starts at %llu, which is not %zu-aligned", path_.c_str(), what,
+                (unsigned long long)off, align);
+        return false;
+    };
+    if (!aligned(hdr_->meta_off, hdr_->meta_count, alignof(RadFileKV), "the metadata table") ||
+        !aligned(hdr_->dir_off, hdr_->dir_count, alignof(RadFileEntry), "the weight directory") ||
+        !aligned(hdr_->plane_off, hdr_->plane_count, alignof(RadFilePlane), "the plane table") ||
+        !aligned(hdr_->enc_off, hdr_->enc_count, alignof(RadEncoding), "the encoding table") ||
+        !aligned(hdr_->prof_off, hdr_->prof_count, alignof(RadFileProfile), "the expert profile"))
+        return RAD_E_FORMAT;
+
     meta_ = (const RadFileKV*)(base_ + hdr_->meta_off);
     dir_  = (const RadFileEntry*)(base_ + hdr_->dir_off);
     planes_ = (const RadFilePlane*)(base_ + hdr_->plane_off);
@@ -335,18 +350,21 @@ int RadFile::validate() {
         }
         const RadVocabHeader* v = (const RadVocabHeader*)(base_ + voff);
         /* Offset 0 means an optional array is absent (scores are unigram-only; types default to
-         * normal). Nothing real lives at file offset 0. */
-        auto arr_ok = [&](uint64_t off, uint64_t bytes, size_t align) {
-            return bytes == 0 || off == 0 ||
-                   (off >= voff && off - voff <= vbytes && bytes <= vbytes - (off - voff) &&
-                    off % align == 0);
+         * normal). Nothing real lives at file offset 0. Token texts, merges and steps are not
+         * optional: the writer places each one its count says exists, and a reader handed a
+         * count with no array would read the file header in its place. */
+        auto arr_ok = [&](uint64_t off, uint64_t bytes, size_t align, bool optional) {
+            if (bytes == 0) return true;
+            if (off == 0) return optional;
+            return off >= voff && off - voff <= vbytes && bytes <= vbytes - (off - voff) &&
+                   off % align == 0;
         };
         const uint64_t nt = v->n_tokens, nm = v->n_merges, ns = v->n_steps;
-        if (!arr_ok(v->tok_text_off,  nt * sizeof(rad_stroff), alignof(rad_stroff)) ||
-            !arr_ok(v->tok_score_off, nt * sizeof(float), alignof(float)) ||
-            !arr_ok(v->tok_type_off,  nt, 1) ||
-            !arr_ok(v->merge_off,     nm * 2 * sizeof(uint32_t), alignof(uint32_t)) ||
-            !arr_ok(v->step_off,      ns * sizeof(RadVocabStep), alignof(RadVocabStep))) {
+        if (!arr_ok(v->tok_text_off,  nt * sizeof(rad_stroff), alignof(rad_stroff), false) ||
+            !arr_ok(v->tok_score_off, nt * sizeof(float), alignof(float), true) ||
+            !arr_ok(v->tok_type_off,  nt, 1, true) ||
+            !arr_ok(v->merge_off,     nm * 2 * sizeof(uint32_t), alignof(uint32_t), false) ||
+            !arr_ok(v->step_off,      ns * sizeof(RadVocabStep), alignof(RadVocabStep), false)) {
             RAD_ERR("%s: the %s section's arrays do not fit inside it, or one is not aligned to its "
                     "element",
                     path_.c_str(), what);
@@ -458,7 +476,17 @@ int RadFile::index_experts() {
                 return RAD_E_FORMAT;
             }
             const uint64_t ebase = dir_[j].offset;
-            if (e_id == 1) g.stride = ebase - g.base;
+            if (e_id == 1) {
+                /* Expert 1 defines the stride, so the arithmetic test below cannot check it: it
+                 * must step forward by at least one whole unit, or experts overlap (or wrap). */
+                if (ebase < g.base || ebase - g.base < g.unit_bytes) {
+                    RAD_ERR("%s: layer %d expert 1 starts at %llu, inside or before expert 0's "
+                            "%llu bytes at %llu", path_.c_str(), layer, (unsigned long long)ebase,
+                            (unsigned long long)g.unit_bytes, (unsigned long long)g.base);
+                    return RAD_E_FORMAT;
+                }
+                g.stride = ebase - g.base;
+            }
             if (ebase != g.base + (uint64_t)e_id * g.stride) {
                 RAD_ERR("%s: layer %d expert %d starts at %llu, but base + %d*%llu is %llu -- the "
                         "layer has no fixed stride and cannot be addressed by arithmetic",
@@ -565,8 +593,16 @@ void RadWriter::abort() {
         /* The file is the caller's container: restore its header (a no-op unless finish_append()
          * failed in that write) and truncate the tail. */
         if (fd_out_ >= 0) {
-            (void)!::pwrite(fd_out_, &old_hdr_, sizeof old_hdr_, 0);
-            (void)!::ftruncate(fd_out_, (off_t)old_size_);
+            /* A failed restore leaves a file that is neither the old container nor the new one,
+             * and the caller has only been told that the write failed. */
+            const bool hdr_ok = ::pwrite(fd_out_, &old_hdr_, sizeof old_hdr_, 0) ==
+                                (ssize_t)sizeof old_hdr_;
+            const bool cut_ok = ::ftruncate(fd_out_, (off_t)old_size_) == 0;
+            if (!hdr_ok || !cut_ok)
+                RAD_ERR("%s: the append was undone only in part (%s) -- the container is damaged; "
+                        "restore it from a copy", path_.c_str(),
+                        !hdr_ok ? "its header could not be rewritten"
+                                : "its tail could not be cut back");
             ::close(fd_out_);
         }
         if (fd_spill_ >= 0) ::close(fd_spill_);
@@ -1009,8 +1045,11 @@ int RadWriter::set_vocab_section(const void* blob, int64_t bytes) {
         !fits(h->tok_score_off, h->tok_score_off ? (uint64_t)h->n_tokens * sizeof(float) : 0) ||
         !fits(h->tok_type_off,  h->tok_type_off ? h->n_tokens : 0) ||
         !fits(h->merge_off,     (uint64_t)h->n_merges * 2 * sizeof(uint32_t)) ||
-        !fits(h->step_off,      (uint64_t)h->n_steps * sizeof(RadVocabStep))) {
-        RAD_ERR("the vocab section's arrays do not fit inside its %lld bytes. Its offsets must be "
+        !fits(h->step_off,      (uint64_t)h->n_steps * sizeof(RadVocabStep)) ||
+        (h->n_tokens && !h->tok_text_off) || (h->n_merges && !h->merge_off) ||
+        (h->n_steps && !h->step_off)) {
+        RAD_ERR("the vocab section's arrays do not fit inside its %lld bytes, or one its count "
+                "names is absent. Its offsets must be "
                 "SECTION-RELATIVE -- serialise with a section_file_off of 0 and let finish() "
                 "rebase them.", (long long)bytes);
         return RAD_E_INVAL;

@@ -272,6 +272,25 @@ TEST(an_expert_reads_its_own_hessian_before_its_layers) {
     CHECK(same_planes(run(both, e11), run(only_pool, e11)));
 }
 
+TEST(a_vocabulary_heads_width_class_reads_the_heads_hessian) {
+    /* A calibration run records the lm_head's input as `output`; the vocabulary-weighted head's
+     * classes (output.k3, output.k4, ...) are rows of that one weight and quantise against it, as
+     * a weight named `output` does. With no Gram at all GPTQ rounds to nearest, which differs. */
+    NEED_LIBQUANT();
+    const TempDir t("rad_quant_vhead"), e("rad_quant_novhead");
+    REQUIRE(!t.path.empty() && !e.path.empty());
+    REQUIRE(write_gram(t.path + "/gram.r0.output.bin", kC, kT, H()));
+    auto run = [&](const std::string& dir, const char* name) -> Quantised {
+        Opts o;
+        o.s("codes", "i4").i("group", 32).s("scale", "f16").s("calib", dir.c_str());
+        Quantised q = quantise(quantizer("gptq"), o, name, kR, kC, weight());
+        CHECK_EQ(q.status, RAD_OK);
+        return q;
+    };
+    CHECK(same_planes(run(t.path, "output.k4.weight"), run(t.path, "output.weight")));
+    CHECK(!same_planes(run(t.path, "output.k4.weight"), run(e.path, "output.k4.weight")));
+}
+
 TEST(gptq_through_lapack_matches_the_loops) {
     /* Where OpenBLAS was found the factorisations go through LAPACK; RAD_LQ_LAPACK=0 takes the
      * single-threaded loops, the reference. The same Gram in two directories (the factor cache is

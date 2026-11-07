@@ -32,10 +32,12 @@ struct StatsScheduler : FakeScheduler {
         r.slot = 2;
         r.age_s = 4.5;
         r.ttft_s = 0.25;
+        r.prefill_s = 0.20;
         r.decode_tps = 61.0;
         out->assign(1, r);
         return 1;
     }
+    int64_t session_res_demoted = 0;
     int sessions(std::vector<SessionStat>* out, SessionOccupancy* occ) const override {
         SessionStat s;
         s.id = 7;
@@ -51,6 +53,7 @@ struct StatsScheduler : FakeScheduler {
         s.snap_bytes = 4096;
         s.resume_tokens = 4096;
         s.moving = true;
+        s.res_demoted = session_res_demoted;
         out->assign(1, s);
         occ->host_bytes = 8 << 20;
         occ->host_cap_bytes = 64 << 20;
@@ -221,6 +224,7 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(r.value("state", ""), std::string("decode"));
     CHECK_EQ(r.value("kv_tokens", (int64_t)0), (int64_t)960);
     CHECK_NEAR(r.value("ttft_s", -1.0), 0.25, 1e-12);
+    CHECK_NEAR(r.value("prefill_s", -1.0), 0.20, 1e-12);
     REQUIRE(s["cards"].size() == 1);
     CHECK_EQ(s["cards"][0].value("name", ""), std::string("R9700"));
     REQUIRE(s["experts"]["tiers"].size() == (size_t)kTierCount);
@@ -241,6 +245,35 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
     Dash g(true);
     CHECK_EQ(g.get("/graph").value("order", json()).size(), (size_t)0);
+}
+
+/* The residency counters are on /stats and, per session, on /sessions, under their final names,
+ * and they follow the scheduler: the second poll after a sweep reads larger numbers. The
+ * per-session ones are the session's own, so two sessions may both include a shared block. */
+TEST(stats_and_sessions_report_residency_counters_and_they_move) {
+    Dash d(false);
+    const json a = d.get("/stats")["kv_residency"];
+    for (const char* k : { "demoted", "promoted", "skipped", "misses", "host_bytes", "cap_bytes",
+                           "freed_bytes", "link_bytes", "scratch_bytes" })
+        CHECK(a.contains(k));
+    CHECK_EQ(a.value("demoted", (int64_t)-1), (int64_t)0);
+
+    d.sched.m.res_demoted = 30;   d.sched.m.res_promoted = 2;  d.sched.m.res_skipped = 4;
+    d.sched.m.res_link_bytes = 65536; d.sched.m.res_freed_bytes = 61440;
+    d.sched.m.res_host_bytes = 61440; d.sched.m.res_scratch_bytes = 8192;
+    const json b = d.get("/stats")["kv_residency"];
+    CHECK_EQ(b.value("demoted", (int64_t)0), (int64_t)30);
+    CHECK_EQ(b.value("promoted", (int64_t)0), (int64_t)2);
+    CHECK_EQ(b.value("skipped", (int64_t)0), (int64_t)4);
+    CHECK_EQ(b.value("link_bytes", (int64_t)0), (int64_t)65536);
+    CHECK_EQ(b.value("freed_bytes", (int64_t)0), (int64_t)61440);
+    CHECK_EQ(b.value("host_bytes", (int64_t)0), (int64_t)61440);
+    CHECK_EQ(b.value("scratch_bytes", (int64_t)0), (int64_t)8192);
+
+    d.sched.session_res_demoted = 12;
+    const json s = d.get("/sessions")["sessions"][0]["kv_residency"];
+    CHECK_EQ(s.value("demoted", (int64_t)0), (int64_t)12);
+    for (const char* k : { "promoted", "skipped", "link_bytes", "freed_bytes" }) CHECK(s.contains(k));
 }
 
 /* /sessions lists each stored conversation with where its blocks are, the pool as the card holds

@@ -67,6 +67,43 @@ int copy_rows(const RadArgs* a, RadStream s, bool scatter) {
     return RAD_OK;
 }
 
+/* A stand-in for `kv_transcode` (window residency's demote layout, RAD_KVQ_DEMOTE), so the tiered
+ * transfer's addressing -- which rows, at which widths and pitches, land in which slot and block --
+ * is testable on the host backend. NOT the codec (libref's kvx_rows is, held by ref_test and on the
+ * card): a row keeps its first min(from, to) bytes and a wider output is padded with 0xA5, so a
+ * demote then promote gives a block whose bytes the test can predict from the original. */
+int64_t t_row(const char* lay, int64_t hd) {
+    if (!lay) return -1;
+    return !std::strcmp(lay, "fp8") ? 2 * hd : !std::strcmp(lay, "i8h") ? 2 * hd + 4
+         : !std::strcmp(lay, "k4h_v4") ? 18 * hd / 16 : !std::strcmp(lay, "k4h_v2h") ? 14 * hd / 16
+         : -1;
+}
+const char* t_str(const RadArgs* a, const char* k) {
+    for (int i = 0; i < a->n_p; ++i)
+        if (a->p[i].kind == RAD_P_STR && !std::strcmp(a->p[i].key, k)) return a->p[i].sval;
+    return nullptr;
+}
+int64_t t_int(const RadArgs* a, const char* k) {
+    for (int i = 0; i < a->n_p; ++i)
+        if (a->p[i].kind == RAD_P_INT && !std::strcmp(a->p[i].key, k)) return a->p[i].ival;
+    return 0;
+}
+int t_transcode(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t != 2) return RAD_E_INVAL;
+    if (rad_stream_sync(s) != RAD_OK) return RAD_E_DEVICE;
+    Rows x, o;
+    if (!rows_of(a->t[0], &x) || !rows_of(a->t[1], &o) || x.n != o.n) return RAD_E_SHAPE;
+    const int64_t hd = t_int(a, "head_dim");
+    if (x.width != t_row(t_str(a, "from"), hd) || o.width != t_row(t_str(a, "to"), hd))
+        return RAD_E_SHAPE;
+    for (int64_t r = 0; r < x.n; ++r) {
+        char* d = o.p + r * o.pitch;
+        const char* src = x.p + r * x.pitch;
+        for (int64_t j = 0; j < o.width; ++j) d[j] = j < x.width ? src[j] : (char)0xA5;
+    }
+    return RAD_OK;
+}
+
 int t_gather(const RadArgs* a, RadStream s)  { return copy_rows(a, s, false); }
 int t_scatter(const RadArgs* a, RadStream s) { return copy_rows(a, s, true); }
 
@@ -84,9 +121,16 @@ static const RadOperandSpec kGather[]  = {
 static const RadOperandSpec kScatter[] = {
     { "v", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
 };
+static const RadParamSpec kPx[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "head_dim", RAD_P_INT, RAD_REQUIRED },
+    { "from", RAD_P_STR, RAD_REQUIRED }, { "to", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec kXcode[] = { { "x", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 } };
 static const RadOpSchema kSchemas[] = {
     { "gather_rows", kP, NELEM(kP), kGather, NELEM(kGather), "y[i,:] = x[idx[i],:]" },
     { "scatter_rows", kP, NELEM(kP), kScatter, NELEM(kScatter), "x[idx[i],:] = v[i,:]" },
+    { "kv_transcode", kPx, NELEM(kPx), kXcode, NELEM(kXcode),
+      "a stand-in: each row's first bytes, padded with 0xA5" },
 };
 static const RadKernelInfo kKernels[] = {
     { .name = "t_rows_gather", .op = "gather_rows", .family = "elem",
@@ -95,6 +139,9 @@ static const RadKernelInfo kKernels[] = {
     { .name = "t_rows_scatter", .op = "scatter_rows", .family = "elem",
       .computes = "byte rows, on the host backend's memory", .shape = "any", .dtypes = "u8",
       .domain = RAD_DOMAIN_DEVICE, .priority = 0, .launch = t_scatter },
+    { .name = "t_rows_transcode", .op = "kv_transcode", .family = "elem",
+      .computes = "a stand-in row map, on the host backend's memory", .shape = "any",
+      .dtypes = "u8", .domain = RAD_DOMAIN_DEVICE, .priority = 0, .launch = t_transcode },
 };
 static const RadPluginInfo kInfo = {
     RAD_PLUGIN_KERNEL, "radtest_rows", "0.1",

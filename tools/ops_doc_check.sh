@@ -37,6 +37,8 @@ function t_opd(t,   q,w,io) {
     if (sub(/:inout$/, "", t)) io = ":inout"
     sub(/:(in|out)$/, "", t); return t w io q }
 # ---- doc notation: `name` followed by its annotations -------------------------------------
+# POSIX awk only: mawk, Debian's and Ubuntu's default awk, has no gensub.
+function trim(t) { sub(/^ +/, "", t); sub(/ +$/, "", t); return t }
 function d_name(t,   a) { a = index(substr(t, 2), "`"); return substr(t, 2, a - 1) }
 function d_rest(t,   a) { a = index(substr(t, 2), "`"); return substr(t, a + 2) }
 function d_param(t,   n,r,f,o) {
@@ -63,9 +65,9 @@ FILENAME != doc {
 # ---- the doc rows --------------------------------------------------------------------------
 /^\| `/ {
     n = split($0, c, "|")
-    op = d_name(gensub(/^ +| +$/, "", "g", c[2])); documented[op] = 1
+    op = d_name(trim(c[2])); documented[op] = 1
     if (n > 5) { exempt++; printf "exempt  %-24s line %d -- %s\n", op, FNR,
-                        gensub(/^ +| +$/, "", "g", c[5]); next }
+                        trim(c[5]); next }
     pc = c[3]; oc = c[4]; gsub(/[,;]/, " ", pc); gsub(/[,;]|→/, " ", oc)
     ps = ""; np = split(pc, pa, /[ \t]+/)
     for (i = 1; i <= np; i++) { v = d_param(pa[i]); if (v != "") ps = ps (ps == "" ? "" : " ") v }

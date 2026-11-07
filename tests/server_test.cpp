@@ -3720,6 +3720,25 @@ TEST(messages_refuse_a_field_they_do_not_know) {
     CHECK(f.sched.submitted.empty());
 }
 
+/* The chat path's history penalties and min-p are taken at the top level under the chat path's
+ * names and reach the sampler as there; out of range they are refused by name, as there. */
+TEST(messages_carry_the_penalties_and_min_p_to_the_sampler) {
+    Fixture f;
+    f.sched.reply = "fine";
+    const HttpResponse r = post_messages(f, R"("presence_penalty":1.5,"frequency_penalty":0.25,)"
+                                            R"("repetition_penalty":1.05,"min_p":0.05,)"
+                                            R"("repeat_last_n":256)");
+    CHECK_EQ(r.status, 200);
+    CHECK_NEAR(f.sched.last_sp.pres_penalty, 1.5f, 1e-6);
+    CHECK_NEAR(f.sched.last_sp.freq_penalty, 0.25f, 1e-6);
+    CHECK_NEAR(f.sched.last_sp.rep_penalty, 1.05f, 1e-6);
+    CHECK_NEAR(f.sched.last_sp.min_p, 0.05f, 1e-6);
+    CHECK_EQ(f.sched.last_sp.penalty_last_n, 256);
+    Fixture g;
+    CHECK(anthropic_refusal(post_messages(g, R"("presence_penalty":3)"), "presence_penalty"));
+    CHECK(g.sched.submitted.empty());
+}
+
 /* What cannot change the answer here is taken and not acted on: capacity and placement,
  * prompt-cache control, and the inputs of Anthropic's own classifiers and fallbacks. */
 TEST(messages_take_the_fields_that_change_nothing_here) {

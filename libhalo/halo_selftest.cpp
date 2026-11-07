@@ -31219,6 +31219,40 @@ static void device_phase(const Plugin& pl) {
             return v;
         };
 
+        /* point_fourier: a shape decoder's query points (three values, eight octaves, f32), past
+         * the 65535 rows one grid row a matrix row would reach, against libm's sinf and cosf. */
+        if (sel("point_fourier_f32")) {
+            if (const RadKernelInfo* r = find(pl, "point_fourier_f32")) {
+                const int64_t M = 70001, n = 3, F = 8, W = n * (2 * F + 1);
+                std::vector<float> x = randv((size_t)(M * n), 1.01f);
+                void* dx = dalloc(x.size() * 4);
+                void* dy = dalloc((size_t)(M * W) * 4);
+                if (dx) st_memcpy(dx, x.data(), x.size() * 4, hipMemcpyHostToDevice);
+                std::vector<RadTensor> ts = { T(dx, RAD_F32, { M, n }), T(dy, RAD_F32, { M, W }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("freqs", F),
+                                             PS("dtype", "f32") };
+                run_case(r, ts, ps);
+                std::vector<float> got((size_t)(M * W));
+                st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+                double worst = 0.0;
+                for (int64_t m = 0; m < M; ++m)
+                    for (int64_t i = 0; i < n; ++i) {
+                        const float v = x[(size_t)(m * n + i)];
+                        worst = std::max(worst, (double)std::fabs(got[(size_t)(m * W + i)] - v));
+                        for (int64_t j = 0; j < F; ++j) {
+                            const float t = v * std::ldexp(1.0f, (int)j);
+                            const float* g = &got[(size_t)(m * W)];
+                            const float es = g[n + i * F + j] - std::sin(t);
+                            const float ec = g[n + n * F + i * F + j] - std::cos(t);
+                            worst = std::max(worst, (double)std::max(std::fabs(es), std::fabs(ec)));
+                        }
+                    }
+                char d[96];
+                std::snprintf(d, sizeof d, "max abs err %.3g", worst);
+                ok("point_fourier_f32 numerics", worst <= 1e-5, d);
+            } else ok("point_fourier_f32", false, "row absent");
+        }
+
         if (sel("relu_bf16") || sel("silu_bf16") || sel("clamp_bf16")) {
             const int64_t M = 5, n = 300;
             std::vector<float> x = randv((size_t)(M * n), 2.0f);

@@ -85,7 +85,7 @@ stateDiagram-v2
     Demoting --> Cold : copy to the store has landed\n→ pool block freed
     Cold --> Resident : promotion (dense step)\nnew pool block, copy back
     Cold --> Paged : a decode step selects it
-    Paged --> Cold : step ends\n(scratch page is per step)
+    Paged --> Cold : step ends\n(the entry; the page keeps a copy)
     Resident --> Cold : re-point (unchanged block\nwhose origin slot is still held)\n→ no copy at all
     Resident --> [*] : sequence freed
     Cold --> [*] : last reference gone\n→ slot freed
@@ -94,9 +94,10 @@ stateDiagram-v2
 * **Demoting.** The copy to the host store is in flight. The entry already reads cold, but the pool
   block keeps its reference until the copy has landed, so nothing can reuse it while it is being
   read.
-* **Paged.** A decode step selected the cold block. The pager copied it into one of that step's
-  scratch pages, and the step's selection points there. On the next step that copy is gone and the
-  entry is cold again. Nothing in the table changed.
+* **Paged.** A decode step selected the cold block. The pager copied it into one of the row's
+  scratch pages, and the step's selection points there. The entry in the table stays cold; the
+  page keeps the copy until the row's pager needs it for another block, so a later step selecting
+  the block again reads it there without a copy (the page cache, [§4](#4-a-decode-step-the-pager)).
 
 ---
 
@@ -106,7 +107,10 @@ The model plugin declares how much of the history its consumer reads. In `arch/c
 attention group `kv_attn` declares the indexer's budget, 2 048 tokens, through
 `rad_kv_set_residency_window`. The block-key group `kv_qsa_bkey` declares **nothing**: the indexer
 scores every block key on every step, so those pages must stay resident. At bf16 they are 3.25 of the
-29.25 KiB a 4-token block costs, and no window can shrink them.
+29.25 KiB a 4-token block costs, and no window can shrink them. `--qsa-bkey-dtype i8` stores them as
+int8 with one f16 scale a key, 1.73 KiB a block (the page 136 bytes a layer), so the resident floor
+under residency drops from 832 to 442 bytes a token a card ([`docs/QSA.md`](docs/QSA.md),
+"Block-key storage").
 
 Only a group that declares a window is ever demoted. For that group a sequence keeps two ends:
 
@@ -125,8 +129,9 @@ every step, which costs more than it saves.
 
 * the sink and the tail,
 * the last, partial block, because the next token is written into it,
-* a block another holder has a reference on and cannot follow into the store, such as a forked
-  child. The prefix cache can follow, as described in [§7](#7-the-prefix-cache-cold-blocks-stay-reusable).
+* a block another live sequence also holds, such as a forked child or a second request that hit
+  the same cached prefix: that sequence's step reads it through its own table. The prefix cache
+  follows a demotion instead, as described in [§7](#7-the-prefix-cache-cold-blocks-stay-reusable).
 
 ---
 
@@ -171,7 +176,54 @@ Properties of the pager:
 * **Counted.** The kernel adds the number of entries it rewrote to one int64 on the card (`paged_in`).
   `/stats` reads that counter back on a poll, never per step.
 * **Scratch.** Each decode row has `topk + 1` scratch pages of its own. They are reserved when the
-  pool is carved and are valid for one step.
+  pool is carved.
+* **Cached across steps.** A scratch page keeps the block it last received (per layer, a tag of
+  `1 + slot` on the card), so a step whose selection names that block again rewrites the entry to
+  that page and copies nothing; only the blocks new to the row's selection cross the link. See
+  [the page cache](#the-page-cache-hiding-the-page-in) below.
+
+### The page cache: hiding the page-in
+
+The pager copies a layer's selected cold blocks over PCIe while the card waits, 3-15 % of a
+single-sequence decode (fp8 at 128K: 85 -> 72 tokens/s). A prefetch of the previous step's
+selection on the copy engine during the preceding gated-delta-net layers cannot be built in this
+engine without a larger restructuring: the selection exists only on the card (`w.sel`, written by
+`qsa_select` in `arch/common/rad_qsa.h` `QsaIndexer::step` and paged right after it), the host never
+learns it, and a DMA copy needs its addresses on the host -- the expert prefetch
+(`core/runtime/xprefetch.h`) gets them through a pinned mailbox, a host thread and device-side
+polling, a machinery a page per block per layer would multiply by 12 x 512.
+
+It is also not needed. The bytes such a prefetch would bring are already on the card: the previous
+step's pager wrote every block that layer selected into the row's scratch pages, and nothing else
+writes them. So the pager became a cache over its own pages. Per row and layer (one launch, two
+kernels):
+
+1. **Plan** (a workgroup a row): every cold entry whose slot a page of the row is tagged with is a
+   hit and is rewritten to that page; the others, in position order, take the pages no hit took, in
+   page order, are rewritten to them, and those pages are marked to fill.
+2. **Fill** (a workgroup a page): each marked page receives its block from the store, then its tag.
+
+A hit costs nothing but the plan's lookup; a miss costs exactly the copy it cost before. A row's
+`topk + 1` pages always suffice (hits plus misses are at most the cold entries of one selection),
+so no page is added. Consecutive decode steps of one layer overlap far more than neighbouring
+layers (0.69-0.82 for those, measured on rebuilt block keys): the query moves by one token, most top-512
+blocks stay, and the blocks new to the selection are mostly the tail's, which is resident. A low
+overlap costs the plan only. `/stats` `kv_residency.paged_hits / paged_in` is the measured rate.
+
+**Correct by construction.** A hit page holds the bytes a demand copy of the same slot writes (it is
+one), and the attention reads the page its entry names, so output is byte-identical whatever hits.
+A tag names a store slot, so the one hazard is a slot that comes to hold another block. A slot's
+bytes change only after it is freed (a demotion takes a fresh or freed slot; a promoted block keeps
+its origin slot; a re-point reuses a slot still held, with unchanged bytes). The manager counts
+frees, store changes and pool carves (`KVManager::residency_epoch`), and the batch builder zeroes
+every tag plane on the compute stream before a step whenever that count moved, after every earlier
+step's pagers. A page whose fill never ran stays marked, not tagged, and is never a hit. Draft and
+verify rows page as decode rows; each row's pages are its own, a row moving to another sequence
+only lowers the hit rate (tags name slots, not sequences).
+
+`RADIANCE_QSA_PAGE_CACHE=0` turns it off (the pager copies every cold entry, as before), for the
+A/B. Tag memory: one i32 a scratch page a residency layer, `layers x rows x (topk + 1) x 4` bytes a
+rank -- 13 x 32 x 513 x 4 = 0.8 MiB on Flash-Next at 8 sequences and 3 drafts; no scratch page added.
 
 `qsa_select` changed in one place: a block is absent exactly when its entry is `-1`. It used to be
 "any negative". This is what lets a cold block be selected at all. Its *score* is unaffected, because
@@ -181,13 +233,31 @@ Properties of the pager:
 
 ## 5. The sweep: how blocks leave the card
 
-After every committed decode step, the scheduler sweeps. It demotes at most a bounded number of
-blocks per step, across all sequences, and only one sweep is in flight at a time.
+After every committed step, decode, mixed or prefill, the scheduler sweeps. It demotes at most a
+bounded number of blocks per step, across all sequences, and only one sweep is in flight at a time.
+
+**Which sequences.** Every running one that is done prefilling. A sequence still mid-prompt is
+skipped (its next chunk would promote it whole again, [§6](#6-dense-steps-promotion)), and so is one
+whose last chunk was this step: the drafter's history pass over that chunk follows the commit and
+pages only the rows the scratch holds. It is swept from the next step on. Sweeping after decode
+steps only, as before, left every decoding conversation's middle in VRAM for as long as prompts
+kept arriving, since nearly every such step is mixed.
+
+**How much.** `TierExec::sweep_blocks`: a byte budget of 32 MiB a rank (`TierExec::kSweepBytes`),
+in blocks of the widest residency group's store block, at least 64 and at most the 1 024 entries of
+the transfer's index ring. 32 MiB is about 1.5 ms of a PCIe 4.0 x16 link, each rank on its own; the
+copy runs after the step already queued and only the step after it waits for it, so a copy well
+under one decode step is hidden. On Flash-Next at `--tp 2` (26 KiB a rank's fp8 block) that is the
+ring's 1 024 blocks, 4 096 tokens a sweep: a 128K-token middle (~31K blocks) drains in ~31 sweeps,
+about 60 steps, instead of ~490 sweeps at the old fixed 64. The host pays ~30 async calls a batch of
+16 (index upload, a gather a layer, a copy a block), ~2 K a sweep and rank. The index ring starts
+over once every earlier move has landed, so a sweep never waits on the host for its wrap
+(`MoveStats::idx_syncs`); a promotion of a whole middle still can.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant SCH as scheduler<br/>(end of decode step)
+    participant SCH as scheduler<br/>(end of a step)
     participant KV as KV manager
     participant TX as transfer stream
     participant CS as compute stream
@@ -196,7 +266,7 @@ sequenceDiagram
     opt landed
         SCH->>KV: residency_demote_landed()<br/>→ pool blocks back to the free list
     end
-    SCH->>KV: residency_demote(seq, sink, tail, ≤ 64 blocks)
+    SCH->>KV: residency_demote(seq, sink, tail, ≤ sweep_blocks)
     KV-->>SCH: moves (block → slot), entries now read cold
     SCH->>TX: issue_moves(to_host)
     TX->>CS: wait for everything compute was given
@@ -215,16 +285,35 @@ The rules that keep this safe without any host wait:
 4. **One sweep in flight.** Landing is a poll of the newest transfer, so a sweep issued every step
    would keep the newest transfer always pending and never free anything.
 
+**The sweep resumes where it left off.** Each sequence remembers, per group, the first table entry
+not yet decided (cold, or kept because the prefix cache or a fork shares it). A step's sweep
+starts there, so it costs the entries that are new since the last one, not the whole context. The
+mark goes back when the table changes (append, promotion, rollback, adoption, preemption), when a
+shared block loses its last other holder, and it stops at an entry a full store kept. The blocks it
+moves are the ones a walk of the whole table would move (`mem_test`).
+
 ---
 
 ## 6. Dense steps: promotion
 
-Prefill and mixed steps read the table densely, every entry. A cold entry there would be a store slot
-read as a pool block id. Before such a step, the scheduler therefore promotes every sequence in it:
+A step that reads a table densely would read a cold entry's store slot as a pool block id. Which rows
+do that is decided per step by the attention (`rad_block_attn_gated_fp8.h`): the whole step is dense
+only while `max_ctx_len + max_q_len <= qsa_exact_to = budget + ratio - 1` (2 051 tokens on
+Flash-Next); past it every row, decode and prefill, reads its own selection (`sel`). So before a
+prefill or mixed step the scheduler promotes (`Scheduler::res_dense_rows`):
+
+* every **prefill row** with cold entries. A sparse prefill row reads only its selection, but the
+  pager cannot serve it: the scratch is `topk + 1` pages a decode row for `max_seqs × (1 + n_spec)`
+  rows, and a chunk is up to thousands of query rows each selecting 512 blocks (see
+  [§12](#12-how-it-relates-to---kv-resident-kv-streaming) for what serving it from the store would take);
+* the **decode rows** only when the step may be dense, i.e. no entry's `ctx_len + n_tokens` passes
+  `window + block - 1` (the plugin's `qsa_exact_to`, pinned by `arch_test`). In a sparse mixed step
+  they keep their cold entries and page what they select, exactly as in a decode step: a long
+  conversation that merely shares a step with a prompt no longer comes back to VRAM whole.
 
 ```mermaid
 flowchart LR
-    A[plan a prefill / mixed step] --> B{sequence has<br/>cold entries?}
+    A[plan a prefill / mixed step] --> B{prefill row, or<br/>a step that may be dense,<br/>with cold entries?}
     B -- no --> E[build the batch]
     B -- yes --> C[residency_promote_all<br/>fresh pool block per cold entry]
     C -->|pool full| P[ask the prefix cache for room]
@@ -281,7 +370,22 @@ flowchart TB
   bytes move, and the store does not gain a copy of the same prefix every turn.
 * **The idle tiers** (the host tier for finished conversations, `--prefix-cache-mib`) are never handed
   an entry with a cold component. They gather pool blocks, and that part's bytes are already in host
-  memory.
+  memory. An entry that goes cold after its copy was taken gives the copy up (`IdleTiers::forget_copy`);
+  its session row stays, since its chain still hits.
+* **A block the cache shares with one sequence moves.** The sweep used to skip every block the cache
+  held, so a follow-up's adopted resident entries (the last turn's sink and tail) stayed on the card
+  for the whole turn and piled up turn after turn. The only other reader of such a block is a later
+  hit, which adopts whatever the entry names and promotes a block of its own, so the block is
+  demoted like the sequence's own and the cache entry is re-pointed at the same slot with a
+  reference of its own (`KVManager::set_residency_cache`, `PrefixCache::repoint_cold`). A block a
+  second live sequence also holds still stays.
+* **An idle conversation leaves the card.** Published and freed, a conversation waiting for its next
+  turn is held by the cache alone. After the sequences, the sweep spends what is left of its budget on
+  those blocks (`KVManager::residency_demote_cached`, oldest first, re-pointing a block promoted from
+  a slot and unchanged since). All of the chain goes, sink and tail included: the next turn's prefill
+  row promotes the whole chain anyway (§6), so keeping them would save one ~640-block copy a turn and
+  cost that much VRAM for every idle conversation. Before, in 32 × 128K runs, `skipped` ran into the
+  millions, idle conversations filled the pool, the cache was evicted and follow-ups recomputed.
 
 ---
 
@@ -303,11 +407,89 @@ flowchart TB
 | item | size | where it is charged |
 |---|---|---|
 | scratch pages | `(window/block + 1) × max_seqs × (1 + n_spec)` blocks per residency group, about 208 MiB on Flash-Next at 8 decode rows | fixed costs, before the VRAM split, so the budget resolver sees them |
-| residency store | `--kv-residency-mib`, slot = one block (every rank's shard) | pinned host memory, opened host-mapped |
+| page-cache tags | one i32 a scratch page and residency layer, under 1 MiB a rank on Flash-Next | allocated beside the pager's counter, not charged to the KV budget |
+| residency store | `--kv-residency-mib`, one store per residency group, its slot one block of that group (every rank's shard) at that group's own layout's size; the budget is split so every store holds the same tokens (in proportion to a group's bytes a token), so it holds (store bytes) / (the groups' real block bytes) blocks a group, not / the widest | pinned host memory, opened host-mapped |
 | per-block bookkeeping | 4 bytes a block (the table entry already holds the slot) | none worth counting |
 
 At 200 K tokens a sequence holds 50 K attention blocks. With a 512-token sink and a 2 048-token tail
-resident, it needs about **51 MiB instead of 4.80 GiB** on the card, before the shared scratch.
+resident, it needs about **51 MiB instead of 4.80 GiB** on the card, before the shared scratch. Its
+block keys stay resident beside that: 159 MiB at bf16, 84 MiB with `--qsa-bkey-dtype i8`. The block-key
+group's page is whatever its declaration says, so the pool, the prefix cache and the residency store
+size it from there unchanged.
+
+### Tiered precision: the demoted middle in a narrower layout
+
+A recipe line may name a second layout for the blocks the sweep demotes (RAD_KVQ_DEMOTE,
+`abi/rad_builder.h`):
+
+```
+vmean kv_vmean.txt
+layer 3  i8h demote k4h_v2h vmean        # resident i8h, the store k4h_v2h
+layer 15 fp8 rotated demote k4h_v4       # fp8 must be rotated: the demoted block keeps its basis
+```
+
+The sink and the tail, read on almost every step, stay in the resident layout; the middle sits in
+the store in the demote layout and comes back expanded. Served: i8h or a rotated fp8 layer
+resident, k4h_v4 or k4h_v2h demoted.
+
+* **Where the requantise and the expand run.** On the card, as the op `kv_transcode`
+  (docs/OPS.md): the demotion gathers the block's layers, transcodes every (token, head) row into
+  the demote layout and copies those bytes to the slot; a promotion copies them back and expands
+  them before the scatter; the pager (`qsa_page` with `store_layout` and `pool_layout`) expands a
+  cold fragment straight into its scratch page. One codec serves all three, so attention reads one
+  layout per layer and no attention kernel changed.
+* **Basis and V mean.** The transcode decodes and encodes values in the stored units and does not
+  rotate, centre or rescale. Both layouts therefore share the layer's rotation and V mean: a k4h
+  demote layout needs a rotated layer, and `vmean` (accepted when either layout has integer V)
+  centres the resident and the demoted bytes alike.
+* **Store sizing.** A tiered layer's slot fragment is its rows at the demote width, so its
+  group's slot is its *demote* block (startup prints `stored as k4h_v2h, N KiB a block`). On Flash-Next at
+  `--tp 2` a rank's i8h block (12 layers + the head's, one KV head, 4 tokens) is 13 × 2 064 =
+  26.2 KiB in VRAM and 13 × 896 = 11.4 KiB in the store as k4h_v2h, 13 × 1 152 = 14.6 KiB as k4h_v4.
+* **Re-pointing.** A promoted tiered block keeps its origin slot even when no cache holds it, so an
+  unchanged block re-demotes by pointing back (no bytes, no second rounding). A block is rounded
+  through the demote layout once in its life; the cost is that a resident block can hold a slot.
+* **Prefix cache.** Cold entries hold demote-precision bytes, and a returning conversation is
+  promoted from them: its middle comes back at the demote precision, never better. The idle tiers
+  still take only resident blocks.
+* **The emulation** (`RADIANCE_DEBUG_KV_TIER=emulate`, with the same flags): the sweep picks exactly
+  the blocks it would demote and the mover runs the demote → expand round trip on them in place;
+  nothing moves. Residency-on output is compared with it byte for byte, both under
+  `RADIANCE_DEBUG_KV_TIER=sync` semantics (each sweep is waited for, so which step first reads a
+  demoted block does not depend on transfer timing). In the KL mode, which scores prefill chunks and
+  runs no decode step, the emulation sweeps after every step, unbounded.
+
+Measured on two R9700s (Flash-Next `--tp 2`, bf16-cache reference, residency on, KL through the
+emulation; `prep/aq/m8/{kl,recall,mr}/fix-*.json`, all taken after the fix of the
+sweep's shared index buffer, below).
+Three corpora: `long.jsonl` (4 documents of ~34K tokens, every position past ~30K scored), `recall.jsonl`
+(a ~2 000-token passage repeated ~26K tokens later, only the repeat scored) and `mr.jsonl` (four
+conversations of four turns, each pasting ~6 000 tokens of a file and answered by the model itself at
+bf16, then a fifth turn asking about the first file; only that last answer, 256 tokens, is scored):
+
+| configuration | store a block (both ranks) | long KL / top-1 / ΔNLL | recall KL / top-1 | multi-round KL / top-1 / ΔNLL |
+|---|--:|--:|--:|--:|
+| uniform i8h | 52.5 KiB | 0.0236 / 94.77 % / −0.0024 | 0.0103 / 99.77 % | 0.0032 / 98.63 % / −0.0016 |
+| i8h, demote k4h_v4 + vmean | 29.25 KiB | 0.0284 / 93.91 % / +0.0012 | 0.0151 / 99.62 % | 0.0047 / 98.43 % / −0.0003 |
+| i8h, demote k4h_v2h + vmean | 22.75 KiB | 0.0408 / 93.00 % / +0.0028 | 0.0183 / 99.62 % | 0.0063 / 97.55 % / **+0.0043** |
+| uniform k4h_v2h + vmean | 22.75 KiB | 0.0833 / 89.90 % / **+0.0132** | 0.0214 / 99.61 % | 0.0177 / 96.27 % / **+0.0190** |
+
+For scale, the bf16 model itself computed in another prefill order measures 0.0243 (long) and 0.0033
+(multi-round). A `k4h_v4` middle stays within that noise everywhere; a `k4h_v2h` middle costs less than
+half of what `k4h_v2h` everywhere costs, but on the multi-round corpus its NLL change is significant
+(+0.0043, 95 % from +0.0004 to +0.0111; uniform: +0.0190). ΔNLL intervals are block bootstraps.
+
+A paged block moves its demote-layout fragment over PCIe: 896 B a layer and rank as k4h_v2h,
+1 152 B as k4h_v4, 2 064 B as i8h. Residency on against the emulation, 12 452 prompt tokens and 256
+greedy tokens, is byte-identical for both demote layouts (`prep/aq/m8/identity-tier.sh`).
+
+**The shared index buffer.** Before this, every batch of a sweep gathered its blocks through one
+pinned index buffer that the transfer stream read only when it got past compute, so a batch could
+gather the last batch's blocks: residency output was then timing-dependent, tiered or not. Each batch
+now owns an entry of a ring of 64, with a stream sync when it wraps; two KL runs of a tiered recipe
+are byte-identical. **Open:** with a tiered recipe, int8 block keys (`--qsa-bkey-dtype i8`) and the MTP
+drafter together, residency on and the emulation diverge (identical with `--num-speculative-tokens
+0`); the drafter's acceptance falls from about 0.68 to 0.10 once blocks really move, also untiered.
 
 ---
 
@@ -321,8 +503,8 @@ flowchart LR
     subgraph decode
         S[qsa_select] --> P[qsa_page] --> A[attn_paged]
     end
-    subgraph dense [prefill / mixed]
-        PR[promote all cold entries] --> D[dense attention]
+    subgraph dense [prefill rows / dense steps]
+        PR[promote all cold entries] --> D[dense attention or<br/>a prefill row's selection]
     end
     X[cold entry] -. never reaches .-> A
     X -. never reaches .-> D
@@ -337,7 +519,10 @@ The checks:
 | selection with cold entries | a cold entry is chosen exactly where a resident one with the same score would be, in both ranking modes | `r4d_selftest --case qsa_select_i32` |
 | a block comes back intact | demoted, the pool overwritten, promoted: byte for byte, and only the named blocks moved | `mem_test` (host backend) |
 | no leaks | slots and blocks across demote, promote, preempt, rollback, fork, eviction, trim, expiry, re-plan | `mem_test` |
-| scheduler | sweep bound, sink and tail never demoted, dense steps see pool ids only, no livelock on a full pool | `sched_test` |
+| scheduler | sweep bound, sink and tail never demoted, dense steps and prefill rows see pool ids only, a sparse mixed step's decode rows stay cold for the pager, no livelock on a full pool | `sched_test` |
+| where a mixed step is sparse | one token past `window + block - 1` every attention launch reads `sel`; at it the step is dense | `arch_test` |
+| drafts page too | the MTP head's draft passes stage their rows as decode rows, so its `qsa_page` runs and it never reads a cold block as absent | `sched_test` |
+| why drafts must match too | under `--state-cache-dtype f16` the anchor state is rounded once a step, so the text depends on how many drafts each step accepts (f32 does not): residency that changes a draft changes the text there | `ref_test` |
 
 ---
 
@@ -354,8 +539,10 @@ radiance --model flashnext.rad --tp 2 \
 * The flag is exclusive with `--kv-resident` (KV streaming, [§12](#12-how-it-relates-to---kv-resident-kv-streaming)).
   The server refuses both together.
 * Startup prints the store, its slot count, the scratch reservation and the window, for example
-  `kv residency: window enforced -- after a decode step, blocks outside the sink and the 2048-token
-  tail leave the pool for the store, 16 per batch and at most 64 per step`.
+  `kv residency: window enforced -- after a step, blocks outside the sink and the 2048-token tail
+  leave the pool for the store, 16 per batch and at most 32.0 MiB a rank per step`, then
+  `kv residency: a sweep moves at most 1024 blocks of 26.0 KiB a rank (26.0 MiB), after any step, of
+  sequences not prefilling`.
 
 **Counters**, in `/stats` under `kv_residency` and per session in `/sessions`:
 
@@ -364,7 +551,8 @@ radiance --model flashnext.rad --tp 2 \
 | `demoted`, `promoted` | blocks moved to the store / back to the pool |
 | `freed_bytes` | VRAM the landed demotions gave back to the pool |
 | `paged_in` | cold entries the pager rewrote on the card (summed over QSA layers and decode rows; rank 0) |
-| `skipped` | blocks a sweep left (shared, partial, store full) |
+| `paged_hits` | of those, the ones the page cache served without a copy (`paged_hits / paged_in` is its hit rate) |
+| `skipped` | blocks a sweep left (held by another live sequence, partial, store full) |
 | `link_bytes` | bytes moved over PCIe, both directions |
 | `host_bytes`, `cap_bytes` | store in use / store size |
 | `scratch_bytes` | VRAM the pager's scratch pages hold |
@@ -411,6 +599,56 @@ Choose window residency for contexts below the streaming floor, for workloads th
 prefixes turn after turn, and for a card that has the VRAM for the tails. Choose streaming for very
 long contexts on a card that cannot hold them at all.
 
+### Prefill rows from the store instead of a promotion (design note, not built)
+
+A returning conversation's prefill is sparse past 2 051 tokens, so each of its rows reads only its
+selection, yet its whole cold middle is promoted first (§6), because the pager serves decode rows
+only. Could a streaming-like resolve copy just what the chunk selects?
+
+**What streaming does for prefill today.** Nothing selection-aware. `kv_pass_view`
+(`core/kvstream/bind.cpp:32`) gives every non-decode pass, and every decode-classified pass wider
+than `n_seq × (1 + n_spec)`, the **stage**: per layer, every block the step's tables name is copied
+from the host mirror into a one-layer buffer at block-id identity (`kvstream_step_runs`,
+`core/kvstream/stage.cpp:154`; ordering in `core/kvstream/stage.h`), decode rows of a mixed step
+included, and `resolve_sel` returns early on a staged pass (`rad_block_attn_gated_fp8.h:993`). It
+was built that way because one prefill launch's selection union is 70-100 % of the history
+(KV-STREAMING.md §3.5: 23 429 of ~33 000 blocks at 133K tokens), which no ring holds.
+
+**Can the residency store be the host source?** As bytes, yes: it is host-mapped and the card reads
+it directly (`qsa_page` does, per layer, at `residency_layer_off`, expanding a tiered demote layout).
+As a drop-in for the mirror, no: the mirror is one row a layer addressed by block id in the pool's
+layout, the store is one slot a block (every layer and rank inside, possibly in the demote layout)
+addressed by slot, and a cold entry has no block id to stage at. `kv_resolve` and the stage copy
+cannot read it unchanged; `qsa_page`'s fragment copy and codec can.
+
+**Copy volume, Flash-Next `--tp 2` fp8, a 128K-token conversation (~31.4K middle blocks, 26 KiB a
+rank's block = 13 layers × 2 KiB).**
+
+| | link a rank | VRAM held a rank during the prefill |
+|---|--:|--:|
+| promotion (today) | ~800 MiB once a turn; re-demoted by re-pointing at its origin slots, no copy | the middle, ~800 MiB |
+| selection union per chunk | ~0.7 × 800 ≈ 560 MiB **a chunk** (each layer its own union) | the union, a pool page a block and layer: no saving |
+| residency stage (streaming's shape) | ~800 MiB **a chunk** (cold H2D + resident D2D) | one layer of the history, ~64 MiB |
+
+The union is no cheaper than the promotion for a one-chunk follow-up, and k chunks cost k times
+as much. Its pages would have to be pool ids, which hold every layer, so it saves no VRAM either: the
+only design that does is the one-layer stage. The gain of that design is **VRAM headroom, not link
+bytes or TTFT**: a follow-up turn proceeds with ~64 MiB a rank free instead of ~800 MiB (a promotion
+that does not fit preempts the sequence and recomputes 128K tokens, §6). The promotion's own cost
+is ~37 ms of link a rank at ~22 GB/s.
+
+**The work.** Not a contained change: (1) a per-rank stage buffer one layer deep, `max_ctx / block ×
+fragment`, charged to the VRAM budget, and a per-step staged table for the prefill rows (stage index
+per table entry); (2) a per-layer copy into it, cold fragments from store slots (with the tiered
+expand) and resident ones from the pool, ordered like streaming's (copy L before L's store, L+1 after
+every attention launch of L); (3) in `rad_qsa.h` the prefill rows' `qsa_select` on the staged table,
+and in `rad_block_attn_gated_fp8.h` the sparse launches split at `n_tok_decode` (decode rows on the
+pool and the pager, prefill rows on the stage) plus the identity store of the chunk's own K/V into the
+stage; (4) the same for the MTP head's history pass; (5) libref / avx / r4d rows, selftests, and the
+emulation. **Plan:** first measure, with the two changes above (sparse mixed steps no longer promote
+decode rows, and the sweep drains a middle in ~60 steps), how often a follow-up's promotion fails
+(`preemptions`, follow-up TTFT); build the stage only if it does.
+
 ---
 
 ## 13. Limits and open points
@@ -419,7 +657,13 @@ long contexts on a card that cannot hold them at all.
 * **`paged_in`** is rank 0's count, per layer (one block paged across 12 layers counts 12), and not
   per session, because the card cannot attribute a row to a session.
 * **A promoted block keeps its origin slot** while it is resident, so the store can be fuller than
-  the number of cold entries.
+  the number of cold entries. A tiered block always does (§8, tiered precision).
+* **The emulation equals residency only while the store has room**: a full store leaves blocks
+  resident at full precision, which the emulation does not model. No per-block importance signal
+  yet chooses between two demote layouts.
+* **A demotion is now a dependency of the next step** (the step that reads the block through the
+  pager waits for its copy to land): a stream wait, not a host sync, which closes a window where the
+  pager could read a slot still being written.
 * **Not yet tested with a host test:** the reap at the end of a step under step-ahead issue. The host
   fixtures do not issue ahead, so only the identity run on the card covers it.
 * **The device kernel cannot refuse** the way the reference does. An entry whose slot or scratch id is
@@ -434,7 +678,7 @@ long contexts on a card that cannot hold them at all.
 
 | part | files |
 |---|---|
-| ABI: cold entries, batch fields, window declaration | `abi/rad_runtime.h`, `abi/rad_builder.h`, `abi/rad_abi.h` (ABI 33) |
+| ABI: cold entries, batch fields, window declaration | `abi/rad_runtime.h`, `abi/rad_builder.h`, `abi/rad_abi.h` (ABI 38; the page cache 51) |
 | block states, slots, demote / promote / re-point | `core/mem/kv.{h,cpp}` |
 | host-mapped store | `core/mem/hostarena.{h,cpp}` (`open_mapped`) |
 | prefix cache with cold entries | `core/mem/prefix.{h,cpp}` |
@@ -442,6 +686,7 @@ long contexts on a card that cannot hold them at all.
 | sweep, reap, dense-step promotion | `core/sched/scheduler.cpp` (`res_sweep`, `res_reap`) |
 | engine wiring, store, mover, counter | `core/engine.cpp`, `core/engine_bringup.cpp` |
 | the window declaration and the pager issue | `arch/common/rad_qsa.h` |
-| the pager | `libref/ref_qsa.cpp` (reference), `libr4d/r4d_qsa_page_u8.hip` (card), `libavx/avx_qsa.cpp` |
+| the pager and its page cache | `libref/ref_qsa.cpp` (reference), `libr4d/r4d_qsa_page_u8.hip` (card), `libavx/avx_qsa.cpp`; tags in `core/runtime/tierexec.cpp` (`page_tags`), cleared in `core/sched/batch.cpp` |
+| the demote layout's codec (`kv_transcode`, the expanding pager) | `libref/ref_attn.cpp` (`kvx_rows`), `libr4d/r4d_kvx.h`, `libavx/avx_qsa.cpp` |
 | the selection change | `libr4d/r4d_qsa_select_bf16.hip` |
 | spec and operator docs | `spec.md` §7.3 "Window residency", `docs/GUIDE.md` §4.8, `docs/OPS.md` `qsa_page`, `docs/qsa-residency-bench.md` |

@@ -4,6 +4,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "rad_plugin.h"
 #include "kld.h"
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -76,8 +78,16 @@ static const Flag g_flags[] = {
                                         "(default) leaves decode rows and new requests their room,\n"
                                         "off takes the whole step, N holds the chunk to N tokens" },
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
-                                        "sequences decode, at most 64; 0 (default) lets every step\n"
+                                        "sequences decode, at most 64; auto fits them in a quarter\n"
+                                        "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
+                                        "0 lets every step; served default\n"
+                                        "auto:1 (0 under --deterministic), every step\n"
                                         "carry a chunk" },
+    { "--decode-headroom",    "MODE",   "rows a step carries for decode rows on top of\n"
+                                        "--max-num-batched-tokens, so a prefill chunk beside\n"
+                                        "decoding sequences fills its checkpoint interval in one\n"
+                                        "step: auto (default) is (max-num-seqs - 1) x (1 + drafts),\n"
+                                        "at most 256; N rows; 0 the budget alone" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -87,13 +97,31 @@ static const Flag g_flags[] = {
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
                                         "keys, no reconvert (docs/YARN.md); none: off" },
 
-    { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
+    { "--gpu-memory-mib",     "N",      "VRAM claimed on every card; the rest is left unclaimed.\n"
+                                        "Not with --gpu-headroom-mib" },
+    { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96).\n"
+                                        "Not with --gpu-memory-mib" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
+    { "--kv-recipe",          "FILE",   "each attention layer's layout from that set, k4h_v4\n"
+                                        "(rotated int4 K and V, 0.56), k4h_v2h (int2 V, 0.44) or i8h\n"
+                                        "(int8, a scale a token and head, 1.01; all rotated,\n"
+                                        "Flash-Next), k5_v4 (int5 K, int4 V, 0.63; Flash-Next)\n"
+                                        "or bf16 (2; Flash-Next), a 'layer N\n"
+                                        "LAYOUT [rotated] [demote LAYOUT] [vmean|vpred]' line a layer\n"
+                                        "(docs/GUIDE.md); needs\n"
+                                        "--kv-cache-dtype fp8" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
                                         "and is lossy; the qwen35 plugins serve it" },
+    { "--qsa-bkey-dtype",     "T",      "bf16 (default) | i8 -- the QSA indexer's block keys: i8\n"
+                                        "halves them (int8, an f16 scale a block; Flash-Next)\n"
+                                        "and moves the indexer's selection slightly" },
+    { "--qsa-bkey-split",     "MODE",   "off (default) | on -- the QSA indexer's block keys split\n"
+                                        "across the --tp ranks (block b on rank b % tp), the\n"
+                                        "ranks' top-k lists merged: the same selection byte for\n"
+                                        "byte, block keys per card / tp (Flash-Next)" },
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
@@ -135,6 +163,16 @@ static const Flag g_flags[] = {
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
+    { "--kv-residency-mib",   "N",      "host memory, up to N MiB, for the KV blocks a sparse\n"
+    "                                    consumer's window does not cover (spec §7.3). A model\n"
+    "                                    whose attention reads a selected part of its history\n"
+    "                                    declares that window, and the rest of its cache then costs\n"
+    "                                    link traffic instead of VRAM. 0 is off: every block stays"
+    "                                    resident" },
+    { "--kv-residency-sink-tokens", "N", "tokens at the start of a conversation kept resident\n"
+    "                                    when --kv-residency-mib is on (default 512): a sparse\n"
+    "                                    consumer scores them every step, so they are cheaper in\n"
+    "                                    VRAM than in the store" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -503,6 +541,615 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
     return true;
 }
 
+/* ------------------------------------------------------------------ --kv-recipe */
+/* The layouts a recipe can name, widest first: the name in the file, the RAD_KVQ_* the plugin
+ * declares, and what one group of 32 K elements and 32 V elements costs in bits, scales included
+ * (the unit rad-autoquant's bit budget is counted in). A row added here is a recipe word and a
+ * calibration candidate at once: rad-autoquant's variants are each row as kv_recipe_parse reads it
+ * plain, `rotated` and `vmean` (kv_autoquant_variants), so a new layout's rules (rotation implied,
+ * no V mean) belong in the parser below and nowhere else. A row marked `opt_in` is a recipe word
+ * like any other but no default candidate: rad-autoquant calibrates it only where --layouts or
+ * --variants names it (kv_layout_opt_in), so adding it leaves a default calibration run as it was.
+ * Unmarking the row makes it a default candidate. */
+struct KvLayout { const char* name; int kvq; int group_bits; bool opt_in = false; };
+static const KvLayout kKvLayouts[] = {
+    /* The cache --kv-cache-dtype bf16 keeps, for one layer: nothing rounded but bf16's own. Twice
+     * fp8; what a layer too sensitive for any 8-bit layout keeps (rad-autoquant's base). */
+    { "bf16",   RAD_KVQ_BF16, 32 * 16 + 32 * 16 },
+    /* K and V int8, stored rotated, one f16 scale a token and head for each: at head_dim 256 a
+     * group of 32 carries an eighth of a scale, 2 bits, so 258/256 of fp8. Wider than fp8; it buys
+     * resolution (7 bits to E4M3's 3), not room. */
+    { "i8h",    RAD_KVQ_I8H,  (32 * 8 + 2) + (32 * 8 + 2) },
+    /* E4M3 K and V; the descales are per (sequence, head), nothing a group. */
+    { "fp8",    RAD_KVQ_NONE, 32 * 8 + 32 * 8 },
+    /* V int4 with an f16 scale a group: 25/32 of fp8. */
+    { "fp8_v4", RAD_KVQ_V4,   32 * 8 + (32 * 4 + 16) },
+    /* K int6 too, its own f16 scale: 22/32. */
+    { "k6_v4",  RAD_KVQ_K6V4, (32 * 6 + 16) + (32 * 4 + 16) },
+    /* K int5, a bit a dim under k6_v4's: 20/32, 5.0 bits an element. Rotated or not, as k6_v4.
+     * A default candidate since RadianceMemory #22 (opt-in before it, #19). */
+    { "k5_v4",  RAD_KVQ_K5V4, (32 * 5 + 16) + (32 * 4 + 16) },
+    /* K int4 as well, stored rotated: 18/32. The rotation is part of the layout (below). */
+    { "k4h_v4", RAD_KVQ_K4H,  (32 * 4 + 16) + (32 * 4 + 16) },
+    /* V int2 under KVarN's variance normalisation, rotated as k4h_v4: 14/32. */
+    { "k4h_v2h", RAD_KVQ_K4HV2H, (32 * 4 + 16) + (32 * 2 + 16) },
+};
+
+int kv_layout_of(const char* name) {
+    if (!name) return -1;
+    for (const KvLayout& l : kKvLayouts)
+        if (!std::strcmp(name, l.name)) return l.kvq;
+    return -1;
+}
+
+const char* kv_layout_name(int kvq) {
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.name;
+    return nullptr;
+}
+
+bool kv_layout_opt_in(int kvq) {
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.opt_in;
+    return false;
+}
+
+int kv_layout_group_bits(int kvq) {
+    for (const KvLayout& l : kKvLayouts)
+        if (l.kvq == kvq) return l.group_bits;
+    return -1;
+}
+
+/* A group of 32 K and 32 V elements' bits over 512 is a row's bytes over head_dim; i8h's scale is
+ * a head's, so its row is that and not a group multiple. */
+int64_t kv_layout_row_bytes(int kvq, int64_t hd) {
+    const int bits = kv_layout_group_bits(kvq);
+    if (bits < 0 || hd <= 0 || hd % 32) return -1;
+    return kvq == RAD_KVQ_I8H ? 2 * hd + 4 : bits * hd / 256;
+}
+
+int64_t kv_layout_head_dim(int kvq, int64_t row) {
+    const int bits = kv_layout_group_bits(kvq);
+    if (bits < 0 || row <= 0) return -1;
+    const int64_t hd = kvq == RAD_KVQ_I8H ? (row - 4) / 2 : row * 256 / bits;
+    return kv_layout_row_bytes(kvq, hd) == row ? hd : -1;
+}
+
+std::vector<int> kv_layouts() {
+    std::vector<int> v;
+    for (const KvLayout& l : kKvLayouts) v.push_back(l.kvq);
+    return v;
+}
+
+/* One `layer N LAYOUT` line per attention layer, `layer N LAYOUT rotated` for a layer that stores
+ * its K and V rotated (RAD_KVQ_ROTATED: the normalised Hadamard over head_dim, its query rotated
+ * before the attention and the output back after it); `#` starts a comment, blank lines are
+ * skipped. k4h_v4, k4h_v2h and i8h are rotated layouts (RAD_KVQ_K4H, RAD_KVQ_K4HV2H,
+ * RAD_KVQ_I8H): a line of any of them marks the layer rotated whether or not it ends in `rotated`. Implied rather than demanded, because the name already says it
+ * (the h is the Hadamard), a k4h or i8h layer without the rotation is not a deployment anyone can ask
+ * for, and rad-autoquant writes every layout as `layer N LAYOUT` from the table above.
+ * `bf16` is the plain bf16 cache (RAD_KVQ_BF16) and takes neither word, nor `demote`: it rounds
+ * nothing a rotation or a mean would help with, the bf16 rows serve neither, and it keeps its
+ * blocks as they are.
+ * A line may also end in `vmean` (after `rotated` when both): the layer subtracts a static V mean
+ * before its store and adds it to the attention output (RAD_KVQ_VMEAN), taken from the file one
+ * `vmean FILE` line names, which `vmean_file` receives as written. Only a layout with integer V
+ * takes it: fp8's E4M3 V has no group scale for an offset to waste.
+ * `demote LAYOUT`, after `rotated` and before `vmean` (RAD_KVQ_DEMOTE): under window residency the
+ * layer's demoted blocks are stored in that second layout (k4h_v4 or k4h_v2h, of an i8h or a
+ * rotated fp8 layer) and expanded back on the card when read, so the store holds more blocks a
+ * MiB and every paged block moves fewer bytes; `vmean` then needs integer V in either layout.
+ * Layer numbers are the checkpoint's (blk.N), so a recipe reads against the model's own config.
+ * Strict: a word the format does not have, a layer named twice, or a layout outside the set is a
+ * refusal with its line, never a skipped line, since a recipe that loads short is a different
+ * deployment from the one its author measured. Which layers keep an attention cache only the
+ * plugin knows, so that check is the plugin's (RadBuildCtx::kv_recipe). */
+int kv_recipe_parse(const std::string& text, const char* name, std::vector<int32_t>* out,
+                    std::string* vmean_file, std::string* vpred_file) {
+    /* Past any model in this tree by far; it bounds the array the engine hands the plugin. */
+    constexpr long kMaxLayer = 4096;
+    out->clear();
+    if (vmean_file) vmean_file->clear();
+    if (vpred_file) vpred_file->clear();
+    std::vector<int32_t> r;
+    std::string file, pfile;
+    int vmean_layers = 0, vpred_layers = 0;
+    std::istringstream in(text);
+    std::string line;
+    for (int ln = 1; std::getline(in, line); ++ln) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::istringstream words(line);
+        std::string kw, num, layout, extra;
+        if (!(words >> kw)) continue;
+        if (kw == "vmean") {
+            if (!(words >> file) || (words >> extra)) {
+                RAD_ERR("%s line %d: 'vmean FILE' names the V mean file, two words", name, ln);
+                return RAD_E_INVAL;
+            }
+            continue;
+        }
+        if (kw == "vpred") {
+            if (!(words >> pfile) || (words >> extra)) {
+                RAD_ERR("%s line %d: 'vpred FILE' names the K-to-V map file, two words", name, ln);
+                return RAD_E_INVAL;
+            }
+            continue;
+        }
+        if (kw != "layer") {
+            RAD_ERR("%s line %d: '%s' is not a recipe line; each is 'layer N LAYOUT'", name, ln,
+                    kw.c_str());
+            return RAD_E_INVAL;
+        }
+        /* After the layout: `rotated`, then `demote LAYOUT`, then `vmean`, each at most once and
+         * in that order. */
+        bool rot_word = false, vmean = false, vpred = false, bad = !(words >> num >> layout);
+        std::string demote;
+        for (std::string w; !bad && (words >> w);) {
+            if (w == "rotated" && !rot_word && demote.empty() && !vmean && !vpred) rot_word = true;
+            else if (w == "demote" && demote.empty() && !vmean && !vpred) bad = !(words >> demote);
+            else if (w == "vmean" && !vmean && !vpred) vmean = true;
+            else if (w == "vpred" && !vpred && !vmean) vpred = true;
+            else if ((w == "vpred" && vmean) || (w == "vmean" && vpred)) {
+                RAD_ERR("%s line %d: 'vmean' and 'vpred' are one or the other: the prediction's "
+                        "bias takes the mean's place", name, ln);
+                return RAD_E_INVAL;
+            }
+            else bad = true;
+        }
+        if (bad) {
+            RAD_ERR("%s line %d: a recipe line is 'layer N LAYOUT', three words, or 'layer N "
+                    "LAYOUT rotated', then 'demote LAYOUT' where window residency stores the "
+                    "layer's demoted blocks narrower, and 'vmean' (or 'vpred') last where the "
+                    "layer subtracts its V mean (or its prediction of V from K)", name, ln);
+            return RAD_E_INVAL;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const long l = std::strtol(num.c_str(), &end, 10);
+        if (errno || !end || *end || num[0] == '-' || num[0] == '+' || l >= kMaxLayer) {
+            RAD_ERR("%s line %d: layer '%s' is not a layer number (0 to %ld)", name, ln,
+                    num.c_str(), kMaxLayer - 1);
+            return RAD_E_INVAL;
+        }
+        const int q = kv_layout_of(layout.c_str());
+        if (q < 0) {
+            RAD_ERR("%s line %d: layer %ld: '%s' is not a KV layout; bf16, fp8, fp8_v4, k6_v4, "
+                    "k5_v4, k4h_v4, k4h_v2h or i8h", name, ln, l, layout.c_str());
+            return RAD_E_INVAL;
+        }
+        if (q == RAD_KVQ_BF16 && (rot_word || vmean || vpred)) {
+            RAD_ERR("%s line %d: layer %ld: bf16 is the unquantised cache and takes no '%s'; a "
+                    "rotation or a V mean only helps a layout that rounds to a narrower code",
+                    name, ln, l, rot_word ? "rotated" : vmean ? "vmean" : "vpred");
+            return RAD_E_INVAL;
+        }
+        if (q == RAD_KVQ_BF16 && !demote.empty()) {
+            RAD_ERR("%s line %d: layer %ld: bf16 is the unquantised cache and takes no 'demote'; "
+                    "it keeps its blocks as they are, and a tiered layer is i8h or fp8", name, ln,
+                    l);
+            return RAD_E_INVAL;
+        }
+        /* The demote layout (RAD_KVQ_DEMOTE): served for an i8h or fp8 layer demoted to k4h_v4
+         * or k4h_v2h. The store holds the same values in the layer's basis, so a demote layout
+         * that only holds rotated keys needs the layer rotated: i8h is, fp8 must say `rotated`. */
+        const int dq = demote.empty() ? 0 : kv_layout_of(demote.c_str());
+        if (!demote.empty()) {
+            if (dq != RAD_KVQ_K4H && dq != RAD_KVQ_K4HV2H) {
+                RAD_ERR("%s line %d: layer %ld: 'demote %s': a demote layout is k4h_v4 or k4h_v2h",
+                        name, ln, l, demote.c_str());
+                return RAD_E_INVAL;
+            }
+            if (q != RAD_KVQ_I8H && q != RAD_KVQ_NONE) {
+                RAD_ERR("%s line %d: layer %ld: 'demote %s' under %s: the resident layout of a "
+                        "tiered layer is i8h or fp8", name, ln, l, demote.c_str(), layout.c_str());
+                return RAD_E_INVAL;
+            }
+            if (q == RAD_KVQ_NONE && !rot_word) {
+                RAD_ERR("%s line %d: layer %ld: 'demote %s' holds rotated keys only, and the "
+                        "demoted block keeps the layer's basis; write 'layer %ld fp8 rotated "
+                        "demote %s'", name, ln, l, demote.c_str(), l, demote.c_str());
+                return RAD_E_INVAL;
+            }
+        }
+        /* Whichever of the two layouts has integer V: the mean is the layer's, subtracted before
+         * its store, so the resident and the demoted bytes are both centred. */
+        if (vmean && q == RAD_KVQ_NONE && dq == 0) {
+            RAD_ERR("%s line %d: layer %ld: 'vmean' is for a layout with integer V (fp8_v4, "
+                    "k6_v4, k5_v4, k4h_v4, k4h_v2h, i8h); fp8 keeps V in E4M3", name, ln, l);
+            return RAD_E_INVAL;
+        }
+        /* `vpred` (RAD_KVQ_VPRED): V less its prediction from the K-hat the cache holds, which the
+         * store, the P K-hat attention and kv_vpred know for k4h's int4 K only. A tiered layer's
+         * K would change at its demotion, so no `demote` either (k4h is no tiered layout). */
+        if (vpred && ((q != RAD_KVQ_K4H && q != RAD_KVQ_K4HV2H) || dq != 0)) {
+            RAD_ERR("%s line %d: layer %ld: 'vpred' predicts V from the int4 K of k4h_v4 or "
+                    "k4h_v2h, and a tiered layer's K would change when it is demoted", name, ln,
+                    l);
+            return RAD_E_INVAL;
+        }
+        if ((size_t)l >= r.size()) r.resize((size_t)l + 1, -1);
+        if (r[(size_t)l] >= 0) {
+            RAD_ERR("%s line %d: layer %ld is named twice", name, ln, l);
+            return RAD_E_INVAL;
+        }
+        const bool rotated_layout = q == RAD_KVQ_K4H || q == RAD_KVQ_K4HV2H || q == RAD_KVQ_I8H;
+        r[(size_t)l] = q | (rot_word || rotated_layout ? RAD_KVQ_ROTATED : 0) |
+                       (vmean ? RAD_KVQ_VMEAN : 0) | (vpred ? RAD_KVQ_VPRED : 0) |
+                       (dq << RAD_KVQ_DEMOTE_SHIFT);
+        vmean_layers += vmean;
+        vpred_layers += vpred;
+    }
+    if (r.empty()) {
+        RAD_ERR("%s names no layer; each attention layer needs a 'layer N LAYOUT' line", name);
+        return RAD_E_INVAL;
+    }
+    /* Both halves or neither: a mean file nothing reads is a recipe that says one thing and does
+     * another, and a `vmean` layer needs its means. */
+    if (vmean_layers && file.empty()) {
+        RAD_ERR("%s: %d layer(s) say 'vmean' and no 'vmean FILE' line names their means", name,
+                vmean_layers);
+        return RAD_E_INVAL;
+    }
+    if (!vmean_layers && !file.empty()) {
+        RAD_ERR("%s: 'vmean %s' and no layer says 'vmean'; mark the layers that subtract it",
+                name, file.c_str());
+        return RAD_E_INVAL;
+    }
+    if (vpred_layers && pfile.empty()) {
+        RAD_ERR("%s: %d layer(s) say 'vpred' and no 'vpred FILE' line names their maps", name,
+                vpred_layers);
+        return RAD_E_INVAL;
+    }
+    if (!vpred_layers && !pfile.empty()) {
+        RAD_ERR("%s: 'vpred %s' and no layer says 'vpred'; mark the layers that predict V from K",
+                name, pfile.c_str());
+        return RAD_E_INVAL;
+    }
+    *out = std::move(r);
+    if (vmean_file) *vmean_file = file;
+    if (vpred_file) *vpred_file = pfile;
+    return RAD_OK;
+}
+
+std::string kv_recipe_summary(const std::vector<int32_t>& recipe) {
+    std::string s;
+    for (int rot : { 0, (int)RAD_KVQ_ROTATED })
+        for (int q : kv_layouts())
+            for (int dq : { (int)RAD_KVQ_NONE, (int)RAD_KVQ_K4H, (int)RAD_KVQ_K4HV2H }) {
+                const int key = q | rot | (dq << RAD_KVQ_DEMOTE_SHIFT);
+                std::string layers;
+                for (size_t l = 0; l < recipe.size(); ++l)
+                    if (recipe[l] >= 0 && (recipe[l] & ~(RAD_KVQ_VMEAN | RAD_KVQ_VPRED)) == key)
+                        layers += (layers.empty() ? "" : ", ") + std::to_string(l);
+                if (layers.empty()) continue;
+                s += (s.empty() ? "" : "; ") + std::string(kv_layout_name(q)) +
+                     (rot ? " rotated" : "") +
+                     (dq ? std::string(" demote ") + kv_layout_name(dq) : std::string()) +
+                     " at layer" + (layers.find(',') != std::string::npos ? "s " : " ") + layers;
+            }
+    std::string vm;
+    for (size_t l = 0; l < recipe.size(); ++l)
+        if (recipe[l] >= 0 && (recipe[l] & RAD_KVQ_VMEAN))
+            vm += (vm.empty() ? "" : ", ") + std::to_string(l);
+    if (!vm.empty())
+        s += "; V mean subtracted at layer" + std::string(vm.find(',') != std::string::npos ? "s " : " ") + vm;
+    std::string vp;
+    for (size_t l = 0; l < recipe.size(); ++l)
+        if (recipe[l] >= 0 && (recipe[l] & RAD_KVQ_VPRED))
+            vp += (vp.empty() ? "" : ", ") + std::to_string(l);
+    if (!vp.empty())
+        s += "; V predicted from K at layer" + std::string(vp.find(',') != std::string::npos ? "s " : " ") + vp;
+    return s;
+}
+
+/* The V mean file. Text, so a calibration's result can be read, diffed and checked by eye; the
+ * values are printed at %.9g by the writer (arch/common/rad_calib_vmean.h), which an f32 reads
+ * back exactly. A file holds every attention layer the calibration saw; a recipe takes the ones
+ * it marks. */
+int kv_vmean_parse(const std::string& text, const char* name, KvVMean* out) {
+    *out = KvVMean{};
+    KvVMean v;
+    bool header = false;
+    std::map<int, std::vector<char>> seen;   /* heads present, by layer */
+    std::istringstream in(text);
+    std::string line;
+    int ln = 0;
+    for (ln = 1; std::getline(in, line); ++ln) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::istringstream words(line);
+        std::string kw;
+        if (!(words >> kw)) continue;
+        if (!header) {
+            std::string ver, k1, k2, k3, extra;
+            long long d = 0, h = 0, rows = 0;
+            if (kw != "kv_vmean" || !(words >> ver >> k1 >> d >> k2 >> h >> k3 >> rows) ||
+                ver != "1" || k1 != "head_dim" || k2 != "kv_heads" || k3 != "rows" ||
+                (words >> extra) || d <= 0 || d > 4096 || h <= 0 || h > 1024 || rows < 0) {
+                RAD_ERR("%s line %d: the first line is 'kv_vmean 1 head_dim D kv_heads H rows R'",
+                        name, ln);
+                return RAD_E_INVAL;
+            }
+            v.head_dim = d;
+            v.n_head_kv = h;
+            v.rows = rows;
+            header = true;
+            continue;
+        }
+        long long l = -1, h = -1;
+        std::string hw;
+        if (kw != "layer" || !(words >> l >> hw >> h) || hw != "head" || l < 0 || l >= 4096) {
+            RAD_ERR("%s line %d: a line is 'layer L head H' and the head's %lld values", name, ln,
+                    (long long)v.head_dim);
+            return RAD_E_INVAL;
+        }
+        if (h < 0 || h >= v.n_head_kv) {
+            RAD_ERR("%s line %d: layer %lld: head %lld is outside the file's %lld KV heads", name,
+                    ln, l, h, (long long)v.n_head_kv);
+            return RAD_E_INVAL;
+        }
+        std::vector<char>& hs = seen[(int)l];
+        hs.resize((size_t)v.n_head_kv, 0);
+        if (hs[(size_t)h]) {
+            RAD_ERR("%s line %d: layer %lld head %lld is listed twice", name, ln, l, h);
+            return RAD_E_INVAL;
+        }
+        hs[(size_t)h] = 1;
+        std::vector<float>& m = v.layer[(int)l];
+        m.resize((size_t)(v.n_head_kv * v.head_dim), 0.0f);
+        int64_t n = 0;
+        for (std::string w; words >> w; ++n) {
+            char* end = nullptr;
+            const float x = std::strtof(w.c_str(), &end);
+            if (!end || *end || !std::isfinite(x)) {
+                RAD_ERR("%s line %d: layer %lld head %lld: '%s' is not a finite number", name, ln,
+                        l, h, w.c_str());
+                return RAD_E_INVAL;
+            }
+            if (n < v.head_dim) m[(size_t)(h * v.head_dim + n)] = x;
+        }
+        if (n != v.head_dim) {
+            RAD_ERR("%s line %d: layer %lld head %lld has %lld values; head_dim is %lld", name,
+                    ln, l, h, (long long)n, (long long)v.head_dim);
+            return RAD_E_INVAL;
+        }
+    }
+    if (!header) {
+        RAD_ERR("%s: no 'kv_vmean 1 head_dim D kv_heads H rows R' line", name);
+        return RAD_E_INVAL;
+    }
+    for (const auto& [l, hs] : seen)
+        for (size_t h = 0; h < hs.size(); ++h)
+            if (!hs[h]) {
+                RAD_ERR("%s: layer %d has no line for head %zu; a layer lists every KV head", name,
+                        l, h);
+                return RAD_E_INVAL;
+            }
+    v.path = name;
+    *out = std::move(v);
+    return RAD_OK;
+}
+
+int kv_vmean_table(const KvVMean& vm, const std::vector<int32_t>& recipe, int64_t head_dim,
+                   int64_t n_head_kv, int64_t n_head, std::vector<uint16_t>* out) {
+    out->clear();
+    const char* name = vm.path.c_str();
+    if (vm.head_dim != head_dim || vm.n_head_kv != n_head_kv) {
+        RAD_ERR("%s holds %lld KV heads of %lld and this model has %lld of %lld; it was "
+                "calibrated on another model", name, (long long)vm.n_head_kv,
+                (long long)vm.head_dim, (long long)n_head_kv, (long long)head_dim);
+        return RAD_E_INVAL;
+    }
+    /* The normalised Hadamard over head_dim in the order had_rotate keeps (libref's fwht, the
+     * Sylvester order), in f64: a rotated layer stores H v / sqrt(D), so its mean is H mu /
+     * sqrt(D). Any vector would keep the layer exact; this one is the one that helps. */
+    if (head_dim <= 0 || (head_dim & (head_dim - 1)) || n_head_kv <= 0 || n_head % n_head_kv) {
+        RAD_ERR("%s: head_dim %lld is not a power of two or %lld query heads do not share %lld KV "
+                "heads evenly", name, (long long)head_dim, (long long)n_head, (long long)n_head_kv);
+        return RAD_E_INVAL;
+    }
+    const int64_t D = head_dim, E = (n_head_kv + n_head) * D, gqa = n_head / n_head_kv;
+    std::vector<uint16_t> t((size_t)(recipe.size() * 2 * E), 0);
+    for (size_t l = 0; l < recipe.size(); ++l) {
+        if (recipe[l] < 0 || !(recipe[l] & RAD_KVQ_VMEAN)) continue;
+        const auto it = vm.layer.find((int)l);
+        if (it == vm.layer.end()) {
+            RAD_ERR("%s has no V mean for layer %zu, which the recipe marks 'vmean'", name, l);
+            return RAD_E_INVAL;
+        }
+        for (int r = 0; r < 2; ++r) {
+            uint16_t* e = t.data() + (l * 2 + (size_t)r) * (size_t)E;
+            for (int64_t k = 0; k < n_head_kv; ++k) {
+                std::vector<double> mu(it->second.begin() + k * D, it->second.begin() + (k + 1) * D);
+                if (r) {
+                    for (int64_t h = 1; h < D; h <<= 1)
+                        for (int64_t i = 0; i < D; i += 2 * h)
+                            for (int64_t j = i; j < i + h; ++j) {
+                                const double a = mu[(size_t)j], b = mu[(size_t)(j + h)];
+                                mu[(size_t)j] = a + b;
+                                mu[(size_t)(j + h)] = a - b;
+                            }
+                    for (double& x : mu) x /= std::sqrt((double)D);
+                }
+                for (int64_t d = 0; d < D; ++d) {
+                    /* bf16 rounds to nearest even, symmetric in sign: -bf16(mu) is bf16(-mu). */
+                    const uint16_t pos = rad_f32_to_bf16((float)mu[(size_t)d]);
+                    e[k * D + d] = (uint16_t)(pos ^ 0x8000u);
+                    for (int64_t q = k * gqa; q < (k + 1) * gqa; ++q)
+                        e[n_head_kv * D + q * D + d] = pos;
+                }
+            }
+        }
+    }
+    *out = std::move(t);
+    return RAD_OK;
+}
+
+/* The map file. Text, as the mean file is, so a calibration's result can be read, diffed and
+ * checked; %.9g values read back exactly into f32. A file holds every attention layer the
+ * calibration saw; a recipe takes the ones it marks. */
+int kv_vpred_parse(const std::string& text, const char* name, KvVPred* out) {
+    *out = KvVPred{};
+    KvVPred v;
+    bool header = false;
+    std::map<int, std::vector<char>> seen;   /* per layer: [head][D + 1] lines present */
+    std::istringstream in(text);
+    std::string line;
+    for (int ln = 1; std::getline(in, line); ++ln) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::istringstream words(line);
+        std::string kw;
+        if (!(words >> kw)) continue;
+        if (!header) {
+            std::string ver, k1, k2, k3, extra;
+            long long d = 0, h = 0, rows = 0;
+            if (kw != "kv_vpred" || !(words >> ver >> k1 >> d >> k2 >> h >> k3 >> rows) ||
+                ver != "1" || k1 != "head_dim" || k2 != "kv_heads" || k3 != "rows" ||
+                (words >> extra) || d <= 0 || d > 4096 || h <= 0 || h > 1024 || rows < 0) {
+                RAD_ERR("%s line %d: the first line is 'kv_vpred 1 head_dim D kv_heads H rows R'",
+                        name, ln);
+                return RAD_E_INVAL;
+            }
+            v.head_dim = d;
+            v.n_head_kv = h;
+            v.rows = rows;
+            header = true;
+            continue;
+        }
+        const int64_t D = v.head_dim;
+        long long l = -1, h = -1, i = -1;
+        std::string hw, what;
+        if (kw != "layer" || !(words >> l >> hw >> h >> what) || hw != "head" || l < 0 ||
+            l >= 4096 || (what != "bias" && what != "row") || (what == "row" && !(words >> i))) {
+            RAD_ERR("%s line %d: a line is 'layer L head H bias' or 'layer L head H row I' and its "
+                    "%lld values", name, ln, (long long)D);
+            return RAD_E_INVAL;
+        }
+        if (h < 0 || h >= v.n_head_kv) {
+            RAD_ERR("%s line %d: layer %lld: head %lld is outside the file's %lld KV heads", name,
+                    ln, l, h, (long long)v.n_head_kv);
+            return RAD_E_INVAL;
+        }
+        if (what == "row" && (i < 0 || i >= D)) {
+            RAD_ERR("%s line %d: layer %lld head %lld: row %lld is outside 0..%lld", name, ln, l, h,
+                    i, (long long)(D - 1));
+            return RAD_E_INVAL;
+        }
+        const int64_t slot = what == "bias" ? D : i;
+        std::vector<char>& hs = seen[(int)l];
+        hs.resize((size_t)(v.n_head_kv * (D + 1)), 0);
+        if (hs[(size_t)(h * (D + 1) + slot)]) {
+            RAD_ERR("%s line %d: layer %lld head %lld: its %s%s is listed twice", name, ln, l, h,
+                    what.c_str(), what == "row" ? (" " + std::to_string(i)).c_str() : "");
+            return RAD_E_INVAL;
+        }
+        hs[(size_t)(h * (D + 1) + slot)] = 1;
+        std::vector<float>& m = v.layer[(int)l];
+        m.resize((size_t)(v.n_head_kv * (D + 1) * D), 0.0f);
+        int64_t n = 0;
+        for (std::string w; words >> w; ++n) {
+            char* end = nullptr;
+            const float x = std::strtof(w.c_str(), &end);
+            if (!end || *end || !std::isfinite(x)) {
+                RAD_ERR("%s line %d: layer %lld head %lld: '%s' is not a finite number", name, ln,
+                        l, h, w.c_str());
+                return RAD_E_INVAL;
+            }
+            if (n < D) m[(size_t)((h * (D + 1) + slot) * D + n)] = x;
+        }
+        if (n != D) {
+            RAD_ERR("%s line %d: layer %lld head %lld has %lld values; head_dim is %lld", name, ln,
+                    l, h, (long long)n, (long long)D);
+            return RAD_E_INVAL;
+        }
+    }
+    if (!header) {
+        RAD_ERR("%s: no 'kv_vpred 1 head_dim D kv_heads H rows R' line", name);
+        return RAD_E_INVAL;
+    }
+    for (const auto& [l, hs] : seen)
+        for (size_t k = 0; k < hs.size(); ++k)
+            if (!hs[k]) {
+                const int64_t D = v.head_dim, h = (int64_t)k / (D + 1), sl = (int64_t)k % (D + 1);
+                RAD_ERR("%s: layer %d head %lld has no %s%s; a layer lists every KV head's bias and "
+                        "%lld rows", name, l, (long long)h, sl == D ? "bias" : "row ",
+                        sl == D ? "" : std::to_string(sl).c_str(), (long long)D);
+                return RAD_E_INVAL;
+            }
+    v.path = name;
+    *out = std::move(v);
+    return RAD_OK;
+}
+
+int kv_vpred_table(const KvVPred& vp, const std::vector<int32_t>& recipe, int64_t head_dim,
+                   int64_t n_head_kv, std::vector<float>* table, std::vector<int32_t>* entry) {
+    table->clear();
+    entry->clear();
+    const char* name = vp.path.c_str();
+    if (vp.head_dim != head_dim || vp.n_head_kv != n_head_kv) {
+        RAD_ERR("%s holds %lld KV heads of %lld and this model has %lld of %lld; it was "
+                "calibrated on another model", name, (long long)vp.n_head_kv,
+                (long long)vp.head_dim, (long long)n_head_kv, (long long)head_dim);
+        return RAD_E_INVAL;
+    }
+    if (head_dim <= 0 || (head_dim & (head_dim - 1))) {
+        RAD_ERR("%s: head_dim %lld is not a power of two, so no Hadamard rotates it", name,
+                (long long)head_dim);
+        return RAD_E_INVAL;
+    }
+    const int64_t D = head_dim, E = n_head_kv * (D + 1) * D;
+    const double inv = 1.0 / std::sqrt((double)D);
+    /* x H for a row vector x: the Sylvester transform (libref's fwht order), then 1 / sqrt(D). */
+    auto rot = [&](std::vector<double>& x) {
+        for (int64_t h = 1; h < D; h <<= 1)
+            for (int64_t i = 0; i < D; i += 2 * h)
+                for (int64_t j = i; j < i + h; ++j) {
+                    const double a = x[(size_t)j], b = x[(size_t)(j + h)];
+                    x[(size_t)j] = a + b;
+                    x[(size_t)(j + h)] = a - b;
+                }
+        for (double& e : x) e *= inv;
+    };
+    std::vector<float> t;
+    std::vector<int32_t> en(recipe.size(), -1);
+    int32_t n = 0;
+    for (size_t l = 0; l < recipe.size(); ++l) {
+        if (recipe[l] < 0 || !(recipe[l] & RAD_KVQ_VPRED)) continue;
+        const auto it = vp.layer.find((int)l);
+        if (it == vp.layer.end()) {
+            RAD_ERR("%s has no maps for layer %zu, which the recipe marks 'vpred'", name, l);
+            return RAD_E_INVAL;
+        }
+        en[l] = n++;
+        t.resize((size_t)(n * E));
+        float* e = t.data() + (size_t)(en[l]) * (size_t)E;
+        for (int64_t k = 0; k < n_head_kv; ++k) {
+            const float* src = it->second.data() + k * (D + 1) * D;
+            /* A rotated layer stores k' = k H and v' = v H (H symmetric and its own inverse), so
+             * v' ~ k' (H A H) + b H: each row of A times H, then each column of the result. */
+            std::vector<std::vector<double>> a((size_t)D, std::vector<double>((size_t)D));
+            for (int64_t i = 0; i < D; ++i) {
+                for (int64_t j = 0; j < D; ++j) a[(size_t)i][(size_t)j] = src[i * D + j];
+                rot(a[(size_t)i]);
+            }
+            std::vector<double> col((size_t)D);
+            for (int64_t j = 0; j < D; ++j) {
+                for (int64_t i = 0; i < D; ++i) col[(size_t)i] = a[(size_t)i][(size_t)j];
+                rot(col);
+                for (int64_t i = 0; i < D; ++i) e[(k * (D + 1) + i) * D + j] = (float)col[(size_t)i];
+            }
+            std::vector<double> b(src + D * D, src + (D + 1) * D);
+            rot(b);
+            for (int64_t j = 0; j < D; ++j) e[(k * (D + 1) + D) * D + j] = (float)b[(size_t)j];
+        }
+    }
+    *table = std::move(t);
+    *entry = std::move(en);
+    return RAD_OK;
+}
+
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
@@ -568,7 +1215,27 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "off"))  c->busy_prefill_chunk = 0;
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
-        else if (S("--prefill-interleave"))    { if (!num(0, 64, &c->prefill_interleave)) return RAD_E_INVAL; }
+        else if (S("--prefill-interleave"))    {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->prefill_interleave_set = true;
+            if (!std::strcmp(v, "auto")) { c->prefill_interleave = -1; c->prefill_interleave_share = 0.25; }
+            else if (!std::strncmp(v, "auto:", 5)) {
+                /* auto:SHARE -- decode-only steps for up to SHARE x a chunk step's time, 0 < SHARE <= 4 */
+                char* e = nullptr;
+                const double sh = std::strtod(v + 5, &e);
+                if (e == v + 5 || *e || !(sh > 0.0 && sh <= 4.0)) {
+                    RAD_ERR("--prefill-interleave %s: auto:SHARE takes a share in (0, 4]", v);
+                    return RAD_E_INVAL;
+                }
+                c->prefill_interleave = -1; c->prefill_interleave_share = sh;
+            }
+            else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
+        }
+        else if (S("--decode-headroom")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->decode_headroom = -1;
+            else if (!parse_int(a.c_str(), v, 0, 1 << 20, &c->decode_headroom)) return RAD_E_INVAL;
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -587,14 +1254,15 @@ int config_parse(int argc, char** argv, Config* c) {
          * old launch lines at the flags that move the split. */
         else if (S("--vram-weights-mib") || S("--vram-kv-mib")) {
             RAD_ERR("%s was removed: the card is split between the weights and the cache from what "
-                    "the model needs. --gpu-headroom-mib takes card space away, --max-model-len and "
-                    "--max-num-seqs bound the cache, and --host-pool-mib decides which experts stay "
-                    "on the card", a.c_str());
+                    "the model needs. --gpu-headroom-mib or --gpu-memory-mib take card space away, "
+                    "--max-model-len and --max-num-seqs bound the cache, and --host-pool-mib "
+                    "decides which experts stay on the card", a.c_str());
             return RAD_E_INVAL;
         }
         /* --gpu-headroom is accepted as an alias of --gpu-headroom-mib. */
         else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
                                                { if (!num(0, INT64_MAX, &c->gpu_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--gpu-memory-mib"))         { if (!num(1, INT64_MAX, &c->gpu_memory_mib)) return RAD_E_INVAL; }
         else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -605,6 +1273,81 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->kv_cache_dtype = v;
         }
+        else if (S("--kv-recipe")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            std::ifstream f(v, std::ios::binary);
+            if (!f) {
+                RAD_ERR("--kv-recipe: cannot read '%s'", v);
+                return RAD_E_INVAL;
+            }
+            const std::string text((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+            const std::string name = std::string("--kv-recipe ") + v;
+            std::string vfile, pfile;
+            const int rc = kv_recipe_parse(text, name.c_str(), &c->kv_recipe, &vfile, &pfile);
+            if (rc != RAD_OK) return rc;
+            c->kv_recipe_path = v;
+            c->kv_vmean = KvVMean{};
+            c->kv_vpred = KvVPred{};
+            if (!pfile.empty()) {
+                /* Beside the recipe unless absolute, as the mean file. */
+                const std::string rp(v);
+                const size_t slash = rp.find_last_of('/');
+                const std::string ppath = pfile[0] == '/' || slash == std::string::npos
+                                              ? pfile : rp.substr(0, slash + 1) + pfile;
+                std::ifstream pf(ppath, std::ios::binary);
+                if (!pf) {
+                    RAD_ERR("%s: cannot read its K-to-V map file '%s'", name.c_str(), ppath.c_str());
+                    return RAD_E_INVAL;
+                }
+                const std::string pt((std::istreambuf_iterator<char>(pf)),
+                                     std::istreambuf_iterator<char>());
+                const int pr = kv_vpred_parse(pt, ppath.c_str(), &c->kv_vpred);
+                if (pr != RAD_OK) return pr;
+                for (size_t l = 0; l < c->kv_recipe.size(); ++l)
+                    if (c->kv_recipe[l] >= 0 && (c->kv_recipe[l] & RAD_KVQ_VPRED) &&
+                        !c->kv_vpred.layer.count((int)l)) {
+                        RAD_ERR("%s: layer %zu says 'vpred' and %s has no maps for it",
+                                name.c_str(), l, ppath.c_str());
+                        return RAD_E_INVAL;
+                    }
+                for (const auto& [l, mp] : c->kv_vpred.layer)
+                    if ((size_t)l >= c->kv_recipe.size() || c->kv_recipe[(size_t)l] < 0) {
+                        RAD_ERR("%s: %s holds layer %d, which the recipe does not name; a map "
+                                "file from another model's recipe", name.c_str(), ppath.c_str(), l);
+                        return RAD_E_INVAL;
+                    }
+            }
+            if (!vfile.empty()) {
+                /* Beside the recipe unless absolute, so a recipe and its means move together. */
+                const std::string rp(v);
+                const size_t slash = rp.find_last_of('/');
+                const std::string vpath = vfile[0] == '/' || slash == std::string::npos
+                                              ? vfile : rp.substr(0, slash + 1) + vfile;
+                std::ifstream vf(vpath, std::ios::binary);
+                if (!vf) {
+                    RAD_ERR("%s: cannot read its V mean file '%s'", name.c_str(), vpath.c_str());
+                    return RAD_E_INVAL;
+                }
+                const std::string vt((std::istreambuf_iterator<char>(vf)),
+                                     std::istreambuf_iterator<char>());
+                const int vr = kv_vmean_parse(vt, vpath.c_str(), &c->kv_vmean);
+                if (vr != RAD_OK) return vr;
+                for (size_t l = 0; l < c->kv_recipe.size(); ++l)
+                    if (c->kv_recipe[l] >= 0 && (c->kv_recipe[l] & RAD_KVQ_VMEAN) &&
+                        !c->kv_vmean.layer.count((int)l)) {
+                        RAD_ERR("%s: layer %zu says 'vmean' and %s has no V mean for it",
+                                name.c_str(), l, vpath.c_str());
+                        return RAD_E_INVAL;
+                    }
+                for (const auto& [l, mu] : c->kv_vmean.layer)
+                    if ((size_t)l >= c->kv_recipe.size() || c->kv_recipe[(size_t)l] < 0) {
+                        RAD_ERR("%s: %s holds layer %d, which the recipe does not name; a mean "
+                                "file from another model's recipe", name.c_str(), vpath.c_str(), l);
+                        return RAD_E_INVAL;
+                    }
+            }
+        }
         else if (S("--state-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (std::strcmp(v, "f32") && std::strcmp(v, "f16")) {
@@ -612,6 +1355,23 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->state_cache_dtype = v;
+        }
+        else if (S("--qsa-bkey-dtype")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "bf16") && std::strcmp(v, "i8")) {
+                RAD_ERR("--qsa-bkey-dtype takes bf16 or i8, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->qsa_bkey_dtype = v;
+        }
+        else if (S("--qsa-bkey-split")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->qsa_bkey_split = true;
+            else if (!std::strcmp(v, "off")) c->qsa_bkey_split = false;
+            else {
+                RAD_ERR("--qsa-bkey-split takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
         }
         else if (S("--attn-prefill-fp8")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -641,7 +1401,7 @@ int config_parse(int argc, char** argv, Config* c) {
                     RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
                 return RAD_E_INVAL;
             }
-            std::string share_dir;
+            std::string share_dir, disk_dir;
             if (!emb && !std::strncmp(v, "ram=", 4)) {
                 share_dir = v + 4;
                 if (share_dir.empty()) {
@@ -650,11 +1410,23 @@ int config_parse(int argc, char** argv, Config* c) {
                     return RAD_E_INVAL;
                 }
                 p = TablePlacement::Ram;
+            } else if (!emb && !std::strncmp(v, "disk=", 5)) {
+                disk_dir = v + 5;
+                if (disk_dir.empty()) {
+                    RAD_ERR("--ngram-placement disk= needs a directory: disk=DIR, where the table "
+                            "is read from its own file");
+                    return RAD_E_INVAL;
+                }
+                p = TablePlacement::Disk;
             } else if (!emb && !parse_table_placement(v, &p)) {
-                RAD_ERR("%s takes auto, vram, ram, ram=DIR or disk, not '%s'", a.c_str(), v);
+                RAD_ERR("%s takes auto, vram, ram, ram=DIR, disk or disk=DIR, not '%s'", a.c_str(),
+                        v);
                 return RAD_E_INVAL;
             }
-            if (!emb) c->ngram_share_dir = share_dir;
+            if (!emb) {
+                c->ngram_share_dir = share_dir;
+                c->ngram_disk_dir = disk_dir;
+            }
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
         }
@@ -671,6 +1443,10 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
+        else if (S("--kv-residency-mib"))     { if (!num(0, INT32_MAX, &c->residency_mib)) return RAD_E_INVAL; }
+        else if (S("--kv-residency-sink-tokens")) {
+            if (!num(0, INT32_MAX, &c->residency_sink_tokens)) return RAD_E_INVAL;
+        }
         else if (S("--lora")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             const char* eq = std::strchr(v, '=');
@@ -1130,6 +1906,14 @@ int config_parse(int argc, char** argv, Config* c) {
         return RAD_E_INVAL;
     }
 
+    /* --gpu-memory-mib claims the card; --gpu-headroom-mib leaves it unclaimed. The alias
+     * --gpu-headroom is recorded as --gpu-headroom-mib, so it is covered. */
+    if (c->given.count("--gpu-memory-mib") && c->given.count("--gpu-headroom-mib")) {
+        RAD_ERR("--gpu-memory-mib claims the card and --gpu-headroom-mib leaves it unclaimed; "
+                "give one");
+        return RAD_E_INVAL;
+    }
+
     /* Prompt lookup alone: the window is its K, stated once. */
     if (c->spec_ngram_min > c->spec_ngram_max) {
         RAD_ERR("--spec-ngram-min %d is longer than --spec-ngram-max %d", c->spec_ngram_min,
@@ -1258,6 +2042,28 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* Two answers to one question: KV streaming (--kv-resident, docs/KV-STREAMING.md) keeps the
+     * sparse attention group in host memory with a ring on the card, window residency
+     * (--kv-residency-mib, spec §7.3) keeps it on the card and demotes what the window does not
+     * cover. Both rewrite the same group's selection and own its blocks' placement, so one server
+     * runs one of them. */
+    /* A recipe sets each layer's layout within the E4M3 cache (RadBuildCtx::kv_recipe), its `bf16`
+     * layers (RAD_KVQ_BF16) the one exception it names per layer, and a drafter's cache stays
+     * E4M3; under bf16 or one of the narrow names the two flags would say two things about the
+     * same layers. */
+    if (!c->kv_recipe.empty() && c->kv_cache_dtype != "fp8") {
+        RAD_ERR("--kv-recipe %s sets each attention layer's layout within the fp8 cache, and "
+                "--kv-cache-dtype is %s; pass --kv-cache-dtype fp8", c->kv_recipe_path.c_str(),
+                c->kv_cache_dtype.c_str());
+        return RAD_E_INVAL;
+    }
+    if (c->kv_resident > 0 && c->residency_mib > 0) {
+        RAD_ERR("--kv-resident and --kv-residency-mib are two ways to keep a sparse attention "
+                "group's KV off the card -- streaming from host memory with a ring on the card, or "
+                "the cache on the card with its unread middle demoted -- and a server runs one of "
+                "them. Pass only one");
+        return RAD_E_INVAL;
+    }
 
     return RAD_OK;
 }
@@ -1322,15 +2128,25 @@ const ShowRow kShow[] = {
           return c.busy_prefill_chunk < 0 ? std::string("auto")
                : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
     { "--prefill-interleave", [](const Config& c) {
-          return c.prefill_interleave > 0 ? num(c.prefill_interleave) : std::string("off"); } },
+          return c.prefill_interleave > 0 ? num(c.prefill_interleave)
+               : c.prefill_interleave < 0 ? "auto:" + std::to_string(c.prefill_interleave_share)
+                                          : std::string("off"); } },
+    { "--decode-headroom",    [](const Config& c) {
+          return c.decode_headroom < 0 ? std::string("auto") : num(c.decode_headroom); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },
     { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
+    { "--gpu-memory-mib",     [](const Config& c) {
+          return c.gpu_memory_mib ? num(c.gpu_memory_mib) : std::string("0 (use --gpu-headroom-mib)"); } },
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
+    { "--kv-recipe",          [](const Config& c) { return or_none(c.kv_recipe_path, "none"); } },
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
+    { "--qsa-bkey-dtype",     [](const Config& c) { return c.qsa_bkey_dtype; } },
+    { "--qsa-bkey-split",     [](const Config& c) {
+          return std::string(c.qsa_bkey_split ? "on" : "off"); } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--kv-resident",        [](const Config& c) {
@@ -1340,13 +2156,17 @@ const ShowRow kShow[] = {
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) {
           std::string v = table_placement_name(c.ngram_placement);
-          return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
+          const std::string& dir = c.ngram_share_dir.empty() ? c.ngram_disk_dir : c.ngram_share_dir;
+          return dir.empty() ? v : v + "=" + dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
+    { "--kv-residency-mib",   [](const Config& c) {
+          return c.residency_mib ? num(c.residency_mib) : std::string("0 (off)"); } },
+    { "--kv-residency-sink-tokens", [](const Config& c) { return num(c.residency_sink_tokens); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

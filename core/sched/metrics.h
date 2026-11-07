@@ -5,10 +5,17 @@
  */
 #pragma once
 #include "rad_core.h"
+#include <vector>
 
 namespace rad {
 
 enum { RAD_SCHED_MAX_KV_GROUPS = 16 };
+
+/* One session's share of the window-residency counters (KVManager::SeqResidency). */
+struct SeqResidency {
+    uint64_t id = 0;
+    int64_t demoted = 0, promoted = 0, skipped = 0, link_bytes = 0, freed_bytes = 0;
+};
 
 struct SchedMetrics {
     int64_t step = 0;
@@ -101,6 +108,21 @@ struct SchedMetrics {
     int64_t prefix_ckpt_retired = 0, prefix_ckpt_lru = 0, prefix_ckpt_refused = 0;
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;   /* --prefix-cache-ttl */
     int64_t prefix_released = 0, prefix_ckpt_released = 0; /* DELETE /sessions */
+    /* Window residency (spec §7.3): blocks a sparse consumer's window does not cover, moved to
+     * host memory and back. `res_misses` is the link traffic a step paid because its selection
+     * named a block that had left; a window that is too small shows here before the step time
+     * does. All zero while --kv-residency-mib is 0, and on a model that declares no window. */
+    int64_t res_demoted = 0, res_promoted = 0, res_skipped = 0, res_misses = 0;
+    int64_t res_host_bytes = 0, res_cap_bytes = 0;
+    int64_t res_freed_bytes = 0;     /* VRAM the demotions gave back to the pool */
+    int64_t res_link_bytes = 0;      /* bytes moved over the link, both directions */
+    int64_t res_scratch_bytes = 0;   /* VRAM the pager's scratch pages hold */
+    /* Cold entries the pager rewrote, summed over QSA layers and decode rows (rank 0's counter on
+     * the card, read back per poll). Not per session: the card cannot attribute a row. */
+    int64_t res_paged_in = 0;
+    int64_t res_paged_hits = 0;
+    /* Per session (= request id), empty until something moved; see SessionStat. */
+    std::vector<SeqResidency> res_seqs;
     /* Admissions whose attention hit was cut to nothing: no snapshot at or below it (recurrent
      * state or a window snapshot), a windowed trunk group no window snapshot covers, or blocks
      * that could not be adopted. `hit_cut_resumed_below` counts those that resumed at a

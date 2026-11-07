@@ -630,6 +630,10 @@ constexpr long long kOnDemandMaxRows = 4096;
  * below); such a gather never waits on another thread's claim, so the pause cannot close a cycle. */
 std::atomic<int> g_urgent_reads{0};
 
+/* The read-ahead reader thread's owner tag (0 before it starts): a decode gather reads a row that
+ * thread holds directly instead of waiting on it, so the g_urgent_reads pause cannot close a cycle. */
+std::atomic<uint64_t> g_reader_tag{0};
+
 struct UrgentReads {
     UrgentReads() { g_urgent_reads.fetch_add(1, std::memory_order_acq_rel); }
     ~UrgentReads() {
@@ -655,6 +659,8 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     g.slot.resize((size_t)M);
     g.reads.clear();
     g.again.clear();
+    g.waits.clear();
+    const uint64_t reader = g_reader_tag.load(std::memory_order_acquire);
     for (long long m = 0; m < M; ++m) {
         uint16_t* dst = q.out + m * x_ld;
         if (pad(row_of(m))) { std::memset(dst, 0, (size_t)ne * sizeof(uint16_t)); continue; }
@@ -667,8 +673,13 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             g.dst.push_back(dst);
             g.dm.push_back(m);
             g.dw.push_back(RowCache::ready(key));
+        } else if (f == RowCache::THEIRS && s >= 0 &&
+                   ((rc.word[s].load(std::memory_order_acquire) >> 2) & 255) != reader) {
+            /* Another rank thread is reading it: wait below instead of reading it a second time
+             * (both ranks gather the same rows, so reading it again doubled decode's reads). */
+            g.waits.push_back(m);
         } else {
-            /* THEIRS, MINE (a row twice in one call) and NONE are read directly: no wait. */
+            /* The reader's THEIRS, MINE (a row twice in one call) and NONE are read directly. */
             g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1});
         }
     }
@@ -686,14 +697,37 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             g.dw.push_back(RowCache::ready(r.key));
         }
     }
-    if (g.src.empty()) return RAD_OK;
-    /* The seqlock, as gather_rows reads it: a row whose word changed during the decode was taken
-     * over, and is read again directly. */
-    decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    for (size_t i = 0; i < g.dm.size(); ++i)
-        if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
-            g.again.push_back(g.dm[i]);
+    /* Wait for the other rank's reads, as gather_rows does. This thread's own reads are done, so no cycle: the other rank reads its claims before it
+     * waits. A row that turns READY decodes from the cache; one released or taken over is read
+     * directly below. */
+    while (!g.waits.empty()) {
+        const uint32_t e = rc.published.load(std::memory_order_acquire);
+        size_t keep = 0;
+        for (long long m : g.waits) {
+            const uint64_t key = key_of(m);
+            const uint64_t x   = rc.word[g.slot[m]].load(std::memory_order_acquire);
+            if (x == RowCache::ready(key)) {
+                g.src.push_back(rc.data + (size_t)g.slot[m] * (size_t)n);
+                g.dst.push_back(q.out + m * x_ld);
+                g.dm.push_back(m);
+                g.dw.push_back(x);
+                continue;
+            }
+            if ((x & 3) == RowCache::LOADING && (x >> 10) == key) { g.waits[keep++] = m; continue; }
+            g.again.push_back(m);
+        }
+        g.waits.resize(keep);
+        if (keep) rc.published.wait(e, std::memory_order_acquire);
+    }
+    if (!g.src.empty()) {
+        /* The seqlock, as gather_rows reads it: a row whose word changed during the decode was
+         * taken over, and is read again directly. */
+        decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        for (size_t i = 0; i < g.dm.size(); ++i)
+            if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
+                g.again.push_back(g.dm[i]);
+    }
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
     for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
@@ -817,8 +851,8 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
  * list adds nothing. A list that does not continue the previous one (another request's prompt)
  * drops the jobs still queued for the previous one.
  *
- * The reader reads in batches of kReaderBatch rows and starts none while a decode-sized gather is
- * reading (g_urgent_reads), so a decode step's few reads do not queue in the drive behind a
+ * The reader keeps up to kReaderBatch reads in the drive, starting one as each lands, and starts
+ * none while a decode-sized gather is reading (g_urgent_reads), so a decode step's few reads do not queue in the drive behind a
  * prefetch's thousands. A failed read releases its claims and the next call reads those rows
  * itself. The reader is detached and never destroyed. */
 
@@ -832,6 +866,105 @@ constexpr size_t kJobRows = 8192;
 /* Reads the reader has in the drive at once. A drive serves a batch in arrival order, so this is
  * the most a decode step's reads can find ahead of them; 128 still keeps an NVMe queue busy. */
 constexpr size_t kReaderBatch = 128;
+
+/* The reader's claimed rows `reads[0, total)` (each with a slot), with at most `depth` in the drive
+ * at once, a new read submitted as each completes, and each row published READY as it lands: waiting
+ * for whole batches let the drive's queue drain at the end of each (40k reads/s against 46k).  While a decode-sized gather is reading, no new read starts;
+ * the ones in flight drain first, so at most `depth` reads are ever ahead of a decode step's (as
+ * with the stock batches). On a failed read every unpublished claim is released. */
+int stream_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
+                   const SpanRead* reads, size_t total, long long n, size_t depth) {
+    const long long A      = tf.align;
+    const long long stride = ((n + A - 1) / A + 1) * A;
+    if (depth > rr.entries) depth = rr.entries;
+    if (depth > 0xffff) depth = 0xffff;
+    static thread_local std::vector<uint32_t> freebuf;
+    static thread_local std::vector<uint8_t>  landed;
+    landed.assign(total, 0);
+    uint8_t* bounce = g.bounce_for(depth * (size_t)stride, (size_t)A);
+    int status = bounce ? RAD_OK : RAD_E_NOMEM;
+    freebuf.clear();
+    for (size_t d = 0; d < depth; ++d) freebuf.push_back((uint32_t)(depth - 1 - d));
+    size_t next = 0, inflight = 0;
+    unsigned pending = 0;                       /* queued in the SQ, not yet submitted */
+    while (status == RAD_OK && (next < total || inflight)) {
+        if (inflight == 0 && pending == 0)
+            for (int u; (u = g_urgent_reads.load(std::memory_order_acquire)) > 0;)
+                g_urgent_reads.wait(u, std::memory_order_acquire);
+        const bool may_start = g_urgent_reads.load(std::memory_order_acquire) == 0;
+        unsigned tail = __atomic_load_n(rr.sq_tail, __ATOMIC_RELAXED);
+        unsigned add = 0;
+        while (may_start && next < total && !freebuf.empty()) {
+            const uint32_t buf = freebuf.back();
+            freebuf.pop_back();
+            const SpanRead& r = reads[next];
+            const long long a = (long long)r.key & ~(A - 1);
+            const long long e = ((long long)r.key + n + A - 1) & ~(A - 1);
+            const unsigned idx = tail & *rr.sq_mask;
+            io_uring_sqe* s = &rr.sqes[idx];
+            std::memset(s, 0, sizeof *s);
+            s->opcode    = IORING_OP_READ;
+            s->fd        = tf.fd;
+            s->off       = (uint64_t)a;
+            s->addr      = (uint64_t)(uintptr_t)(bounce + (size_t)buf * (size_t)stride);
+            s->len       = (unsigned)(e - a);
+            s->user_data = (uint64_t)next << 16 | buf;
+            rr.sq_array[idx] = idx;
+            ++tail; ++add; ++next; ++inflight;
+        }
+        if (add) __atomic_store_n(rr.sq_tail, tail, __ATOMIC_RELEASE);
+        pending += add;
+        if (!inflight) continue;
+        const long rc_ = syscall(__NR_io_uring_enter, rr.fd, pending, 1u, IORING_ENTER_GETEVENTS,
+                                 nullptr, (size_t)0);
+        if (rc_ < 0 && errno != EINTR && errno != EAGAIN && errno != EBUSY) { status = RAD_E_IO; break; }
+        if (rc_ > 0) pending -= (unsigned)rc_ < pending ? (unsigned)rc_ : pending;
+        unsigned h = __atomic_load_n(rr.cq_head, __ATOMIC_RELAXED);
+        const unsigned tl = __atomic_load_n(rr.cq_tail, __ATOMIC_ACQUIRE);
+        unsigned got = 0;
+        for (; h != tl; ++h) {
+            const io_uring_cqe& c = rr.cqes[h & *rr.cq_mask];
+            const size_t   i   = (size_t)(c.user_data >> 16);
+            const uint32_t buf = (uint32_t)(c.user_data & 0xffff);
+            --inflight;
+            freebuf.push_back(buf);
+            const SpanRead& r = reads[i];
+            const long long a = (long long)r.key & ~(A - 1);
+            const long long e = ((long long)r.key + n + A - 1) & ~(A - 1);
+            if (c.res < 0 || (long long)c.res != e - a) { status = RAD_E_IO; continue; }
+            const uint8_t* row = bounce + (size_t)buf * (size_t)stride + (r.key & (uint64_t)(A - 1));
+            std::memcpy(rc.data + (size_t)r.slot * (size_t)n, row, (size_t)n);
+            rc.ref[r.slot].store(1, std::memory_order_relaxed);
+            rc.word[r.slot].store(RowCache::ready(r.key), std::memory_order_release);
+            landed[i] = 1;
+            ++got;
+        }
+        __atomic_store_n(rr.cq_head, h, __ATOMIC_RELEASE);
+        if (got) {
+            g_rows_read.fetch_add(got, std::memory_order_relaxed);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+    }
+    /* After an error, drain what is still in flight so the ring is clean for the next job. */
+    while (inflight) {
+        const long rc_ = syscall(__NR_io_uring_enter, rr.fd, pending, 1u, IORING_ENTER_GETEVENTS,
+                                 nullptr, (size_t)0);
+        if (rc_ < 0 && errno != EINTR && errno != EAGAIN && errno != EBUSY) break;
+        if (rc_ > 0) pending -= (unsigned)rc_ < pending ? (unsigned)rc_ : pending;
+        unsigned h = __atomic_load_n(rr.cq_head, __ATOMIC_RELAXED);
+        const unsigned tl = __atomic_load_n(rr.cq_tail, __ATOMIC_ACQUIRE);
+        for (; h != tl; ++h) --inflight;
+        __atomic_store_n(rr.cq_head, h, __ATOMIC_RELEASE);
+    }
+    if (status != RAD_OK) {
+        for (size_t i = 0; i < total; ++i)
+            if (!landed[i]) rc.word[reads[i].slot].store(RowCache::EMPTY, std::memory_order_release);
+        rc.published.fetch_add(1, std::memory_order_release);
+        rc.published.notify_all();
+    }
+    return status;
+}
 
 /* Tries at matching a list against the previous one (read_ahead) before it counts as new. */
 constexpr int kShiftTries = 64;
@@ -883,6 +1016,7 @@ struct AheadReader {
         Gather&        g  = gather_state();
         ReadRing*      rr = read_ring(nullptr);
         const uint64_t me = owner_tag();
+        g_reader_tag.store(me, std::memory_order_release);
         for (;;) {
             AheadJob j;
             {
@@ -907,21 +1041,9 @@ struct AheadReader {
                 else if (f == RowCache::NONE && !j.retry)
                     retry.push_back(j.keys[i]);
             }
-            /* Every read has a slot, so nothing is decoded and there is no output. */
-            for (size_t b = 0; b < g.reads.size(); b += kReaderBatch) {
-                for (int u; (u = g_urgent_reads.load(std::memory_order_acquire)) > 0;)
-                    g_urgent_reads.wait(u, std::memory_order_acquire);
-                const size_t cnt = std::min(kReaderBatch, g.reads.size() - b);
-                if (read_and_publish(*j.tf, *j.rc, *rr, g, &g.reads[b], cnt, j.n, 0, nullptr,
-                                     nullptr, nullptr, 0) == RAD_OK)
-                    continue;
-                /* The failed batch released its own claims; the later batches' go too. */
-                for (size_t i = b + cnt; i < g.reads.size(); ++i)
-                    j.rc->word[g.reads[i].slot].store(RowCache::EMPTY, std::memory_order_release);
-                j.rc->published.fetch_add(1, std::memory_order_release);
-                j.rc->published.notify_all();
-                break;
-            }
+            /* Every read has a slot, so nothing is decoded and there is no output; a failed read
+             * releases every claim not yet published. */
+            stream_publish(*j.tf, *j.rc, *rr, g, g.reads.data(), g.reads.size(), j.n, kReaderBatch);
             if (!retry.empty()) {
                 std::lock_guard<std::mutex> lk(mu);
                 AheadJob r;

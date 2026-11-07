@@ -18,8 +18,69 @@ extern "C" {
  * the number. Every kind of plugin reports it, and a plugin that does not report exactly this
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
- * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 32u
+ * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default.
+ *
+ * 38: window residency (spec §7.3, docs/OPS.md `qsa_page`), an alternative to KV streaming for
+ * the same sparse attention group: RadKVGroupDecl gained residency_window; RadKVGroupBatch the
+ * residency store (device base, slot size and count, per-layer offsets), the pager's per-row
+ * scratch pages and its counter; RadBuildCtx gained kv_residency (in the tail padding after
+ * expert_file_tier); and a paged block-table entry a third meaning, cold (-2 - slot;
+ * rad_kv_cold_entry in rad_runtime.h).
+ *
+ * 39: a per-layer KV recipe (--kv-recipe): RadBuildCtx gained n_kv_recipe and kv_recipe,
+ * RadArchProbe kv_recipe_ok (in the tail padding after gen_shape).
+ *
+ * 40: a kv_recipe entry a second meaning, RAD_KVQ_ROTATED beside the layout (rad_builder.h); no
+ * struct moved. A plugin built at 39 would read a rotated layer as a layout it does not know.
+ *
+ * 41: a fourth kv_quant / kv_recipe layout, RAD_KVQ_K4H (k4h_v4: rotated int4 K, int4 V;
+ * rad_builder.h), and its bit in RadArchProbe::kv_quant_ok; no struct moved.
+ *
+ * 42: a fifth layout, RAD_KVQ_K4HV2H (k4h_v2h: rotated int4 K, rotated int2 V under KVarN's
+ * variance normalisation; rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built
+ * at 41 would read a k4h_v2h layer as a layout it does not know.
+ *
+ * 43: a static V mean per layer (--kv-recipe `vmean`): a kv_recipe entry a third meaning,
+ * RAD_KVQ_VMEAN, RadBuildCtx gained kv_vmean, and RadKvVMean (rad_builder.h) is new.
+ *
+ * 44: a sixth layout, RAD_KVQ_I8H (i8h: rotated int8 K and V, one f16 scale a token and head;
+ * rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built at 43 would read an i8h
+ * layer as a layout it does not know.
+ *
+ * 45: the QSA indexer's block keys in int8 (--qsa-bkey-dtype i8): RadBuildCtx gained
+ * qsa_bkey_dtype and RadArchProbe qsa_bkey_i8_ok (rad_builder.h). A plugin built at 44 would keep
+ * bf16 block keys under a flag that promised half their memory.
+ *
+ * 46: a seventh kv_recipe layout, RAD_KVQ_BF16 (the layer keeps the plain bf16 cache
+ * --kv-cache-dtype bf16 keeps, beside fp8-family layers; rad_builder.h), and its kv_quant_ok bit;
+ * no struct moved. A plugin built at 45 would read a bf16 layer as a layout it does not know.
+ *
+ * 47: a kv_recipe entry's fourth meaning, the demote layout under window residency
+ * (RAD_KVQ_DEMOTE, rad_builder.h; --kv-recipe `demote LAYOUT`), and the optional `store_layout`,
+ * `pool_layout` and `head_dim` of `qsa_page` with the new op `kv_transcode` (docs/OPS.md); no
+ * struct moved. A plugin built at 46 would read a tiered layer's entry as a layout it does not
+ * know and refuse it.
+ *
+ * 48: an eighth kv_recipe layout, RAD_KVQ_K5V4 (k5_v4: int5 K, int4 V, f16 scales a group of 32;
+ * rad_builder.h), and its kv_quant_ok bit; no struct moved. A plugin built at 47 would read a k5_v4
+ * layer as a layout it does not know and refuse it.
+ *
+ * 49: V predicted from the same layer's K (--kv-recipe `vpred`): a kv_recipe entry's fifth
+ * meaning, RAD_KVQ_VPRED, RadBuildCtx gained kv_vpred (past qsa_bkey_dtype), RadKvVPred
+ * (rad_builder.h) is new, and with it the op `kv_vpred` and attn_paged's kv_dtype k4h_v4_pk /
+ * k4h_v2h_pk (docs/OPS.md). A plugin built at 48 would read a vpred layer's entry as a layout it
+ * does not know and refuse it.
+ *
+ * 50: the QSA indexer's block keys split across the tensor-parallel ranks (--qsa-bkey-split on):
+ * RadBuildCtx gained qsa_bkey_split (in the padding between qsa_bkey_dtype and kv_vpred) and
+ * RadArchProbe qsa_bkey_split_ok (rad_builder.h), with the new ops `qsa_select_part` and
+ * `qsa_select_join` and the optional `ranks` and `rank` of `qsa_work` (docs/OPS.md). A plugin built
+ * at 49 would keep every block key on every rank under a flag that promised to halve them.
+ *
+ * 51: the pager's page cache (docs/OPS.md `qsa_page`, `tags` and `hits`): RadKVGroupBatch gained
+ * residency_tags, residency_tags_rows and residency_hits, appended. A plugin built at 50 would
+ * read past the struct it knows. */
+#define RAD_ABI_VERSION 51u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -60,6 +121,16 @@ typedef struct RadArgs {
     void*            instance;      /* whatever init() returned for this resolved instance */
     int              rank;          /* tensor-parallel rank and world size, for collectives */
     int              world_size;
+    /* ABI 35: host-side maximum KV length represented by this exact launch operand (a seqused
+     * span or a supported one-sequence prefill boundary), or -1 when it cannot be proven. In a
+     * decode, verify or draft pass of an architecture with no rad_arch_pass_key it is instead the
+     * step's context bound plus its longest query, which the recorded pass's key holds. Plugins
+     * must not infer it from a device pointer or synchronously read device memory to get it. */
+    int32_t          kv_used_max_h;
+    /* The current rank's WGP count (HIP multiProcessorCount on RDNA); lets split launchers use
+     * exactly the same per-device occupancy as architecture pass-key callbacks without querying
+     * the process-global current device on the hot path. */
+    int32_t          wgp_count;
 } RadArgs;
 
 /* Read a parameter by key. Inline definitions, because a plugin links only the ABI headers and
@@ -465,14 +536,19 @@ typedef struct RadKernelInfo {
      * against: a named skip, not a failure. */
     RadUnrelayoutFn unrelayout;
     /* The chain of conventional ops this kernel computes in one launch, or null if it is not a
-     * fusion. Non-null also counts in rad-kbench's fusion-claim column.
+     * fusion. Non-null also counts in rad-kbench's fusion-claim column. */
+    RadFuseFn      replaces;
+    /* Flags describing runtime behavior relevant to core safety decisions. Zero means none.
      *
      * Keep this field last. Kernel tables are positional aggregate initialisers
      * (`{..., nullptr, nullptr, r4d_rad_embed_lookup, nullptr, ...}`), so a field inserted
      * anywhere else shifts every later initialiser, and since `nullptr` converts to any function
      * pointer type, part of that shift would still compile. Append new fields after this one. */
-    RadFuseFn      replaces;
+    uint64_t       capabilities;
 } RadKernelInfo;
+
+/* This row's launch grid can depend on live seqused during prefill. */
+#define RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT (1ull << 0)
 
 /* ================================================================== kernel plugin exports */
 /* Every kernel plugin exports the whole set. The first plugin in hierarchy order to declare an op

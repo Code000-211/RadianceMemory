@@ -3379,11 +3379,16 @@ int anthropic_image(const json& block, const std::string& at, json* out, ApiErro
  * continuation sends only the tail of the conversation), so a field outside these lists is
  * refused by name rather than ignored. The refusal says "Extra inputs are not permitted", as
  * Anthropic's does; Claude Code matches those words to retry without a beta field it can
- * drop. */
+ * drop.
+ *
+ * The last row is not Anthropic's: the chat path's history penalties and min-p, under the chat
+ * path's names, ranges and meaning, for clients that speak only this format to a model whose
+ * card asks for them (Qwen's presence_penalty). */
 const char* kAnthropicFields[] = {
     "model", "messages", "system", "max_tokens", "temperature", "top_p", "top_k", "stream",
     "stop_sequences", "tools", "tool_choice", "thinking", "metadata", "output_config",
     "output_format", "context_management", "thread",
+    "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "repeat_last_n",
 };
 
 /* Accepted and not acted on: none of them can change the answer here. Capacity and placement
@@ -3917,8 +3922,11 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         if (one) o["parallel_tool_calls"] = false;
     }
 
-    /* `model` included, since the reply names it back as Anthropic's does. */
-    for (const char* k : { "model", "max_tokens", "temperature", "top_p", "top_k", "stream" })
+    /* `model` included, since the reply names it back as Anthropic's does. The penalties and
+     * min-p are the chat path's own fields, checked there. */
+    for (const char* k : { "model", "max_tokens", "temperature", "top_p", "top_k", "stream",
+                           "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty",
+                           "repeat_last_n" })
         if (b.contains(k)) o[k] = b.at(k);
     if (b.contains("stop_sequences")) o["stop"] = b.at("stop_sequences");
 

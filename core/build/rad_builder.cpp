@@ -371,6 +371,43 @@ int Builder::bind_layer_kv(int layer, rad_kvgroup g) {
     return RAD_OK;
 }
 
+/* The sparse consumer's reach. Declared by the plugin that owns the sparse read, after the group
+ * and before the build finishes: the attention helper declares the group without knowing whether
+ * the model reads all of its history, and only the plugin does.
+ *
+ * A zero is an explicit "the whole history is read" and is accepted, so a plugin can pass a number
+ * it computed from a checkpoint field that is missing. A different non-zero number on a second call
+ * is refused rather than overwritten: two plugins disagreeing about one group's reach would leave
+ * the residency policy sized for whichever ran last. */
+int Builder::set_residency_window(rad_kvgroup g, int64_t tokens) {
+    if (g == 0 || g >= prog_.kv_groups.size()) {
+        err(RAD_E_INVAL, "set_residency_window: kv group handle %u is not one this builder handed "
+                         "out", g);
+        return RAD_E_INVAL;
+    }
+    if (tokens < 0) {
+        err(RAD_E_INVAL, "set_residency_window: %lld tokens", (long long)tokens);
+        return RAD_E_INVAL;
+    }
+    KVGroupInfo& gi = prog_.kv_groups[g];
+    const int kind = gi.decl.kind;
+    if (kind != RAD_KV_FULL) {
+        err(RAD_E_INVAL, "kv group '%s': a residency window on kind %d. Only a RAD_KV_FULL group "
+                         "can hold blocks the consumer skips: a windowed group recycles them and a "
+                         "stateful one is not paged",
+            gi.name.c_str(), kind);
+        return RAD_E_INVAL;
+    }
+    if (gi.decl.residency_window > 0 && tokens > 0 && gi.decl.residency_window != tokens) {
+        err(RAD_E_STATE, "kv group '%s': residency window already %lld tokens, and %lld was asked "
+                         "for. Two readers of one group must agree on its reach",
+            gi.name.c_str(), (long long)gi.decl.residency_window, (long long)tokens);
+        return RAD_E_STATE;
+    }
+    gi.decl.residency_window = tokens;
+    return RAD_OK;
+}
+
 /* Which op reads this group. The ABI does not link an op to a KV group, so declaration order is
  * the binding, as documented: "declare the group, declare the op, then ask rad_kv_block_size()"
  * (docs/OPS.md, spec §7.2). The consumer is the first unclaimed op after the group that carries a
@@ -1201,6 +1238,11 @@ int Builder::declare_logits(rad_buf b) {
             prog_.vgen_str.name.c_str());
         return RAD_E_STATE;
     }
+    if (prog_.is_shape_generator()) {
+        err(RAD_E_STATE, "declare_logits: this program already declared the shape generator '%s'",
+            prog_.sgen_name.c_str());
+        return RAD_E_STATE;
+    }
     prog_.logits_buf = b;
     return RAD_OK;
 }
@@ -1239,6 +1281,11 @@ int Builder::declare_pooled(rad_buf b) {
     if (prog_.is_video_generator()) {
         err(RAD_E_STATE, "declare_pooled: this program already declared the video generator '%s'",
             prog_.vgen_str.name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.is_shape_generator()) {
+        err(RAD_E_STATE, "declare_pooled: this program already declared the shape generator '%s'",
+            prog_.sgen_name.c_str());
         return RAD_E_STATE;
     }
     const RadBufDecl& d = prog_.buffers[b].decl;
@@ -1329,6 +1376,11 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
             (int)d->one_grid);
         return RAD_E_INVAL;
     }
+    if (d->bidirectional != 0 && (d->bidirectional != 1 || audio)) {
+        err(RAD_E_INVAL, "declare_encoder '%s': bidirectional %d -- 0, or 1 for a picture and video "
+                         "encoder", nm, (int)d->bidirectional);
+        return RAD_E_INVAL;
+    }
     slot = *d;
     slot_name = nm;
     slot.name = nullptr;   /* the plugin's storage; the name is the copy */
@@ -1348,12 +1400,13 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.is_audio_generator() || prog_.is_video_generator()) {
+        prog_.is_audio_generator() || prog_.is_video_generator() || prog_.is_shape_generator()) {
         err(RAD_E_STATE, "declare_generator '%s': this program already declared %s; a program "
-                         "generates text, embeds, makes images, audio or video -- one of the five",
-            nm, prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                         "generates text, embeds, makes images, audio, video or shapes -- one of "
+                         "the six", nm, prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
-                : prog_.is_audio_generator() ? "an audio generator" : "a video generator");
+                : prog_.is_audio_generator() ? "an audio generator"
+                : prog_.is_video_generator() ? "a video generator" : "a shape generator");
         return RAD_E_STATE;
     }
     if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID && d->layout != RAD_GEN_LAYOUT_JOINT_STEP) {
@@ -1505,13 +1558,14 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.generator.layout != 0 || prog_.is_video_generator()) {
+        prog_.generator.layout != 0 || prog_.is_video_generator() || prog_.is_shape_generator()) {
         err(RAD_E_STATE, "declare_audio_generator '%s': this program already declared %s; a "
-                         "program generates text, embeds, makes images, audio or video -- one of "
-                         "the five", nm,
+                         "program generates text, embeds, makes images, audio, video or shapes -- "
+                         "one of the six", nm,
             prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
-                : prog_.generator.layout != 0 ? "an image generator" : "a video generator");
+                : prog_.generator.layout != 0 ? "an image generator"
+                : prog_.is_video_generator() ? "a video generator" : "a shape generator");
         return RAD_E_STATE;
     }
     if (!d->tmpl && !d->tmpl_plain) {
@@ -1682,13 +1736,14 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.generator.layout != 0 || prog_.is_audio_generator()) {
+        prog_.generator.layout != 0 || prog_.is_audio_generator() || prog_.is_shape_generator()) {
         err(RAD_E_STATE, "declare_video_generator '%s': this program already declared %s; a "
-                         "program generates text, embeds, makes images, audio or video -- one of "
-                         "the five", nm,
+                         "program generates text, embeds, makes images, audio, video or shapes -- "
+                         "one of the six", nm,
             prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
-                : prog_.generator.layout != 0 ? "an image generator" : "an audio generator");
+                : prog_.generator.layout != 0 ? "an image generator"
+                : prog_.is_audio_generator() ? "an audio generator" : "a shape generator");
         return RAD_E_STATE;
     }
     if (!d->tmpl || !std::strstr(d->tmpl, "{prompt}") || d->max_text <= 0) {
@@ -1900,6 +1955,108 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     prog_.video_gen.default_negative = nullptr;
     prog_.video_gen.decoders = nullptr;
     prog_.video_gen.decoder_max_area = nullptr;
+    return RAD_OK;
+}
+
+/* The shape generator (rad_declare_shape_generator). Checked here rather than at the first request:
+ * the picture's geometry, the sampler, the grid and the field's buffer, which the core reads back
+ * after every query pass. */
+int Builder::declare_shape_generator(const RadShapeGenDecl* d) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_shape_generator after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!d) { err(RAD_E_INVAL, "declare_shape_generator: null declaration"); return RAD_E_INVAL; }
+    const char* nm = d->name && *d->name ? d->name : "(unnamed)";
+    if (prog_.is_shape_generator()) {
+        err(RAD_E_STATE, "declare_shape_generator: '%s' was already declared; '%s' is a second one",
+            prog_.sgen_name.c_str(), nm);
+        return RAD_E_STATE;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
+        prog_.generator.layout != 0 || prog_.is_audio_generator() || prog_.is_video_generator()) {
+        err(RAD_E_STATE, "declare_shape_generator '%s': this program already declared %s; a "
+                         "program generates text, embeds, makes images, audio, video or shapes -- "
+                         "one of the six", nm,
+            prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
+                : prog_.generator.layout != 0 ? "an image generator"
+                : prog_.is_audio_generator() ? "an audio generator" : "a video generator");
+        return RAD_E_STATE;
+    }
+    if (d->canvas < 1 || d->canvas > 4096 || !(d->border_ratio >= 0.0 && d->border_ratio < 1.0) ||
+        d->enc_patch < 1 || d->enc_size < d->enc_patch || d->enc_size > 4096 ||
+        d->enc_size % d->enc_patch != 0) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': the picture is out of range (canvas %lld, "
+                         "border %g, encoder %lld in patches of %lld): the canvas 1..4096, the "
+                         "border in [0, 1), the encoder's side 1..4096 and a whole number of "
+                         "patches", nm, (long long)d->canvas, d->border_ratio,
+            (long long)d->enc_size, (long long)d->enc_patch);
+        return RAD_E_INVAL;
+    }
+    for (int c = 0; c < 3; ++c)
+        if (!std::isfinite(d->pix_mean[c]) || !(d->pix_std[c] > 0.0) ||
+            !std::isfinite(d->pix_std[c])) {
+            err(RAD_E_INVAL, "declare_shape_generator '%s': channel %d's mean %g and deviation %g "
+                             "must be finite and the deviation positive", nm, c, d->pix_mean[c],
+                d->pix_std[c]);
+            return RAD_E_INVAL;
+        }
+    if (d->latent_rows < 1 || d->latent_channels < 1 || d->step_rows < 2 * d->latent_rows) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': a latent of %lld rows of %lld channels "
+                         "and a step of %lld rows; a step holds both branches' latents", nm,
+            (long long)d->latent_rows, (long long)d->latent_channels, (long long)d->step_rows);
+        return RAD_E_INVAL;
+    }
+    if (d->default_steps < 2 || d->max_steps < d->default_steps || d->max_steps > 1000 ||
+        !(d->default_guidance >= 0.0) || !std::isfinite(d->default_guidance)) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': the sampler is out of range (%lld steps "
+                         "by default, %lld at most, guidance %g): at least 2 grid points, at most "
+                         "1000, the guidance finite and not negative", nm,
+            (long long)d->default_steps, (long long)d->max_steps, d->default_guidance);
+        return RAD_E_INVAL;
+    }
+    if (!(d->bounds > 0.0) || !std::isfinite(d->bounds) || !std::isfinite(d->level) ||
+        d->min_resolution < 2 || d->default_resolution < d->min_resolution ||
+        d->max_resolution < d->default_resolution || d->max_resolution > 2048) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': the field is out of range (bounds %g, "
+                         "level %g, resolution %lld in %lld..%lld): the bounds positive, the level "
+                         "finite, the resolutions in order from 2 to 2048", nm, d->bounds,
+            d->level, (long long)d->default_resolution, (long long)d->min_resolution,
+            (long long)d->max_resolution);
+        return RAD_E_INVAL;
+    }
+    if (d->max_lanes < 1 || d->max_query < 1) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': %lld lanes and %lld points a query pass; "
+                         "both at least 1", nm, (long long)d->max_lanes, (long long)d->max_query);
+        return RAD_E_INVAL;
+    }
+    const int64_t n_patch = (d->enc_size / d->enc_patch) * (d->enc_size / d->enc_patch);
+    const int64_t rows = std::max({ d->step_rows, d->max_query, n_patch, d->latent_rows });
+    if (prog_.ctx.max_tok < rows) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': a pass carries %lld rows and this one's "
+                         "largest is %lld", nm, (long long)prog_.ctx.max_tok, (long long)rows);
+        return RAD_E_INVAL;
+    }
+    const rad_buf h = d->field_out;
+    if (h == RAD_NULL_HANDLE || (size_t)h >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': field_out %u is not a declared buffer", nm,
+            (unsigned)h);
+        return RAD_E_INVAL;
+    }
+    const RadBufDecl& ob = prog_.buffers[h].decl;
+    if (ob.dtype != RAD_F32 || ob.domain != RAD_DOMAIN_DEVICE ||
+        decl_numel(ob.rank, ob.shape) < d->max_query) {
+        err(RAD_E_INVAL, "declare_shape_generator '%s': field_out '%s' must be a device f32 "
+                         "buffer of at least %lld elements", nm, prog_.buffers[h].name.c_str(),
+            (long long)d->max_query);
+        return RAD_E_INVAL;
+    }
+    prog_.sgen_name = nm;
+    prog_.shape_gen = *d;
+    /* As for the other generators: the Program is moved after declare; the name lives in
+     * sgen_name. */
+    prog_.shape_gen.name = nullptr;
     return RAD_OK;
 }
 
@@ -2600,6 +2757,11 @@ int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
     return B(b)->bind_layer_kv(layer, g);
 }
 
+int rad_kv_set_residency_window(RadBuilder* b, rad_kvgroup g, int64_t tokens) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->set_residency_window(g, tokens);
+}
+
 rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_params,
                    const rad_weight* weights, int n_weights) {
     if (!b) return RAD_NULL_HANDLE;
@@ -2743,6 +2905,11 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d) {
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_video_generator(d);
+}
+
+int rad_declare_shape_generator(RadBuilder* b, const RadShapeGenDecl* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_shape_generator(d);
 }
 
 void rad_note(RadBuilder* b, const char* f, ...) {

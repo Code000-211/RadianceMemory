@@ -68,9 +68,69 @@ typedef struct RadKVGroupBatch {
     int64_t     state_index_pitch;
     int64_t     block_size;
     int64_t     max_blocks;
-    /* Null unless this group streams (RadKVStream). Trailing and zero-defaulted. */
+    /* Null unless this group streams (RadKVStream). */
     const RadKVStream* stream;
+    /* ABI 35: host mirror of seqused, retained through this batch for exact sliced-launch bounds. */
+    const int32_t* seqused_h;
+    /* ---- window residency (ABI 38): what the pager (`qsa_page`) reads. All zero/null for a group that
+     * declares no residency window or whose store is closed, and then the group's table holds no
+     * cold entry and no pager op is issued.
+     *
+     * A paged `block_table` entry is one of three things (see rad_kv_cold_entry below):
+     *    >= 0       a pool block id: the block's bytes are in the pool
+     *    -1         empty: no block at that position
+     *    -2 - slot  cold: the block's bytes are in the residency store's slot `slot`
+     * Only a group declaring a residency window ever holds a cold entry. An op that dereferences
+     * the table as a pool block id (the attention, `qsa_score`'s liveness test on a dense table)
+     * must never see one: dense steps promote first, and the pager rewrites a selection before the
+     * attention reads it. */
+    /* The store's base as the card addresses it (host-mapped memory); null when the store is
+     * closed. Slot `s` starts at residency_store + s * residency_slot_bytes. */
+    void*          residency_store;
+    int64_t        residency_slot_bytes;
+    /* Host array indexed by model layer (the layer passed to rad_bind_layer_kv): the byte offset,
+     * from the start of a slot, of that layer's fragment of this group's block. Host memory: a
+     * plugin adds it to residency_store when it issues a layer's pager, and no kernel reads it. Fragments are one
+     * block of that layer's pool, so the fragment's size is the layer pool's block stride. Null
+     * when the store is closed. */
+    const int64_t* residency_layer_off;
+    /* Scratch pages, device: [n_rows, residency_scratch_pitch] pool block ids, one row per decode
+     * row of the step (n_seq_decode x (1 + n_spec)), each (topk + 1) pages. They are ordinary pool
+     * blocks the engine owns, and nothing but the pager writes them: a page keeps the block it last
+     * received until the pager gives it another, which the page cache (residency_tags) relies on. */
+    const int32_t* residency_scratch;
+    int64_t        residency_scratch_pitch;
+    /* One int64 on the card (null: not counted). `qsa_page` adds the cold entries it rewrote, one
+     * per entry per layer launch, so it measures how much the window paged and not how often the
+     * step ran. The engine zeroes it once and reads it back when /stats asks; no step waits on it. */
+    int64_t*       residency_paged;
+    /* Slots in the residency store, so the pager can bound a cold entry's slot and see the store
+     * as the plane it is ([slots, residency_slot_bytes]); 0 when the store is closed. */
+    int64_t        residency_slots;
+    /* ---- the pager's page cache (ABI 51): a scratch page keeps the block it last received, so a
+     * later step whose selection names that block again rewrites its entry to the page and copies
+     * nothing (docs/OPS.md `qsa_page`, `tags`). Null/0: the pager copies every cold entry, as at 50.
+     *
+     * Device, i32, persistent across steps: one plane of [residency_tags_rows,
+     * residency_scratch_pitch] per layer this group holds, in model-layer order -- the plane of a
+     * model layer is the count of layers below it with residency_layer_off[l] >= 0. Entry (m, p)
+     * is 1 + the store slot whose fragment page residency_scratch[m][p] holds for that layer, 0 for
+     * none (negative: a copy the pager has planned but not finished, also none). The pager is the
+     * only writer; the engine zeroes every plane, on the compute stream before the step, whenever a
+     * store slot was freed since the last zeroing, so a tag never names a slot reused for another
+     * block. */
+    int32_t*       residency_tags;
+    int64_t        residency_tags_rows;
+    /* One int64 on the card (null: not counted): the entries of residency_paged that were served
+     * by the page cache without a copy. */
+    int64_t*       residency_hits;
 } RadKVGroupBatch;
+
+/* The cold block-table entry: the block's bytes are in residency-store slot `slot` (>= 0). Its own
+ * inverse; a pool id (>= 0) and empty (-1) are not cold. */
+static inline int32_t rad_kv_cold_entry(int32_t slot)  { return -2 - slot; }
+static inline int     rad_kv_entry_cold(int32_t entry) { return entry <= -2; }
+static inline int32_t rad_kv_entry_slot(int32_t entry) { return -2 - entry; }
 
 typedef struct RadBatch {
     int      phase;              /* RAD_PHASE_* -- the run phase uses it to index bucket tables */
@@ -325,6 +385,42 @@ typedef struct RadBatch {
     const int32_t* plugin_cu;          /* [n_seq + 1] device */
     const int32_t* plugin_words_h;
     const int32_t* plugin_cu_h;
+
+    /* ---- appended in ABI 33 (the shape generator) */
+    /* A shape generator's pass (rad_declare_shape_generator; `gen` is one of its
+     * RAD_GEN_PASS_S*): its payload. Null on every other step. */
+    const struct RadShapeGenBatch* sgen_b;
+
+    /* ---- appended in ABI 34: host-side max seqused per entry of kv[], for an architecture's
+     * optional recorded-pass geometry key. Null when the batch has no host summary. */
+    const int32_t* kv_used_max_h;
+    /* ABI 35: host mirror of positions, for a one-sequence prefill op whose exact KV bound is the
+     * position immediately after its first query piece. Valid through the batch's issue pass. */
+    const int32_t* positions_h;
+    /* ---- appended in ABI 35 (runs read both ways) */
+    /* The runs of a trunk pass whose rows attend to each other both ways
+     * (RadEncoderDecl::bidirectional): a picture's or a video frame's placeholders inside one
+     * sequence's chunk. The pass attends them causally like every other row; the plugin attends a
+     * run's rows again without the causal bound, over the keys before `bidi_used` (the position
+     * after the run's last token), in place of that result. The scheduler ends no chunk inside such
+     * a run, so its keys are this pass's or, after a prefix hit, the cache's; a run longer than any
+     * step is cut where its chunk ends, and that chunk's rows see the run up to the cut.
+     *
+     * host: n_bidi and, per run, its first row in this pass, its rows and the index of its sequence
+     * in the per-sequence arrays; device: [n_bidi] the keys a run's rows see. 0 runs on every other
+     * pass. */
+    int64_t        n_bidi;
+    const int32_t* bidi_row;           /* host */
+    const int32_t* bidi_n;             /* host */
+    const int32_t* bidi_seq;           /* host */
+    const int32_t* bidi_used;          /* device */
+    /* ---- appended in ABI 36 (a block drafter's anchor row) */
+    /* A block drafter's query pass (draft_pass 1): [n_seq] device, for each drafting sequence the
+     * row of its last committed position in the context pass just run, whose rows are the verify
+     * step's in order. -1 for a row the card did not position. A drafter that conditions on the
+     * context state at the anchor (LiLiCorr) gathers it there; the query rows themselves sit past
+     * that position. Null on every other pass. */
+    const int32_t* anchor_rows;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -712,6 +808,44 @@ typedef struct RadVideoGenBatch {
 
 enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
 
+/* What a shape generator's pass carries beside the step batch's own fields (rad_builder.h,
+ * RadShapeGenDecl, describes the passes). Every pass is one request's, in lane `lane`:
+ *
+ *   SCOND    `n_tok` is the picture's patches, `patches` [n_tok, 3 enc_patch^2] f32.
+ *   SSTEP    `n_tok` is step_rows. The two branches' latents are entries 0 (the picture's) and 1
+ *            (the unconditioned one) of the image generator's sampler ops (`randn_lanes`,
+ *            `lane_gather`, `flow_euler`): `lat_cu` bounds them and the per-entry arrays are
+ *            theirs, entry 0 guided against entry 1 (`pair` {1, -2}) at the request's scale.
+ *   SLATENT  `n_tok` is latent_rows; nothing of the pass's own.
+ *   SQUERY   `n_tok` is n_query, `query` [n_query, 3] f32: x, y, z a point, and `query_cu`
+ *            {0, n_query}.
+ *
+ * `lanes` and `lat_cu` are staged on every pass; the latent's rows are lat_cu[0..1]. Every
+ * pointer is device memory. */
+typedef struct RadShapeGenBatch {
+    int32_t         lane;
+
+    /* ---- SCOND */
+    const float*    patches;
+
+    /* ---- SSTEP: the step (from 0) of the request's `n_steps` evaluations, then the two
+     * entries' sampler operands, [2] each but `seed` [2, 2] (low word first) and `lat_cu` [3]. */
+    int32_t         step, n_steps;
+    const float*    sigma;
+    const float*    sigma_next;
+    const float*    cfg;
+    const int32_t*  pair;
+    const int32_t*  lanes;
+    const int32_t*  flags;         /* RAD_GEN_F_FIRST on entry 0 of the first step */
+    const uint32_t* seed;
+    const int32_t*  lat_cu;
+
+    /* ---- SQUERY */
+    int64_t         n_query;
+    const float*    query;
+    const int32_t*  query_cu;
+} RadShapeGenBatch;
+
 /* RadVideoGenBatch::enc_kind: the media an encode pass carries, numbered from 1 within a kind. A
  * keyframe is 1 for the first frame and 2 for the last. */
 enum {
@@ -861,6 +995,9 @@ int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGrou
 int             rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
 int             rad_rank(RadCtx* c);
 int             rad_world_size(RadCtx* c);
+/* Workgroups the current rank's card can run concurrently (HIP multiProcessorCount on RDNA;
+ * 32 on the host backend or when the backend has no positive count). */
+int             rad_ctx_wgp_count(RadCtx* c);
 RadStream       rad_stream(RadCtx* c);
 
 /* The routing result for a MoE layer, resolved on device against the current residency table.

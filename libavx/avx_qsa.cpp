@@ -25,7 +25,9 @@
 #include "avx_common.h"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
+#include <vector>
 #include <type_traits>
 
 using namespace avx;
@@ -38,17 +40,6 @@ int64_t cu_at(const RadTensor* cu, int64_t i) { return ldi(cu, offlin(cu, i)); }
  * index row's committed slot). */
 int64_t col0(const RadTensor* t, int64_t i) {
     return t->rank >= 2 ? i * t->stride[0] : offlin(t, i);
-}
-
-/* Whether the dimensions after the first are dense, so a row of a paged store is
- * `numel / shape[0]` contiguous values from `row * stride[0]`. */
-bool rows_dense(const RadTensor* t) {
-    int64_t acc = 1;
-    for (int i = (int)t->rank - 1; i >= 1; --i) {
-        if (t->shape[i] != 1 && t->stride[i] != acc) return false;
-        acc *= t->shape[i];
-    }
-    return true;
 }
 
 /* seq[m] for every m < M: the first sequence whose cu span holds row m, or `none` (libref's
@@ -157,6 +148,7 @@ struct ScoreJob {
     int64_t q_rs, q_cs, pg_rs, bt_rs, bt_cs, o_rs, o_cs;
     int64_t esz;          /* bytes an element of bk, 0 for a packed dtype */
     float rn;
+    bool i8;              /* `key_dtype` i8: codes widened, the page's f16 scale after them */
 };
 
 /* Scores blocks [b0, b1) of one tile. */
@@ -200,10 +192,23 @@ static void score_unit(const ScoreJob& j, const ScoreTile& t, int64_t b0, int64_
             if (p >= 0) widen(j.bk, p * j.pg_rs, 1, n, d);
             else        std::fill(d, d + n, 0.0f);
         }
+        /* In int8, lane L's dot is block L's over its codes, scaled before the relu as libref's
+         * relu(scale * (q . codes)); a NaN product is dropped by vf_max(x, 0) as by fmax. */
+        alignas(64) float scl[VF_N];
+        if (j.i8)
+            for (int L = 0; L < VF_N; ++L) {
+                uint16_t s16 = 0;
+                if (pg[L] >= 0) std::memcpy(&s16, bkb + pg[L] * j.pg_rs + n, 2);
+                scl[L] = rad_f16_to_f32(s16);
+            }
+        const vf vsc = j.i8 ? vf_load(scl) : vf_zero();
         for (int64_t qi = 0; qi < t.rows; ++qi) {
             vf s = vf_zero();
-            for (int64_t h = 0; h < j.heads; ++h)
-                s = vf_add(s, vf_max(dot_group(qf + (qi * j.heads + h) * np, kf, np), vf_zero()));
+            for (int64_t h = 0; h < j.heads; ++h) {
+                vf d = dot_group(qf + (qi * j.heads + h) * np, kf, np);
+                if (j.i8) d = vf_mul(d, vsc);
+                s = vf_add(s, vf_max(d, vf_zero()));
+            }
             vf_store(lanes, vf_div(s, vf_set1(j.rn)));
             const int64_t ob = (t.m0 + qi) * j.o_rs + g * j.o_cs;
             if (f32_out) {
@@ -234,7 +239,11 @@ AVX_KERNEL(qsa_score) {
     const int64_t n_seq = numel(cu) - 1, pages = bk->shape[0];
     if (M <= 0 || nb <= 0 || n_seq <= 0 || pages <= 0) return RAD_E_SHAPE;
     if (bt->shape[0] < n_seq || numel(nc) < n_seq || rows_of(q, heads * n) < M) return RAD_E_SHAPE;
-    if (numel(bk) / pages != n) return RAD_E_SHAPE;
+    const char* kd = p_str(a, "key_dtype", nullptr);
+    if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;
+    const bool i8 = kd != nullptr;
+    if (i8 ? numel(bk) / pages < n + 2 || rad_dtype_bits(bk->dtype) != 8 : numel(bk) / pages != n)
+        return RAD_E_SHAPE;
     if (!rows_dense(bk)) return RAD_E_STRIDE;
     const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
     /* Every page id the launch will read must name a page of `bk`. */
@@ -252,6 +261,7 @@ AVX_KERNEL(qsa_score) {
     j.o_rs = o->stride[0]; j.o_cs = o->stride[1];
     j.esz = rad_dtype_bits(bk->dtype) / 8;
     j.rn = std::sqrt((float)n);
+    j.i8 = i8;
 
     /* Tiles: runs of up to kQT consecutive rows of one sequence. One allocation, as a second
      * scratch_raw call could move the first. */
@@ -554,13 +564,176 @@ AVX_KERNEL(qsa_select) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ qsa_select_part / _join */
+/* The selection with the block keys split across ranks (libref's ref_qsa_select_part and
+ * ref_qsa_select_join state the contract; docs/OPS.md). Scalar and sort-based: one rank's share
+ * and the merge of a few hundred candidates are small next to the score. */
+namespace {
+
+constexpr int64_t kPartOver = int64_t(1) << 30;
+
+int64_t part_width(int64_t topk) { return (2 * topk + 1 + 3) / 4 * 4; }
+
+/* The selection's order key (order_keys above): bits(max(v, 0)) + 1, or the signed total order. */
+uint32_t part_key(float v, bool sgn) {
+    uint32_t u = 0;
+    if (sgn) {
+        if (v != 0.0f) std::memcpy(&u, &v, 4);
+        return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+    }
+    const float x = v > 0.0f ? v : 0.0f;
+    std::memcpy(&u, &x, 4);
+    return u + 1u;
+}
+
+struct Cand { uint32_t key; int64_t b; };
+
+/* qsa_select's rule over candidates: every one in block order when `all`, else the topk largest
+ * by (key desc, block asc), those above the topk-th key in block order, then its ties in block
+ * order. Rewrites `c` to the taken ones in that order. */
+void take_rule(std::vector<Cand>& c, int64_t topk, bool all) {
+    auto by_b = [](const Cand& x, const Cand& y) { return x.b < y.b; };
+    if (all) {
+        std::sort(c.begin(), c.end(), by_b);
+        if ((int64_t)c.size() > topk) c.resize((size_t)topk);
+        return;
+    }
+    std::sort(c.begin(), c.end(),
+              [](const Cand& x, const Cand& y) { return x.key != y.key ? x.key > y.key : x.b < y.b; });
+    if ((int64_t)c.size() > topk) c.resize((size_t)topk);
+    if (c.empty()) return;
+    const uint32_t thr = c.back().key;
+    const auto mid = std::stable_partition(c.begin(), c.end(),
+                                           [&](const Cand& x) { return x.key > thr; });
+    std::sort(c.begin(), mid, by_b);
+    std::sort(mid, c.end(), by_b);
+}
+
+}  /* namespace */
+
+AVX_KERNEL(qsa_select_part) {
+    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
+    const RadTensor *cu = &a->t[4], *pt = &a->t[5];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t R = p_int(a, "ranks", 0), rk = p_int(a, "rank", -1);
+    const int64_t sgn = p_int(a, "signed", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (R < 1 || rk < 0 || rk >= R || (sgn != 0 && sgn != 1)) return RAD_E_INVAL;
+    if (sc->rank != 2 || bt->rank != 2 || pt->rank != 2) return RAD_E_SHAPE;
+    const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], R * sc->shape[1]);
+    const int64_t n_seq = numel(cu) - 1, W = part_width(topk);
+    if (M <= 0 || nb <= 0 || n_seq <= 0) return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
+    if (pt->shape[0] < M || pt->shape[1] < W || numel(po) < M) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
+    for (int64_t m = 0; m < M; ++m)
+        if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    int64_t* seq = (int64_t*)scratch_raw((size_t)M * sizeof(int64_t) + 64);
+    seq_rows(cu, n_seq, M, 0, seq);
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq[m], p = ldi(po, offlin(po, m));
+        const int64_t n = std::min(std::min(ldi(nc, offlin(nc, s)), nb), (p + 1) / ratio);
+        std::vector<Cand> c;
+        for (int64_t b = rk; b < n; b += R) {
+            const float v = ldt(sc, m * sc->stride[0] + (b / R) * sc->stride[1]);
+            if (ldi(bt, s * bt->stride[0] + b * bt->stride[1]) < 0) continue;
+            if (sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+            c.push_back({ part_key(v, sgn != 0), b });
+        }
+        const bool over = (int64_t)c.size() > topk;
+        take_rule(c, topk, !over);
+        std::sort(c.begin(), c.end(), [](const Cand& x, const Cand& y) { return x.b < y.b; });
+        std::vector<int32_t> row((size_t)W, 0);
+        for (size_t i = 0; i < c.size(); ++i) {
+            row[i] = (int32_t)c[i].key;
+            row[(size_t)topk + i] = (int32_t)c[i].b;
+        }
+        row[(size_t)(2 * topk)] = (int32_t)((int64_t)c.size() | (over ? kPartOver : 0));
+        for (int64_t i = 0; i < W; ++i)
+            st_int_dt(pt->dtype, pt->data, m * pt->stride[0] + i * pt->stride[1], row[(size_t)i]);
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(qsa_select_join) {
+    if (!rad_args_have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *pt = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
+    const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t R = p_int(a, "ranks", 0);
+    if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (R < 1) return RAD_E_INVAL;
+    if (pt->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
+    const int64_t M = pt->shape[0], nb = bt->shape[1], W = part_width(topk);
+    const int64_t n_seq = numel(cu) - 1;
+    if (M <= 0 || nb <= 0 || n_seq <= 0 || pt->shape[1] < R * W) return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
+    if (se->shape[0] < M || se->shape[1] < topk + 1) return RAD_E_SHAPE;
+    if (numel(ns) < M || numel(po) < M || numel(su) < M) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
+    for (int64_t m = 0; m < M; ++m)
+        if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    int64_t* seq = (int64_t*)scratch_raw((size_t)M * sizeof(int64_t) + 64);
+    seq_rows(cu, n_seq, M, 0, seq);
+    const int64_t p_rs = pt->stride[0], p_cs = pt->stride[1];
+    auto bound = [&](int64_t m) {
+        return std::min(std::min(ldi(nc, offlin(nc, seq[m])), nb),
+                        (ldi(po, offlin(po, m)) + 1) / ratio);
+    };
+    /* Every list, validated before any write (libref's refusals). */
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t n = bound(m);
+        for (int64_t q = 0; q < R; ++q) {
+            const int64_t base = m * p_rs + q * W * p_cs;
+            const int64_t cnt = ldi(pt, base + 2 * topk * p_cs) & ~kPartOver;
+            if (cnt < 0 || cnt > topk) return RAD_E_INVAL;
+            for (int64_t i = 0, last = -1; i < cnt; ++i) {
+                const int64_t b = ldi(pt, base + (topk + i) * p_cs);
+                if (b <= last || b >= n || b % R != q || ldi(pt, base + i * p_cs) == 0)
+                    return RAD_E_INVAL;
+                last = b;
+            }
+        }
+    }
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq[m], p = ldi(po, offlin(po, m)), n = bound(m);
+        std::vector<Cand> c;
+        bool over = false;
+        for (int64_t q = 0; q < R; ++q) {
+            const int64_t base = m * p_rs + q * W * p_cs;
+            const int64_t w = ldi(pt, base + 2 * topk * p_cs);
+            over = over || (w & kPartOver);
+            for (int64_t i = 0; i < (w & ~kPartOver); ++i)
+                c.push_back({ (uint32_t)ldi(pt, base + i * p_cs), ldi(pt, base + (topk + i) * p_cs) });
+        }
+        take_rule(c, topk, n <= topk || (!over && (int64_t)c.size() <= topk));
+        std::vector<int32_t> row((size_t)(topk + 1), -1);
+        int64_t out = 0;
+        for (const Cand& x : c)
+            row[(size_t)out++] = (int32_t)ldi(bt, s * bt->stride[0] + x.b * bt->stride[1]);
+        if (n < nb && (p + 1) % ratio != 0) {
+            const int64_t part = ldi(bt, s * bt->stride[0] + n * bt->stride[1]);
+            if (part >= 0) row[(size_t)out++] = (int32_t)part;
+        }
+        for (int64_t i = 0; i <= topk; ++i)
+            st_int_dt(se->dtype, se->data, m * se->stride[0] + i * se->stride[1], row[(size_t)i]);
+        st_int_dt(ns->dtype, ns->data, offlin(ns, m), out);
+        st_int_dt(su->dtype, su->data, offlin(su, m),
+                  out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_tail_store */
 /* state[sidx[s][0]][0][pos[t] % ring] = k[t] for the last `ring` rows of each sequence, rows in
  * ascending order, so a later row wins a shared target as in libref's serial loop (a row whose
  * slot is -1, or that no sequence holds, writes nothing). At most `ring` rows a sequence write, so
  * the copy is serial. */
 AVX_KERNEL(qsa_tail_store) {
-    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *po = &a->t[1], *cu = &a->t[2], *st = &a->t[3];
     const RadTensor *sx = &a->t[4];
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
@@ -596,6 +769,312 @@ AVX_KERNEL(qsa_tail_store) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the KV row codec */
+/* One (token, head) row of a KV layout decoded and re-encoded in another: kv_transcode and the
+ * expanding qsa_page (RAD_KVQ_DEMOTE). libref's kvx_rows (libref/ref_attn.cpp) is the contract and
+ * this is its scalar arithmetic in its order: exact decodes, then each layout's store encode (the
+ * i8h head scale, k4h's absmax / 7 group, k4h_v2h's variance-normalised odd levels, fp8's clamp to
+ * +-448), so every byte is libref's. Layout ids are RAD_KVQ_*: 0 fp8, 3 k4h_v4, 4 k4h_v2h, 5 i8h. */
+namespace {
+
+int kvx_layout(const char* s) {
+    if (!s) return -1;
+    return !std::strcmp(s, "fp8") ? 0 : !std::strcmp(s, "k4h_v4") ? 3
+         : !std::strcmp(s, "k4h_v2h") ? 4 : !std::strcmp(s, "i8h") ? 5 : -1;
+}
+int64_t kvx_row(int lay, int64_t hd) {
+    return lay == 0 ? 2 * hd : lay == 3 ? 18 * hd / 16 : lay == 4 ? 14 * hd / 16
+         : lay == 5 ? 2 * hd + 4 : -1;
+}
+float kvx_f16(const uint8_t* p) { uint16_t h; std::memcpy(&h, p, 2); return rad_f16_to_f32(h); }
+void kvx_put16(uint8_t* p, uint16_t h) { std::memcpy(p, &h, 2); }
+float kvx_int4(const uint8_t* codes, const uint8_t* scales, int64_t d) {
+    return (float)((((codes[d / 2] >> (4 * (d & 1))) & 0xF) ^ 8) - 8) * kvx_f16(scales + (d / 32) * 2);
+}
+void kvx_i8h(const float* x, int64_t hd, uint8_t* codes, uint8_t* scale) {
+    float amax = std::fabs(x[0]);
+    for (int64_t i = 1; i < hd; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 127.0f, 512.0f));
+    const float sc = rad_f16_to_f32(s16);
+    for (int64_t i = 0; i < hd; ++i) {
+        const float r = sc > 0.0f ? std::rint(x[i] / sc) : 0.0f;
+        codes[i] = (uint8_t)(int8_t)(int)std::fmin(std::fmax(r, -127.0f), 127.0f);
+    }
+    kvx_put16(scale, s16);
+}
+void kvx_k4h(const float* x, uint8_t* codes, uint8_t* scale) {
+    float amax = std::fabs(x[0]);
+    for (int i = 1; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 7.0f, 8188.0f));
+    const float sc = rad_f16_to_f32(s16);
+    for (int i = 0; i < 32; i += 2) {
+        int q[2];
+        for (int e = 0; e < 2; ++e) {
+            const float r = sc > 0.0f ? std::rint(x[i + e] / sc) : 0.0f;
+            q[e] = (int)std::fmin(std::fmax(r, -7.0f), 7.0f) & 0xF;
+        }
+        codes[i / 2] = (uint8_t)(q[0] | (q[1] << 4));
+    }
+    kvx_put16(scale, s16);
+}
+void kvx_v2h(const float* x, uint8_t* codes, uint8_t* scale) {
+    float p[8];
+    for (int l = 0; l < 8; ++l) {
+        const float* y = x + 4 * l;
+        p[l] = std::fma(y[3], y[3], std::fma(y[2], y[2], std::fma(y[1], y[1], y[0] * y[0])));
+    }
+    for (int m = 4; m >= 1; m >>= 1) {
+        float q[8];
+        for (int l = 0; l < 8; ++l) q[l] = p[l] + p[l ^ m];
+        std::memcpy(p, q, sizeof p);
+    }
+    const float sum = std::fmin(p[0], 3.40282347e38f), rms = std::sqrt(sum / 32.0f);
+    int c2 = 0;
+    std::memset(codes, 0, 8);
+    for (int i = 0; i < 32; ++i) {
+        const float r = rms > 0.0f ? 2.0f * std::floor(x[i] / rms) + 1.0f : 1.0f;
+        const int c = (int)std::fmin(std::fmax(r, -3.0f), 3.0f);
+        c2 += c * c;
+        codes[i / 4] = (uint8_t)(codes[i / 4] | (((c + 3) / 2) << (2 * (i & 3))));
+    }
+    kvx_put16(scale, rad_f32_to_f16(std::fmin(std::sqrt(sum / (float)c2), 21824.0f)));
+}
+/* head_dim up to 2048, libref's bound. */
+void kvx_row_copy(int from, int to, int64_t hd, const uint8_t* s, uint8_t* o) {
+    float x[2][2048];
+    for (int64_t d = 0; d < hd; ++d) {
+        if (from == 0) {
+            x[0][d] = rad_fp8e4m3_to_f32(s[d]);
+            x[1][d] = rad_fp8e4m3_to_f32(s[hd + d]);
+        } else if (from == 5) {
+            x[0][d] = (float)(int8_t)s[d] * kvx_f16(s + 2 * hd);
+            x[1][d] = (float)(int8_t)s[hd + d] * kvx_f16(s + 2 * hd + 2);
+        } else {
+            x[0][d] = kvx_int4(s, s + (from == 4 ? hd * 3 / 4 : hd), d);
+            if (from == 4) {
+                const int u = (s[hd / 2 + d / 4] >> (2 * (d & 3))) & 3;
+                x[1][d] = (float)(2 * u - 3) * kvx_f16(s + hd * 13 / 16 + (d / 32) * 2);
+            } else {
+                x[1][d] = kvx_int4(s + hd / 2, s + hd * 17 / 16, d);
+            }
+        }
+    }
+    if (to == 0) {
+        for (int w = 0; w < 2; ++w)
+            for (int64_t d = 0; d < hd; ++d)
+                o[w * hd + d] = rad_f32_to_fp8e4m3(std::fmin(std::fmax(x[w][d], -448.0f), 448.0f));
+    } else if (to == 5) {
+        kvx_i8h(x[0], hd, o, o + 2 * hd);
+        kvx_i8h(x[1], hd, o + hd, o + 2 * hd + 2);
+    } else {
+        for (int64_t g = 0; g < hd; g += 32) {
+            kvx_k4h(x[0] + g, o + g / 2, o + (to == 4 ? hd * 3 / 4 : hd) + (g / 32) * 2);
+            if (to == 4) kvx_v2h(x[1] + g, o + hd / 2 + g / 4, o + hd * 13 / 16 + (g / 32) * 2);
+            else         kvx_k4h(x[1] + g, o + hd / 2 + g / 2, o + hd * 17 / 16 + (g / 32) * 2);
+        }
+    }
+}
+
+}  // namespace
+
+/* ------------------------------------------------------------------ kv_transcode */
+/* x [M, row(from)] into out [M, row(to)], libref's ref_kv_transcode with its refusals. */
+AVX_KERNEL(kv_transcode) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *o = &a->t[1];
+    const int from = kvx_layout(p_str(a, "from", nullptr)), to = kvx_layout(p_str(a, "to", nullptr));
+    const int64_t hd = p_int(a, "head_dim", 0);
+    if (from < 0 || to < 0 || from == to) return RAD_E_INVAL;
+    if (hd <= 0 || hd % 32) return RAD_E_SHAPE;
+    if (hd > 2048) return RAD_E_UNSUPPORTED;
+    if (x->dtype != RAD_U8 || o->dtype != RAD_U8) return RAD_E_DTYPE;
+    if (x->rank != 2 || o->rank != 2 || x->shape[1] != kvx_row(from, hd) ||
+        o->shape[1] != kvx_row(to, hd) || x->shape[0] != o->shape[0] || x->shape[0] <= 0)
+        return RAD_E_SHAPE;
+    if (x->stride[1] != 1 || o->stride[1] != 1) return RAD_E_STRIDE;
+    const int64_t n = x->shape[0];
+    const uint8_t* xb = (const uint8_t*)x->data;
+    uint8_t* ob = (uint8_t*)o->data;
+    AVX_PARALLEL_FOR_IF(n * hd >= AVX_PAR_MIN && n > 1)
+    for (int64_t r = 0; r < n; ++r) kvx_row_copy(from, to, hd, xb + r * x->stride[0], ob + r * o->stride[0]);
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ kv_vpred */
+/* libref's ref_kv_vpred, its refusals and its order: per (row, head) xq is the head of x, through
+ * k4h_v4's K store and back with k_quant "k4h" (kvx_k4h, kvx_int4: libref's encode and decode);
+ * then per output column acc = b[j], acc = fma(xq[i], A[i][j], acc) for i ascending, and out =
+ * y +- acc rounded once. Scalar fma in libref's order, so the bytes are libref's; rows split across
+ * threads. */
+AVX_KERNEL(kv_vpred) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *mp = &a->t[1], *y = &a->t[2], *o = &a->t[3];
+    const int64_t hd = p_int(a, "head_dim", 0), nh = p_int(a, "n_head", 0);
+    const int64_t gqa = p_int(a, "gqa", 1), sign = p_int(a, "sign", 1);
+    const char* kq = p_str(a, "k_quant", "none");
+    const bool k4 = kq && std::strcmp(kq, "k4h") == 0;
+    if (!kq || (!k4 && std::strcmp(kq, "none"))) return RAD_E_INVAL;
+    if (sign != 1 && sign != -1) return RAD_E_INVAL;
+    if (hd <= 0 || nh <= 0 || gqa <= 0 || nh % gqa || (k4 && hd % 32)) return RAD_E_SHAPE;
+    if (hd > 2048) return RAD_E_UNSUPPORTED;
+    if (mp->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t w = nh * hd, M = numel(x) / w;
+    if (M <= 0 || numel(x) != M * w || numel(y) < M * w || numel(o) < M * w ||
+        numel(mp) < (nh / gqa) * (hd + 1) * hd)
+        return RAD_E_SHAPE;
+    const int64_t x_rs = row_stride(x, w), y_rs = row_stride(y, w), o_rs = row_stride(o, w);
+    const float* A = (const float*)mp->data;
+    AVX_PARALLEL_FOR_IF(M * nh * hd * hd >= AVX_PAR_MIN && M * nh > 1)
+    for (int64_t rh = 0; rh < M * nh; ++rh) {
+        const int64_t r = rh / nh, h = rh % nh;
+        float xq[2048], yr[2048];
+        widen(x, r * x_rs + h * hd, 1, hd, xq);
+        widen(y, r * y_rs + h * hd, 1, hd, yr);
+        if (k4)
+            for (int64_t g = 0; g < hd; g += 32) {
+                uint8_t codes[16], sc[2];
+                kvx_k4h(xq + g, codes, sc);
+                for (int i = 0; i < 32; ++i) xq[g + i] = kvx_int4(codes, sc, i);
+            }
+        const float* Am = A + (h / gqa) * (hd + 1) * hd;
+        for (int64_t j = 0; j < hd; ++j) {
+            float acc = Am[hd * hd + j];
+            for (int64_t i = 0; i < hd; ++i) acc = std::fma(xq[i], Am[i * hd + j], acc);
+            yr[j] = yr[j] + (sign < 0 ? -acc : acc);
+        }
+        narrow(o, r * o_rs + h * hd, 1, hd, yr);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_page */
+/* libref's ref_qsa_page (the statement of the contract is there): a cold entry (<= -2) of `sel`
+ * becomes its scratch page after block_bytes at the start of its store slot (this layer's view) are copied into that
+ * pool block. All refusals come before any write. A byte copy, so no vector code; the copies are
+ * independent (scratch pages are pairwise distinct) and are split across threads. */
+AVX_KERNEL(qsa_page) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *sel = &a->t[0], *st = &a->t[1], *pl = &a->t[2], *sc = &a->t[3];
+    const int64_t topk = p_int(a, "topk", 0), bb = p_int(a, "block_bytes", 0);
+    if (topk <= 0 || bb <= 0) return RAD_E_SHAPE;
+    /* `pool` is the layer's cache in its own shape -- [blocks, ...] of the group's dtype, as the
+     * core binds a KV operand -- and the pager moves bytes: a block is its leading stride's
+     * worth of elements, contiguous. `store` is [slots, slot_bytes] of bytes. */
+    if (sel->rank != 2 || sc->rank != 2 || st->rank != 2 || pl->rank < 2) return RAD_E_SHAPE;
+    const int64_t ebits = rad_dtype_bits(pl->dtype);
+    if (st->dtype != RAD_U8 || ebits <= 0 || ebits % 8) return RAD_E_DTYPE;
+    if (st->stride[1] != 1 || pl->stride[pl->rank - 1] != 1) return RAD_E_STRIDE;
+    /* A block's elements past the leading dimension are packed, so its bytes from its start are
+     * contiguous for `inner` elements; the pitch between blocks may be anything. */
+    int64_t inner = 1;
+    for (uint32_t d = pl->rank - 1; d >= 1; --d) {
+        if (pl->stride[d] != inner) return RAD_E_STRIDE;
+        inner *= pl->shape[d];
+    }
+    const int64_t pitch = pl->stride[0] * (ebits / 8);           /* bytes a block */
+    const int64_t M = sel->shape[0], w = topk + 1;
+    if (M <= 0 || sel->shape[1] < w || sc->shape[0] < M || sc->shape[1] < w) return RAD_E_SHAPE;
+    /* `store` is this layer's view of the store (the plugin folds the layer's offset in): row s
+     * is slot s, its first block_bytes are this layer's fragment. */
+    if (inner * (ebits / 8) < bb || pitch < bb) return RAD_E_SHAPE;
+    /* Expanding (libref's): both layout words or neither, the store's fragment as many rows of its
+     * width as `block_bytes` holds of the pool's. */
+    const char* sl = p_str(a, "store_layout", nullptr);
+    const char* pw = p_str(a, "pool_layout", nullptr);
+    int xf = -1, xt = -1;
+    int64_t hd = 0, rows = 0, sbb = bb;
+    if (sl || pw) {
+        xf = kvx_layout(sl); xt = kvx_layout(pw); hd = p_int(a, "head_dim", 0);
+        if (xf < 0 || xt < 0 || xf == xt) return RAD_E_INVAL;
+        if (hd <= 0 || hd % 32 || bb % kvx_row(xt, hd)) return RAD_E_SHAPE;
+        if (hd > 2048) return RAD_E_UNSUPPORTED;
+        rows = bb / kvx_row(xt, hd);
+        sbb = rows * kvx_row(xf, hd);
+    }
+    if (st->shape[1] < sbb) return RAD_E_SHAPE;
+    const int64_t slots = st->shape[0], slot_b = st->stride[0], blocks = pl->shape[0];
+    /* The cold positions as (sel offset, slot, page), validated before any write. */
+    int64_t* paged = a->n_t > 4 && a->t[4].data ? (int64_t*)a->t[4].data : nullptr;
+    if (paged && a->t[4].dtype != RAD_I64) return RAD_E_DTYPE;
+    /* The page cache (libref's plan): `tags` and `hits` optional; the hits are rewritten here, the
+     * misses join `cold` with the page the plan gave them. */
+    const RadTensor* tg = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
+    int64_t* hits = a->n_t > 6 && a->t[6].data ? (int64_t*)a->t[6].data : nullptr;
+    if (hits && a->t[6].dtype != RAD_I64) return RAD_E_DTYPE;
+    std::vector<int64_t> cold;
+    std::vector<bool> used((size_t)blocks);
+    int64_t n_rw = 0;
+    if (tg) {
+        if (tg->dtype != RAD_I32) return RAD_E_DTYPE;
+        if (tg->rank != 2 || tg->shape[0] < M || tg->shape[1] < w) return RAD_E_SHAPE;
+        /* The plan first (libref's), refusals before any write: hits as (sel offset, page id),
+         * misses into `cold` with their tag offsets beside. */
+        std::vector<int64_t> hit, mtag;
+        std::vector<int64_t> page((size_t)w);
+        std::vector<bool> busy((size_t)w);
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t t0 = m * tg->stride[0], ts = tg->stride[1];
+            std::fill(busy.begin(), busy.end(), false);
+            std::fill(page.begin(), page.end(), (int64_t)-1);
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t e = ldi(sel, m * sel->stride[0] + j * sel->stride[1]);
+                if (e > -2) continue;
+                for (int64_t p = 0; p < w; ++p)
+                    if (ldi(tg, t0 + p * ts) == -1 - e) { page[(size_t)j] = p; busy[(size_t)p] = true; break; }
+            }
+            int64_t q = 0;
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
+                if (e > -2) continue;
+                int64_t p = page[(size_t)j];
+                const bool h = p >= 0;
+                if (!h) {
+                    while (busy[(size_t)q]) ++q;
+                    p = q;
+                    busy[(size_t)p] = true;
+                }
+                const int64_t pg = ldi(sc, m * sc->stride[0] + p * sc->stride[1]);
+                if (-2 - e >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
+                used[(size_t)pg] = true;
+                if (h) { hit.push_back(so); hit.push_back(pg); continue; }
+                cold.push_back(so); cold.push_back(-2 - e); cold.push_back(pg);
+                mtag.push_back(t0 + p * ts);
+            }
+        }
+        for (size_t i = 0; i < hit.size(); i += 2) st_int_dt(sel->dtype, sel->data, hit[i], hit[i + 1]);
+        for (size_t i = 0; i < mtag.size(); ++i) st_int_dt(tg->dtype, tg->data, mtag[i], cold[3 * i + 1] + 1);
+        n_rw = (int64_t)(hit.size() / 2 + mtag.size());
+        if (hits) *hits += (int64_t)hit.size() / 2;
+    } else {
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t so = m * sel->stride[0] + j * sel->stride[1], e = ldi(sel, so);
+                if (e > -2) continue;
+                const int64_t slot = -2 - e, pg = ldi(sc, m * sc->stride[0] + j * sc->stride[1]);
+                if (slot >= slots || pg < 0 || pg >= blocks || used[(size_t)pg]) return RAD_E_INVAL;
+                used[(size_t)pg] = true;
+                cold.push_back(so); cold.push_back(slot); cold.push_back(pg);
+            }
+    }
+    const int64_t n = (int64_t)cold.size() / 3;
+    if (!tg) n_rw = n;
+    const uint8_t* sb = (const uint8_t*)st->data;
+    uint8_t* pb = (uint8_t*)pl->data;
+    AVX_PARALLEL_FOR_IF(n * bb >= AVX_PAR_MIN && n > 1)
+    for (int64_t i = 0; i < n; ++i) {
+        if (xf >= 0)
+            for (int64_t r = 0; r < rows; ++r)
+                kvx_row_copy(xf, xt, hd, sb + cold[3 * i + 1] * slot_b + r * kvx_row(xf, hd),
+                             pb + cold[3 * i + 2] * pitch + r * kvx_row(xt, hd));
+        else
+            std::memcpy(pb + cold[3 * i + 2] * pitch, sb + cold[3 * i + 1] * slot_b,
+                        (size_t)bb);
+        st_int_dt(sel->dtype, sel->data, cold[3 * i], cold[3 * i + 2]);
+    }
+    if (paged) *paged += n_rw;   /* the optional counter operand (libref's ref_qsa_page) */
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_work */
 /* The blocks that complete in this batch, in sequence order and ascending within one (libref's
  * ref_qsa_work has the full statement): page bt[s][b] (-1 without a tail slot), the first token's
@@ -612,6 +1091,9 @@ AVX_KERNEL(qsa_work) {
     if (!k || !po || !cu || !tl || !sx || !bt || !stg || !pg || !bp || !nc) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
+    /* Split across ranks: only blocks b % R == rk are this rank's, at page bt[b / R]. */
+    const int64_t R = p_int(a, "ranks", 1), rk = p_int(a, "rank", 0);
+    if (R < 1 || rk < 0 || rk >= R) return RAD_E_INVAL;
     if (k->rank != 2 || bt->rank != 2 || stg->rank != 2) return RAD_E_SHAPE;
     if (tl->rank != 4 || tl->shape[1] != 1 || tl->shape[2] < ring || tl->shape[3] != n)
         return RAD_E_SHAPE;
@@ -645,7 +1127,7 @@ AVX_KERNEL(qsa_work) {
         const int64_t p0 = ldi(po, offlin(po, t0)), p1 = ldi(po, offlin(po, t1 - 1));
         for (int64_t b = p0 / ratio; b <= (p1 + 1) / ratio - 1; ++b) {
             if (ni >= mw) break;
-            if (b >= bt->shape[1]) return RAD_E_SHAPE;
+            if (b / R >= bt->shape[1]) return RAD_E_SHAPE;
             const int64_t si = ldi(sx, col0(sx, s));
             if (si >= slots) return RAD_E_INVAL;
             for (int64_t i = 0; si >= 0 && i < ratio; ++i) {
@@ -675,8 +1157,9 @@ AVX_KERNEL(qsa_work) {
         const int64_t s = items[2 * w], b = items[2 * w + 1];
         const int64_t t0 = cu_at(cu, s), p0 = ldi(po, offlin(po, t0));
         const int64_t si = ldi(sx, col0(sx, s));
+        const bool mine = b % R == rk;
         st_int_dt(pg->dtype, pg->data, offlin(pg, w),
-                  si < 0 ? -1 : ldi(bt, s * bt->stride[0] + b * bt->stride[1]));
+                  si < 0 || !mine ? -1 : ldi(bt, s * bt->stride[0] + (b / R) * bt->stride[1]));
         const int64_t f = b * ratio;
         if (!rp) {
             st_int_dt(bp->dtype, bp->data, bpos_at(0), f);
@@ -687,7 +1170,7 @@ AVX_KERNEL(qsa_work) {
                           f >= p0 ? ldi(rp, c * rs + (t0 + f - p0) * rc)
                                   : f + (ldi(rp, t0 * rc) - p0));
         }
-        if (si < 0) continue;
+        if (si < 0 || !mine) continue;
         float* buf = scratch_f32((size_t)n);
         for (int64_t i = 0; i < ratio; ++i) {
             const int64_t q = f + i;

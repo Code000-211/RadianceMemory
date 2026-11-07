@@ -313,6 +313,17 @@ static inline float narrow1(uint32_t dt, float v) {
  * docs/OPS.md names the exceptions. */
 static inline bool dense_row(const RadTensor* t) { return laststride(t) == 1; }
 
+/* Whether the dimensions after the first are dense, so a row of a paged store is
+ * `numel / shape[0]` contiguous values from `row * stride[0]`. */
+static inline bool rows_dense(const RadTensor* t) {
+    int64_t acc = 1;
+    for (int i = (int)t->rank - 1; i >= 1; --i) {
+        if (t->shape[i] != 1 && t->stride[i] != acc) return false;
+        acc *= t->shape[i];
+    }
+    return true;
+}
+
 /* The gemm_nt_q dtypes whose activation is quant_act_i8's, codes in the int8 WMMA's step order
  * (libref/ref_common.h). */
 static inline bool i8_steps_dtype(const char* dt) {

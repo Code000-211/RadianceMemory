@@ -95,14 +95,121 @@ static inline void axpy(float* acc, const float* v, float w, int64_t n) {
     for (; i < n; ++i) acc[i] += w * v[i];
 }
 
+/* ------------------------------------------------------------------ the k5_v4 cache */
+/* kv_dtype k5_v4 (RAD_KVQ_K5V4, abi/rad_builder.h): a token's row of 20 * head_dim / 16 bytes in an
+ * E4M3-declared cache, K int5 and V int4 in groups of 32 with f16 scales. libref's kv_store and
+ * attn_paged (libref/ref_attn.cpp, its header) are the contract, and this is their scalar
+ * arithmetic in their order: the store's bytes are libref's, the attention reads each code times
+ * its scale in f32 as libref does. The attention widens the whole cache to f32 and runs the plain
+ * path over it: a host fallback, not a fast one. */
+static bool kv_k5v4(const RadArgs* a) {
+    const char* s = p_str(a, "kv_dtype", nullptr);
+    return s && !std::strcmp(s, "k5_v4");
+}
+static bool k5_cache_ok(const RadTensor* kv, int64_t head_dim) {
+    return kv->rank == 4 && kv->dtype == RAD_F8E4M3 && head_dim > 0 && head_dim % 32 == 0 &&
+           kv->shape[3] == head_dim * 20 / 16 && kv->stride[3] == 1 && kv->stride[2] == kv->shape[3];
+}
+static float k5_f16(const uint8_t* p) { uint16_t h; std::memcpy(&h, p, 2); return rad_f16_to_f32(h); }
+/* A token's row of head_dim hd into its 2 * hd values, K then V. */
+static void k5_decode_row(const uint8_t* row, int64_t hd, float* out) {
+    for (int64_t d = 0; d < hd; ++d) {
+        const int lo = (row[d / 2] >> (4 * (d & 1))) & 0xF;
+        const int x = (int)(d % 32), c = x / 16, h = (x % 16) / 8, j = (x % 8) / 2, p = x & 1;
+        const int hi = (row[hd / 2 + (d / 32) * 4 + j] >> (4 * c + 2 * h + p)) & 1;
+        out[d] = (float)(((lo | (hi << 4)) ^ 16) - 16) * k5_f16(row + hd * 9 / 8 + (d / 32) * 2);
+        const int v = (row[hd * 5 / 8 + d / 2] >> (4 * (d & 1))) & 0xF;
+        out[hd + d] = (float)((v ^ 8) - 8) * k5_f16(row + hd * 19 / 16 + (d / 32) * 2);
+    }
+}
+/* One group of 32 values at dims g .. g + 31 into the row: K (`v` false) as int5, V as int4. */
+static void k5_encode_group(const float* x, uint8_t* row, int64_t hd, int64_t g, bool v) {
+    float amax = std::fabs(x[0]);
+    for (int i = 1; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+    const float lim = v ? 7.0f : 15.0f;
+    const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / lim, v ? 8188.0f : 4364.0f));
+    const float sc = rad_f16_to_f32(s16);
+    uint8_t* const codes = row + (v ? hd * 5 / 8 : 0);
+    uint8_t* const hb = row + hd / 2 + (g / 32) * 4;
+    if (!v) std::memset(hb, 0, 4);
+    for (int i = 0; i < 32; i += 2) {
+        int q[2];
+        for (int e = 0; e < 2; ++e) {
+            const float r = sc > 0.0f ? std::rint(x[i + e] / sc) : 0.0f;
+            q[e] = (int)std::fmin(std::fmax(r, -lim), lim) & (v ? 0xF : 0x1F);
+            const int y = i + e;
+            if (!v) hb[(y % 8) / 2] = (uint8_t)(hb[(y % 8) / 2] |
+                                                ((q[e] >> 4) << (4 * (y / 16) + 2 * ((y % 16) / 8) + e)));
+        }
+        codes[(g + i) / 2] = (uint8_t)((q[0] & 0xF) | ((q[1] & 0xF) << 4));
+    }
+    std::memcpy(row + (v ? hd * 19 / 16 : hd * 9 / 8) + (g / 32) * 2, &s16, 2);
+}
+/* libref's reciprocal descale: 1 / k_scale in double, rounded once. */
+static float k5_inv(const RadArgs* a, const char* k) {
+    const RadParam* p = p_find(a, k);
+    const double v = p && p->kind == RAD_P_F64 ? p->dval : (double)p_f32(a, k, 1.0f);
+    return (float)(1.0 / v);
+}
+
+static int attn_paged_rows(const RadArgs* a, RadStream stream, const RadTensor* sinks, int oi,
+                           bool shared_anchor_window = false);
+
+/* attn_paged (and its sink and anchor forms) over a k5_v4 cache: the cache widened to an f32 one
+ * [n_blocks, kv_heads, block_size, 2 * head_dim], then the f32 path with the same operands and
+ * parameters (kv_dtype f32). */
+static int attn_paged_k5v4(const RadArgs* a, RadStream stream, const RadTensor* sinks, int oi,
+                           bool shared_anchor_window) {
+    if (a->n_t < oi + 1) return RAD_E_INVAL;
+    const RadTensor* kv = &a->t[1];
+    const int64_t hd = p_int(a, "head_dim", 0);
+    if (!kv->data || !k5_cache_ok(kv, hd)) return RAD_E_SHAPE;
+    const int64_t rows = kv->shape[0] * kv->shape[1] * kv->shape[2], rb = kv->shape[3];
+    std::vector<float> wide((size_t)(rows * 2 * hd));
+    const uint8_t* c = (const uint8_t*)kv->data;
+    for (int64_t r = 0; r < rows; ++r) k5_decode_row(c + r * rb, hd, wide.data() + r * 2 * hd);
+    std::vector<RadTensor> t(a->t, a->t + a->n_t);
+    t[1].data = wide.data();
+    t[1].dtype = RAD_F32;
+    t[1].shape[3] = 2 * hd;
+    t[1].stride[3] = 1;
+    t[1].stride[2] = 2 * hd;
+    t[1].stride[1] = kv->shape[2] * 2 * hd;
+    t[1].stride[0] = kv->shape[1] * kv->shape[2] * 2 * hd;
+    std::vector<RadParam> p(a->p, a->p + a->n_p);
+    for (RadParam& x : p)
+        if (x.key && !std::strcmp(x.key, "kv_dtype")) x.sval = "f32";
+    RadArgs b = *a;
+    b.t = t.data();
+    b.p = p.data();
+    /* The sinks are an operand of a, not of the widened copy's cache: same index in t. */
+    return attn_paged_rows(&b, stream, sinks ? &t[(size_t)(sinks - a->t)] : nullptr, oi,
+                           shared_anchor_window);
+}
+
 /* ------------------------------------------------------------------ attn_paged */
 /* Prefill form, used for uniform (no cus) long queries (q_len >= 32). The decode form below widens
  * K/V per query row, re-converting the shared context q_len times. Here each (seq, kv-head,
  * q-block) unit widens the context once into panels and runs its rows from them. Per-row math
  * (ascending dots, the same rescale points) is the decode form's; the loads differ. q-blocks of 64
  * keep enough units for the thread pool. Ragged (cus) inputs always take the decode form. */
-static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream stream) {
-    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
+/* A sink (attn_paged_sink): one more logit in a row's softmax, with no value. Folded in after the
+ * keys: the maximum moves to it if it is larger, and the sum takes its weight. */
+static inline void sink_fold(float sk, float* acc, int64_t head_dim, float* m, float* l) {
+    if (*m == -INFINITY) return;          /* no visible key: the row stays zero */
+    if (sk > *m) {
+        const float r = sc_exp(*m - sk);
+        for (int64_t d = 0; d < head_dim; ++d) acc[d] *= r;
+        *l = *l * r + 1.0f;
+        *m = sk;
+    } else {
+        *l += sc_exp(sk - *m);
+    }
+}
+
+static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream stream,
+                              const RadTensor* sinks, int oi) {
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[oi];
     const RadTensor* kdes = rad_arg_in(a, 4);
     const RadTensor* vdes = rad_arg_in(a, 5);
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
@@ -225,6 +332,7 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
                     if (++ntile == AVX_KV_TILE) flush();
                 }
                 flush();
+                if (sinks) sink_fold(ldt(sinks, h), acc, head_dim, &m, &l);
                 if (m == -INFINITY) {
                     for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
                     continue;
@@ -246,18 +354,26 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
     return RAD_OK;
 }
 
+/* attn_paged, and attn_paged_sink with `sinks` (one logit a query head): out at operand `oi`. */
 /* attn_paged_tree's ninth operand, `spec_parent` (rad_drafter_tree), is read here too, as libref
  * reads it: -2 an ordinary causal row; else the row's parent's index within its sequence's rows
  * (-1 for the block's first). Inside the block such a row sees itself and its ancestors only, and
  * its window is measured from the block's first position plus its depth. */
-AVX_KERNEL(attn_paged) {
-    if (a->n_t < 8) return RAD_E_INVAL;
-    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
+/* `shared_anchor_window` (attn_paged_anchor_window): every row of a sequence measures its window,
+ * and a causal row its last visible key, from the sequence's first query position instead of its
+ * own, as libref does (ref_attn.cpp, ref_attn_paged_impl). */
+static int attn_paged_rows(const RadArgs* a, RadStream stream, const RadTensor* sinks, int oi,
+                           bool shared_anchor_window) {
+    if (kv_k5v4(a)) return attn_paged_k5v4(a, stream, sinks, oi, shared_anchor_window);
+    if (a->n_t < oi + 1) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[oi];
     const RadTensor* kdes = rad_arg_in(a, 4);
     const RadTensor* vdes = rad_arg_in(a, 5);
     const RadTensor* cus  = rad_arg_in(a, 6);
-    const RadTensor* tpar = a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    /* The tree operand sits where attn_paged_sink keeps its output; a sinked call has none. */
+    const RadTensor* tpar = !sinks && a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
     if (!q->data || !kv->data || !bt->data || !su->data || !o->data) return RAD_E_INVAL;
+    if (sinks && !sinks->data) return RAD_E_INVAL;
 
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa = p_int(a, "gqa", 1);
@@ -266,13 +382,15 @@ AVX_KERNEL(attn_paged) {
     const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
     const int causal = (int)p_int(a, "causal", 1);
     const int64_t window = p_int(a, "window", 0);
-    if (head_dim <= 0 || gqa <= 0 || block_size <= 0) return RAD_E_SHAPE;
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0 || (shared_anchor_window && window <= 0))
+        return RAD_E_SHAPE;
     if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
 
     const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
     if (kv_heads <= 0) return RAD_E_SHAPE;
     const int64_t q_heads = gqa * kv_heads;
     if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    if (sinks && numel(sinks) != q_heads) return RAD_E_SHAPE;
     const int64_t n_seq = numel(su);
     const int64_t rows = numel(q) / (q_heads * head_dim);
     if (n_seq <= 0 || rows <= 0) return RAD_E_SHAPE;
@@ -299,7 +417,8 @@ AVX_KERNEL(attn_paged) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     /* Uniform long queries take the panel form; ragged (cus) inputs stay here. */
-    if (!cus && q_len >= 32 && !tpar) return attn_paged_prefill(a, stream);
+    if (!cus && q_len >= 32 && !tpar && !shared_anchor_window)
+        return attn_paged_prefill(a, stream, sinks, oi);
     /* Work units are (token, kv-head) groups: the gqa query rows of a group share every key and
      * value row, so each is widened once for gqa dots/axpys. Per-row arithmetic is unchanged. */
     const int64_t total = rows * kv_heads;
@@ -415,12 +534,14 @@ AVX_KERNEL(attn_paged) {
             ntile = 0;
         };
 
+        const int64_t mask_pos = shared_anchor_window ? base : pos;
         for (int64_t j = 0; j < ctx; ++j) {
-            if (causal ? (j > pos) : (j >= ctx)) continue;
+            if (causal ? (j > mask_pos) : (j >= ctx)) continue;
             if (tree && j >= base && !((tmask >> (j - base)) & 1)) continue;
             if (window > 0) {
-                const int64_t d = wpos - j;
-                if (causal ? (d >= window) : (d >= window || d <= -window)) continue;
+                const int64_t d = (shared_anchor_window ? base : wpos) - j;
+                if (shared_anchor_window ? (d >= window)
+                    : causal ? (d >= window) : (d >= window || d <= -window)) continue;
             }
             if (j / block_size >= max_blocks) break;   /* past the block table's width */
             const int64_t blk = ldi(bt, s * bt_rs + (j / block_size) * bt_cs);
@@ -440,6 +561,7 @@ AVX_KERNEL(attn_paged) {
             const int64_t h = kh * gqa + g;
             const int64_t ob = tok * o_rs + h * o_hs;
             float* ac = accs + g * head_dim;
+            if (sinks) sink_fold(ldt(sinks, h), ac, head_dim, &mm[g], &ll[g]);
             if (mm[g] == -INFINITY) {
                 for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
                 continue;
@@ -458,6 +580,11 @@ AVX_KERNEL(attn_paged) {
         }
     }
     return RAD_OK;
+}
+
+AVX_KERNEL(attn_paged_sink) {
+    if (a->n_t < 9 || !a->t[7].data) return RAD_E_INVAL;
+    return attn_paged_rows(a, stream, &a->t[7], 8);
 }
 
 /* ------------------------------------------------------------------ attn_dense, bf16 blocks */
@@ -745,6 +872,15 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
     return true;
 }
 #endif
+
+AVX_KERNEL(attn_paged) { return attn_paged_rows(a, stream, nullptr, 7, false); }
+
+/* attn_paged with one window anchor a sequence (DSpark's drafter); no tree operand. */
+AVX_KERNEL(attn_paged_anchor_window) {
+    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    if (a->n_t > 8 && rad_arg_in(a, 8)) return RAD_E_UNSUPPORTED;
+    return attn_paged_rows(a, stream, nullptr, 7, true);
+}
 
 /* attn_paged with its tree operand present, which attn_paged reads (see there). Refused without
  * one, and for a non-causal layer. */
@@ -1047,8 +1183,54 @@ static void kv_scatter(const RadTensor* k, const RadTensor* v, const RadTensor* 
     }
 }
 
+/* kv_store at kv_dtype k5_v4 (the k5_v4 cache above): libref's bytes, its refusals. */
+static int kv_store_k5v4(const RadArgs* a) {
+    const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
+    const int64_t head_dim = p_int(a, "head_dim", k->rank >= 3 ? k->shape[k->rank - 1] : 0);
+    const int64_t block_size = p_int(a, "block_size", 0);
+    const int64_t kv_heads = p_int(a, "n_head_kv", kv->rank == 4 ? kv->shape[1] : 0);
+    if (head_dim <= 0 || block_size <= 0 || kv_heads <= 0) return RAD_E_SHAPE;
+    if (!k5_cache_ok(kv, head_dim) || kv->shape[1] != kv_heads || kv->shape[2] != block_size)
+        return RAD_E_SHAPE;
+    const int64_t M = numel(sm);
+    if (M <= 0 || numel(k) < M * kv_heads * head_dim) return RAD_E_SHAPE;
+    const int64_t n_blocks = kv->shape[0];
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t slot = ldi(sm, offlin(sm, t));
+        if (slot >= 0 && slot / block_size >= n_blocks) return RAD_E_SHAPE;
+    }
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1;
+    const int64_t k_hs = k->rank >= 3 ? k->stride[k->rank - 2] : head_dim * k_ds;
+    const int64_t k_rs = row_stride(k, kv_heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1;
+    const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
+    const int64_t v_rs = row_stride(v, kv_heads * head_dim);
+    const float kin = k5_inv(a, "k_scale"), vin = k5_inv(a, "v_scale");
+    uint8_t* const c = (uint8_t*)kv->data;
+    const int64_t rb = kv->shape[3];
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t slot = ldi(sm, offlin(sm, t));
+        if (slot < 0) continue;
+        const int64_t blk = slot / block_size, off = slot % block_size;
+        for (int64_t h = 0; h < kv_heads; ++h) {
+            uint8_t* const row = c + ((blk * kv_heads + h) * block_size + off) * rb;
+            for (int64_t g = 0; g < head_dim; g += 32) {
+                float kx[32], vx[32];
+                for (int i = 0; i < 32; ++i) {
+                    kx[i] = ldt(k, t * k_rs + h * k_hs + (g + i) * k_ds) * kin;
+                    vx[i] = ldt(v, t * v_rs + h * v_hs + (g + i) * v_ds) * vin;
+                }
+                k5_encode_group(kx, row, head_dim, g, false);
+                k5_encode_group(vx, row, head_dim, g, true);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 AVX_KERNEL(kv_store) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    if (kv_k5v4(a)) return kv_store_k5v4(a);
     const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
 
     const int64_t head_dim = p_int(a, "head_dim", k->rank >= 3 ? k->shape[k->rank - 1] : 0);
@@ -1684,10 +1866,18 @@ AVX_KERNEL(qsa_block_key) {
     const int64_t rot = p_int(a, "rotary_dim", 0), pos0 = p_int(a, "pos0", -1);
     if (n <= 0 || ratio <= 0 || (pos0 < 0 && !pos)) return RAD_E_INVAL;
     if (rot < 0 || rot > n || (rot & 1) || rot / 2 > AVX_HD_MAX / 2) return RAD_E_SHAPE;
-    if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
+    /* `ratio`, or a multiple of it for a group split across ranks (one key a page either way). */
+    if (const int64_t bs = p_int(a, "block_size", ratio); bs < ratio || bs % ratio) return RAD_E_SHAPE;
     if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
+    /* `key_dtype` i8: libref's int8 page, n codes, an f16 scale and zero padding (libref's
+     * ref_qsa_block_key states the rule). */
+    const char* kd = p_str(a, "key_dtype", nullptr);
+    if (kd && std::strcmp(kd, "i8")) return RAD_E_UNSUPPORTED;
+    const bool i8 = kd != nullptr;
     const int64_t M = page ? numel(page) : out->shape[0];
-    if (M < 1 || numel(out) / out->shape[0] != n) return RAD_E_SHAPE;
+    const int64_t ow = numel(out) / out->shape[0];
+    if (M < 1 || (i8 ? ow < n + 2 : ow != n)) return RAD_E_SHAPE;
+    if (i8 && (rad_dtype_bits(out->dtype) != 8 || !rows_dense(out))) return RAD_E_SHAPE;
     if (k->shape[0] != M * ratio || k->shape[1] != n || numel(w) < n) return RAD_E_SHAPE;
     const bool pos2 = pos && pos->rank == 2;
     if (pos && (pos2 ? pos->shape[0] < M : numel(pos) < M)) return RAD_E_SHAPE;
@@ -1764,6 +1954,26 @@ AVX_KERNEL(qsa_block_key) {
             const float x0 = y[i], x1 = y[half + i];
             y[i] = x0 * c - x1 * sn;
             y[half + i] = x0 * sn + x1 * c;
+        }
+        if (i8) {
+            /* Rounded to k's dtype as the activation store would hold it, then i8h's rule. */
+            uint8_t* row = (uint8_t*)out->data + orow * out->stride[0];
+            float amax = 0.0f;
+            for (int64_t t = 0; t < n; ++t) {
+                uint64_t tmp = 0;
+                st_elem(&tmp, k->dtype, 0, y[t]);
+                y[t] = ld_elem(&tmp, k->dtype, 0);
+                amax = t ? std::fmax(amax, std::fabs(y[t])) : std::fabs(y[t]);
+            }
+            const uint16_t s16 = rad_f32_to_f16(std::fmin(amax / 127.0f, 512.0f));
+            const float sc = rad_f16_to_f32(s16);
+            for (int64_t t = 0; t < n; ++t) {
+                const float r = sc > 0.0f ? std::rint(y[t] / sc) : 0.0f;
+                row[t] = (uint8_t)(int8_t)(int)std::fmin(std::fmax(r, -127.0f), 127.0f);
+            }
+            std::memcpy(row + n, &s16, 2);
+            std::memset(row + n + 2, 0, (size_t)(ow - n - 2));
+            continue;
         }
         for (int64_t t = 0; t < n; ++t) stt(out, offlin(out, orow * n + t), y[t]);
     }

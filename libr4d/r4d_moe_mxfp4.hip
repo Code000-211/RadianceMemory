@@ -1071,6 +1071,10 @@ int table(const RadTensor* t, uint32_t dtype, int bits, long experts, long n, lo
     *row = (int)(t->stride[1] * bits / 8);
     return RAD_OK;
 }
+/* r4d_moe_mxfp4_pin_small: 0 the rule, 1 the small-M form at any GLM slice up to 384 routed rows
+ * (TP4 as well as TP8, past the rule's bounds), 2 never, 3 as 1 with the K256 x4 tiles whatever
+ * K. For r4d_selftest --perfmx to measure the form where the rule does not take it. */
+int g_mx_small_pin = 0;
 int body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     const auto *aq = rad_arg_in(a, 0), *as = rad_arg_in(a, 1), *sorted = rad_arg_in(a, 4),
@@ -1157,12 +1161,19 @@ int body(const RadArgs* a, RadStream stream) {
         return bm == 64 ? MX_P64(64, 64, 256, 1, false) : MX_P64(32, 64, 256, 1, false);
 #undef MX_P64
     }
-    /* The small-M form at GLM's TP8 slices, ahead of the expert-major band: gate_up up to 384
-     * routed rows, down up to 32, where it stops gaining (at 5 to 8 tokens it reads 3 to 5 %
-     * slower than the staged form). At those slices on gfx1201 (perfmx, cold) it is 6 to 16 %
-     * faster than the expert-major form for gate_up from 1 to 48 tokens, and 4 to 23 % for down
-     * from 1 to 4. */
-    if (tp8 && m.T <= (m.K <= 256 ? 32 : 384)) {
+    /* The small-M form at GLM's slices, ahead of the expert-major band (perfmx, cold, its output
+     * byte-identical to the expert-major form's). At the TP8 slices: gate_up up to 384 routed rows,
+     * down up to 32, where it stops gaining (at 5 to 8 tokens it reads 3 to 5 % slower than the
+     * staged form); on gfx1201 it is 6 to 16 % faster than the expert-major form for gate_up from
+     * 1 to 48 tokens, and 4 to 23 % for down from 1 to 4. At the TP4 slices (--perfmx-tp 4):
+     * gate_up from 2 to 48 tokens, 3 to 18 % faster (at one token it reads 5 % slower), and down
+     * up to 48 tokens at the K256 x4 tiles, 37 % faster at one token and 4 % at 48. */
+    const bool tp8_small = tp8 && m.T <= (m.sorted_a ? 32 : 384);
+    const bool tp4 = glm_prefill && !tp8;
+    const bool tp4_small = tp4 && m.T <= 384 && (m.sorted_a || m.T > m.topk);
+    if (g_mx_small_pin == 1 || g_mx_small_pin == 3
+            ? glm_prefill && m.T <= 384
+            : g_mx_small_pin != 2 && (tp8_small || tp4_small)) {
         const long rows = std::min<long>(m.experts, m.T) + 1;
 #define MX_SMALL(SK, CT)                                                                           \
     R4D_EMIT(stream, (moe_mxfp4_small_kernel<SK, CT>),                                             \
@@ -1170,7 +1181,9 @@ int body(const RadArgs* a, RadStream stream) {
              (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data,             \
              w[1]->data, s[1]->data, (const int*)sorted->data, (const int*)off->data,              \
              (uint16_t*)y->data, m)
-        return m.K <= 256 ? MX_SMALL(256, 4) : MX_SMALL(512, 1);
+        return m.K <= 256 || g_mx_small_pin == 3 || (g_mx_small_pin == 0 && tp4 && m.sorted_a)
+                   ? MX_SMALL(256, 4)
+                   : MX_SMALL(512, 1);
 #undef MX_SMALL
     }
     /* The expert-major form up to a routed-row bound per projection (token rows: gate_up, sorted
@@ -1205,3 +1218,4 @@ int body(const RadArgs* a, RadStream stream) {
 }
 }
 extern "C" int r4d_rad_moe_mxfp4(const RadArgs* a, RadStream stream) { return body(a, stream); }
+extern "C" void r4d_moe_mxfp4_pin_small(int form) { g_mx_small_pin = form; }

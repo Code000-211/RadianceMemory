@@ -80,6 +80,7 @@ unsigned emu_ballot(bool p);
 /* HIP's __ballot: the wave32 mask, zero-extended */
 inline unsigned long long __ballot(int p) { return emu_ballot(p != 0); }
 inline int __popcll(unsigned long long v) { return __builtin_popcountll(v); }
+inline int __ffsll(long long v) { return __builtin_ffsll(v); }
 /* v_readfirstlane_b32: a cross-lane op is a wave barrier here, so every lane is active, lane 0 first */
 #define __builtin_amdgcn_readfirstlane(v) emu_readlane((v), 0)
 /* DPP16 row_shl, row_shr and row_xmask with every row and bank written; a source outside the row
@@ -140,6 +141,11 @@ inline emu_v8f emu_wmma_bf16(emu_v8bf a, emu_v8bf b, emu_v8f c) {
 #define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) emu_wmma_bf16((a), (b), (c))
 typedef _Float16 emu_v8h __attribute__((ext_vector_type(8)));
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
+/* the __fp16 fragments of r4d_dt16.h, the same bits */
+typedef __fp16 emu_v8fp16 __attribute__((ext_vector_type(8)));
+inline emu_v8f emu_wmma_f16(emu_v8fp16 a, emu_v8fp16 b, emu_v8f c) {
+    return emu_wmma_f16(__builtin_bit_cast(emu_v8h, a), __builtin_bit_cast(emu_v8h, b), c);
+}
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) emu_wmma_f16((a), (b), (c))
 /* v_wmma_f32_16x16x16_fp8_fp8 (gfx12, wave32): the bf16 form's layout with eight E4M3 bytes a
  * lane, element e in byte e. Each output is c plus its 16 products in k order: not the hardware's
@@ -224,6 +230,8 @@ inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }   /* v_rsq_f32 is w
 /* The device's fast exponential is not bit-exact to expf; here it is expf, so a test compares two
  * kernels that both take it, never a kernel against a host value of it. */
 inline float __expf(float x) { return std::exp(x); }
+/* the fast logarithm likewise */
+inline float __logf(float x) { return std::log(x); }
 inline unsigned __float_as_uint(float f) { unsigned u; std::memcpy(&u, &f, 4); return u; }
 inline float __int_as_float(int u) { float f; std::memcpy(&f, &u, 4); return f; }
 inline int __float_as_int(float f) { int u; std::memcpy(&u, &f, 4); return u; }
@@ -328,6 +336,12 @@ inline float __fsub_rn(float a, float b) { return a - b; }
 inline float __fmul_rn(float a, float b) { return a * b; }
 inline float __fdiv_rn(float a, float b) { return a / b; }
 inline float __fsqrt_rn(float a) { return std::sqrt(a); }
+/* The reciprocal square root, rounded once (from double); v_rsq_f32 and v_rcp_f32 below are within
+ * an ulp of these, so a test compares two kernels that both take them, never a kernel against a
+ * host value of them (as __expf) */
+inline float __frsqrt_rn(float a) { return (float)(1.0 / std::sqrt((double)a)); }
+#define __builtin_amdgcn_rcpf(x) (1.0f / (float)(x))
+struct alignas(8) ushort4 { unsigned short x, y, z, w; };
 struct alignas(8) float2 { float x, y; };
 inline float2 make_float2(float a, float b) { return float2{a, b}; }
 struct alignas(4) uchar4 { unsigned char x, y, z, w; };

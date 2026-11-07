@@ -9,11 +9,13 @@
 
 namespace rad {
 
-/* lcm, with a non-positive side meaning "no constraint yet". */
+/* lcm, with a non-positive side meaning "no constraint yet". The sides are plugin-declared; an lcm
+ * past int64 saturates, so the quantum check refuses it rather than wrapping to a small one. */
 static int64_t lcm64(int64_t a, int64_t b) {
     if (a <= 0) return b;
     if (b <= 0) return a;
-    return std::lcm(a, b);
+    const int64_t q = a / std::gcd(a, b);
+    return q > INT64_MAX / b ? INT64_MAX : q * b;
 }
 
 /* The op's sequence-chunk parameter, found by role (RAD_PROLE_SEQ_CHUNK) in its schema. Steps
@@ -36,6 +38,12 @@ int64_t prefill_shared_tok(const Config& cfg) {
     if (cfg.prefill_span <= 1 || cfg.checkpoint_interval <= 0) return cfg.max_tok;
     const int64_t I = cfg.checkpoint_interval;
     return std::max(std::min(cfg.max_tok, I), cfg.max_tok - (cfg.prefill_span - 1) * I);
+}
+
+int64_t decode_headroom_auto(int64_t max_seqs, int64_t n_spec) {
+    const int64_t rows = (max_seqs - 1) * (1 + std::max<int64_t>(n_spec, 0));
+    if (rows <= 0) return 0;
+    return std::min(align_up(rows, kDecodeHeadroomAlign), kDecodeHeadroomCap);
 }
 
 /* What a prefix hit restores beside the cached blocks: linear state, or a trunk's sliding window.

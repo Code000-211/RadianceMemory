@@ -10,6 +10,7 @@
  * the host. See ctx.h for the cost budget (spec §3.2).
  */
 #include <algorithm>
+#include <cstdint>
 #include <chrono>
 #include <functional>
 #include <unordered_map>
@@ -60,6 +61,66 @@ std::string tensor_shape_str(const RadTensor& t) {
     for (uint32_t d = 0; d < t.rank; ++d)
         s += fmt("%s%lld", d ? "," : "", (long long)t.stride[d]);
     return s + "]";
+}
+
+/* A device launch may use a host-side KV bound only when its exact operand maps to the host mirror
+ * of seqused (including a sequence slice), or to the position just after a one-sequence prefill
+ * piece. Never copy seqused back from a device queue here: the AQL upload may still be pending on
+ * another queue. */
+static bool issue_vector_operand(const RadTensor& t) {
+    return (t.rank == 1 && t.stride[0] == 1) ||
+           (t.rank == 2 && t.shape[1] == 1 && t.stride[0] == 1 && t.stride[1] == 1);
+}
+
+static bool issue_host_span_max(const RadTensor& t, const int32_t* device, const int32_t* host,
+                                int64_t total, int32_t* out) {
+    if (!t.data || !issue_vector_operand(t) || t.shape[0] <= 0 || !device || !host || total <= 0 || !out)
+        return false;
+    const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(t.data);
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(device);
+    if (p < base) return false;
+    const std::uintptr_t delta = p - base;
+    if (delta % sizeof(int32_t)) return false;
+    const std::uint64_t first = delta / sizeof(int32_t);
+    const std::uint64_t count = (std::uint64_t)t.shape[0];
+    if (first > (std::uint64_t)total || count > (std::uint64_t)total - first) return false;
+    int32_t maximum = host[first];
+    for (std::uint64_t i = 1; i < count; ++i) maximum = std::max(maximum, host[first + i]);
+    *out = maximum;
+    return true;
+}
+
+static int32_t issue_kv_used_max_h(const RadBatch* b, const RadTensor* t, int n) {
+    if (!b || !t || b->n_seq <= 0) return -1;
+    bool have = false;
+    int32_t found = -1;
+    auto add = [&](int32_t value) {
+        if (!have) { found = value; have = true; }
+        else if (found != value) return false;
+        return true;
+    };
+    for (int i = 0; i < n; ++i) {
+        if (!t[i].data || !issue_vector_operand(t[i]) || t[i].shape[0] <= 0) continue;
+        if (b->kv) for (int g = 0; g < b->n_kv_groups; ++g) {
+            if (b->kv_used_max_h && t[i].data == b->kv[g].seqused &&
+                t[i].shape[0] == b->n_seq) {
+                if (!add(b->kv_used_max_h[g])) return -1;
+                continue;
+            }
+            int32_t used = -1;
+            if (issue_host_span_max(t[i], b->kv[g].seqused, b->kv[g].seqused_h,
+                                    b->n_seq, &used) && !add(used)) return -1;
+        }
+        /* ArPieces' first attention uses positions[R] as its exact KV end: it is the position after
+         * the first query piece. This special operand is one length for one ordinary prefill seq. */
+        if (b->phase == RAD_PHASE_PREFILL && b->n_seq == 1 && b->n_spec == 0 &&
+            b->draft_pass == 0 && t[i].shape[0] == 1) {
+            int32_t used = -1;
+            if (issue_host_span_max(t[i], b->positions, b->positions_h, b->n_tok, &used) &&
+                !add(used)) return -1;
+        }
+    }
+    return have ? found : -1;
 }
 
 /* Element offset to byte offset. False when it cannot be expressed: a mid-byte offset into a
@@ -854,6 +915,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. There is one
      * entry per schema operand, the trailing optional ones the issue left out null. */
     ip.args.n_t = std::max(n_opd, (int)p.n_opd_schema);
+    ip.args.kv_used_max_h = issue_kv_used_max_h(batch_, t, ip.args.n_t);
+    /* A plugin with no pass-key callback has its decode, verify and draft passes recorded
+     * (pass_key), and a played pass keeps the arguments it was recorded with, so a launch there
+     * must not read a bound the key does not: it gets the step's context bound plus its longest
+     * query, both keyed, which crosses a bucket every 1024 tokens or more (batch.cpp) instead of
+     * moving with every token. Its prefill and mixed passes are never recorded and keep the
+     * exact maximum. */
+    if (ip.args.kv_used_max_h > 0 && !arch_pass_key_ && batch_ &&
+        batch_->phase != RAD_PHASE_PREFILL && batch_->phase != RAD_PHASE_MIXED)
+        ip.args.kv_used_max_h = (int32_t)std::min<int64_t>(
+            INT32_MAX, (int64_t)batch_->max_ctx_len + batch_->max_q_len);
     p.issued    = true;
     ++n_issues_;
 
@@ -1280,6 +1352,9 @@ int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
 }
 int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->rank() : 0; }
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
+int             rad_ctx_wgp_count(RadCtx* c) {
+    return c ? static_cast<rad::Ctx*>(c)->wgp_count() : 32;
+}
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }
 
 /* The second lane. `rad_lane` selects the lane subsequent issues launch on; `rad_lane_join`

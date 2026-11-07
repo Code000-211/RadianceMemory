@@ -99,6 +99,8 @@ static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_d
     if (kv->stride[3] != 1) return R4D_NO(RAD_E_STRIDE);
     if (kv->stride[2] != row) return R4D_NO(RAD_E_STRIDE);
     if (kv->shape[3] != row) return R4D_NO(RAD_E_SHAPE);
+    /* The kernels divide q_heads by kv_heads for the GQA factor. */
+    if (kv->shape[1] <= 0) return R4D_NO(RAD_E_SHAPE);
 
     /* 16-byte alignment for 128-bit loads. */
     if (!r4d_aligned(q->data, 16) || !r4d_aligned(o->data, 16) || !r4d_aligned(kv->data, 16))

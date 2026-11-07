@@ -28,6 +28,7 @@ __device__ __forceinline__ float act_of(float g) {
     if (ACT == 0) return g / (1.0f + expf(-g));
     if (ACT == 1) return 0.5f * g * (1.0f + erff(g * 0.70710678118654752f));
     if (ACT == 3) return 1.0f / (1.0f + expf(-g));
+    if (ACT == 5) return fmaxf(g, 0.0f);
     if (ACT == 4)   // quick_gelu: sigmoid of the bf16-rounded 1.702*g, as the unfused mul stores it
         return 1.0f / (1.0f + expf(-bf2f(f32_to_bf16(g * bf2f(f32_to_bf16(1.702f))))));
     return 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
@@ -351,6 +352,31 @@ __global__ __launch_bounds__(kThreads) void pool_cols_kernel(
         for (uint32_t j = 0; j < k; ++j) acc += bf2f(x[(size_t)r * x_ld + (size_t)i * k + j]);
         const float mean = bf2f(f32_to_bf16(acc * (1.0f / (float)k)));
         y[(size_t)r * y_ld + i] = f32_to_bf16(mean * mult);
+    }
+}
+
+// ---------------------------------------------------------------------------- point_fourier
+// ref_point_fourier: row m of y is [x | sin(x_i f_j) | cos(x_i f_j)], f_j = 2^j (times pi), the
+// sines then the cosines each i-major then j; f32 in and out. A thread an output column.
+__global__ __launch_bounds__(kThreads) void point_fourier_kernel(
+    const float* __restrict__ x, float* __restrict__ y, uint32_t n, uint32_t F, uint32_t pi,
+    uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    const uint32_t w = n * (2 * F + 1);
+    const uint32_t c = blockIdx.x * kThreads + threadIdx.x;
+    if (c >= w) return;
+    for (uint32_t r = blockIdx.y; r < M; r += gridDim.y) {
+        float v;
+        if (c < n) {
+            v = x[(size_t)r * x_ld + c];
+        } else {
+            const uint32_t k = c - n, half = n * F;
+            const uint32_t i = (k % half) / F, j = (k % half) % F;
+            const float f = pi ? (float)ldexp(3.14159265358979323846, (int)j)
+                               : ldexpf(1.0f, (int)j);
+            const float t = x[(size_t)r * x_ld + i] * f;
+            v = k < half ? sinf(t) : cosf(t);
+        }
+        y[(size_t)r * y_ld + c] = v;
     }
 }
 
@@ -757,11 +783,11 @@ __global__ __launch_bounds__(kLrThreads) void attn_local_rel_kernel(
 
 // ============================================================== launchers
 
-// act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))).
+// act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))), 5 relu.
 extern "C" int r4d_act_mul_bf16(long a, long b, long y, int M, int n, int act, int a_ld, int b_ld,
                                 int y_ld, long stream) {
     if (!a || !b || !y) return -1;
-    if (M <= 0 || n <= 0 || act < 0 || act > 4) return -2;
+    if (M <= 0 || n <= 0 || act < 0 || act > 5) return -2;
     const dim3 grid((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M));
 #define R4D_AM(A)                                                                               \
     hipLaunchKernelGGL(act_mul_kernel<A>, grid, dim3(kThreads), 0, (hipStream_t)stream,         \
@@ -771,7 +797,8 @@ extern "C" int r4d_act_mul_bf16(long a, long b, long y, int M, int n, int act, i
     else if (act == 1) R4D_AM(1);
     else if (act == 2) R4D_AM(2);
     else if (act == 3) R4D_AM(3);
-    else               R4D_AM(4);
+    else if (act == 4) R4D_AM(4);
+    else               R4D_AM(5);
 #undef R4D_AM
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -920,6 +947,19 @@ extern "C" int r4d_pool_cols_bf16(long x, long y, int rows, int n, int k, float 
                        dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)y,
                        (uint32_t)n, (uint32_t)k, mult, (uint32_t)x_ld, (uint32_t)y_ld,
                        (uint32_t)rows);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_point_fourier_f32(long x, long y, int rows, int n, int freqs, int pi,
+                                     int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (rows <= 0 || n <= 0 || freqs <= 0 || freqs > 30) return -2;
+    const uint32_t w = (uint32_t)(n * (2 * freqs + 1));
+    hipLaunchKernelGGL(point_fourier_kernel,
+                       dim3((w + kThreads - 1) / kThreads, grid_rows(rows)),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const float*)x, (float*)y,
+                       (uint32_t)n, (uint32_t)freqs, (uint32_t)(pi != 0), (uint32_t)x_ld,
+                       (uint32_t)y_ld, (uint32_t)rows);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1100,6 +1140,7 @@ extern "C" int r4d_rad_act_mul(const RadArgs* a, RadStream s) {
     else if (act && !std::strcmp(act, "gelu_tanh")) ai = 2;
     else if (act && !std::strcmp(act, "sigmoid")) ai = 3;
     else if (act && !std::strcmp(act, "quick_gelu")) ai = 4;
+    else if (act && !std::strcmp(act, "relu")) ai = 5;
     if (ai < 0) return R4D_NO(RAD_E_INVAL);
     const long long n = r4d_geti_or(a, "n", r4d_dim(Y, (int)Y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -1310,6 +1351,24 @@ extern "C" int r4d_rad_pool_cols(const RadArgs* a, RadStream s) {
     return enc_status(r4d_pool_cols_bf16(r4d_addr(X), r4d_addr(Y), (int)M, (int)n, (int)k,
                                          (float)r4d_getf(a, "mult", 1.0), (int)x_ld, (int)y_ld,
                                          (long)(uintptr_t)s));
+}
+
+/* ------------------------------------------------------------------ point_fourier */
+extern "C" int r4d_rad_point_fourier(const RadArgs* a, RadStream s) {
+    const RadTensor* X = r4d_opt(a, 0);
+    const RadTensor* Y = r4d_opt(a, 1);
+    if (!X || !Y) return R4D_NO(RAD_E_INVAL);
+    if (X->dtype != RAD_F32 || Y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), F = r4d_geti_or(a, "freqs", 0);
+    if (n <= 0 || F <= 0 || F > 30) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(X, n, &M);
+    const long long y_ld = r4d_rows_pitch(Y, n * (2 * F + 1), &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+    return enc_status(r4d_point_fourier_f32(r4d_addr(X), r4d_addr(Y), (int)M, (int)n, (int)F,
+                                           (int)r4d_geti_or(a, "pi", 0), (int)x_ld, (int)y_ld,
+                                           (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ cast bf16 -> f32 */

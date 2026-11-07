@@ -36,6 +36,7 @@
 #include "r4d_ar_seq.h"   // the all-reduce sequence step the fused all-reduce + norm takes
 #include "r4d_fp8_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"   // r4d_act_threads: the workgroup width, shared with the int8 path
 #include "r4d_fwht.h"     // the in-register rotation the `_had_` forms put before the absmax
 #include "r4d_q8.h"       // the 8-bit codes: E4M3, or int8 for an int8 trunk linear
@@ -215,7 +216,7 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
 // The launcher sizes the workgroup to the row's groups (capped at r4d_act_threads' width) and the
 // kernel reads the width from blockDim, so a narrow row does not leave most waves idle.
 template <int ACT, bool ROT = false, bool I8 = false>
-__global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
+__device__ __forceinline__ void gated_quant_fp8_kernel_body(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
     float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
     uint32_t q_ld, uint32_t s_ld) {
@@ -251,6 +252,24 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     }
 }
 
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <int ACT, bool ROT = false, bool I8 = false>
+__global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
+    float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
+    uint32_t q_ld, uint32_t s_ld) {
+    gated_quant_fp8_kernel_body<ACT, ROT, I8>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
+}
+template <int ACT, bool ROT = false, bool I8 = false>
+__global__ __launch_bounds__(1024) void r4dchain_gated_quant_fp8(
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
+    float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
+    uint32_t q_ld, uint32_t s_ld) {
+    r4d_chain_wait();
+    gated_quant_fp8_kernel_body<ACT, ROT, I8>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
+    r4d_chain_done();
+}
+
 // -------------------------------------------------- gate . x -> quant, two source buffers
 //
 // The same epilogue with the gate in a separate buffer. For gated attention, `x` is the attention
@@ -262,8 +281,12 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
 //
 // ACT 2 is the product with no activation: the unfused pair is `mul` then the quantiser, so the
 // gate is not rounded on its own and the product is rounded once, as mul_bf16 does.
-template <int ACT, bool I8 = false>
-__global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
+//
+// ROT (with I8: gate_had_quant_i8g) puts the width-128 Hadamard between the bf16-rounded product
+// and the absmax, as gated_quant_fp8_kernel's ROT, for an out projection stored rotated: the codes
+// are had_quant_act_i8g's over `y`.
+template <int ACT, bool I8 = false, bool ROT = false>
+__device__ __forceinline__ void gate_quant_fp8_kernel_body(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t g_ld,
     uint32_t x_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) {
@@ -303,8 +326,28 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
                 v[j] = bf2f(h);
             }
         }
+        // The rotated launcher requires n % 128 == 0, so no rotated group contains padding.
+        if constexpr (ROT) r4d_fwht_wave<(int)kGroup>(v, (int)lane);
         quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
     }
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <int ACT, bool I8 = false, bool ROT = false>
+__global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
+    const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t g_ld,
+    uint32_t x_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) {
+    gate_quant_fp8_kernel_body<ACT, I8, ROT>(g, x, y, q, s, n, nkb, g_ld, x_ld, y_ld, q_ld, s_ld);
+}
+template <int ACT, bool I8 = false, bool ROT = false>
+__global__ __launch_bounds__(1024) void r4dchain_gate_quant_fp8(
+    const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t g_ld,
+    uint32_t x_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) {
+    r4d_chain_wait();
+    gate_quant_fp8_kernel_body<ACT, I8, ROT>(g, x, y, q, s, n, nkb, g_ld, x_ld, y_ld, q_ld, s_ld);
+    r4d_chain_done();
 }
 
 // -------------------------------------------------------- all-reduce -> rmsnorm -> quant
@@ -802,7 +845,7 @@ extern "C" int r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long 
 // projection; `rot` alone pairs with a rotated four-bit expert, which reads E4M3.
 static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n, int mode,
                                   int gu_ld, int y_ld, int q_ld, int s_ld, RadStream stream,
-                                  bool rot, bool i8 = false) {
+                                  bool rot, bool i8 = false, bool chain = false) {
     int emit_rc = RAD_OK;
     if (!gu || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -818,7 +861,8 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     // there is no cross-row reduction and the rotation is wave-local (r4d_fwht.h).
     const int thr = std::min(nkb, r4d_act_threads(M, n) / (int)kWave) * (int)kWave;
 #define R4D_GQ_R(a, R, I)                                                                       \
-    emit_rc = R4D_EMIT(stream, (gated_quant_fp8_kernel<a, R, I>), dim3((uint32_t)M), dim3(thr),  \
+    emit_rc = R4D_EMIT(stream, (chain ? &r4dchain_gated_quant_fp8<a, R, I>                     \
+                                      : &gated_quant_fp8_kernel<a, R, I>), dim3((uint32_t)M), dim3(thr), \
                        0, (const uint16_t*)gu, (uint16_t*)y, (uint8_t*)q,                      \
                        (float*)s, (uint32_t)n, (uint32_t)nkb, (uint32_t)gu_ld, (uint32_t)y_ld,  \
                        (uint32_t)q_ld, (uint32_t)s_ld)
@@ -866,11 +910,12 @@ extern "C" int r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, i
 //   s  [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
 static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, int n, int mode,
                                int g_ld, int x_ld, int y_ld, int q_ld, int s_ld,
-                               RadStream stream, bool i8 = false) {
+                               RadStream stream, bool i8 = false, bool rot = false) {
     int emit_rc = RAD_OK;
     if (!g || !x || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;
+    if (rot && (!i8 || n % (int)kGroup)) return -3;
     if (mode < 0 || mode > 2) return -5;
     if (!g_ld) g_ld = n;
     if (!x_ld) x_ld = n;
@@ -881,7 +926,15 @@ static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, in
     // A wave a group, capped at r4d_act_threads' width, as gated_quant_fp8 above.
     const int thr = std::min(nkb, r4d_act_threads(M, n) / (int)kWave) * (int)kWave;
 #define R4D_GTQ_I(a, I)                                                                         \
-    emit_rc = R4D_EMIT(stream, (gate_quant_fp8_kernel<a, I>), dim3((uint32_t)M), dim3(thr), 0,  \
+    emit_rc = rot ? R4D_EMIT(stream, (g_r4d_chain_arg ? &r4dchain_gate_quant_fp8<a, true, true>  \
+                                                      : &gate_quant_fp8_kernel<a, true, true>),   \
+                             dim3((uint32_t)M), dim3(thr), 0, (const uint16_t*)g,                 \
+                             (const uint16_t*)x, (uint16_t*)y, (uint8_t*)q, (float*)s,            \
+                             (uint32_t)n, (uint32_t)nkb, (uint32_t)g_ld, (uint32_t)x_ld,          \
+                             (uint32_t)y_ld, (uint32_t)q_ld, (uint32_t)s_ld)                      \
+        : R4D_EMIT(stream, (g_r4d_chain_arg ? &r4dchain_gate_quant_fp8<a, I>                     \
+                                            : &gate_quant_fp8_kernel<a, I>), dim3((uint32_t)M),   \
+                   dim3(thr), 0,                                                                 \
                        (const uint16_t*)g, (const uint16_t*)x,                                 \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)nkb,        \
                        (uint32_t)g_ld, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)q_ld,          \
@@ -1113,7 +1166,9 @@ static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, boo
     if (mode < 0) return R4D_NO(RAD_E_UNSUPPORTED);
     const int e = gated_quant_fp8_launch(r4d_addr(gu), y ? r4d_addr(y) : 0, r4d_addr(q),
                                          r4d_addr(sc), (int)M, (int)K, mode, (int)gp, (int)yp,
-                                         (int)qp, (int)sp, stream, rot, q->dtype == RAD_I8);
+                                         (int)qp, (int)sp, stream, rot, q->dtype == RAD_I8,
+                                         /* decode heights: its rows are tokens or routed slots */
+                                         r4d_geti_or(a, "chain", 0) != 0 && M <= 1024);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1152,7 +1207,7 @@ static long long tq_pitch(const RadTensor* t, long long width) {
 /* Two-operand form of gated_quant_fp8 for gated attention: `x` is the attention output and the
  * gate a column view of the [q|gate] projection. The gate offset comes from the view, so there is
  * no `gate_offset` parameter. */
-extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
+static int rad_gate_quant(const RadArgs* a, RadStream stream, bool rot) {
     const RadTensor* g  = r4d_opt(a, TQ_G);
     const RadTensor* x  = r4d_opt(a, TQ_X);
     const RadTensor* q  = r4d_opt(a, TQ_Q);
@@ -1160,6 +1215,7 @@ extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
     const RadTensor* y  = r4d_opt(a, TQ_Y);
     if (!g || !x || !q || !sc) return R4D_NO(RAD_E_INVAL);
     if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (rot && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
     /* M is numel(x) / n. The `M` parameter is the band's declared maximum, not this issue's, and
      * shape[0] counts tokens while a row here is a (token, head) pair. */
     const long long K = r4d_geti_or(a, "n", 0);
@@ -1178,10 +1234,20 @@ extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
     if (gp < 0 || xp < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
     const int mode = act_mode(a, 1);                 /* sigmoid: gated attention */
     if (mode < 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0 && M <= 1024);
     const int e = gate_quant_fp8_emit(r4d_addr(g), r4d_addr(x), y ? r4d_addr(y) : 0,
                                       r4d_addr(q), r4d_addr(sc), (int)M, (int)K, mode,
                                       (int)gp, (int)xp, (int)yp, (int)qp, (int)sp, stream,
-                                      q->dtype == RAD_I8);
+                                      q->dtype == RAD_I8, rot);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
+    return rad_gate_quant(a, stream, false);
+}
+
+/* gate_quant_fp8 at had_quant_act_i8g's codes, for an out projection stored rotated (i8a8h). */
+extern "C" int r4d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream stream) {
+    return rad_gate_quant(a, stream, true);
 }
 

@@ -49,13 +49,26 @@ struct Ctx {
  * rows' 8-byte fragment reads fall on distinct banks. */
 constexpr uint32_t kTrPitch = 136, kTrBytes = 16 * kTrPitch;
 
+/* Bits [s, s + n) of the 64 bits hi:lo, n <= 32 (constants after unrolling). On byte bounds one
+ * v_perm, which also zeroes the bytes above; else a funnel shift and a mask. */
+__device__ __forceinline__ uint32_t window(uint32_t lo, uint32_t hi, uint32_t s, uint32_t n) {
+    if (s % 8u == 0u && n % 8u == 0u && n < 32u) {
+        uint32_t sel = 0x0C0C0C0Cu;
+        for (uint32_t i = 0; i < n / 8u; ++i)   /* byte s / 8 + i of hi:lo: lo's 0-3, hi's 4-7 */
+            sel = (sel & ~(0xFFu << (8u * i))) | ((s / 8u + i) << (8u * i));
+        return __builtin_amdgcn_perm(hi, lo, sel);
+    }
+    const uint32_t m = n == 32u ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    return __builtin_amdgcn_alignbit(hi, lo, s) & m;
+}
+
 /* `n` <= 32 bits of a little-endian dword stream from bit `o` (constant after unrolling). */
 template <uint32_t ND>
 __device__ __forceinline__ uint32_t field(const uint32_t (&d)[ND], uint32_t o, uint32_t n) {
     const uint32_t q = o >> 5, s = o & 31u;
     const uint32_t m = n == 32u ? 0xFFFFFFFFu : ((1u << n) - 1u);
     if (s + n <= 32u) return (d[q] >> s) & m;
-    return __builtin_amdgcn_alignbit(q + 1u < ND ? d[q + 1u] : 0u, d[q], s) & m;
+    return window(d[q], q + 1u < ND ? d[q + 1u] : 0u, s, n);
 }
 
 /* Low bytes of two, then of two pairs, into one dword. */
@@ -161,9 +174,50 @@ struct Dec {
     /* A grid lane segment may start mid-dword: read the dword-aligned window covering it. */
     static constexpr bool ALIGNED = LANE_BITS % 32u == 0u;
     static constexpr uint32_t ND = ALIGNED ? LANE_BITS / 32u : (LANE_BITS + 24u + 31u) / 32u;
-    /* The dwords of the unit above a trellis column's continuation can reach: its first codes. */
-    static constexpr uint32_t NP = TR ? ND : 1;
+    /* A trellis column's continuation: its first L - B bits in the unit above, which lie in one
+     * dword of that unit's lane segment for every width (column e starts at bit 16 B e), so a lane
+     * reads that dword alone of each of its four columns: p[e]. */
+    static constexpr uint32_t CB = 16u * B;
+    static constexpr uint32_t NP = TR ? 4u : 1u;
+    static constexpr uint32_t pdw(uint32_t e) { return e * CB / 32u; }
+    static constexpr uint32_t pbit(uint32_t e) { return e * CB % 32u; }
     struct Raw { uint32_t d[ND]; uint32_t p[NP]; };
+    /* A trellis column's stream: its CB code bits, then its continuation, as NW dwords, which
+     * its sixteen rows' states are windows of (row q's at bit q B). Built once a unit: a dword of
+     * a column that does not start on a dword bound is one funnel shift or v_perm, where reading
+     * each state from the lane's codes would join every state that crosses a bound, and every
+     * continued one, separately. */
+    static constexpr uint32_t NW = TR ? (15u * B + F::L + 31u) / 32u : 1u;
+    __device__ static uint32_t colw(const Raw& r, uint32_t e, uint32_t i) {
+        const uint32_t a = e * CB + 32u * i, oe = e * CB + CB;
+        const uint32_t q = a >> 5, s = a & 31u;
+        if (a + 32u <= oe) return s == 0u ? r.d[q] : __builtin_amdgcn_alignbit(r.d[q + 1u], r.d[q], s);
+        if (a >= oe) return r.p[e] >> (pbit(e) + (a - oe));
+        const uint32_t n0 = oe - a;   /* the column's own last bits, then its continuation */
+        if (s + n0 == 32u && pbit(e) == 0u) return __builtin_amdgcn_alignbit(r.p[e], r.d[q], s);
+        if (s % 8u == 0u && n0 % 8u == 0u && pbit(e) % 8u == 0u && s + n0 <= 32u) {
+            uint32_t sel = 0u;
+            for (uint32_t j = 0; j < 4u; ++j) {
+                const uint32_t b = j < n0 / 8u ? s / 8u + j : 4u + pbit(e) / 8u + (j - n0 / 8u);
+                sel |= (b < 8u ? b : 0x0Cu) << (8u * j);
+            }
+            return __builtin_amdgcn_perm(r.p[e], r.d[q], sel);
+        }
+        return field<ND>(r.d, a, n0) | (r.p[e] >> pbit(e)) << n0;
+    }
+    __device__ static void columns(const Raw& r, uint32_t (&cw)[4][NW]) {
+#pragma unroll
+        for (uint32_t e = 0; e < 4; ++e)
+#pragma unroll
+            for (uint32_t i = 0; i < NW; ++i) cw[e][i] = colw(r, e, i);
+    }
+    /* Row q's state of column e: L bits from bit q B of the column's stream. */
+    __device__ static uint32_t state(const uint32_t (&cw)[4][NW], uint32_t q, uint32_t e) {
+        constexpr uint32_t L = F::L;
+        const uint32_t o = q * B, i = o >> 5, s = o & 31u;
+        if (s + L <= 32u) return (cw[e][i] >> s) & ((1u << L) - 1u);
+        return window(cw[e][i], cw[e][i + 1u], s, L);
+    }
     static constexpr bool HALF = H16 && TR && !MAD && F::LRB != 0;
     static constexpr uint32_t kTab = F::KIND == kTable ? 256u
                                    : GRID ? (1u << B) << F::LV
@@ -203,9 +257,14 @@ struct Dec {
                 r.d[i] = __builtin_amdgcn_alignbit(i + 1u < ND ? w[i + 1u] : 0u, w[i], sh);
         }
         if constexpr (TR) {
+            static_assert(!TR || (pbit(1) + F::L - B <= 32u && pbit(2) + F::L - B <= 32u &&
+                                  pbit(3) + F::L - B <= 32u),
+                          "a column's continuation in one dword");
             const uint32_t rp = rt % c.run_tiles == 0u ? rt + c.run_tiles - 1u : rt - 1u;
-            const uint8_t* up = c.W + ((size_t)rp * c.nkb + kb) * ub;
-            load_dw<NP>(r.p, up + (size_t)lane * (LANE_BITS / 8u), live);
+            const uint32_t* up = (const uint32_t*)(c.W + ((size_t)rp * c.nkb + kb) * ub +
+                                                   (size_t)lane * (LANE_BITS / 8u));
+#pragma unroll
+            for (uint32_t e = 0; e < 4; ++e) r.p[e] = live ? up[pdw(e)] : 0u;
         } else {
             r.p[0] = 0u;
         }
@@ -219,19 +278,14 @@ struct Dec {
     __device__ static void rows(const Raw& r, const Ctx& c, float ratio, uint32_t (&w)[16]) {
         static_assert(!UNS || (MAD && F::LRB == 0), "unsigned values: a computed trellis, one scale a row");
         if constexpr (TR) {
-            constexpr uint32_t L = F::L, CB = 16u * B;
             /* All 64 states, then all 64 lookups, then the values: the LDS reads go out together
              * instead of each waiting on the last's use. */
-            uint32_t st[64];
+            uint32_t st[64], cw[4][NW];
+            columns(r, cw);
 #pragma unroll
             for (uint32_t q = 0; q < 16; ++q)
 #pragma unroll
-                for (uint32_t e = 0; e < 4; ++e) {
-                    const uint32_t pos = e * CB + q * B, own = CB - q * B;
-                    st[q * 4 + e] = L <= own ? field<ND>(r.d, pos, L)
-                                             : field<ND>(r.d, pos, own) |
-                                                   field<NP>(r.p, e * CB, L - own) << own;
-                }
+                for (uint32_t e = 0; e < 4; ++e) st[q * 4 + e] = state(cw, q, e);
             [[maybe_unused]] int32_t t[HALF ? 1 : 64];
             [[maybe_unused]] _Float16 th[HALF ? 64 : 1];
             if constexpr (MAD) {
@@ -315,20 +369,16 @@ struct Dec {
      * each byte is the value plus 126 times the activation, the sum and the product in one. */
     __device__ static void hashes(const Raw& r, const Ctx& c, uint32_t (&h)[16][4]) {
         static_assert(MAD, "hashes: a computed trellis");
-        constexpr uint32_t L = F::L, CB = 16u * B;
         constexpr Form f{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
         const uint32_t* ab = (const uint32_t*)(c.W + aux_off(f, c.N, (int64_t)c.nkb * 128) +
                                                ((int64_t)1 << F::L));
         const uint32_t A = ab[0], Bc = ab[1];
+        uint32_t cw[4][NW];
+        columns(r, cw);
 #pragma unroll
         for (uint32_t q = 0; q < 16; ++q)
 #pragma unroll
-            for (uint32_t e = 0; e < 4; ++e) {
-                const uint32_t pos = e * CB + q * B, own = CB - q * B;
-                const uint32_t st = L <= own ? field<ND>(r.d, pos, L)
-                                             : field<ND>(r.d, pos, own) | field<NP>(r.p, e * CB, L - own) << own;
-                h[15u - q][e] = (__umul24(st, A) + Bc) & 0x3F3F3F3Fu;
-            }
+            for (uint32_t e = 0; e < 4; ++e) h[15u - q][e] = (__umul24(state(cw, q, e), A) + Bc) & 0x3F3F3F3Fu;
     }
 
     /* Zero: the zero of row (rt*16 + q) for block kb is subtracted bytewise after `rows`. */

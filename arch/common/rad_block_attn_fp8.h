@@ -9,6 +9,9 @@
  *     the GEMM output directly.
  *   - No output gate. The attention output goes straight into the out-projection.
  *
+ * `rotary_dim` 0 is attention without positions (NoPE, Nemotron-H's attention layers): no `rope`
+ * is declared, and position reaches the model through its recurrent layers alone.
+ *
  * That allows a fused q|k|v, which the gated block cannot have (its query projection is [q|gate]
  * interleaved per head). The three weights concatenate along dim 0 into one
  * [q_dim + 2*kv_dim, n_embd], and `rope` takes that row as is: q heads, then k heads, v untouched
@@ -81,19 +84,21 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
     const int64_t q_dim  = g.q_dim();
     const int64_t kv_dim = g.kv_dim();
 
-    if (n_rot <= 0 || n_rot > g.head_dim || (n_rot & 1)) {
+    if (n_rot < 0 || n_rot > g.head_dim || (n_rot & 1)) {
         fprintf(stderr, "radiance: rotary_dim %lld is not an even width inside head_dim %lld\n",
                 (long long)n_rot, (long long)g.head_dim);
         return RAD_E_INVAL;
     }
 
-    /* No KV-head replication: the fused [q|k|v] uses the plain even row shard, so above the KV head
-     * count a rank would read the wrong rows. rad_block_attn_gated_fp8.h is the block that uses
-     * geom_from's `kv_off`. */
-    if (g.world > g.n_head_kv_all) {
-        fprintf(stderr, "radiance: %s declares no KV row span and cannot serve world_size = %d "
-                        "with n_head_kv = %lld.\n", __func__, g.world,
-                (long long)g.n_head_kv_all);
+    /* Above the KV head count geom_from replicates KV heads (rad_arch.h): each of the fused row's
+     * three parts takes its own span (as gemma4's q|k|v does), q this rank's heads and k and v the
+     * shared head at `kv_off`, where the even shard would hand a rank part of a head. A smaller
+     * attention world (Geom::attn_world) is not served here. */
+    const bool kv_repl = g.world > g.n_head_kv_all;
+    if (kv_repl && g.attn_world != g.world) {
+        fprintf(stderr, "radiance: %s replicates KV heads but declares no attention-zero ranks; "
+                        "world_size = %d must be a multiple of n_head_kv = %lld.\n", __func__,
+                g.world, (long long)g.n_head_kv_all);
         return RAD_E_UNSUPPORTED;
     }
 
@@ -107,9 +112,17 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
     RAD_ARCH_TRY(qkv.declare(b, nm, g, nm.f("blk.%d.attn_qkv", l), q_dim + 2 * kv_dim, g.n_embd,
                              RAD_SHARD_ROW, grp_layer(l), { src.q, src.k, src.v }, w.h, w.qkv,
                              0, { q_dim, kv_dim, kv_dim }));
+    if (kv_repl) {
+        const int64_t lo[3] = { g.rank * q_dim, g.kv_off, g.kv_off };
+        const int64_t hi[3] = { lo[0] + q_dim, lo[1] + kv_dim, lo[2] + kv_dim };
+        const int64_t tot[3] = { g.n_head_all * g.head_dim, g.n_head_kv_all * g.head_dim,
+                                 g.n_head_kv_all * g.head_dim };
+        RAD_ARCH_TRY(qkv.span_parts(b, lo, hi, tot, 3));
+    }
 
-    op_rope = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head, g.n_head_kv, n_rot, mode),
-                 {w.qkv}, {w.qkv});
+    if (n_rot > 0)
+        op_rope = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head, g.n_head_kv, n_rot, mode),
+                     {w.qkv}, {w.qkv});
 
     /* Copies the query out of the fused row: libr4d's paged attention reads `q` as a dense
      * [total_q, n_head, head_dim] block with no pitch argument (r4d_attn_args.h, fill_paged), so a
@@ -179,7 +192,7 @@ inline void AttnFP8::step(RadCtx* c, const RadBatch* batch) const {
     qkv.step(c, w.h, w.qkv, T);
     /* In place over the fused row: rotates n_head query heads, then n_head_kv key heads, and
      * leaves the value heads alone. */
-    RAD_ISSUE(c, op_rope, brows(w.qkv, T), rope_posmc(g, batch, T));
+    if (op_rope) RAD_ISSUE(c, op_rope, brows(w.qkv, T), rope_posmc(g, batch, T));
 
     /* k and v are column slices of the fused row, at q_dim and q_dim + kv_dim. */
     RAD_ISSUE(c, op_kv_store,

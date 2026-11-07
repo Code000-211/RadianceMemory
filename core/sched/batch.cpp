@@ -123,6 +123,7 @@ void BatchBuilder::carve(Set& s, char* h) {
     /* The advance's per-sequence runtime-window data (advance.h); 0 when there is none. */
     pair(&s.h_rpos,   &s.d_rpos,   S);
     pair(&s.h_tlen,   &s.d_tlen,   S);
+    pair(&s.h_arow,   &s.d_arow,   S);
     s.h_grp = ::rad::carve<AdvGroup>(h, oh, (int64_t)s.groups.size());
     s.d_grp = ::rad::carve<AdvGroup>(d, od, (int64_t)s.groups.size());
     for (size_t gi = 0; gi < s.groups.size(); ++gi) {
@@ -130,11 +131,14 @@ void BatchBuilder::carve(Set& s, char* h) {
         pair(&g.h_slot, &g.d_slot, T);
         pair(&g.h_used, &g.d_used, S);
         pair(&g.h_sidx, &g.d_sidx, S * g.sidx_pitch);
+        /* One row per decode row the step can carry, as O above counts them for the logits. */
+        pair(&g.h_scr, &g.d_scr, g.scratch_pitch * S * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0)));
     }
     /* Rotary planes and encoder-row targets, only for a program with an encoder; nothing else
      * moves a rotary position off the token index. */
     pair(&s.h_rope,  &s.d_rope,  mm_on_ ? 3 * T : 0);
     pair(&s.h_mmrow, &s.d_mmrow, mm_on_ ? T : 0);
+    pair(&s.h_bidi,  &s.d_bidi,  bidi_on_ ? 4 * T : 0);
     /* Each row's adapter slot, carved only when the engine serves adapters, so an engine without
      * them lays the slab out as if the array did not exist. */
     pair(&s.h_lora,  &s.d_lora,  lora_on_ ? T : 0);
@@ -190,6 +194,7 @@ void BatchBuilder::size_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         }
         s.groups[gi].max_blocks = mb;
         s.groups[gi].sidx_pitch = e.sidx_width > 0 ? e.sidx_width : 1;
+        s.groups[gi].scratch_pitch = e.scratch_pitch > 0 ? e.scratch_pitch : 0;
     }
     carve(s, nullptr);
 }
@@ -245,6 +250,7 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
         o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
+        o.kv_used_max_h.assign(s.groups.size(), 0);
         o.seqs.clear();
         o.seqs.reserve((size_t)max_seqs_);   /* a build fills it without allocating */
         o.has_seqs = false;
@@ -373,7 +379,8 @@ int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeo
 }
 
 int BatchBuilder::layout(Program& prog, const Config& cfg) {
-    max_tok_ = cfg.max_tok;
+    /* A whole step: the prefill budget plus the decode headroom (step_tok), as the declare. */
+    max_tok_ = step_tok(cfg);
     max_seqs_ = cfg.max_seqs;
 
     if (max_tok_ <= 0 || max_seqs_ <= 0) return RAD_E_INVAL;
@@ -480,6 +487,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
               });
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
+    bidi_on_ = prog.encoder.modalities != 0 && prog.encoder.bidirectional != 0;
     lora_on_ = cfg.lora.enabled();
     pw_cap_ = prog.plugin_words;
     return RAD_OK;
@@ -725,7 +733,13 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 first = kv.first_block_pos(e.seq, (int32_t)gi);
                 has_win = kv.runtime_window(e.seq, (int32_t)gi, &win);
                 if (has_win) {
-                    assert(!ring_blocks || ring_blocks == (int32_t)win.ring_blocks);
+                    /* The ring size sets the group header's geometry, so every sequence in the
+                     * group must report the same one. */
+                    if (ring_blocks && ring_blocks != (int32_t)win.ring_blocks) {
+                        RAD_ERR("kv group %d: sequences report ring sizes of %d and %d blocks",
+                                (int)gi, (int)ring_blocks, (int)win.ring_blocks);
+                        return RAD_E_STATE;
+                    }
                     ring_blocks = (int32_t)win.ring_blocks;
                 }
                 bt_len = (int64_t)bt.size();
@@ -808,6 +822,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                                    (int)g.sidx_pitch);
             }
         }
+        int32_t group_used = 0;
+        for (int64_t i = 0; i < n_seq; ++i)
+            group_used = std::max(group_used, g.h_used[i]);
+        o.kv_used_max_h[gi] = group_used;
         /* A state group's rows are one slot per sequence: n_seq words, restaged whole. */
         if (!L.paged) {
             stage(g.bt_fix, np, n_seq);
@@ -836,8 +854,19 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             a.tlen_off    = (const char*)s.d_tlen - d0;
         }
 
+        /* Every build, not once: the slab's staging is re-carved from the ring each build and the
+         * whole prefix is uploaded with it, so a table written once would not be on the card. */
+        if (g.scratch_pitch > 0) {
+            const IKVManager::Pager pg = kv.pager(g.g, 0);
+            const int64_t n = g.scratch_pitch * max_seqs_ * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0));
+            if (pg.scratch) std::memcpy(g.h_scr, pg.scratch, (size_t)n * sizeof(int32_t));
+            else std::fill(g.h_scr, g.h_scr + n, -1);
+        }
+
         /* Each rank's own view of the group's ring and mirror (kvstream_step_view). */
         const RadKVStream* sv = kv.stream_view((int32_t)gi);
+        if (tags_epoch_.size() < s.groups.size()) tags_epoch_.resize(s.groups.size());
+        if (tags_epoch_[gi].size() != ranks_.size()) tags_epoch_[gi].assign(ranks_.size(), -1);
         for (size_t r = 0; r < ranks_.size(); ++r) {
             void* base = s.dev[r];
             RadKVGroupBatch& b = o.kv[r][gi];
@@ -846,6 +875,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             b.block_table = on_rank(base, s.dev[0], g.d_bt);
             b.block_table_pitch = pitch;
             b.seqused = on_rank(base, s.dev[0], g.d_used);
+            b.seqused_h = g.h_used;
             b.state_index = on_rank(base, s.dev[0], g.d_sidx);
             b.state_index_pitch = g.sidx_pitch;
             b.block_size = L.block_size;
@@ -855,6 +885,44 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                                           ranks_[r].kv_streams != nullptr,
                                           ranks_[0].kv_base, ranks_[r].kv_base);
 
+            /* The pager's operands, from this rank's manager: all zero when the group has no
+             * window or its store is closed, which is also what gates the pager op. */
+            const IKVManager::Pager pg = kv.pager(g.g, (int)r);
+            if (pg.store && g.scratch_pitch > 0) {
+                b.residency_store         = pg.store;
+                b.residency_slot_bytes    = pg.slot_bytes;
+                b.residency_layer_off     = pg.layer_off;
+                b.residency_scratch       = on_rank(base, s.dev[0], g.d_scr);
+                b.residency_scratch_pitch = g.scratch_pitch;
+                b.residency_paged         = pg.paged;
+                b.residency_slots         = pg.slots;
+                b.residency_tags          = pg.tags;
+                b.residency_tags_rows     = pg.tags_rows;
+                b.residency_hits          = pg.hits;
+                /* A slot freed since the last build may hold another block by this step: every
+                 * tag goes, on the compute stream before this step's pagers and after every
+                 * earlier step's (RadKVGroupBatch::residency_tags). */
+                if (pg.tags && pg.epoch != tags_epoch_[gi][r]) {
+                    if (rad_memset_async(pg.tags, 0, pg.tags_bytes, ranks_[r].stream) < 0) {
+                        RAD_ERR("step batch: rank %zu could not clear the page cache", r);
+                        b.residency_tags = nullptr;
+                        b.residency_tags_rows = 0;
+                    } else {
+                        tags_epoch_[gi][r] = pg.epoch;
+                    }
+                }
+            } else {
+                b.residency_store = nullptr;
+                b.residency_slot_bytes = 0;
+                b.residency_layer_off = nullptr;
+                b.residency_scratch = nullptr;
+                b.residency_scratch_pitch = 0;
+                b.residency_paged = nullptr;
+                b.residency_slots = 0;
+                b.residency_tags = nullptr;
+                b.residency_tags_rows = 0;
+                b.residency_hits = nullptr;
+            }
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }
     }
@@ -933,6 +1001,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
+    int64_t n_bidi = 0;
     bool lora_rows = false;
     int32_t cvec_rows = 0;
     int64_t n_pw = 0;
@@ -1022,6 +1091,23 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 n_mm += got;
             }
         }
+        /* The part of each picture's or video frame's run inside this chunk, read both ways
+         * (RadBatch::n_bidi), on a trunk pass: its rows see the keys up to the run's end, or the
+         * chunk's where a run longer than any step was cut (Scheduler::bidi_fit). */
+        if (bidi_on_ && plan.draft_pass == 0 && shift == 0 && e.req && e.req->media) {
+            const mm::PromptMedia& pm = *e.req->media;
+            const int64_t c0 = e.ctx_len, c1 = c0 + e.n_tokens, T = max_tok_;
+            for (const mm::RopeLayout::Run& run : pm.rope.runs) {
+                const int64_t a = std::max<int64_t>(run.tok, c0);
+                const int64_t b = std::min<int64_t>((int64_t)run.tok + run.n, c1);
+                if (a >= b || pm.items[(size_t)run.item].item->kind == mm::Kind::Audio) continue;
+                s.h_bidi[n_bidi]         = (int32_t)b;
+                s.h_bidi[T + n_bidi]     = (int32_t)(k + a - c0);
+                s.h_bidi[2 * T + n_bidi] = (int32_t)(b - a);
+                s.h_bidi[3 * T + n_bidi] = (int32_t)i;
+                ++n_bidi;
+            }
+        }
         if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0) {
             /* checkpoint_tok indexes this step's tokens: the sequence's base plus the offset the
              * scheduler chose, the last token of a checkpoint interval (§7.3). */
@@ -1075,6 +1161,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         s.h_q[i]   = e.n_tokens;
         s.h_ctx[i] = e.ctx_len;
         s.h_acc[i] = e.n_accepted;
+        s.h_arow[i] = -1;
         if (e.is_prefill) { if (e.n_tokens > max_q_pf) max_q_pf = e.n_tokens; }
         else               { if (e.n_tokens > max_q_dec) max_q_dec = e.n_tokens; }
     }
@@ -1205,6 +1292,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_seq = n_seq;
         B.token_ids = on_rank(base, b0, s.d_tok);
         B.positions = on_rank(base, b0, s.d_pos);
+        B.positions_h = s.h_pos;
         B.cu_seqlens = on_rank(base, b0, s.d_cu);
         B.seq_ids = on_rank(base, b0, s.d_sid);
         B.n_out = n_out;
@@ -1220,6 +1308,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.max_q_len_decode = max_q_dec;
         B.max_q_len_prefill = max_q_pf;
         B.max_ctx_len = (int32_t)ctx_bound;
+        B.kv_used_max_h = o.kv_used_max_h.data();
         B.n_kv_groups = (int)o.kv[r].size();
         B.kv = o.kv[r].data();
         B.draft_pass = plan.draft_pass;
@@ -1230,10 +1319,17 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.num_accepted = cfg_.n_spec > 0 ? on_rank(base, b0, s.d_acc) : nullptr;
         /* Staged above on a tree step: each row's parent row, -2 for an ordinary causal one. */
         B.spec_parent = plan.spec_is_tree ? on_rank(base, b0, s.d_parent) : nullptr;
+        /* Pass 1 is a block drafter's query pass (a serial head has no pass 1). */
+        B.anchor_rows = plan.draft_pass == 1 ? on_rank(base, b0, s.d_arow) : nullptr;
         B.rope_pos = mm_on_ ? on_rank(base, b0, s.d_rope) : nullptr;
         B.rope_mixed = rope_mixed;
         B.n_mm_rows = n_mm;
         B.mm_rows = n_mm ? on_rank(base, b0, s.d_mmrow) : nullptr;
+        B.n_bidi = n_bidi;
+        B.bidi_used = n_bidi ? on_rank(base, b0, s.d_bidi) : nullptr;
+        B.bidi_row  = n_bidi ? s.h_bidi + max_tok_ : nullptr;
+        B.bidi_n    = n_bidi ? s.h_bidi + 2 * max_tok_ : nullptr;
+        B.bidi_seq  = n_bidi ? s.h_bidi + 3 * max_tok_ : nullptr;
         B.mm_embd = n_mm ? mm_dev_[r] : nullptr;
         /* Null on a step with no adapter row: the core then issues no adapter op, and the step
          * runs the same pass as an engine serving no adapters. */
@@ -1309,6 +1405,7 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.ctx_off  = off(s.d_ctx);
     a.acc_off  = off(s.d_acc);
     a.out_off  = off(s.d_out);
+    a.arow_off = off(s.d_arow);
     a.sid_off  = off(s.d_sid);
     a.cu_off   = off(s.d_cu);
     a.q_off    = off(s.d_q);

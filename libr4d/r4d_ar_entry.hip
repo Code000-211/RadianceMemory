@@ -18,6 +18,7 @@
  * with a 60-second timeout and a named error.
  */
 
+#include "r4d_chain.h"
 #include "r4d_args.h"
 #include "r4d.h"
 #include "r4d_ar_shards.h"
@@ -1715,7 +1716,8 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
         (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-        early ? in->gate_ctr : 0L, in->my_stage);
+        early ? in->gate_ctr : 0L, in->my_stage,
+        r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M) ? 1L : 0L);
     if (rc != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
@@ -1844,7 +1846,8 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
                         nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, early,
-                        early ? in->gate_ctr : 0L, in->my_stage));
+                        early ? in->gate_ctr : 0L, in->my_stage,
+                        r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
